@@ -41,11 +41,31 @@
 #include "offsets.h"
 
 // ---------------------------------------------------------------------------
-// small logging helper -> %TEMP%\frostmod.log  (and OutputDebugString)
+// small logging helper -> <dll folder>\frostmod.log  (and OutputDebugString)
+//
+// We log NEXT TO the dll (frostmod.exe reads the same folder) rather than to
+// %TEMP%, because a Steam-launched game can have a different %TEMP% than the
+// launcher, which would hide our output. Falls back to %TEMP% if read-only.
 // ---------------------------------------------------------------------------
 namespace {
 
 std::mutex g_logMutex;
+char g_logPath[MAX_PATH] = {0};
+
+// Resolve the log path once, from the dll's own module handle (its folder is the
+// same folder as frostmod.exe). Called from DllMain before anything else logs.
+void InitLogPath(HMODULE self) {
+    char p[MAX_PATH];
+    if (self && GetModuleFileNameA(self, p, sizeof(p))) {
+        if (char* slash = strrchr(p, '\\')) *(slash + 1) = 0;
+        char cand[MAX_PATH];
+        strcpy_s(cand, p);
+        strcat_s(cand, "frostmod.log");
+        if (FILE* f; fopen_s(&f, cand, "a") == 0 && f) { fclose(f); strcpy_s(g_logPath, cand); return; }
+    }
+    char t[MAX_PATH];
+    if (GetTempPathA(sizeof(t), t)) { strcat_s(t, "frostmod.log"); strcpy_s(g_logPath, t); }
+}
 
 void Log(const char* fmt, ...) {
     char buf[1024];
@@ -58,9 +78,11 @@ void Log(const char* fmt, ...) {
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
 
-    char path[MAX_PATH];
-    if (GetTempPathA(sizeof(path), path)) {
-        strcat_s(path, "frostmod.log");
+    // fall back to %TEMP% if InitLogPath hasn't run yet for some reason
+    char temp[MAX_PATH];
+    const char* path = g_logPath[0] ? g_logPath
+                     : (GetTempPathA(sizeof(temp), temp) ? (strcat_s(temp, "frostmod.log"), temp) : nullptr);
+    if (path) {
         if (FILE* f; fopen_s(&f, path, "a") == 0 && f) {
             SYSTEMTIME st; GetLocalTime(&st);
             fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
@@ -211,6 +233,12 @@ wglSwapBuffers_t g_origWglSwapBuffers = nullptr;
 HANDLE g_reloadEvent = nullptr;
 
 void Tick() {
+    // Heartbeat: prove the render hook is actually firing. If you never see this
+    // line in frostmod.log, the game isn't calling the SwapBuffers we hooked, so
+    // F8 / reload can't run - that's the thing to fix, not the reload itself.
+    static bool firstFrame = true;
+    if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
+
     // Optional in-game hotkey (F8) as a fullscreen-friendly alternative to the
     // floating window, which some exclusive-fullscreen modes will hide.
     static bool prev = false;
@@ -219,8 +247,10 @@ void Tick() {
     prev = down;
 
     // Reload requested from frostmod.exe? (auto-reset event self-clears on wait.)
-    if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0)
+    if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0) {
+        Log("[event] reload signal received from frostmod.exe");
         RequestReload();
+    }
 
     DrainGameThreadTasks();
 }
@@ -265,8 +295,8 @@ DWORD WINAPI UiThread(LPVOID) {
         60, 60, 200, 120,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    CreateWindowA("STATIC", "FrostMod  \xE2\x9D\x84",   // snowflake
-                  WS_CHILD | WS_VISIBLE | SS_CENTER,
+    CreateWindowA("STATIC", "FrostMod",   // (plain ASCII: the console/GDI code page
+                  WS_CHILD | WS_VISIBLE | SS_CENTER,  //  can't render a UTF-8 snowflake)
                   10, 10, 170, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
 
     CreateWindowA("BUTTON", "Reload Mods",
@@ -343,6 +373,7 @@ DWORD WINAPI Init(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        InitLogPath(hModule);   // resolve <dll folder>\frostmod.log before we log
         CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
     }
     return TRUE;

@@ -68,7 +68,18 @@ You can start `frostmod.exe` before the game — it waits and injects on launch,
 which also lets it capture the startup scan automatically.
 
 Options: `frostmod.exe --process gpbikes.exe`, `--mods "D:\path\mods"`, or an
-explicit DLL path. Logs also go to `%TEMP%\frostmod.log`.
+explicit DLL path. The log is written next to the binaries
+(`…\build\bin\Release\frostmod.log`, falling back to `%TEMP%` if that folder is
+read-only) — the console streams it for you.
+
+### Reload isn't taking?
+
+Watch the log the console streams. In order, you want to see: `[tick] render hook
+alive` (the per-frame hook fires — required for reload to run at all), then a
+`[capture] scanner …` line (only appears once the game scans — that's why you open
+a content menu first), then on reload `[reload] … scanner returned …`. If you
+never see `[tick]`, the game isn't calling the present function we hooked; if you
+see `[reload] ABORT … not captured`, open the track/bike menu once and try again.
 
 ## How it works
 

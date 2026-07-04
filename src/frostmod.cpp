@@ -191,6 +191,12 @@ void DoReloadOnGameThread() {
     Log("[reload] running on game thread (strategy=%d)",
         (int)g_strategy.load());
 
+    if (!g_origScan) {
+        Log("[reload] ABORT: content hooks were not installed (offsets.h didn't match "
+            "this mxbikes build - see the [sig] lines above). Reload is unavailable.");
+        return;
+    }
+
     if (!g_scanArgs.valid.load()) {
         Log("[reload] ABORT: scanner args not captured yet. Trigger a content "
             "scan first (e.g. open the track/bike selection menu), then retry.");
@@ -317,6 +323,88 @@ DWORD WINAPI UiThread(LPVOID) {
 }
 
 // ---------------------------------------------------------------------------
+// signature (AOB) validation - is offsets.h actually correct for THIS build?
+//
+// offsets.h ships RVAs recovered from one specific mxbikes.exe. A game update
+// shifts them, and blindly hooking a stale address hooks the wrong code (or
+// crashes). So instead of trusting the RVA, we verify the bytes at that RVA
+// against the known signature; if they don't match we scan the module's
+// executable sections for the pattern and use whatever we find. All of this is
+// logged, so the console tells you plainly whether offsets.h fits your build.
+// ---------------------------------------------------------------------------
+bool MatchAt(const uint8_t* p, const char* pat, const char* mask) {
+    for (; *mask; ++mask, ++p, ++pat)
+        if (*mask == 'x' && (uint8_t)*pat != *p) return false;
+    return true;
+}
+
+// bounds of the module's executable bytes, from its PE section headers
+bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end) {
+    auto dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    uintptr_t lo = ~(uintptr_t)0, hi = 0;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            uintptr_t s = base + sec->VirtualAddress;
+            uintptr_t e = s + sec->Misc.VirtualSize;
+            if (s < lo) lo = s;
+            if (e > hi) hi = e;
+        }
+    }
+    if (hi <= lo) return false;
+    *begin = (uint8_t*)lo; *end = (uint8_t*)hi;
+    return true;
+}
+
+uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* mask) {
+    size_t len = strlen(mask);                       // mask has no embedded NULs
+    if (len == 0 || (size_t)(end - begin) < len) return nullptr;
+    for (uint8_t* p = begin; p <= end - len; ++p)
+        if (MatchAt(p, pat, mask)) return p;
+    return nullptr;
+}
+
+// Resolve the scanner by signature. Returns its address (0 if unresolvable) and
+// sets *outDelta to how far it moved from the offsets.h RVA (0 == offsets fit).
+uintptr_t ResolveScanner(intptr_t* outDelta) {
+    *outDelta = 0;
+    uint8_t* expected = (uint8_t*)(g_base + mxb::RVA_SCAN_FOLDER);
+    size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
+
+    uint8_t *b, *e;
+    bool haveRange = GetExecRange(g_base, &b, &e);
+
+    // only read the raw RVA if it actually lies inside an executable section
+    bool rvaInRange = haveRange && expected >= b && expected + sigLen <= e;
+    if (rvaInRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
+        Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
+            (size_t)mxb::RVA_SCAN_FOLDER);
+        return (uintptr_t)expected;
+    }
+    if (!haveRange) {
+        Log("[sig] WARNING: can't read module sections to validate; using the raw RVA "
+            "0x%zx anyway (may be wrong).", (size_t)mxb::RVA_SCAN_FOLDER);
+        return (uintptr_t)expected;
+    }
+    Log("[sig] WARNING: bytes at scanner RVA 0x%zx do NOT match the signature - "
+        "offsets.h looks stale for this mxbikes build. Scanning .text...",
+        (size_t)mxb::RVA_SCAN_FOLDER);
+    uint8_t* found = PatternScan(b, e, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK);
+    if (!found) {
+        Log("[sig] ERROR: scanner signature not found in .text. The reload can't work on "
+            "this build until offsets.h/SIG_SCAN_FOLDER are updated. Skipping content hooks.");
+        return 0;
+    }
+    *outDelta = (intptr_t)((uintptr_t)found - (g_base + mxb::RVA_SCAN_FOLDER));
+    Log("[sig] scanner RELOCATED: found at RVA 0x%zx (delta %+lld from offsets.h).",
+        (size_t)((uintptr_t)found - g_base), (long long)*outDelta);
+    return (uintptr_t)found;
+}
+
+// ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
 bool InstallHook(void* target, void* detour, void** original, const char* name) {
@@ -344,11 +432,26 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
 
-    // content functions (capture-and-replay)
-    InstallHook((void*)(g_base + mxb::RVA_SCAN_FOLDER),     &hkScan,
-                (void**)&g_origScan,  "scanFolder(0x158be0)");
-    InstallHook((void*)(g_base + mxb::RVA_REGISTRY_RESET),  &hkReset,
-                (void**)&g_origReset, "registryReset(0x159340)");
+    // content functions (capture-and-replay). Resolve the scanner by its byte
+    // signature so a stale offsets.h can't make us hook the wrong code.
+    intptr_t delta = 0;
+    uintptr_t scanAddr = ResolveScanner(&delta);
+    if (scanAddr) {
+        InstallHook((void*)scanAddr, &hkScan, (void**)&g_origScan, "scanFolder");
+
+        // The registry-reset function has no signature in offsets.h, so we can't
+        // verify it independently - we apply the same delta the scanner moved by
+        // (correct if the update shifted .text uniformly; best-effort otherwise).
+        uintptr_t resetAddr = g_base + mxb::RVA_REGISTRY_RESET + delta;
+        if (delta)
+            Log("[sig] NOTE: applying scanner delta %+lld to registryReset @ RVA 0x%zx "
+                "(unverified - it has no signature).",
+                (long long)delta, (size_t)(resetAddr - g_base));
+        InstallHook((void*)resetAddr, &hkReset, (void**)&g_origReset, "registryReset");
+    } else {
+        Log("[init] content hooks NOT installed - reload is unavailable on this build "
+            "until offsets.h is updated. (mods listing + logs still work.)");
+    }
 
     // per-frame tick (render thread). Hook both entry points OpenGL games use.
     if (HMODULE gdi = GetModuleHandleA("gdi32.dll"))

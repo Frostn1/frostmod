@@ -87,6 +87,19 @@ It hooks the game's folder scanner (`0x158be0`) and registry reset (`0x159340`),
 records the arguments the game passes when it scans, and replays them on the
 render thread when you hit Reload. Offsets are in `src/offsets.h`.
 
+**Offsets are validated at runtime.** Those RVAs come from one specific
+`mxbikes.exe`; a game update shifts them. So FrostMod doesn't trust the address —
+it checks the bytes at that RVA against a known signature, and if they don't
+match it scans the executable for the pattern and uses whatever it finds. The
+log tells you which happened (`[sig] … VERIFIED`, `… RELOCATED`, or `… not
+found`). If the scanner can't be located, the content hooks are skipped (reload
+is disabled) instead of hooking the wrong code — the mods list and logs still work.
+
+`frostmod.exe` stays resident: it injects when the game launches and **re-injects
+automatically on every relaunch**, so a rebuilt DLL always takes effect (Windows
+won't hot-swap a DLL that's already loaded in a live process — you must relaunch
+the game, which FrostMod now handles for you).
+
 The scanner skips folders it already loaded, so a plain re-scan does nothing —
 that's why FrostMod resets the registry first. If new files still don't appear,
 check the log and the notes in `frostmod.cpp`.

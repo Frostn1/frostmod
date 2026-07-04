@@ -3,8 +3,10 @@
 //
 //  Unlike a fire-and-forget injector, this STAYS OPEN and gives you feedback:
 //
-//    1. Waits for mxbikes.exe, then loads frostmod.dll into it
-//       (classic CreateRemoteThread + LoadLibraryA).
+//    1. Stays resident and watches for mxbikes.exe: injects frostmod.dll when
+//       the game launches (classic CreateRemoteThread + LoadLibraryA), and
+//       RE-INJECTS a fresh copy every time you relaunch the game - so a rebuilt
+//       DLL always takes effect without any manual restart juggling.
 //    2. Lists the .pkz mods it found in your MX Bikes mods folder, and keeps
 //       watching that folder - new / removed .pkz files are printed live.
 //    3. Streams frostmod.log (what the injected DLL writes) to this console in
@@ -267,77 +269,106 @@ int main(int argc, char** argv) {
     // cross-process reload trigger (the DLL watches the same named event).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
 
-    // remember the log size now, so we only stream THIS session's new lines.
-    if (HANDLE h = CreateFileA(logPath.c_str(), GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-        h != INVALID_HANDLE_VALUE) {
-        LARGE_INTEGER sz; if (GetFileSizeEx(h, &sz)) g_logStart = sz.QuadPart;
-        CloseHandle(h);
-    }
-
-    // 1) wait for the game, then inject ---------------------------------------
-    DWORD pid = FindProcess(processName);
-    if (!pid) {
-        printf("[*] waiting for %s to start (Ctrl+C to quit)...\n", processName);
-        while (g_running && !(pid = FindProcess(processName))) Sleep(500);
-    }
-    if (!g_running) return 0;
-
     // base name of the DLL (for the "already loaded?" check)
     std::string dllName = dllPath;
     if (size_t s = dllName.find_last_of("\\/"); s != std::string::npos) dllName = dllName.substr(s + 1);
 
-    // If our DLL is already loaded in the game (from a previous run), Windows
-    // won't load a rebuilt copy - DllMain won't re-run - so re-injecting just
-    // runs the OLD code. Warn and skip; the fix is to restart the game.
-    bool alreadyLoaded = IsModuleLoaded(pid, dllName.c_str());
-    if (alreadyLoaded) {
-        printf("[!] %s is ALREADY loaded in %s (pid %lu) from an earlier run.\n"
-               "    Windows won't hot-swap a live DLL, so a REBUILT %s only takes effect\n"
-               "    after you FULLY QUIT and relaunch the game. Not re-injecting (that would\n"
-               "    just re-run the OLD code). Monitoring the existing instance...\n",
-               dllName.c_str(), processName, pid, dllName.c_str());
-    } else {
-        printf("[*] %s pid=%lu - injecting...\n", processName, pid);
-        if (!InjectDll(pid, dllPath)) {
-            printf("[!] injection failed. See messages above.\n");
-            return 1;
-        }
-    }
-    ULONGLONG injectedAt = GetTickCount64();
-
-    // 2) initial mods listing --------------------------------------------------
+    // ----- resident loop: inject on each game launch, re-inject on relaunch ---
+    // We never quit when the game closes - we wait for it to come back. Only Q /
+    // Ctrl+C exits. Every fresh game process gets a fresh DLL (DllMain re-runs),
+    // which sidesteps the "Windows won't hot-swap a live DLL" trap entirely.
+    DWORD     injectedPid  = 0;      // pid we've handled this session (0 = none)
+    DWORD     pendingPid   = 0;      // a new pid, warming up before we inject
+    ULONGLONG pendingSince = 0;
+    ULONGLONG injectedAt   = 0;
+    bool      alreadyLoaded = false;
+    bool      hintShown     = false;
+    bool      announcedWait = false;
+    ULONGLONG lastScan      = 0;
     std::set<std::string> known;
-    if (modsExist) EnumPkz(modsPath, known);
-    printf("\nMods found (%zu):\n", known.size());
-    if (known.empty())
-        printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
-    else
-        for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
 
-    printf("\nTip: open the in-game track/bike menu ONCE so FrostMod can capture the\n"
-           "     scan, then add a .pkz and reload.\n");
-    printf("\n--- live log ---   [R] reload mods   [Q]/Ctrl+C quit\n");
-
-    // 3) monitor loop: tail log, watch mods folder, handle keys ---------------
-    ULONGLONG lastScan = 0;
-    bool hintShown = false;
     while (g_running) {
+        DWORD pid = FindProcess(processName);
+
+        // ---- game not running: reset session state, wait -------------------
+        if (!pid) {
+            if (injectedPid) {
+                printf("\n[*] %s closed. Waiting for it to launch again... (Q/Ctrl+C quits)\n",
+                       processName);
+                injectedPid = 0; pendingPid = 0; announcedWait = true;
+            } else if (!announcedWait) {
+                printf("[*] waiting for %s to start (Q/Ctrl+C quits)...\n", processName);
+                announcedWait = true;
+            }
+            if (_kbhit()) { int c = _getch(); if (c == 'q' || c == 'Q') break; }
+            Sleep(400);
+            continue;
+        }
+
+        // ---- a new game process appeared: warm up, then inject a FRESH dll --
+        if (pid != injectedPid) {
+            if (pendingPid != pid) {                       // first sighting of this pid
+                pendingPid = pid; pendingSince = GetTickCount64();
+                printf("[*] %s detected (pid=%lu) - letting it initialize...\n", processName, pid);
+            }
+            if (GetTickCount64() - pendingSince < 2000) {  // ~2s warmup before inject
+                if (_kbhit()) { int c = _getch(); if (c == 'q' || c == 'Q') break; }
+                Sleep(150);
+                continue;
+            }
+
+            // anchor the log tail to the current end so we stream THIS session.
+            g_logStart = 0; g_logPos = 0; g_logOpened = false; g_sawDllLog = false;
+            if (HANDLE h = CreateFileA(logPath.c_str(), GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, 0, nullptr);
+                h != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER sz; if (GetFileSizeEx(h, &sz)) g_logStart = sz.QuadPart;
+                CloseHandle(h);
+            }
+            hintShown = false;
+
+            alreadyLoaded = IsModuleLoaded(pid, dllName.c_str());
+            if (alreadyLoaded) {
+                printf("[!] %s is already loaded in pid %lu (another injector running?).\n"
+                       "    Not re-injecting; a rebuilt DLL needs a full game restart.\n",
+                       dllName.c_str(), pid);
+            } else {
+                printf("[*] injecting into pid %lu...\n", pid);
+                if (!InjectDll(pid, dllPath)) {
+                    printf("[!] injection failed (elevation? run frostmod.exe as admin).\n"
+                           "    Will retry when the game is relaunched.\n");
+                    injectedPid = pid; pendingPid = 0;     // don't spin on this pid
+                    Sleep(500);
+                    continue;
+                }
+            }
+            injectedPid = pid; pendingPid = 0; announcedWait = false;
+            injectedAt = GetTickCount64();
+
+            // list mods for this session
+            known.clear();
+            if (modsExist) EnumPkz(modsPath, known);
+            printf("\nMods found (%zu):\n", known.size());
+            if (known.empty())
+                printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
+            else
+                for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
+            printf("\nTip: open the in-game track/bike menu ONCE so FrostMod can capture the\n"
+                   "     scan, then add a .pkz and reload.\n");
+            printf("\n--- live log ---   [R] reload mods   [Q]/Ctrl+C quit\n");
+        }
+
+        // ---- monitor the running, injected game ----------------------------
         TailLog(logPath);
 
-        // if the DLL never logs anything, something's off - say so, once.
-        if (!hintShown && !g_sawDllLog && GetTickCount64() - injectedAt > 4000) {
+        // if the (freshly injected) DLL never logs, something's off - say so once.
+        if (!hintShown && !alreadyLoaded && !g_sawDllLog && GetTickCount64() - injectedAt > 4000) {
             hintShown = true;
-            if (alreadyLoaded)
-                printf("[!] Still no DLL output - the OLD %s from a previous run is still\n"
-                       "    loaded. Quit MX Bikes COMPLETELY, relaunch it, then run frostmod.exe\n"
-                       "    again so the freshly-built DLL actually loads.\n", dllName.c_str());
-            else
-                printf("[!] no output from frostmod.dll yet. It loaded, but isn't logging to\n"
-                       "    %s\n"
-                       "    Check that this folder is writable, or that the DLL you injected is\n"
-                       "    this build. (The render hook may also not have ticked yet.)\n", logPath.c_str());
+            printf("[!] no output from frostmod.dll yet. It loaded, but isn't logging to\n"
+                   "    %s\n"
+                   "    Check that this folder is writable, or that the render hook ticked.\n",
+                   logPath.c_str());
         }
 
         // re-scan the mods folder about once a second and report changes
@@ -361,12 +392,6 @@ int main(int argc, char** argv) {
             } else if (c == 'q' || c == 'Q') {
                 break;
             }
-        }
-
-        // stop if the game exits
-        if (!FindProcess(processName)) {
-            printf("\n[*] %s exited. Bye.\n", processName);
-            break;
         }
 
         Sleep(150);

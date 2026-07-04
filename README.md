@@ -3,9 +3,9 @@
 Reloads the MX Bikes mods folder without restarting the game.
 
 MX Bikes only scans your mods folders at startup, so tracks or skins you add
-while it's running don't show up until you relaunch. FrostMod adds a small
-floating window with a Reload button (and an F8 hotkey) that re-runs the game's
-own content scan. Same idea as BakkesMod. Windows x64 only.
+while it's running don't show up until you relaunch. FrostMod re-runs the game's
+own content scan on demand — trigger it from the `frostmod.exe` console, an F8
+hotkey, or a small floating in-game window. Same idea as BakkesMod. Windows x64 only.
 
 ## Build
 
@@ -35,7 +35,8 @@ From the project root (the directory containing `CMakeLists.txt`):
     cmake -B build -A x64
     cmake --build build --config Release
 
-Outputs `frostmod.dll` and `injector.exe` to `build\bin`.
+Outputs `frostmod.exe` (the launcher you run) and `frostmod.dll` (the injected
+mod) to `build\bin`.
 
 ### Common issues
 
@@ -53,13 +54,21 @@ the **x64 Native Tools Command Prompt for VS 2026**.
 
 ## Use
 
-1. Start MX Bikes windowed or borderless so the window shows (in fullscreen, use F8).
-2. Run `injector.exe` to load the DLL into `mxbikes.exe`.
-3. Open the track/bike menu once so FrostMod can grab the scan arguments.
-4. Add a `.pkz` to your mods folder.
-5. Click Reload (or press F8).
+1. Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`,
+   then stays open showing:
+   - the `.pkz` mods it found in your MX Bikes mods folder (live — new files you
+     drop in are printed as they appear), and
+   - a live stream of `frostmod.log` (capture / reload activity).
+2. Open the track/bike menu once so FrostMod can capture the scan arguments.
+3. Add a `.pkz` to your mods folder.
+4. Reload with **`R`** in the `frostmod.exe` console, **F8** in-game, or the
+   floating window button. Press `Q` (or Ctrl+C) to quit the console.
 
-Logs go to `%TEMP%\frostmod.log`.
+You can start `frostmod.exe` before the game — it waits and injects on launch,
+which also lets it capture the startup scan automatically.
+
+Options: `frostmod.exe --process gpbikes.exe`, `--mods "D:\path\mods"`, or an
+explicit DLL path. Logs also go to `%TEMP%\frostmod.log`.
 
 ## How it works
 

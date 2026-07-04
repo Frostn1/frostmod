@@ -205,6 +205,11 @@ using wglSwapBuffers_t = BOOL(WINAPI*)(HDC);
 SwapBuffers_t    g_origSwapBuffers    = nullptr;
 wglSwapBuffers_t g_origWglSwapBuffers = nullptr;
 
+// Cross-process reload trigger. frostmod.exe (the launcher console) signals this
+// named auto-reset event when you press R; we consume it here on the render
+// thread. Created in Init(); "Local\..." keeps it scoped to the logon session.
+HANDLE g_reloadEvent = nullptr;
+
 void Tick() {
     // Optional in-game hotkey (F8) as a fullscreen-friendly alternative to the
     // floating window, which some exclusive-fullscreen modes will hide.
@@ -212,6 +217,10 @@ void Tick() {
     bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (down && !prev) RequestReload();
     prev = down;
+
+    // Reload requested from frostmod.exe? (auto-reset event self-clears on wait.)
+    if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0)
+        RequestReload();
 
     DrainGameThreadTasks();
 }
@@ -301,6 +310,10 @@ DWORD WINAPI Init(LPVOID) {
 
     if (MH_Initialize() != MH_OK) { Log("[init] MinHook init failed"); return 1; }
 
+    // reload trigger shared with frostmod.exe (press R in the launcher console).
+    g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
+    if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
+
     // content functions (capture-and-replay)
     InstallHook((void*)(g_base + mxb::RVA_SCAN_FOLDER),     &hkScan,
                 (void**)&g_origScan,  "scanFolder(0x158be0)");
@@ -320,8 +333,8 @@ DWORD WINAPI Init(LPVOID) {
 
     CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
 
-    Log("[init] ready. Open a content menu once (to capture the scan), then "
-        "click Reload / press F8 after adding a .pkz.");
+    Log("[init] ready. Open a content menu once (to capture the scan), then after "
+        "adding a .pkz reload via: R in frostmod.exe, F8 in-game, or the window button.");
     return 0;
 }
 

@@ -430,6 +430,43 @@ uintptr_t ResolveScanner(intptr_t* outDelta) {
     return (uintptr_t)found;
 }
 
+// If we inject EARLY (to get hooked before the game's one-time startup mods
+// scan), the scanner's code may not be decrypted yet - SteamStub unpacks .text
+// in place during early execution. The game can't run its scan until that code
+// exists, so we spin until the signature appears, then hook: that lands our hook
+// after unpack but (hopefully) before the game itself calls the scanner.
+uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
+    *outDelta = 0;
+    uint8_t* expected = (uint8_t*)(g_base + mxb::RVA_SCAN_FOLDER);
+    size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
+    DWORD    start    = GetTickCount();
+    bool     announced = false;
+
+    for (;;) {
+        uint8_t *b, *e;
+        bool haveRange = GetExecRange(g_base, &b, &e);
+        bool inRange = haveRange && expected >= b && expected + sigLen <= e;
+        if (inRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
+            if (announced)
+                Log("[sig] scanner code decrypted after %lums; hooking now (before the scan, we hope).",
+                    (unsigned long)(GetTickCount() - start));
+            else
+                Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
+                    (size_t)mxb::RVA_SCAN_FOLDER);
+            return (uintptr_t)expected;
+        }
+        if (GetTickCount() - start > timeoutMs) break;
+        if (!announced) {
+            Log("[sig] game code not decrypted yet (SteamStub); waiting to install content hooks...");
+            announced = true;
+        }
+        Sleep(2);
+    }
+    // Timed out waiting on the exact RVA - fall back to a one-shot full resolve
+    // (handles a relocated/updated build, or reports that it's truly absent).
+    return ResolveScanner(outDelta);
+}
+
 // ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
@@ -461,10 +498,13 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
 
-    // content functions (capture-and-replay). Resolve the scanner by its byte
-    // signature so a stale offsets.h can't make us hook the wrong code.
+    CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
+
+    // CONTENT hooks first and ASAP - they're timing-critical: we must be hooked
+    // before the game's one-time startup mods scan. Wait for the code to be
+    // decrypted (SteamStub), then hook.
     intptr_t delta = 0;
-    uintptr_t scanAddr = ResolveScanner(&delta);
+    uintptr_t scanAddr = WaitForScanner(&delta, 30000 /*ms*/);
     if (scanAddr) {
         InstallHook((void*)scanAddr, &hkScan, (void**)&g_origScan, "scanFolder");
 
@@ -482,21 +522,28 @@ DWORD WINAPI Init(LPVOID) {
             "until offsets.h is updated. (mods listing + logs still work.)");
     }
 
-    // per-frame tick (render thread). Hook both entry points OpenGL games use.
+    // RENDER hooks (drive Tick: F8, the reload-event check, and running reloads on
+    // the game thread). Not timing-critical for capture, so we can wait for
+    // opengl32 to load - when injecting early it isn't mapped yet. gdi32 is always
+    // present. Reload only runs much later (when you press R), by which point
+    // these are installed.
     if (HMODULE gdi = GetModuleHandleA("gdi32.dll"))
         if (auto p = GetProcAddress(gdi, "SwapBuffers"))
             InstallHook((void*)p, &hkSwapBuffers,
                         (void**)&g_origSwapBuffers, "gdi32!SwapBuffers");
 
-    if (HMODULE gl = GetModuleHandleA("opengl32.dll"))
+    HMODULE gl = nullptr;
+    for (int i = 0; i < 3000 && !(gl = GetModuleHandleA("opengl32.dll")); ++i) Sleep(10);
+    if (gl) {
         if (auto p = GetProcAddress(gl, "wglSwapBuffers"))
             InstallHook((void*)p, &hkWglSwapBuffers,
                         (void**)&g_origWglSwapBuffers, "opengl32!wglSwapBuffers");
+    } else {
+        Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
+    }
 
-    CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
-
-    Log("[init] ready. Waiting to capture the game's startup folder scan (must be loaded "
-        "before it). Once you see [capture], add a .pkz and reload via R / F8 / the button.");
+    Log("[init] ready. If you started frostmod.exe BEFORE the game, watch for a [capture] "
+        "scan line with ext='pkz' during load - that's the mods scan we need.");
     return 0;
 }
 

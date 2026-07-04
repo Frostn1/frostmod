@@ -94,18 +94,18 @@ static bool IsModuleLoaded(DWORD pid, const char* moduleName) {
 // ---------------------------------------------------------------------------
 // inject frostmod.dll into the target process
 // ---------------------------------------------------------------------------
-static bool InjectDll(DWORD pid, const std::string& dllPath) {
+static bool InjectDll(DWORD pid, const std::string& dllPath, bool quiet = false) {
     HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                               PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                               FALSE, pid);
-    if (!proc) { printf("[!] OpenProcess failed (%lu). Run elevated?\n", GetLastError()); return false; }
+    if (!proc) { if (!quiet) printf("[!] OpenProcess failed (%lu). Run elevated?\n", GetLastError()); return false; }
 
     SIZE_T len = dllPath.size() + 1;
     void* remote = VirtualAllocEx(proc, nullptr, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote) { printf("[!] VirtualAllocEx failed (%lu)\n", GetLastError()); CloseHandle(proc); return false; }
+    if (!remote) { if (!quiet) printf("[!] VirtualAllocEx failed (%lu)\n", GetLastError()); CloseHandle(proc); return false; }
 
     if (!WriteProcessMemory(proc, remote, dllPath.c_str(), len, nullptr)) {
-        printf("[!] WriteProcessMemory failed (%lu)\n", GetLastError());
+        if (!quiet) printf("[!] WriteProcessMemory failed (%lu)\n", GetLastError());
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc); return false;
     }
 
@@ -113,7 +113,7 @@ static bool InjectDll(DWORD pid, const std::string& dllPath) {
         GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
     HANDLE thread = CreateRemoteThread(proc, nullptr, 0, loadLib, remote, 0, nullptr);
     if (!thread) {
-        printf("[!] CreateRemoteThread failed (%lu)\n", GetLastError());
+        if (!quiet) printf("[!] CreateRemoteThread failed (%lu)\n", GetLastError());
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc); return false;
     }
 
@@ -124,7 +124,7 @@ static bool InjectDll(DWORD pid, const std::string& dllPath) {
     CloseHandle(thread);
     CloseHandle(proc);
 
-    if (!loaded) { printf("[!] remote LoadLibrary returned 0 - DLL failed to load.\n"); return false; }
+    if (!loaded) { if (!quiet) printf("[!] remote LoadLibrary returned 0 - DLL failed to load.\n"); return false; }
     printf("[+] injected (module handle 0x%lX in target).\n", loaded);
     return true;
 }
@@ -234,11 +234,14 @@ int main(int argc, char** argv) {
     const char* processName = "mxbikes.exe";
     std::string dllPath;
     std::string modsPath;
+    long warmupMs = 400;     // delay after seeing the process before injecting;
+                             // small = catch the startup scan. Override with --wait.
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--process" && i + 1 < argc)    processName = argv[++i];
         else if (a == "--mods" && i + 1 < argc)  modsPath = argv[++i];
+        else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else                                     dllPath = a;
     }
 
@@ -310,11 +313,16 @@ int main(int argc, char** argv) {
         if (pid != injectedPid) {
             if (pendingPid != pid) {                       // first sighting of this pid
                 pendingPid = pid; pendingSince = GetTickCount64();
-                printf("[*] %s detected (pid=%lu) - letting it initialize...\n", processName, pid);
+                printf("[*] %s detected (pid=%lu) - injecting EARLY to catch the startup scan...\n",
+                       processName, pid);
             }
-            if (GetTickCount64() - pendingSince < 2000) {  // ~2s warmup before inject
+            // Small warmup so OpenProcess/CreateRemoteThread succeed, but short so
+            // we're loaded before the game's one-time mods scan. The DLL then waits
+            // for SteamStub to decrypt before hooking, so injecting early is safe.
+            // If early injection ever destabilizes the game, use --wait 2000.
+            if ((long)(GetTickCount64() - pendingSince) < warmupMs) {
                 if (_kbhit()) { int c = _getch(); if (c == 'q' || c == 'Q') break; }
-                Sleep(150);
+                Sleep(50);
                 continue;
             }
 
@@ -336,10 +344,18 @@ int main(int argc, char** argv) {
                        dllName.c_str(), pid);
             } else {
                 printf("[*] injecting into pid %lu...\n", pid);
-                if (!InjectDll(pid, dllPath)) {
-                    printf("[!] injection failed (elevation? run frostmod.exe as admin).\n"
+                // A freshly-launched process may briefly reject injection - retry
+                // quietly for a few seconds before giving up.
+                bool ok = false;
+                for (int attempt = 0; attempt < 20 && g_running; ++attempt) {
+                    if (InjectDll(pid, dllPath, /*quiet=*/attempt < 19)) { ok = true; break; }
+                    if (!FindProcess(processName)) break;   // game died during startup
+                    Sleep(250);
+                }
+                if (!ok) {
+                    printf("[!] injection failed after retries (elevation? run as admin).\n"
                            "    Will retry when the game is relaunched.\n");
-                    injectedPid = pid; pendingPid = 0;     // don't spin on this pid
+                    injectedPid = pid; pendingPid = 0;      // don't spin on this pid
                     Sleep(500);
                     continue;
                 }

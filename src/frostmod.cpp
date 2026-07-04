@@ -447,7 +447,10 @@ bool InstallHook(void* target, void* detour, void** original, const char* name) 
 }
 
 DWORD WINAPI Init(LPVOID) {
-    Log("=============== FrostMod loading ===============");
+    // __DATE__/__TIME__ = when THIS dll was compiled. If this timestamp isn't
+    // recent, you're running a stale frostmod.dll (rebuild failed to overwrite it,
+    // usually because the game had it locked). Close the game before rebuilding.
+    Log("=============== FrostMod loading (dll built " __DATE__ " " __TIME__ ") ===============");
 
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // mxbikes.exe
     Log("[init] module base = %p", (void*)g_base);

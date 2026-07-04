@@ -260,6 +260,7 @@ int main(int argc, char** argv) {
     const std::string logPath = LogPath();
 
     printf("================== FrostMod ==================\n");
+    printf("[*] build : " __DATE__ " " __TIME__ "  (this exe)\n");
     printf("[*] DLL   : %s\n", dllPath.c_str());
     printf("[*] mods  : %s%s\n", modsPath.empty() ? "<unknown>" : modsPath.c_str(),
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");

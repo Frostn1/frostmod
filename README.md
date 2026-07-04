@@ -9,13 +9,47 @@ own content scan. Same idea as BakkesMod. Windows x64 only.
 
 ## Build
 
-Needs Visual Studio (Desktop development with C++) and CMake. Windows only — it's
-a DLL for a Windows game. MinHook is fetched automatically.
+Windows x64 only — it's a DLL for a 64-bit Windows game. MinHook is fetched
+automatically during configure.
+
+### Prerequisites
+
+- Visual Studio Community 2026
+- **Desktop development with C++** workload installed
+- CMake
+
+### Open the correct command prompt
+
+Do **not** use a normal Command Prompt. Open the **x64 Native Tools Command
+Prompt for VS 2026** — it puts the Visual C++ compiler (`cl.exe`) on `PATH` so
+CMake can find it. Verify with:
+
+    cl
+
+If it prints a compiler version, the environment is configured correctly.
+
+### Build the project
+
+From the project root (the directory containing `CMakeLists.txt`):
 
     cmake -B build -A x64
     cmake --build build --config Release
 
 Outputs `frostmod.dll` and `injector.exe` to `build\bin`.
+
+### Common issues
+
+**`'cl' is not recognized`** — you're in a normal Command Prompt. Open the
+**x64 Native Tools Command Prompt for VS 2026** instead.
+
+**`Generator "NMake Makefiles" does not support platform specification`** —
+`NMake Makefiles` doesn't accept `-A x64`. Force the Visual Studio generator:
+
+    cmake -B build -G "Visual Studio 18 2026" -A x64
+
+**`CMAKE_CXX_COMPILER not set`** — either the **Desktop development with C++**
+workload isn't installed, or you started from a normal Command Prompt instead of
+the **x64 Native Tools Command Prompt for VS 2026**.
 
 ## Use
 

@@ -1,6 +1,9 @@
 # Changelog
 
 ## 2026-07-03
+### Fixed
+- Reload replayed the wrong scan. The scanner is generic — `(status, dir, file-extension, buf)` — and the game calls it for many folders (e.g. `ui`/`str`). The old capture kept whatever was scanned last, so reload replayed a non-mods scan and did nothing. Now the hook logs every distinct `(dir, ext)` the game scans and keeps the `ext="pkz"` call (the mods/content mount) as the replay target.
+
 ### Added
 - Signature (AOB) validation of `offsets.h`: before hooking, the DLL checks the bytes at the scanner RVA against the known signature; on mismatch it scans the executable sections for the pattern and uses the found address, logging `[sig] VERIFIED` / `RELOCATED (delta …)` / `not found`. If the scanner can't be located, content hooks are skipped (reload disabled) instead of hooking wrong code. The registry-reset (which has no signature) gets the same delta as a best-effort, flagged as unverified.
 - `frostmod.exe` is now resident and auto-(re)injects: it waits for the game, injects on launch, and re-injects a fresh DLL on every relaunch — so a rebuilt DLL always takes effect without manual restart juggling. It no longer quits when the game closes (only `Q`/Ctrl+C exits).

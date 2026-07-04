@@ -36,6 +36,8 @@
 #include <functional>
 #include <mutex>
 #include <atomic>
+#include <set>
+#include <cstring>
 
 #include "MinHook.h"
 #include "offsets.h"
@@ -161,12 +163,33 @@ std::string SafeStr(void* p) {
 // hooks that CAPTURE the game's own content-load calls
 // ---------------------------------------------------------------------------
 int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
-    if (!g_scanArgs.valid.load()) {
-        Log("[capture] scanner(0x158be0) args: rcx=%p rdx=%p('%s') r8=%p('%s') r9=%p",
-            a0, a1, SafeStr(a1).c_str(), a2, SafeStr(a2).c_str(), a3);
+    // This scanner is GENERIC: (status, directory, file-extension, buf). The game
+    // calls it for many folders - e.g. ui/str, and mods content with ext "pkz".
+    std::string dir = SafeStr(a1);
+    std::string ext = SafeStr(a2);
+
+    // Log each DISTINCT (dir, ext) once, so the console shows every folder the
+    // game scans and which extension - that's how we know which call is the
+    // mods/content one to replay.
+    {
+        static std::mutex m;
+        static std::set<std::string> seen;
+        std::string key = dir + "|" + ext;
+        bool isNew;
+        { std::lock_guard<std::mutex> lk(m); isNew = seen.insert(key).second; }
+        if (isNew)
+            Log("[capture] scan dir='%s' ext='%s' (rcx=%p rdx=%p r8=%p r9=%p)",
+                dir.c_str(), ext.c_str(), a0, a1, a2, a3);
     }
-    g_scanArgs.a0 = a0; g_scanArgs.a1 = a1; g_scanArgs.a2 = a2; g_scanArgs.a3 = a3;
-    g_scanArgs.valid.store(true);
+
+    // Keep the args of the ".pkz" scan as our replay target - that's the one that
+    // mounts mods/tracks. (The old code kept whatever was scanned LAST, which was
+    // the ui/str scan, so replay did nothing.)
+    if (_stricmp(ext.c_str(), "pkz") == 0) {
+        g_scanArgs.a0 = a0; g_scanArgs.a1 = a1; g_scanArgs.a2 = a2; g_scanArgs.a3 = a3;
+        g_scanArgs.valid.store(true);
+    }
+
     return g_origScan(a0, a1, a2, a3);
 }
 
@@ -214,11 +237,13 @@ void DoReloadOnGameThread() {
         }
     }
 
-    Log("[reload] replay scanner(rcx=%p rdx=%p('%s') r8=%p r9=%p)",
-        g_scanArgs.a0, g_scanArgs.a1, SafeStr(g_scanArgs.a1).c_str(),
-        g_scanArgs.a2, g_scanArgs.a3);
+    Log("[reload] replay scanner dir='%s' ext='%s' (rcx=%p rdx=%p r8=%p r9=%p)",
+        SafeStr(g_scanArgs.a1).c_str(), SafeStr(g_scanArgs.a2).c_str(),
+        g_scanArgs.a0, g_scanArgs.a1, g_scanArgs.a2, g_scanArgs.a3);
     int64_t r = g_origScan(g_scanArgs.a0, g_scanArgs.a1, g_scanArgs.a2, g_scanArgs.a3);
-    Log("[reload] scanner returned %lld. Done.", (long long)r);
+    Log("[reload] scanner returned %lld. Done. (if the track still doesn't show, the "
+        "scanner likely skips already-loaded folders - we'll need the registry reset.)",
+        (long long)r);
 }
 
 void RequestReload() {

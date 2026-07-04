@@ -12,10 +12,6 @@
 //    4. Press  R  to reload mods,  Q  (or Ctrl+C) to quit. Reload also works
 //       from inside the game (F8 / the floating window).
 //
-//  The log lives NEXT TO the binaries (frostmod.exe + frostmod.dll are in the
-//  same folder), so the exe and the injected dll always agree on the file even
-//  if the game's %TEMP% differs. Falls back to %TEMP% if that folder is read-only.
-//
 //  Usage:
 //     frostmod.exe                         (auto: waits for mxbikes.exe,
 //                                           loads .\frostmod.dll, watches
@@ -71,24 +67,6 @@ static DWORD FindProcess(const char* name) {
     return pid;
 }
 
-// Is a module (e.g. frostmod.dll) already loaded in the target process? Windows
-// won't reload a live DLL, so if it's already there a rebuild won't take effect
-// until the game restarts - we detect that and warn instead of silently running
-// the old code.
-static bool IsModuleLoaded(DWORD pid, const char* moduleName) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    MODULEENTRY32 me{ sizeof(me) };
-    bool found = false;
-    if (Module32First(snap, &me)) {
-        do {
-            if (_stricmp(me.szModule, moduleName) == 0) { found = true; break; }
-        } while (Module32Next(snap, &me));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
 // ---------------------------------------------------------------------------
 // inject frostmod.dll into the target process
 // ---------------------------------------------------------------------------
@@ -128,28 +106,8 @@ static bool InjectDll(DWORD pid, const std::string& dllPath) {
 }
 
 // ---------------------------------------------------------------------------
-// paths: this exe's folder, the log file, and the default mods folder
+// mods folder: default location + recursive *.pkz enumeration
 // ---------------------------------------------------------------------------
-static std::string ExeDir() {
-    char p[MAX_PATH];
-    if (!GetModuleFileNameA(nullptr, p, sizeof(p))) return "";
-    if (char* slash = strrchr(p, '\\')) *(slash + 1) = 0;
-    return p;
-}
-
-// Log lives next to the binaries so the exe and the injected dll agree on it.
-// (frostmod.dll uses the exact same rule.) Falls back to %TEMP% if read-only.
-static std::string LogPath() {
-    std::string dir = ExeDir();
-    if (!dir.empty()) {
-        std::string cand = dir + "frostmod.log";
-        if (FILE* f = nullptr; fopen_s(&f, cand.c_str(), "a") == 0 && f) { fclose(f); return cand; }
-    }
-    char t[MAX_PATH];
-    if (GetTempPathA(sizeof(t), t)) return std::string(t) + "frostmod.log";
-    return dir + "frostmod.log";
-}
-
 static std::string DefaultModsPath() {
     // MX Bikes (PiBoSo) keeps user content under Documents\PiBoSo\MX Bikes\mods.
     char docs[MAX_PATH];
@@ -188,40 +146,43 @@ static std::string Rel(const std::string& modsRoot, const std::string& full) {
 }
 
 // ---------------------------------------------------------------------------
-// tail the log -> this console (only the current session's new lines).
-// We re-open the file each poll: cheap, and immune to stale-handle/caching
-// issues when another process is appending to it.
+// tail frostmod.log -> this console (only the current session's new lines)
 // ---------------------------------------------------------------------------
-static LONGLONG g_logPos    = 0;      // where we've read up to
-static LONGLONG g_logStart  = 0;      // size of the log before we injected
-static bool     g_logOpened = false;  // have we anchored g_logPos yet?
-static bool     g_sawDllLog = false;  // did the DLL ever write anything we read?
+static std::string LogPath() {
+    char p[MAX_PATH];
+    if (!GetTempPathA(sizeof(p), p)) return "";
+    return std::string(p) + "frostmod.log";
+}
+
+static HANDLE   g_log      = INVALID_HANDLE_VALUE;
+static LONGLONG g_logPos   = 0;    // where we've read up to
+static LONGLONG g_logStart = 0;    // size of the log before we injected
 
 static void TailLog(const std::string& path) {
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;                 // not created yet
-    if (!g_logOpened) { g_logPos = g_logStart; g_logOpened = true; }
+    if (g_log == INVALID_HANDLE_VALUE) {
+        g_log = CreateFileA(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (g_log == INVALID_HANDLE_VALUE) return;   // not created yet
+        g_logPos = g_logStart;                       // skip pre-injection history
+    }
 
     LARGE_INTEGER sz;
-    if (GetFileSizeEx(h, &sz)) {
-        if (sz.QuadPart < g_logPos) g_logPos = 0;          // rotated / truncated
-        while (g_logPos < sz.QuadPart) {
-            LARGE_INTEGER mv; mv.QuadPart = g_logPos;
-            SetFilePointerEx(h, mv, nullptr, FILE_BEGIN);
-            char buf[8192];
-            LONGLONG remain = sz.QuadPart - g_logPos;
-            DWORD toRead = (DWORD)(remain < (LONGLONG)sizeof(buf) ? remain : sizeof(buf));
-            DWORD got = 0;
-            if (!ReadFile(h, buf, toRead, &got, nullptr) || got == 0) break;
-            fwrite(buf, 1, got, stdout);
-            g_logPos += got;
-            g_sawDllLog = true;
-        }
-        fflush(stdout);
+    if (!GetFileSizeEx(g_log, &sz)) return;
+    if (sz.QuadPart < g_logPos) g_logPos = 0;        // log was rotated/truncated
+
+    while (g_logPos < sz.QuadPart) {
+        LARGE_INTEGER mv; mv.QuadPart = g_logPos;
+        SetFilePointerEx(g_log, mv, nullptr, FILE_BEGIN);
+        char buf[8192];
+        LONGLONG remain = sz.QuadPart - g_logPos;
+        DWORD toRead = (DWORD)(remain < (LONGLONG)sizeof(buf) ? remain : sizeof(buf));
+        DWORD got = 0;
+        if (!ReadFile(g_log, buf, toRead, &got, nullptr) || got == 0) break;
+        fwrite(buf, 1, got, stdout);
+        g_logPos += got;
     }
-    CloseHandle(h);
+    fflush(stdout);
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +202,12 @@ int main(int argc, char** argv) {
     }
 
     // default DLL path: frostmod.dll next to this exe
-    if (dllPath.empty()) dllPath = ExeDir() + "frostmod.dll";
+    if (dllPath.empty()) {
+        char exeDir[MAX_PATH];
+        GetModuleFileNameA(nullptr, exeDir, sizeof(exeDir));
+        if (char* slash = strrchr(exeDir, '\\')) *(slash + 1) = 0;
+        dllPath = std::string(exeDir) + "frostmod.dll";
+    }
     // make it absolute (LoadLibrary in the target runs from the game's cwd)
     char full[MAX_PATH];
     if (GetFullPathNameA(dllPath.c_str(), sizeof(full), full, nullptr))
@@ -255,20 +221,19 @@ int main(int argc, char** argv) {
     if (modsPath.empty()) modsPath = DefaultModsPath();
     bool modsExist = !modsPath.empty() &&
                      GetFileAttributesA(modsPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    const std::string logPath = LogPath();
 
-    printf("================== FrostMod ==================\n");
+    printf("================= FrostMod \xE2\x9D\x84 =================\n");
     printf("[*] DLL   : %s\n", dllPath.c_str());
     printf("[*] mods  : %s%s\n", modsPath.empty() ? "<unknown>" : modsPath.c_str(),
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
-    printf("[*] log   : %s\n", logPath.c_str());
-    printf("=============================================\n");
+    printf("[*] log   : %s\n", LogPath().c_str());
+    printf("=================================================\n");
 
     // cross-process reload trigger (the DLL watches the same named event).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
 
     // remember the log size now, so we only stream THIS session's new lines.
-    if (HANDLE h = CreateFileA(logPath.c_str(), GENERIC_READ,
+    if (HANDLE h = CreateFileA(LogPath().c_str(), GENERIC_READ,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, 0, nullptr);
         h != INVALID_HANDLE_VALUE) {
@@ -283,29 +248,11 @@ int main(int argc, char** argv) {
         while (g_running && !(pid = FindProcess(processName))) Sleep(500);
     }
     if (!g_running) return 0;
-
-    // base name of the DLL (for the "already loaded?" check)
-    std::string dllName = dllPath;
-    if (size_t s = dllName.find_last_of("\\/"); s != std::string::npos) dllName = dllName.substr(s + 1);
-
-    // If our DLL is already loaded in the game (from a previous run), Windows
-    // won't load a rebuilt copy - DllMain won't re-run - so re-injecting just
-    // runs the OLD code. Warn and skip; the fix is to restart the game.
-    bool alreadyLoaded = IsModuleLoaded(pid, dllName.c_str());
-    if (alreadyLoaded) {
-        printf("[!] %s is ALREADY loaded in %s (pid %lu) from an earlier run.\n"
-               "    Windows won't hot-swap a live DLL, so a REBUILT %s only takes effect\n"
-               "    after you FULLY QUIT and relaunch the game. Not re-injecting (that would\n"
-               "    just re-run the OLD code). Monitoring the existing instance...\n",
-               dllName.c_str(), processName, pid, dllName.c_str());
-    } else {
-        printf("[*] %s pid=%lu - injecting...\n", processName, pid);
-        if (!InjectDll(pid, dllPath)) {
-            printf("[!] injection failed. See messages above.\n");
-            return 1;
-        }
+    printf("[*] %s pid=%lu - injecting...\n", processName, pid);
+    if (!InjectDll(pid, dllPath)) {
+        printf("[!] injection failed. See messages above.\n");
+        return 1;
     }
-    ULONGLONG injectedAt = GetTickCount64();
 
     // 2) initial mods listing --------------------------------------------------
     std::set<std::string> known;
@@ -316,29 +263,12 @@ int main(int argc, char** argv) {
     else
         for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
 
-    printf("\nTip: open the in-game track/bike menu ONCE so FrostMod can capture the\n"
-           "     scan, then add a .pkz and reload.\n");
     printf("\n--- live log ---   [R] reload mods   [Q]/Ctrl+C quit\n");
 
     // 3) monitor loop: tail log, watch mods folder, handle keys ---------------
     ULONGLONG lastScan = 0;
-    bool hintShown = false;
     while (g_running) {
-        TailLog(logPath);
-
-        // if the DLL never logs anything, something's off - say so, once.
-        if (!hintShown && !g_sawDllLog && GetTickCount64() - injectedAt > 4000) {
-            hintShown = true;
-            if (alreadyLoaded)
-                printf("[!] Still no DLL output - the OLD %s from a previous run is still\n"
-                       "    loaded. Quit MX Bikes COMPLETELY, relaunch it, then run frostmod.exe\n"
-                       "    again so the freshly-built DLL actually loads.\n", dllName.c_str());
-            else
-                printf("[!] no output from frostmod.dll yet. It loaded, but isn't logging to\n"
-                       "    %s\n"
-                       "    Check that this folder is writable, or that the DLL you injected is\n"
-                       "    this build. (The render hook may also not have ticked yet.)\n", logPath.c_str());
-        }
+        TailLog(LogPath());
 
         // re-scan the mods folder about once a second and report changes
         ULONGLONG now = GetTickCount64();
@@ -373,5 +303,6 @@ int main(int argc, char** argv) {
     }
 
     if (reloadEvent) CloseHandle(reloadEvent);
+    if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
     return 0;
 }

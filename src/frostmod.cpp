@@ -198,8 +198,9 @@ void DoReloadOnGameThread() {
     }
 
     if (!g_scanArgs.valid.load()) {
-        Log("[reload] ABORT: scanner args not captured yet. Trigger a content "
-            "scan first (e.g. open the track/bike selection menu), then retry.");
+        Log("[reload] ABORT: scanner args never captured. MX Bikes scans the mods folder "
+            "only ONCE at startup, and FrostMod was loaded after that. Fix: quit the game, "
+            "start frostmod.exe FIRST, then relaunch - watch for a [capture] line on load.");
         return;
     }
 
@@ -466,8 +467,8 @@ DWORD WINAPI Init(LPVOID) {
 
     CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
 
-    Log("[init] ready. Open a content menu once (to capture the scan), then after "
-        "adding a .pkz reload via: R in frostmod.exe, F8 in-game, or the window button.");
+    Log("[init] ready. Waiting to capture the game's startup folder scan (must be loaded "
+        "before it). Once you see [capture], add a .pkz and reload via R / F8 / the button.");
     return 0;
 }
 

@@ -354,8 +354,11 @@ int main(int argc, char** argv) {
                 printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
             else
                 for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
-            printf("\nTip: open the in-game track/bike menu ONCE so FrostMod can capture the\n"
-                   "     scan, then add a .pkz and reload.\n");
+            printf("\nIMPORTANT: MX Bikes scans the mods folder only ONCE, at startup.\n"
+                   "  For reload to work, FrostMod must be loaded BEFORE that scan - i.e. start\n"
+                   "  frostmod.exe FIRST, then launch the game, and watch for a [capture] line\n"
+                   "  during loading. If you injected into an already-running game, the scan was\n"
+                   "  already done: quit the game (leave this running) and relaunch it.\n");
             printf("\n--- live log ---   [R] reload mods   [Q]/Ctrl+C quit\n");
         }
 

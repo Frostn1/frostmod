@@ -67,14 +67,31 @@ on your install — candidates: `…\steamapps\common\MX Bikes\plugins\` or
   captures that call's args (and logs every distinct `dir|ext` seen).
 - `registryReset` (RVA `0x159340`) rebuilds the content registry — needed because
   the scanner skips folders it already loaded.
-- On **reload**, `DoReloadOnGameThread()` replays the captured reset + `pkz` scan
-  on the render thread (via the task queue drained in `Tick`).
+- On **reload**, `DoReloadOnGameThread()` runs the selected **strategy** on the
+  render thread (via the task queue drained in `Tick`). There are two families,
+  four strategies — **cycle with `F7` in-game or `S` in the console** and watch
+  the log to see which one actually makes a new track appear:
+
+  | Strategy | What it does |
+  |----------|--------------|
+  | **A** `ReplayPkzScan` | Replay the captured `pkz` scan only. |
+  | **A+** `ReplayResetThenPkz` (default) | Replay the captured `registryReset`, then the `pkz` scan. |
+  | **A++** `ReplayAllContent` | Replay the reset, then **every** captured content scan. |
+  | **B** `DirectCallScanner` | *Construct* the call ourselves (`<savePath>\mods`, ext `pkz`, fresh status/out buffers) and call the scanner — works even if nothing was captured. Experimental. |
+
+  All calls go through SEH-guarded wrappers (`SafeCallScan`/`SafeCallReset`), so a
+  wrong-argument attempt logs `FAULTED - caught` instead of crashing the game.
 - Trigger a reload: `R` in `frostmod.exe`, `F8` in-game, the floating-window
-  button, or by signalling `Local\FrostModReload`.
-- **Status:** works only if we captured the startup `pkz` scan — i.e. loaded
-  before it (plugin mode, or inject-before-launch). If MX Bikes mounts mods via a
-  different function than `0x158be0`, that function must be reverse-engineered and
-  added to `offsets.h`.
+  button, or by signalling `Local\FrostModReload`. Cycle strategy: `S` / `F7` /
+  `Local\FrostModCycle`.
+- **Note on captured args:** the scanner's `dir`/`ext` (rdx/r8) point into the
+  module and stay valid, but the game's `status`/`out` buffers (rcx/r9) were on its
+  stack. Strategies A* reuse the captured pointers (empirically fine); strategy B
+  passes fresh zeroed buffers instead.
+- **Status:** the replay strategies need the startup `pkz` scan captured — i.e.
+  loaded before it (plugin mode, or inject-before-launch). If MX Bikes mounts mods
+  via a different function than `0x158be0`, that function must be reverse-engineered
+  and added to `offsets.h`; strategy B is the fallback to probe direct calls.
 
 ## Feature 2 — server-list spam filter
 
@@ -105,7 +122,8 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 |------|---------|
 | `<dll folder>\frostmod.log` | activity log (exe and dll share it) |
 | `<dll folder>\frostmod_serverfilter.txt` | filter rules (editable) |
-| `Local\FrostModReload` | named auto-reset event; cross-process reload trigger |
+| `Local\FrostModReload` | named auto-reset event; cross-process reload trigger (`R`) |
+| `Local\FrostModCycle` | named auto-reset event; cross-process cycle-strategy trigger (`S`) |
 
 ## Key internal functions (reference)
 
@@ -113,9 +131,11 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 - `EnsureInit`, `Init` — one-time startup (see sequence above).
 - `WaitForScanner`, `ResolveScanner`, `MatchAt` / `GetExecRange` / `PatternScan` —
   signature validation + AOB scan.
-- `hkScan`, `hkReset` — capture the game's content-load calls.
-- `DoReloadOnGameThread`, `RequestReload`, `EnqueueGameThreadTask` /
-  `DrainGameThreadTasks` — the reload action, queued to the render thread.
+- `hkScan`, `hkReset` — capture the game's content-load calls (all distinct
+  `(dir,ext)` scans go into `g_scans`; the `pkz` one into `g_scanArgs`).
+- `DoReloadOnGameThread`, `DoDirectCall`, `ReplayReset`, `SafeCallScan` /
+  `SafeCallReset`, `CycleStrategy` / `StrategyName` — the reload strategies, queued
+  to the render thread via `EnqueueGameThreadTask` / `DrainGameThreadTasks`.
 - `Tick`, `hkSwapBuffers` / `hkWglSwapBuffers` — per-frame hook (F8, reload-event,
   task drain, heartbeat).
 - `UiThread` / `WndProc` — the floating window.

@@ -79,7 +79,14 @@ alive` (the per-frame hook fires — required for reload to run at all), then a
 `[capture] scanner …` line (only appears once the game scans — that's why you open
 a content menu first), then on reload `[reload] … scanner returned …`. If you
 never see `[tick]`, the game isn't calling the present function we hooked; if you
-see `[reload] ABORT … not captured`, open the track/bike menu once and try again.
+see `[reload] ABORT … not captured`, load FrostMod before the game's startup scan
+(plugin mode, or start `frostmod.exe` before launching).
+
+**Reload has several strategies** — cycle them with **`F7`** in-game or **`S`** in
+the console and watch the log for which one makes the track appear: `A` replay the
+`.pkz` scan, `A+` reset + replay (default), `A++` reset + replay all captured
+scans, `B` call the scanner directly (works without a capture, experimental). Bad
+attempts are caught (`FAULTED - caught`) rather than crashing the game.
 
 ## Run as a plugin (recommended)
 

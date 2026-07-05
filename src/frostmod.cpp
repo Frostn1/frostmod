@@ -370,9 +370,12 @@ size_t BlobHeadBytes() {
 // callback the loop-splice stub will call: read the fields (SafeCopyStr for the
 // inline name), build a ServerInfo, ask serverfilter. Returns true => SKIP the row.
 // The powerful default: ping == 0xFFFFFFFF ("---") means unjoinable = ghost/ad.
-// Actually perform the row-skip? Off = detect-only (safe). Flip to true once the
-// 0x0ACE68 skip state is understood so hiding doesn't crash.
-bool g_filterHideEnabled = false;
+// Actually perform the row-skip? The 0x0ACE68 skip target is a loop-continue, and
+// after the loop DISPLAY_COUNT (0x4C8F48) += the RAW count - so a skipped row that
+// isn't added still gets counted, and the list is later indexed past its end
+// (crash). The stub compensates by decrementing DISPLAY_COUNT per hidden row, so
+// hiding is now safe.
+bool g_filterHideEnabled = true;
 
 // ---------------------------------------------------------------------------
 // POD, no C++ objects -> SEH is allowed here (a function that must unwind C++
@@ -466,13 +469,15 @@ bool InstallServerFilterHook() {
     b(0xFF);b(0xD0);                                     // call rax
     b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp -> post-pushfq)
     b(0x84);b(0xC0);                                     // test al,al
-    b(0x74);b(0x13);                                     // jz +0x13  (skip the hide-writes)
+    b(0x74);b(0x1F);                                     // jz +0x1F  (skip the hide-writes)
     b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x40);             // lea rax,[rsp+rdi+0x40]  (entry; rsp now -0x40)
-    // Make the row look like a GENUINE empty server (players=maxplayers=r12d, ==0),
-    // so the game's own jz->row-skip takes the exact same safe path it uses for real
-    // empty rows. (Forcing only maxplayers left players non-zero -> inconsistent -> crash.)
+    // Force players=maxplayers=r12d so the game's own cmp/jz skips (hides) this row.
     b(0x44);b(0x89);b(0xA0);b(0xC8);b(0x00);b(0x00);b(0x00); // mov [rax+0xC8], r12d  (players    = r12d)
     b(0x44);b(0x89);b(0xA0);b(0xCC);b(0x00);b(0x00);b(0x00); // mov [rax+0xCC], r12d  (maxplayers = r12d)
+    // Compensate the count: the loop adds RAW count to DISPLAY_COUNT after, so a
+    // skipped-but-counted row would over-count and later crash the list index.
+    b(0x48);b(0xB8);b8((uint64_t)(g_base + mxb::RVA_SB_DISPLAY_COUNT)); // mov rax, &DISPLAY_COUNT
+    b(0xFF);b(0x08);                                     // dec dword [rax]  (DISPLAY_COUNT--)
     // restore regs+flags, then continue into the original cmp (trampoline)
     b(0x9D);                                             // popfq
     b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax

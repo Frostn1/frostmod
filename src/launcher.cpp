@@ -19,9 +19,10 @@
 //  if the game's %TEMP% differs. Falls back to %TEMP% if that folder is read-only.
 //
 //  Usage:
-//     frostmod.exe                         (auto: waits for mxbikes.exe,
-//                                           loads .\frostmod.dll, watches
-//                                           Documents\PiBoSo\MX Bikes\mods)
+//     frostmod.exe                         (no flags needed: mod reload + the
+//                                           server filter are both ON. Waits for
+//                                           mxbikes.exe, loads .\frostmod.dll.)
+//     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
 //     frostmod.exe --process gpbikes.exe   (different game)
 //     frostmod.exe --mods "D:\path\mods"   (override the mods folder)
 //     frostmod.exe C:\path\frostmod.dll    (explicit DLL path)
@@ -239,7 +240,7 @@ int main(int argc, char** argv) {
                              // small = catch the startup scan. Override with --wait.
     bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
-    bool filterSrv   = false; // --filter-servers: install the server-browser filter
+    bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -248,7 +249,8 @@ int main(int argc, char** argv) {
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else if (a == "--probe-mount")           probeMount = true;
         else if (a == "--dump-serverlist")       dumpList = true;
-        else if (a == "--filter-servers")        filterSrv = true;
+        else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
+        else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
         else                                     dllPath = a;
     }
 
@@ -296,10 +298,10 @@ int main(int argc, char** argv) {
     std::string filterFlag = ExeDir() + "frostmod_filter.flag";
     if (filterSrv) {
         if (FILE* f = nullptr; fopen_s(&f, filterFlag.c_str(), "w") == 0 && f) fclose(f);
-        printf("[*] --filter-servers ON: DLL will HIDE cheat/ad 'ghost' servers from the online\n"
-               "    browser (via the game's own row-skip). Every row is logged below as [srv] ...\n"
-               "    HIDE (skipped) or keep (shown). Edit frostmod_serverfilter.txt to tune the rules.\n");
+        printf("[*] server filter: ON - hides cheat/ad 'ghost' servers from the online browser\n"
+               "    (edit frostmod_serverfilter.txt to tune; pass --no-filter-servers to turn it off).\n");
     } else {
+        printf("[*] server filter: OFF (--no-filter-servers).\n");
         DeleteFileA(filterFlag.c_str());
     }
 

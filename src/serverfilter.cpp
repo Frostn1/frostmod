@@ -29,6 +29,7 @@ struct Rules {
     int  maxPerIP  = 0;                        // 0 = disabled
     bool hideLocked = false;
     bool hideEmpty  = false;
+    bool hideUnjoinable = true;                // ping "---" ghost/ad servers (default ON)
 };
 Rules g_rules;
 
@@ -70,8 +71,10 @@ const char* kDefaultConfig =
     "#   maxPerIP: <n>     hide servers past <n> from the same IP per refresh (0=off)\n"
     "#   hideLocked: 0|1   hide password-locked servers\n"
     "#   hideEmpty: 0|1    hide servers with 0 players\n"
+    "#   hideUnjoinable: 0|1  hide servers whose ping shows '---' (ghost/ad spam)\n"
     "#\n"
-    "# --- defaults: catch the obvious ad names. Add your own 'name:' lines. ---\n"
+    "# --- defaults: hide unjoinable ghost servers + obvious ad names. ---\n"
+    "hideUnjoinable: 1\n"
     "regex: (https?://|www\\.|discord(\\.gg)?|t\\.me/|\\.gg/|telegram|join us)\n"
     "maxPerIP: 5\n"
     "hideLocked: 0\n"
@@ -118,6 +121,8 @@ void parseInto(Rules& r) {
             r.hideLocked = atoi(trim(s.substr(11)).c_str()) != 0;
         } else if (starts_with(s, "hideempty:")) {
             r.hideEmpty = atoi(trim(s.substr(10)).c_str()) != 0;
+        } else if (starts_with(s, "hideunjoinable:")) {
+            r.hideUnjoinable = atoi(trim(s.substr(15)).c_str()) != 0;
         } else {
             logf("[filter] ignoring unrecognized rule: %s", s.c_str());
         }
@@ -133,9 +138,9 @@ void Reload() {
     parseInto(r);
     g_rules = std::move(r);
     g_ipCount.clear();
-    logf("[filter] loaded %zu name rule(s), %zu regex(es); maxPerIP=%d hideLocked=%d hideEmpty=%d",
+    logf("[filter] loaded %zu name rule(s), %zu regex(es); maxPerIP=%d hideLocked=%d hideEmpty=%d hideUnjoinable=%d",
          g_rules.nameContains.size(), g_rules.regexes.size(),
-         g_rules.maxPerIP, (int)g_rules.hideLocked, (int)g_rules.hideEmpty);
+         g_rules.maxPerIP, (int)g_rules.hideLocked, (int)g_rules.hideEmpty, (int)g_rules.hideUnjoinable);
 }
 
 void Init(const std::string& configPath, LogFn log) {
@@ -150,6 +155,9 @@ void Init(const std::string& configPath, LogFn log) {
 
 std::string ShouldHide(const ServerInfo& s) {
     std::lock_guard<std::mutex> lk(g_mx);
+
+    // The strongest ghost/ad signal: the server can't actually be joined (ping "---").
+    if (g_rules.hideUnjoinable && s.unjoinable) return "unjoinable (ping ---)";
 
     const std::string n = lower(s.name);
     for (const auto& sub : g_rules.nameContains)

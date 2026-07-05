@@ -24,6 +24,7 @@ struct ServerInfo {
     int         players    = -1;   // -1 = unknown
     int         maxPlayers = -1;
     bool        locked     = false; // password protected
+    bool        unjoinable = false; // ping shown as "---" (ghost/ad servers)
 };
 
 using LogFn = void(*)(const char*);

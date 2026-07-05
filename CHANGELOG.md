@@ -1,6 +1,9 @@
 # Changelog
 
 ## 2026-07-05
+### Added
+- Server browser RE landed (from IDA): `offsets.h` now has the real networking + server-browser layout — `SB_Entry` fields (name `+0x00`, players `+0xC8`, maxplayers `+0xCC`, **ping `+0xD8` where `0xFFFFFFFF` = unjoinable**), the populate loop + row-skip target, UI-state globals, and AOB signatures for the LAN/world browser commands. `serverfilter` gains a **`hideUnjoinable`** rule (default ON) — the ping-"---" ghost/ad signal the user described — plus `SB_ShouldHideEntry()` in the DLL that reads an entry (SEH-guarded) and returns show/hide. Remaining to go live: a mid-function code-cave splice in the populate loop (needs the splice address + entry register + stolen bytes from RE).
+
 ### Changed
 - **Key RE finding:** early-load capture proved `0x158be0` is a generic **VFS directory walker** (called with ext `/`, `cfg`, `pnt` — never `pkz`), not the pkz loader. By the time it runs the `.pkz` are already mounted and appear as virtual dirs it walks, so replaying/calling it can never mount a newly-added track — which is why every reload strategy failed. Corrected the `offsets.h` labels; the real target is the pkz-**mount** function (`0x15a9e0`).
 - Added `frostmod.exe --probe-mount`: leaves a flag so the DLL hooks the pkz-mount function (`0x15a9e0`) and logs its args (`[mount] …`) at startup — to reveal which arg is the `.pkz` path so a real mount-based reload can be built. Observe-only pass-through, opt-in (default off).

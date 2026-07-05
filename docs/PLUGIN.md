@@ -98,15 +98,23 @@ on your install — candidates: `…\steamapps\common\MX Bikes\plugins\` or
 - The master server (`master.mx-bikes.com`, UDP 54200) sends the server list;
   the plugin API does **not** expose it, so we filter inside the client.
 - `serverfilter` (`src/serverfilter.{h,cpp}`) is a config-driven rule engine:
-  name substring, name regex (case-insensitive), `maxPerIP` per refresh,
-  `hideLocked`, `hideEmpty`. Rules live in `frostmod_serverfilter.txt` next to the
-  DLL (written with docs + ad-name defaults on first run); press `R` to hot-reload.
-- **Hook (RE pending):** the game's "add one parsed server entry to the browser"
-  function — `RVA_SRV_LIST_ADD` + the `ServerEntry` field offsets +
-  `SIG_SRV_LIST_ADD` in `offsets.h`. Once RE'd, `hkSrvAdd` reads name/IP/players
-  and calls `serverfilter::ShouldHide`; a match skips the entry and logs
-  `[filter] hid '<name>' (<reason>)`. See the `SERVER FILTER` block in
-  `frostmod.cpp` for the ~4 steps to finish.
+  **hide-unjoinable (ping "---", the ghost/ad signal — on by default)**, name
+  substring, name regex, `maxPerIP` per refresh, `hideLocked`, `hideEmpty`. Rules
+  live in `frostmod_serverfilter.txt` next to the DLL (written with docs + defaults
+  on first run); press `R` to hot-reload.
+- The RE is in `offsets.h`: the browser builds `SB_Entry` working copies
+  (stride `0x1D8`; name `+0x00`, players `+0xC8`, maxplayers `+0xCC`, **ping `+0xD8`
+  where `0xFFFFFFFF` = unjoinable**) and a populate loop (`RVA_SB_POPULATE_LOOP`)
+  emits one row each, with a row-skip target (`RVA_SB_ROW_SKIP_TGT`).
+- `SB_ShouldHideEntry(void* entry)` in `frostmod.cpp` reads an entry (SEH-guarded)
+  and returns show/hide via `serverfilter::ShouldHide` — the callback the loop
+  splice will use.
+- **Remaining:** the emit is inline (a loop, not a per-row call), so it needs a
+  mid-function **code-cave splice** (not a MinHook prologue hook): jmp to a stub
+  that calls `SB_ShouldHideEntry(entryReg)` and, if true, jmps to
+  `RVA_SB_ROW_SKIP_TGT`, else runs the stolen bytes and returns. To author it
+  safely we need, at the splice site (near `RVA_SB_HIDE_EMPTY_BR`): the exact
+  address, the register holding the `SB_Entry` pointer, and the overwritten bytes.
 
 ## Offsets & signature validation
 

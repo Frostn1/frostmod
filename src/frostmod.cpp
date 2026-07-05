@@ -245,42 +245,60 @@ int64_t __fastcall hkMount(void* a0, void* a1, void* a2, void* a3) {
 }
 
 // ---------------------------------------------------------------------------
-// SERVER FILTER hook (RE PENDING) - hide spam/"ghost" servers from the browser.
+// SERVER FILTER - hide spam/"ghost" servers from the browser.
 //
-// The rule engine (serverfilter::ShouldHide) + config are DONE. What's missing is
-// the game-side hook: the function that adds one parsed server entry to the list.
-// Once the RE prompt returns RVA_SRV_LIST_ADD + the ServerEntry field offsets +
-// SIG_SRV_LIST_ADD (see offsets.h), finish this in ~4 steps:
+// The RE (offsets.h) shows the browser builds SB_Entry working copies (stride
+// 0x1D8) and a populate loop (RVA_SB_POPULATE_LOOP) emits one row each, with a
+// row-skip target (RVA_SB_ROW_SKIP_TGT) that keeps the game's counts consistent.
 //
-//   1) Declare the original's prototype (match the RE'd calling convention/args):
-//        using SrvAdd_t = int64_t(__fastcall*)(void* list, void* entry /*, ...*/);
-//        SrvAdd_t g_origSrvAdd = nullptr;
+// Given a pointer to the current SB_Entry, this decides show/hide. It's the exact
+// callback the loop-splice stub will call: read the fields (SafeCopyStr for the
+// inline name), build a ServerInfo, ask serverfilter. Returns true => SKIP the row.
+// The powerful default: ping == 0xFFFFFFFF ("---") means unjoinable = ghost/ad.
+// ---------------------------------------------------------------------------
+// POD, no C++ objects -> SEH is allowed here (a function that must unwind C++
+// objects can't use __try). Reads the numeric SB_Entry fields safely.
+struct SBNums { int players, maxPlayers; bool unjoinable, ok; };
+static SBNums SafeReadSBNums(void* entry) {
+    SBNums f{};
+    __try {
+        f.players    = (int)*(uint32_t*)((char*)entry + mxb::SBE_PLAYERS);
+        f.maxPlayers = (int)*(uint32_t*)((char*)entry + mxb::SBE_MAXPLAYERS);
+        f.unjoinable = (*(uint32_t*)((char*)entry + mxb::SBE_PING) == mxb::SBE_PING_UNJOINABLE);
+        f.ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { f.ok = false; }
+    return f;
+}
+
+extern "C" bool SB_ShouldHideEntry(void* entry) {   // extern "C": easy to call from an asm stub
+    if (!entry) return false;
+
+    SBNums nums = SafeReadSBNums(entry);
+    if (!nums.ok) return false;                     // bad read -> never hide/crash
+
+    frostmod::serverfilter::ServerInfo si;
+    char nameBuf[256];
+    if (SafeCopyStr((char*)entry + mxb::SBE_NAME, nameBuf, sizeof(nameBuf))) si.name = nameBuf;
+    si.players    = nums.players;
+    si.maxPlayers = nums.maxPlayers;
+    si.unjoinable = nums.unjoinable;
+
+    std::string why = frostmod::serverfilter::ShouldHide(si);
+    if (why.empty()) return false;
+    Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
+    return true;
+}
 //
-//   2) Extract fields from the entry pointer using the offsets, then ask the engine:
-//        int64_t __fastcall hkSrvAdd(void* list, void* entry) {
-//            auto at = [&](uintptr_t off){ return (char*)entry + off; };
-//            frostmod::serverfilter::ServerInfo si;
-//            si.name = mxb::SRV_NAME_IS_PTR ? SafeStr(*(void**)at(mxb::SRV_OFF_NAME))
-//                                           : SafeStr(at(mxb::SRV_OFF_NAME));
-//            si.ip         = SafeStr(at(mxb::SRV_OFF_IP));      // adjust if IP is a u32
-//            si.port       = *(uint16_t*)at(mxb::SRV_OFF_PORT);
-//            si.players    = *(int*)at(mxb::SRV_OFF_PLAYERS);
-//            si.maxPlayers = *(int*)at(mxb::SRV_OFF_MAXPLR);
-//            si.locked     = (*(uint32_t*)at(mxb::SRV_OFF_FLAGS)) & LOCK_BIT;
-//            std::string why = frostmod::serverfilter::ShouldHide(si);
-//            if (!why.empty()) {
-//                Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
-//                return 0;   // <-- the "did not add" return value; confirm via RE
-//            }
-//            return g_origSrvAdd(list, entry);
-//        }
-//
-//   3) In Init, resolve the address by signature (reuse the ResolveScanner pattern
-//      with SIG_SRV_LIST_ADD) and InstallHook it - only if RVA_SRV_LIST_ADD != 0.
-//
-//   4) Wrap field reads in the existing SafeStr/SEH style; never trust a pointer.
-//
-// Until wired, serverfilter still loads its config so you can curate the blocklist.
+// REMAINING to make it live: the populate emit is INLINE (a loop, not a per-row
+// function call), so we can't use a plain MinHook prologue hook - we need a small
+// mid-function splice: at a point in the loop where a register holds the SB_Entry
+// pointer, jmp to a code cave that calls SB_ShouldHideEntry(thatReg) and, if true,
+// jmps to RVA_SB_ROW_SKIP_TGT; else runs the stolen bytes and jmps back. To build
+// that stub safely (no guessing) the RE needs to pin down, at the splice site
+// (near RVA_SB_HIDE_EMPTY_BR 0x0ABAB6, where maxplayers is read):
+//    (a) the exact splice address,
+//    (b) which register holds the SB_Entry pointer there, and
+//    (c) the bytes we overwrite (so they can be relocated).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -748,9 +766,8 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.txt";
         frostmod::serverfilter::Init(cfg, &SfLog);
-        if (mxb::RVA_SRV_LIST_ADD == 0)
-            Log("[filter] rules loaded, but the server-list hook isn't wired yet "
-                "(RVA_SRV_LIST_ADD is 0 - needs RE). Filtering is inert for now.");
+        Log("[filter] rules loaded. Decision fn (SB_ShouldHideEntry) is ready, but the "
+            "populate-loop splice isn't installed yet - filtering is inert until it is.");
     }
 
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "

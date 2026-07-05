@@ -55,6 +55,13 @@ namespace {
 std::mutex g_logMutex;
 char g_logPath[MAX_PATH] = {0};
 
+// lifecycle: FrostMod loads two ways - injected (frostmod.exe) or as a PiBoSo
+// plugin the game loads itself from its plugins folder. Either way we run Init
+// exactly once (guarded), then install the same hooks.
+std::atomic<bool> g_initStarted{false};
+HMODULE g_selfModule = nullptr;
+char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin mode)
+
 // Resolve the log path once, from the dll's own module handle (its folder is the
 // same folder as frostmod.exe). Called from DllMain before anything else logs.
 void InitLogPath(HMODULE self) {
@@ -603,18 +610,70 @@ DWORD WINAPI Init(LPVOID) {
                 "(RVA_SRV_LIST_ADD is 0 - needs RE). Filtering is inert for now.");
     }
 
-    Log("[init] ready. If you started frostmod.exe BEFORE the game, watch for a [capture] "
-        "scan line with ext='pkz' during load - that's the mods scan we need.");
+    Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "
+        "[capture] scan line with ext='pkz' - that's the mods scan we need.",
+        g_savePath[0] ? " (plugin mode)" : "");
     return 0;
+}
+
+// Start Init exactly once, whether we got here via DllMain (injected) or via the
+// PiBoSo Startup() export (plugin). Guarded so the two paths can't double-init.
+void EnsureInit() {
+    bool expected = false;
+    if (g_initStarted.compare_exchange_strong(expected, true))
+        CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
 }
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// DLL entry - runs on ANY load (injected by frostmod.exe, or LoadLibrary'd by
+// the game when we're a plugin). We kick off Init here so the injector path
+// works with no plugin support on the game's side.
+// ---------------------------------------------------------------------------
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        g_selfModule = hModule;
         InitLogPath(hModule);   // resolve <dll folder>\frostmod.log before we log
-        CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
+        EnsureInit();
     }
     return TRUE;
 }
+
+// ---------------------------------------------------------------------------
+// PiBoSo plugin interface (MX Bikes). Placing frostmod.dll in the game's
+// plugins folder makes the game load it at STARTUP and call these - which gets
+// our hooks installed before the one-time mods scan, no injector needed. The
+// game validates the plugin via GetModID + the two version numbers (must match
+// this MX Bikes build: "mxbikes", data 8, interface 9 - from mxb_example.c).
+// Optional data/telemetry callbacks are intentionally omitted; the game only
+// calls the exports that exist. See docs/PLUGIN.md.
+// ---------------------------------------------------------------------------
+extern "C" {
+
+__declspec(dllexport) char* GetModID() {
+    static char id[] = "mxbikes";
+    return id;
+}
+__declspec(dllexport) int GetModDataVersion()   { return 8; }
+__declspec(dllexport) int GetInterfaceVersion() { return 9; }
+
+// Called once at game startup. _szSavePath is the game's save/data folder.
+// Return value = requested telemetry rate (3 = 10Hz); we don't use telemetry,
+// but must return a valid rate to stay loaded. We (re)ensure our hooks are up.
+__declspec(dllexport) int Startup(char* _szSavePath) {
+    if (_szSavePath) strncpy_s(g_savePath, sizeof(g_savePath), _szSavePath, _TRUNCATE);
+    if (g_selfModule) InitLogPath(g_selfModule);
+    Log("=============== FrostMod plugin Startup() savePath='%s' ===============",
+        g_savePath[0] ? g_savePath : "<null>");
+    EnsureInit();
+    return 3;
+}
+
+__declspec(dllexport) void Shutdown() {
+    Log("[plugin] Shutdown() requested by game.");
+    // MinHook hooks are torn down with the process; nothing required here.
+}
+
+} // extern "C"

@@ -2,6 +2,7 @@
 
 ## 2026-07-05
 ### Added
+- FrostMod is now also a **PiBoSo plugin**, not just an injected DLL. Added the plugin exports (`GetModID`→"mxbikes", `GetModDataVersion`→8, `GetInterfaceVersion`→9, `Startup`, `Shutdown`) so MX Bikes loads `frostmod.dll` itself from its `plugins` folder at startup — before the one-time mods scan, with no injector or SteamStub timing race. `EnsureInit` guards so the injected and plugin paths init exactly once. The injector (`frostmod.exe`) stays as a fallback. New `docs/PLUGIN.md` documents the exports, lifecycle, hooks, and files. Researched the PiBoSo SDK: the plugin API is telemetry/timing/spectate/input + a `Draw()` overlay and exposes no server list or content-directory access, so filtering/refresh remain function hooks — the plugin is purely a cleaner loader.
 - Server-list spam filter (client-side), scaffolded. New `serverfilter` module (`src/serverfilter.{h,cpp}`) with a config-driven rule engine (name substring, name regex, max-per-IP per refresh, hide-locked, hide-empty), reading `frostmod_serverfilter.txt` (created with docs + sensible ad-name defaults on first run). Loaded on DLL init and hot-reloaded on `R`. The game-side hook that feeds server entries in is stubbed behind `RVA_SRV_*` / `SIG_SRV_LIST_ADD` placeholders in `offsets.h` (RE pending) — until filled in, config loads but nothing is hidden.
 
 ## 2026-07-03

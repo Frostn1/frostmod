@@ -81,6 +81,19 @@ a content menu first), then on reload `[reload] … scanner returned …`. If yo
 never see `[tick]`, the game isn't calling the present function we hooked; if you
 see `[reload] ABORT … not captured`, open the track/bike menu once and try again.
 
+## Run as a plugin (recommended)
+
+`frostmod.dll` is also a **PiBoSo plugin**. Drop it in MX Bikes' `plugins` folder
+and the game loads it at startup itself — no injector, and (crucially) it's loaded
+*before* the game's one-time mods scan, which is what the live reload needs. It
+exports the PiBoSo identity/lifecycle functions (`GetModID` → `"mxbikes"`,
+`GetInterfaceVersion` → `9`, `GetModDataVersion` → `8`, `Startup`, `Shutdown`) and
+installs the same hooks from `Startup()`. The injector (`frostmod.exe`) still works
+as a fallback and log viewer.
+
+Full details — exports, lifecycle, hooks, files — are in
+[docs/PLUGIN.md](docs/PLUGIN.md).
+
 ## How it works
 
 It hooks the game's folder scanner (`0x158be0`) and registry reset (`0x159340`),

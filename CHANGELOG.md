@@ -2,6 +2,7 @@
 
 ## 2026-07-05
 ### Added
+- **Auto-start at login (`frostmod.exe --install-startup`).** Registers a per-user `HKCU\…\Run` entry (no admin) so FrostMod launches automatically at every login — minimized — and, since it already watches for the game, injects into MX Bikes the moment it starts, however you launch it. One-time setup; `--install-startup` also keeps running immediately. Undo with `--uninstall-startup`. A new `--startup` flag (used by the login entry) starts the console minimized so it isn't in your face. The normal banner now shows whether auto-start is on.
 - **F8 reload now shows a live progress bar + spinner instead of a "freeze".** The surgical reload used to run as one blocking call on the render thread, so no frame could present while it worked — it looked like the game hung. It's now a **per-frame step machine**: each content list (tracks, bikes, tyres, …) is rebuilt on its own frame, and the in-game overlay draws an advancing progress bar with a `|/-\` spinner and `Reloading mods… NN%` between steps. Because every step fully rebuilds one list, the game stays consistent between frames. A re-press while a reload is running is ignored. (Same content-load as before — just paced across frames so you can see it working.)
 
 ### Fixed

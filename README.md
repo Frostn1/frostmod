@@ -133,15 +133,15 @@ MX Bikes gets its online server list from the master server
 from *your* browser — purely client-side, nobody else is affected.
 
 Rules live in `frostmod_serverfilter.txt` (created next to the binaries, with docs,
-on first run). You can hide by name substring, name regex, too-many-from-one-IP,
-password-locked, or empty. Edit the file and press `R` (or reload) to apply it live.
-Hidden servers are logged as `[filter] hid '<name>' (<reason>)`.
+on first run): hide by **unjoinable** (ping shows "---" — the ghost/ad signal, on by
+default), name substring, name regex, too-many-from-one-IP, password-locked, or
+empty. Edit the file and press `R` (or reload) to apply it live. Hidden servers are
+logged as `[filter] hid '<name>' (<reason>)`.
 
-Status: the rule engine + config are done, but the game-side hook that feeds
-server entries through the filter needs the server-list function reverse-engineered
-(the `RVA_SRV_*` / `SIG_SRV_LIST_ADD` placeholders in `src/offsets.h`, and the
-SERVER FILTER block in `src/frostmod.cpp`). Until that's filled in, the filter loads
-its config but doesn't hide anything yet.
+Enable it with **`frostmod.exe --filter-servers`** (opt-in — it splices the server
+browser's populate loop at `0x0ABAB6`, verified against the expected bytes first, to
+skip rows the rules reject). With the default `hideUnjoinable`, the ghost/ad servers
+disappear from the browser. Purely client-side — only your view changes.
 
 ## License
 

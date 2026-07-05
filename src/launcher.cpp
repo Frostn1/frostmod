@@ -236,8 +236,9 @@ int main(int argc, char** argv) {
     std::string modsPath;
     long warmupMs = 400;     // delay after seeing the process before injecting;
                              // small = catch the startup scan. Override with --wait.
-    bool probeMount = false; // --probe-mount: hook the pkz-mount fn to log its args
-    bool dumpList   = false; // --dump-serverlist: dump the master server-list blob
+    bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
+    bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
+    bool filterSrv   = false; // --filter-servers: install the server-browser filter
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -246,6 +247,7 @@ int main(int argc, char** argv) {
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else if (a == "--probe-mount")           probeMount = true;
         else if (a == "--dump-serverlist")       dumpList = true;
+        else if (a == "--filter-servers")        filterSrv = true;
         else                                     dllPath = a;
     }
 
@@ -289,6 +291,13 @@ int main(int argc, char** argv) {
         printf("[*] --dump-serverlist ON: DLL will dump the master server-list blob ([srvlist]).\n");
     } else {
         DeleteFileA(dumpFlag.c_str());
+    }
+    std::string filterFlag = ExeDir() + "frostmod_filter.flag";
+    if (filterSrv) {
+        if (FILE* f = nullptr; fopen_s(&f, filterFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --filter-servers ON: DLL will splice the browser to hide unjoinable/spam servers.\n");
+    } else {
+        DeleteFileA(filterFlag.c_str());
     }
 
     // cross-process triggers (the DLL watches these named events).

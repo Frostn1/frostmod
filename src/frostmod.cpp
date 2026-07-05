@@ -403,18 +403,73 @@ extern "C" bool SB_ShouldHideEntry(void* entry) {   // extern "C": easy to call 
     Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
     return true;
 }
-//
-// REMAINING to make it live: the populate emit is INLINE (a loop, not a per-row
-// function call), so we can't use a plain MinHook prologue hook - we need a small
-// mid-function splice: at a point in the loop where a register holds the SB_Entry
-// pointer, jmp to a code cave that calls SB_ShouldHideEntry(thatReg) and, if true,
-// jmps to RVA_SB_ROW_SKIP_TGT; else runs the stolen bytes and jmps back. To build
-// that stub safely (no guessing) the RE needs to pin down, at the splice site
-// (near RVA_SB_HIDE_EMPTY_BR 0x0ABAB6, where maxplayers is read):
-//    (a) the exact splice address,
-//    (b) which register holds the SB_Entry pointer there, and
-//    (c) the bytes we overwrite (so they can be relocated).
-// ---------------------------------------------------------------------------
+
+// The populate emit is INLINE (a loop, not a per-row call). We splice the game's
+// hide-empty branch (0x0ABAB6: `cmp [rsp+rdi+0xCC], r12d`, entry = rsp+rdi) with a
+// MinHook hook to a hand-built stub that: captures rsp+rdi, calls SB_ShouldHideEntry,
+// and if it returns true jumps to the row-skip target (0x0ACE68); otherwise runs the
+// original cmp (via the trampoline) so the game's own empty-check still decides.
+void* g_sbTramp = nullptr;
+
+bool InstallServerFilterHook() {
+    uintptr_t target = g_base + mxb::RVA_SB_HIDE_EMPTY_BR;   // 0x0ABAB6
+    uintptr_t skip   = g_base + mxb::RVA_SB_ROW_SKIP_TGT;    // 0x0ACE68
+
+    // verify the splice site really is the expected cmp before touching it
+    unsigned char here[sizeof(mxb::SB_HIDE_EMPTY_BYTES)];
+    if (SafeReadBytes((const char*)target, (char*)here, sizeof(here)) < sizeof(here) ||
+        memcmp(here, mxb::SB_HIDE_EMPTY_BYTES, sizeof(here)) != 0) {
+        Log("[filter] site 0x%zx isn't the expected cmp - build changed? not hooking.",
+            (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+        return false;
+    }
+
+    auto stub = (unsigned char*)VirtualAlloc(nullptr, 0x100, MEM_COMMIT | MEM_RESERVE,
+                                             PAGE_EXECUTE_READWRITE);
+    if (!stub) { Log("[filter] stub alloc failed"); return false; }
+
+    // register the hook first so MinHook builds the trampoline (detour = our stub);
+    // we then fill the stub bytes (which reference the trampoline), then enable.
+    if (MH_CreateHook((void*)target, stub, &g_sbTramp) != MH_OK) {
+        Log("[filter] MH_CreateHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+        VirtualFree(stub, 0, MEM_RELEASE); return false;
+    }
+
+    size_t o = 0;
+    auto b  = [&](unsigned char x){ stub[o++] = x; };
+    auto b8 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) b((unsigned char)(v >> (i * 8))); };
+    b(0x50);                                             // push rax
+    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x08);             // lea rax,[rsp+rdi+8]  (entry ptr)
+    b(0x51);b(0x52);b(0x41);b(0x50);b(0x41);b(0x51);     // push rcx,rdx,r8,r9
+    b(0x41);b(0x52);b(0x41);b(0x53);                     // push r10,r11
+    b(0x9C);                                             // pushfq
+    b(0x48);b(0x89);b(0xC1);                             // mov rcx,rax   (arg = entry)
+    b(0x49);b(0x89);b(0xE2);                             // mov r10,rsp   (save rsp)
+    b(0x48);b(0x83);b(0xE4);b(0xF0);                     // and rsp,-16   (align)
+    b(0x48);b(0x83);b(0xEC);b(0x20);                     // sub rsp,0x20  (shadow)
+    b(0x48);b(0xB8);b8((uint64_t)&SB_ShouldHideEntry);   // mov rax, &SB_ShouldHideEntry
+    b(0xFF);b(0xD0);                                     // call rax
+    b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp)
+    b(0x84);b(0xC0);                                     // test al,al
+    b(0x74);b(0x12);                                     // jz show (+0x12)
+    // hide path: restore + jmp skip
+    b(0x9D);b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58);
+    b(0xFF);b(0x25);b(0x12);b(0x00);b(0x00);b(0x00);     // jmp [rip+0x12] -> skip slot
+    // show path (jz target): restore + jmp trampoline
+    b(0x9D);b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58);
+    b(0xFF);b(0x25);b(0x08);b(0x00);b(0x00);b(0x00);     // jmp [rip+0x08] -> tramp slot
+    b8((uint64_t)skip);                                  // skip slot
+    b8((uint64_t)g_sbTramp);                             // tramp slot
+
+    if (MH_EnableHook((void*)target) != MH_OK) {
+        Log("[filter] MH_EnableHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+        return false;
+    }
+    Log("[filter] server-filter hook LIVE @ populate loop 0x%zx (entry=rsp+rdi). "
+        "Unjoinable/spam rows will be dropped from the browser.",
+        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // the reload action - runs ON THE GAME THREAD (called from the swap hook)
@@ -940,8 +995,19 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.txt";
         frostmod::serverfilter::Init(cfg, &SfLog);
-        Log("[filter] rules loaded. Decision fn (SB_ShouldHideEntry) is ready, but the "
-            "populate-loop splice isn't installed yet - filtering is inert until it is.");
+
+        // OPT-IN (frostmod.exe --filter-servers): splice the populate loop so the
+        // rules actually hide rows. Mid-function hook, so gated behind a flag.
+        char fflag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(fflag, g_logPath);
+            if (char* s = strrchr(fflag, '\\')) { *(s + 1) = 0; strcat_s(fflag, "frostmod_filter.flag"); }
+        }
+        if (fflag[0] && GetFileAttributesA(fflag) != INVALID_FILE_ATTRIBUTES)
+            InstallServerFilterHook();
+        else
+            Log("[filter] rules loaded (inert). Run frostmod.exe --filter-servers to "
+                "install the populate-loop hook and actually hide servers.");
     }
 
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "

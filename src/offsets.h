@@ -104,10 +104,18 @@ constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABAB6; // game's own skip branch 
 constexpr uintptr_t RVA_SB_BUILD_CLEAR    = 0x0AB59C; // ListBegin + zero counts + ListClear
 constexpr uintptr_t RVA_SB_REFRESHLIST    = 0x0AB6A8; // ID_REFRESHLIST branch (LAN)
 
-// SB_Entry (working copy) field offsets
+// SB_Entry (working copy) field offsets. Confirmed from the populate loop disasm:
+//   at 0x0ABAB6 the entry is addressed as [rsp + rdi + field] (entries are a stack
+//   buffer, rdi = per-row offset). players +0xC8, maxplayers +0xCC, and the field
+//   compared to 0xFFFFFFFF (shown "---" = unjoinable) is +0xDC (NOT 0xD8).
 constexpr int SBE_STRIDE = 0x1D8, SBE_NAME = 0x00, SBE_PLAYERS = 0xC8,
-              SBE_MAXPLAYERS = 0xCC, SBE_PING = 0xD8, SBE_TYPE = 0x100;
+              SBE_MAXPLAYERS = 0xCC, SBE_PING = 0xDC, SBE_TYPE = 0x100;
 constexpr uint32_t SBE_PING_UNJOINABLE = 0xFFFFFFFFu; // ping value shown as "---"
+
+// exact bytes at RVA_SB_HIDE_EMPTY_BR: cmp [rsp+rdi+0xCC], r12d (8 bytes). The
+// filter hook verifies these before splicing, and jz's target is the skip label.
+constexpr unsigned char SB_HIDE_EMPTY_BYTES[] =
+    {0x44, 0x39, 0xA4, 0x3C, 0xCC, 0x00, 0x00, 0x00};
 
 // AOB signatures (32-byte prologues; ?? = RIP/call-rel disp, wildcarded)
 constexpr char SIG_SB_LAN_CMD[]  =

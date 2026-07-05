@@ -613,56 +613,79 @@ static void RL_Dir(uintptr_t fn, const void* gameDir, const void* mods) {
 
 void SetStatus(const char* s, unsigned ms);   // in-game overlay status (defined below)
 
-void DoReloadOnGameThread() {
-    if (!g_contentInit) {   // g_contentInit resolved <=> offsets match this build
-        Log("[reload] ABORT: offsets didn't match this build (see the [sig] lines). "
-            "Reload unavailable.");
-        SetStatus("reload unavailable (offsets mismatch)", 5000);
-        return;
-    }
+// The reload is the same surgical content-load as before (each SC/DIR fully rebuilds
+// one content list: SC = self-contained clear+scan; DIR = zero 3 list globals, then
+// scan game dir + mods). But instead of running all of them in one blocking call (the
+// render thread can't present a frame while it runs -> looks like a freeze), we drive
+// them ONE PER FRAME from the swap hook. Between steps every list is complete (old or
+// new), so the game stays consistent, and the overlay can draw an advancing progress
+// bar + spinner so you can see it's working.
+struct RLStep { uint8_t dir; uintptr_t z1, z2, z3, rva; };  // dir=0 -> SC(rva); dir=1 -> DIR(...)
+static const RLStep kReloadSteps[] = {
+    {0,0,0,0,0x2460}, {0,0,0,0,0x1CE00},                 // tracks
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790},
+    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x171D0}, // bikes
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950},
+    {0,0,0,0,0x17F80},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18360},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x19060},
+    {0,0,0,0,0x1BDD0},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10},
+    {0,0,0,0,0x1B420}, {0,0,0,0,0x19DA0},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450},
+};
+static const int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
+
+// progress state - touched on the render thread; the overlay reads the two atomics.
+std::atomic<bool> g_reloadActive{false};
+std::atomic<int>  g_reloadDone{0};    // steps completed (drives the progress bar)
+static int  g_reloadCur = 0;          // next step to run
+static bool g_reloadPrimed = false;   // have we presented one frame before starting work?
+
+static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
     const void* S = (const void*)(b + 0x3333EB);   // "String" = "" (game dir = cwd)
     const void* M = (const void*)(b + 0xE54B44);   // byte_140E54B44 = mods folder path
-    auto SC  = [&](uintptr_t rva){ RL_SC(b + rva); };
-    auto DIR = [&](uintptr_t z1, uintptr_t z2, uintptr_t z3, uintptr_t rva){
-        RL_Z32(b + z1); RL_Z32(b + z2); RL_Z64(b + z3); RL_Dir(b + rva, S, M);
-    };
+    const RLStep& s = kReloadSteps[i];
+    if (!s.dir) RL_SC(b + s.rva);
+    else { RL_Z32(b + s.z1); RL_Z32(b + s.z2); RL_Z64(b + s.z3); RL_Dir(b + s.rva, S, M); }
+}
 
-    Log("[reload] surgical content reload (no re-init, no menu bounce)...");
-
-    SC(0x2460);                                     // tracks
-    SC(0x1CE00);
-    DIR(0xF3DC80, 0x109DEC4, 0xF3DC48, 0x1B790);
-    SC(0x3100);                                     // bikes
-    SC(0x3FA0);
-    SC(0x171D0);
-    DIR(0x109DE88, 0xF3DC40, 0xF4EDF8, 0x17320);
-    DIR(0xF3DB9C, 0xF3DC9C, 0xF4EDA0, 0x17950);
-    SC(0x17F80);
-    DIR(0xF48620, 0xF3DB64, 0x109E090, 0x18360);
-    DIR(0x10A30F4, 0xF4EDDC, 0xF3DC28, 0x189C0);
-    DIR(0xF4EE00, 0x109DE90, 0xF48610, 0x19060);
-    SC(0x1BDD0);
-    DIR(0xF3DB50, 0x109DEA8, 0xF3DC90, 0x19330);
-    DIR(0x109DEA4, 0xF3DC8C, 0xF48658, 0x1AE10);
-    SC(0x1B420);
-    SC(0x19DA0);
-    DIR(0xF48660, 0xF4EDE0, 0xF432A0, 0x1A110);
-    DIR(0xF3DC58, 0xF432B4, 0xF48208, 0x1A770);
-    DIR(0x106BB28, 0x109DEB0, 0xF432A8, 0x1C140);
-    DIR(0xF432C0, 0xF48608, 0xF4EDD0, 0x1C450);
-
-    Log("[reload] done - all content lists rebuilt from disk.");
-    SetStatus("reloaded - new mods listed", 5000);
+// Called once per frame on the render thread (from Tick). Runs at most ONE step, so a
+// frame is presented between steps and the progress bar advances instead of freezing.
+void AdvanceReload() {
+    if (!g_reloadActive.load()) return;
+    if (!g_reloadPrimed) { g_reloadPrimed = true; return; }   // show the 0% frame first
+    if (g_reloadCur < kReloadStepCount) {
+        RunReloadStep(g_reloadCur);
+        g_reloadDone.store(++g_reloadCur);
+    } else {
+        g_reloadActive.store(false);
+        Log("[reload] done - all %d content lists rebuilt from disk.", kReloadStepCount);
+        SetStatus("reloaded - new mods listed", 4000);
+    }
 }
 
 void RequestReload() {
     Log("[ui] reload requested");
-    SetStatus("reloading mods...", 10000);
-    // Also re-read the server-filter blocklist, so editing it takes effect without
-    // restarting the game (the next server-list refresh uses the new rules).
+    if (!g_contentInit) {   // g_contentInit resolved <=> offsets match this build
+        Log("[reload] ABORT: offsets didn't match this build (see the [sig] lines).");
+        SetStatus("reload unavailable (offsets mismatch)", 5000);
+        return;
+    }
+    if (g_reloadActive.load()) { Log("[reload] already in progress - ignoring"); return; }
+    // Re-read the server-filter blocklist too, so editing it takes effect live.
     frostmod::serverfilter::Reload();
-    EnqueueGameThreadTask(DoReloadOnGameThread);
+    g_reloadCur = 0; g_reloadDone.store(0); g_reloadPrimed = false;
+    g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
+    Log("[reload] surgical content reload (stepped over %d frames)...", kReloadStepCount);
+    SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +734,12 @@ void GlText(int x, int y, const char* s) {
     glCallLists((GLsizei)strlen(s), GL_UNSIGNED_BYTE, s);
 }
 
+static void FillRect(int x0, int y0, int x1, int y1) {
+    glBegin(GL_QUADS);
+      glVertex2i(x0, y0); glVertex2i(x1, y0); glVertex2i(x1, y1); glVertex2i(x0, y1);
+    glEnd();
+}
+
 void DrawOverlay(HDC hdc) {
     if (!g_overlayOn.load()) return;
     EnsureFont(hdc);
@@ -720,8 +749,19 @@ void DrawOverlay(HDC hdc) {
     const int w = vp[2], h = vp[3];
     if (w <= 0 || h <= 0) return;
 
+    static unsigned frame = 0; ++frame;              // advances every presented frame
+    const bool reloading = g_reloadActive.load();
+    const int  done = g_reloadDone.load(), total = kReloadStepCount;
+    const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
+
     char line[128];
-    if (GetTickCount64() < g_statusUntil.load()) {
+    if (reloading) {
+        static const char spin[4] = {'|', '/', '-', '\\'};
+        // spinner animates on each PRESENTED frame (so if a step blocks a frame, it
+        // just pauses that frame - you still see it's mid-reload, not crashed).
+        sprintf_s(line, "%c  Reloading mods...  %d%%", spin[(frame / 3) % 4],
+                  total ? (done * 100 / total) : 0);
+    } else if (GetTickCount64() < g_statusUntil.load()) {
         std::lock_guard<std::mutex> lk(g_statusMutex);
         strncpy_s(line, g_statusText, _TRUNCATE);
     } else {
@@ -736,15 +776,22 @@ void DrawOverlay(HDC hdc) {
     glDisable(GL_LIGHTING);   glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // background pill, top-left corner
-    const int bw = 250, bh = 24, x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
-    glColor4f(0.04f, 0.05f, 0.08f, 0.70f);
-    glBegin(GL_QUADS);
-      glVertex2i(x0, y0); glVertex2i(x1, y0); glVertex2i(x1, y1); glVertex2i(x0, y1);
-    glEnd();
+    // background pill, top-left corner (taller while reloading, to fit the bar)
+    const int bw = 250, bh = reloading ? 38 : 24;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.72f);
+    FillRect(x0, y0, x1, y1);
 
     glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
-    GlText(x0 + 8, y0 + 7, line);
+    GlText(x0 + 8, y1 - 17, line);               // text near the top of the pill
+
+    if (reloading) {                             // progress bar along the bottom
+        const int bx0 = x0 + 8, bx1 = x1 - 8, by0 = y0 + 7, by1 = by0 + 6;
+        glColor4f(1.0f, 1.0f, 1.0f, 0.18f);      // track
+        FillRect(bx0, by0, bx1, by1);
+        glColor4f(0.47f, 0.78f, 1.0f, 0.95f);    // fill
+        FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
+    }
 
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
@@ -814,6 +861,7 @@ void Tick() {
     }
 
     DrainGameThreadTasks();
+    AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }

@@ -202,23 +202,26 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
     std::string dir = SafeStr(a1);
     std::string ext = SafeStr(a2);
 
-    // Record each DISTINCT (dir, ext) once: log it, and keep its args so a reload
-    // can replay it. This is how we see every folder/extension the game scans.
+    // Record each DISTINCT (dir, ext) once and keep its args so a reload can replay
+    // it. We still store ALL of them, but only LOG the first few - the startup scan
+    // fires hundreds of times and used to bury everything else (e.g. [srvlist]).
     {
-        std::string key = dir + "|" + ext;
         bool isNew = false;
+        size_t count = 0;
         {
             std::lock_guard<std::mutex> lk(g_scansMutex);
             bool exists = false;
             for (const auto& c : g_scans) if (c.dir == dir && c.ext == ext) { exists = true; break; }
             if (!exists && g_scans.size() < 128) {
                 g_scans.push_back(ScanCall{a0, a1, a2, a3, dir, ext});
-                isNew = true;
+                isNew = true; count = g_scans.size();
             }
         }
-        if (isNew)
+        if (isNew && count <= 5)
             Log("[capture] scan dir='%s' ext='%s' (rcx=%p rdx=%p r8=%p r9=%p)",
                 dir.c_str(), ext.c_str(), a0, a1, a2, a3);
+        else if (isNew && count == 6)
+            Log("[capture] ...(further startup scans still recorded, logging suppressed)");
     }
 
     // Keep the args of the ".pkz" scan as the primary replay target - that's the

@@ -37,7 +37,8 @@ stays open as a console - listing the mods it finds and streaming its log.
   `--no-filter-servers` to turn it off.
 - **Quit** - `Q` or Ctrl+C.
 
-Other options: `--process <name>`, `--mods "<path>"`, or an explicit DLL path.
+Full command-line reference — every flag, key, and file — is in
+[docs/USAGE.md](docs/USAGE.md).
 
 You can also run it as a **PiBoSo plugin**: drop `frostmod.dll` into MX Bikes'
 `plugins` folder and the game loads it at startup — no injector needed. See

@@ -1,16 +1,14 @@
 # FrostMod
 
-FrostMod is a client-side toolkit for MX Bikes. It reloads your mods without
-restarting the game, filters spam out of the online server browser, and shows a
-small in-game overlay. Windows x64 only. Same idea as BakkesMod.
+FrostMod is a client-side toolkit for MX Bikes.
 
 ## Features
 
-- **Live mod reload** — drop in a track, bike, or skin and it shows up in-game
-  instantly. No restart, no loading screen.
-- **Server-browser spam filter** — hide ad / cheat-shop / "ghost" servers from
-  your list. Purely client-side; nobody else is affected.
-- **In-game overlay** — a small status hint that shows FrostMod is live and
+- **Live mod reload** - drop in a track, bike, or skin and it shows up in-game
+  instantly without restarting the game.
+- **Server-browser spam filter** - hide ad / cheat-shop / "ghost" servers from
+  your list. Purely client-side, nobody else is affected.
+- **In-game overlay** - a small status hint that shows FrostMod is live and
   reports each reload.
 
 ## Build
@@ -30,13 +28,13 @@ This outputs `frostmod.exe` (the launcher you run) and `frostmod.dll` to
 ## Usage
 
 Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`, and
-stays open as a console — listing the mods it finds and streaming its log.
+stays open as a console - listing the mods it finds and streaming its log.
 
-- **Reload mods** — drop a `.pkz` into your mods folder, then press **`R`** in the
+- **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
   console or **`F8`** in-game.
-- **Filter servers** — run `frostmod.exe --filter-servers`. Rules live in
+- **Filter servers** - run `frostmod.exe --filter-servers`. Rules live in
   `frostmod_serverfilter.txt`, created next to the binaries (with docs) on first run.
-- **Quit** — `Q` or Ctrl+C.
+- **Quit** - `Q` or Ctrl+C.
 
 Other options: `--process <name>`, `--mods "<path>"`, or an explicit DLL path.
 
@@ -44,7 +42,6 @@ You can also run it as a **PiBoSo plugin**: drop `frostmod.dll` into MX Bikes'
 `plugins` folder and the game loads it at startup — no injector needed. See
 [docs/PLUGIN.md](docs/PLUGIN.md).
 
-Offline use only. Don't inject during online sessions.
 
 ## License
 

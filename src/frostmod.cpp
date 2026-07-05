@@ -139,6 +139,12 @@ uintptr_t g_base = 0;
 using ScanFolder_t = int64_t(__fastcall*)(void*, void*, void*, void*);
 ScanFolder_t g_origScan = nullptr;
 
+// fcn.1400ef210 - the game's content-load / app-init routine; re-running it
+// rescans all content (bikes/tracks/tyres/...) from disk. This is the reload
+// target. Resolved (g_base + RVA_CONTENT_INIT) in Init; null if unavailable.
+using ContentInit_t = int64_t(__fastcall*)(int, int64_t, int64_t, int64_t);
+ContentInit_t g_contentInit = nullptr;
+
 // fcn.140159340 - registry reset/rebuild  (2 register args)
 using RegistryReset_t = int64_t(__fastcall*)(void*, void*);
 RegistryReset_t g_origReset = nullptr;
@@ -147,8 +153,7 @@ struct CapturedCall {
     std::atomic<bool> valid{false};
     void* a0{}; void* a1{}; void* a2{}; void* a3{};
 };
-CapturedCall g_scanArgs;   // args of the last .pkz (mods) scan we saw
-CapturedCall g_resetArgs;  // last args seen for the registry reset
+CapturedCall g_resetArgs;  // last args seen for the registry reset (probe only)
 
 // Every DISTINCT (dir, ext) scan the game made at startup, so a reload can replay
 // just the mods (.pkz) scan or all content scans. NOTE: a0 (status) and a3 (out
@@ -260,13 +265,6 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
 
         // Pin the content-loader: log who called us (up through the API dispatcher).
         if (isNew) LogScanCallers(dir, ext);
-    }
-
-    // Keep the args of the ".pkz" scan as the primary replay target - that's the
-    // one that mounts mods/tracks.
-    if (_stricmp(ext.c_str(), "pkz") == 0) {
-        g_scanArgs.a0 = a0; g_scanArgs.a1 = a1; g_scanArgs.a2 = a2; g_scanArgs.a3 = a3;
-        g_scanArgs.valid.store(true);
     }
 
     return g_origScan(a0, a1, a2, a3);
@@ -452,9 +450,13 @@ bool InstallServerFilterHook() {
     b(0xFF);b(0xD0);                                     // call rax
     b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp -> post-pushfq)
     b(0x84);b(0xC0);                                     // test al,al
-    b(0x74);b(0x0C);                                     // jz +0x0C  (skip the hide-write)
+    b(0x74);b(0x13);                                     // jz +0x13  (skip the hide-writes)
     b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x40);             // lea rax,[rsp+rdi+0x40]  (entry; rsp now -0x40)
-    b(0x44);b(0x89);b(0xA0);b(0xCC);b(0x00);b(0x00);b(0x00); // mov [rax+0xCC], r12d  (force maxplayers==r12d)
+    // Make the row look like a GENUINE empty server (players=maxplayers=r12d, ==0),
+    // so the game's own jz->row-skip takes the exact same safe path it uses for real
+    // empty rows. (Forcing only maxplayers left players non-zero -> inconsistent -> crash.)
+    b(0x44);b(0x89);b(0xA0);b(0xC8);b(0x00);b(0x00);b(0x00); // mov [rax+0xC8], r12d  (players    = r12d)
+    b(0x44);b(0x89);b(0xA0);b(0xCC);b(0x00);b(0x00);b(0x00); // mov [rax+0xCC], r12d  (maxplayers = r12d)
     // restore regs+flags, then continue into the original cmp (trampoline)
     b(0x9D);                                             // popfq
     b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax
@@ -474,129 +476,33 @@ bool InstallServerFilterHook() {
 // ---------------------------------------------------------------------------
 // the reload action - runs ON THE GAME THREAD (called from the swap hook)
 // ---------------------------------------------------------------------------
-// Two families of reload, several variants - cycle with F7 (in-game) or S (in the
-// frostmod.exe console) and see which one actually makes a new track appear:
-//   A  replay: re-run the exact scan the game did (needs it captured at startup).
-//   B  direct: call the scanner ourselves with our own args (works without capture,
-//              experimental - guarded so a bad guess can't crash the game).
-enum class ReloadStrategy {
-    ReplayPkzScan,        // A : replay the captured .pkz scan only
-    ReplayResetThenPkz,   // A+: replay captured reset, then the .pkz scan  (default)
-    ReplayAllContent,     // A++: replay captured reset, then EVERY captured scan
-    DirectCallScanner,    // B : construct + call the scanner (experimental)
-    COUNT
-};
-std::atomic<ReloadStrategy> g_strategy{ReloadStrategy::ReplayResetThenPkz};
-
-const char* StrategyName(ReloadStrategy s) {
-    switch (s) {
-    case ReloadStrategy::ReplayPkzScan:      return "A  (replay .pkz scan)";
-    case ReloadStrategy::ReplayResetThenPkz: return "A+ (reset + replay .pkz scan)";
-    case ReloadStrategy::ReplayAllContent:   return "A++ (reset + replay ALL scans)";
-    case ReloadStrategy::DirectCallScanner:  return "B  (direct-call scanner, experimental)";
-    default:                                 return "?";
-    }
-}
-
-void CycleStrategy() {
-    int cur  = (int)g_strategy.load();
-    auto next = (ReloadStrategy)((cur + 1) % (int)ReloadStrategy::COUNT);
-    g_strategy.store(next);
-    Log("[reload] strategy -> %s", StrategyName(next));
-}
-
-// SEH-guarded calls: never let a wrong-argument replay/construct crash the game.
-// (No C++ objects here, so __try/__except is allowed.)
-static int64_t SafeCallScan(void* a0, void* a1, void* a2, void* a3) {
-    __try { return g_origScan(a0, a1, a2, a3); }
+// The reload re-runs the game's own content-load routine (fcn.1400ef210) on the
+// game thread. That routine clears and rebuilds EVERY content list from disk, so a
+// newly dropped .pkz registers live - no mounting, no captured-scan replay (the old
+// A/A+/A++/B strategies were removed: they called the wrong function; see CHANGELOG).
+//
+// CAVEAT: fcn.1400ef210 is also the app's boot init - it re-inits input/sound/Steam
+// and returns to the UI, i.e. this is effectively a "soft restart to the menu". It's
+// SEH-guarded so a fault is caught rather than crashing. The lighter per-category
+// reload (rebuild just the track list, no re-init) is the planned follow-up once the
+// track loader is pinned (offsets.h RVA_TRACK_LOADER).
+static int64_t SafeCallContentInit() {
+    __try { return g_contentInit(0, 0, 0, 0); }   // mode 0 -> rescan + return to UI
     __except (EXCEPTION_EXECUTE_HANDLER) { return -0x1EAD; }
-}
-static int64_t SafeCallReset(void* a0, void* a1) {
-    __try { return g_origReset(a0, a1); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return -0x1EAD; }
-}
-
-void ReplayReset() {
-    if (g_resetArgs.valid.load() && g_origReset) {
-        Log("[reload] replay registryReset(rcx=%p rdx=%p)", g_resetArgs.a0, g_resetArgs.a1);
-        int64_t r = SafeCallReset(g_resetArgs.a0, g_resetArgs.a1);
-        Log("[reload]   registryReset returned %lld%s", (long long)r,
-            r == -0x1EAD ? "  (FAULTED - caught)" : "");
-    } else {
-        Log("[reload] note: registry-reset args not captured; skipping reset");
-    }
-}
-
-// Strategy B: build the call ourselves. Reuse the game's real dir/ext string
-// pointers if we captured them (best), else construct <savePath>\mods + "pkz".
-// Pass FRESH zeroed status/out buffers instead of the game's old stack pointers.
-void DoDirectCall() {
-    static char          dirBuf[MAX_PATH];
-    static char          extBuf[] = "pkz";
-    static unsigned char statusBuf[0x40];
-    static unsigned char outBuf[0x200];       // scanner out-buf is ~0x108
-
-    void* dirPtr; void* extPtr;
-    if (g_scanArgs.valid.load()) {
-        dirPtr = g_scanArgs.a1; extPtr = g_scanArgs.a2;   // exact strings the game used
-    } else {
-        dirBuf[0] = 0;
-        if (g_savePath[0]) { strcpy_s(dirBuf, g_savePath); strcat_s(dirBuf, "\\mods"); }
-        else               { strcpy_s(dirBuf, "mods"); }
-        dirPtr = dirBuf; extPtr = extBuf;
-    }
-    memset(statusBuf, 0, sizeof(statusBuf));
-    memset(outBuf,    0, sizeof(outBuf));
-
-    if (g_strategy.load() == ReloadStrategy::DirectCallScanner) ReplayReset();  // reset first helps
-    Log("[reload] DIRECT scanner dir='%s' ext='%s' (fresh status/out buffers)",
-        SafeStr(dirPtr).c_str(), SafeStr(extPtr).c_str());
-    int64_t r = SafeCallScan(statusBuf, dirPtr, extPtr, outBuf);
-    Log("[reload] direct scanner returned %lld%s", (long long)r,
-        r == -0x1EAD ? "  (FAULTED - caught; the constructed args are wrong)" : ". Done.");
 }
 
 void DoReloadOnGameThread() {
-    ReloadStrategy s = g_strategy.load();
-    Log("[reload] running on game thread - strategy %s", StrategyName(s));
-
-    if (!g_origScan) {
-        Log("[reload] ABORT: content hooks were not installed (offsets.h didn't match "
-            "this mxbikes build - see the [sig] lines above). Reload is unavailable.");
+    if (!g_contentInit) {
+        Log("[reload] ABORT: content-load routine (RVA 0x%zx) not resolved on this build - "
+            "offsets.h didn't match it (see the [sig] lines). Reload unavailable.",
+            (size_t)mxb::RVA_CONTENT_INIT);
         return;
     }
-
-    if (s == ReloadStrategy::DirectCallScanner) { DoDirectCall(); return; }
-
-    // replay strategies need the .pkz scan captured at startup
-    if (!g_scanArgs.valid.load()) {
-        Log("[reload] ABORT: no .pkz scan captured. Load FrostMod BEFORE the startup scan "
-            "(plugin mode, or inject before launch). Or press F7/S to try strategy B "
-            "(direct-call), which doesn't need a capture.");
-        return;
-    }
-
-    if (s == ReloadStrategy::ReplayResetThenPkz || s == ReloadStrategy::ReplayAllContent)
-        ReplayReset();
-
-    if (s == ReloadStrategy::ReplayAllContent) {
-        std::vector<ScanCall> scans;
-        { std::lock_guard<std::mutex> lk(g_scansMutex); scans = g_scans; }
-        Log("[reload] replaying ALL %zu captured content scans...", scans.size());
-        for (auto& c : scans) {
-            int64_t r = SafeCallScan(c.a0, c.a1, c.a2, c.a3);
-            Log("[reload]   dir='%s' ext='%s' -> %lld%s", c.dir.c_str(), c.ext.c_str(),
-                (long long)r, r == -0x1EAD ? " (FAULTED)" : "");
-        }
-        Log("[reload] done replaying all scans.");
-    } else {   // ReplayPkzScan or ReplayResetThenPkz
-        Log("[reload] replay .pkz scan dir='%s' ext='%s'",
-            SafeStr(g_scanArgs.a1).c_str(), SafeStr(g_scanArgs.a2).c_str());
-        int64_t r = SafeCallScan(g_scanArgs.a0, g_scanArgs.a1, g_scanArgs.a2, g_scanArgs.a3);
-        Log("[reload] scanner returned %lld. Done.%s", (long long)r,
-            r == -0x1EAD ? "  (FAULTED - caught)"
-                         : "  If the track still doesn't show, press F7/S to try another strategy.");
-    }
+    Log("[reload] running on game thread - re-running the content load (fcn.1400ef210)...");
+    int64_t r = SafeCallContentInit();
+    Log("[reload] content load returned %lld.%s", (long long)r,
+        r == -0x1EAD ? "  (FAULTED - caught; the game may be unstable)"
+                     : "  Newly added tracks/skins should now be listed.");
 }
 
 void RequestReload() {
@@ -618,7 +524,6 @@ wglSwapBuffers_t g_origWglSwapBuffers = nullptr;
 // Cross-process triggers from frostmod.exe (named auto-reset events, consumed on
 // the render thread). "Local\..." scopes them to the logon session. Created in Init.
 HANDLE g_reloadEvent = nullptr;   // R in the console -> reload
-HANDLE g_cycleEvent  = nullptr;   // S in the console -> cycle reload strategy
 HANDLE g_dumpEvent   = nullptr;   // D in the console -> dump the server-list blob now
 
 void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
@@ -631,15 +536,12 @@ void Tick() {
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // In-game hotkeys (work in fullscreen): F8 = reload, F7 = cycle strategy,
+    // In-game hotkeys (work in fullscreen): F8 = reload,
     // F9 = dump the server list right now (handy while the browser is on screen).
-    static bool prevF8 = false, prevF7 = false, prevF9 = false;
+    static bool prevF8 = false, prevF9 = false;
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) RequestReload();
     prevF8 = f8;
-    bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (f7 && !prevF7) CycleStrategy();
-    prevF7 = f7;
     bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (f9 && !prevF9) { Log("[srvlist] manual dump (F9)"); DumpServerListBlob(true); }
     prevF9 = f9;
@@ -661,13 +563,11 @@ void Tick() {
         }
     }
 
-    // Same, driven from the frostmod.exe console (R / S).
+    // Same, driven from the frostmod.exe console (R = reload).
     if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0) {
         Log("[event] reload signal received from frostmod.exe");
         RequestReload();
     }
-    if (g_cycleEvent && WaitForSingleObject(g_cycleEvent, 0) == WAIT_OBJECT_0)
-        CycleStrategy();
     if (g_dumpEvent && WaitForSingleObject(g_dumpEvent, 0) == WAIT_OBJECT_0) {
         Log("[srvlist] manual dump (D)"); DumpServerListBlob(true);
     }
@@ -882,13 +782,11 @@ DWORD WINAPI Init(LPVOID) {
 
     if (MH_Initialize() != MH_OK) { Log("[init] MinHook init failed"); return 1; }
 
-    // triggers shared with frostmod.exe: R = reload, S = cycle strategy.
+    // triggers shared with frostmod.exe: R = reload, D = dump server list.
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
-    g_cycleEvent  = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModCycle");
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
-    Log("[init] reload strategy = %s  (F7 in-game or S in the console cycles it)",
-        StrategyName(g_strategy.load()));
+    Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
 
     CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
 
@@ -899,6 +797,22 @@ DWORD WINAPI Init(LPVOID) {
     uintptr_t scanAddr = WaitForScanner(&delta, 30000 /*ms*/);
     if (scanAddr) {
         InstallHook((void*)scanAddr, &hkScan, (void**)&g_origScan, "scanFolder");
+
+        // Resolve the content-load routine (fcn.1400ef210) - the reload target. It has
+        // no signature, so apply the same delta the scanner moved by (best-effort) and
+        // only accept it if it lands inside .text.
+        {
+            uintptr_t ci = g_base + mxb::RVA_CONTENT_INIT + delta;
+            uint8_t *cb, *ce;
+            if (GetExecRange(g_base, &cb, &ce) && (uint8_t*)ci >= cb && (uint8_t*)ci < ce) {
+                g_contentInit = (ContentInit_t)ci;
+                Log("[init] content-load routine @ RVA 0x%zx - reload ready (R / F8).",
+                    (size_t)(ci - g_base));
+            } else {
+                Log("[init] WARNING: content-load RVA 0x%zx outside .text; reload disabled.",
+                    (size_t)mxb::RVA_CONTENT_INIT);
+            }
+        }
 
         // The registry-reset function has no signature in offsets.h, so we can't
         // verify it independently - we apply the same delta the scanner moved by

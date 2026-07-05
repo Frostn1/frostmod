@@ -30,6 +30,8 @@ treated as an explicit path to the DLL.
 | Flag | Argument | Default | What it does |
 |------|----------|---------|--------------|
 | *(none)* | — | — | Reload **and** the server filter are both on. |
+| `--install-startup` | — | off | Run FrostMod automatically at every login (minimized) so it's always watching and injects when MX Bikes starts. Also keeps running now. Per-user, no admin. |
+| `--uninstall-startup` | — | — | Stop running at login (removes the entry above). |
 | `--no-filter-servers` | — | filter **on** | Turn the server filter off (reload only; leaves the browser untouched). |
 | `--filter-servers` | — | *(already on)* | Force the filter on. Redundant now that it's the default; kept for clarity. |
 | `--process <name>` | exe name | `mxbikes.exe` | Inject into a different process (e.g. `--process gpbikes.exe`). |

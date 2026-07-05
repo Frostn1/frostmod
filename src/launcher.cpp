@@ -22,10 +22,17 @@
 //     frostmod.exe                         (no flags needed: mod reload + the
 //                                           server filter are both ON. Waits for
 //                                           mxbikes.exe, loads .\frostmod.dll.)
+//     frostmod.exe --install-startup       (run automatically at login from now on,
+//                                           minimized, and keep running now)
+//     frostmod.exe --uninstall-startup     (stop running at login)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
 //     frostmod.exe --process gpbikes.exe   (different game)
 //     frostmod.exe --mods "D:\path\mods"   (override the mods folder)
 //     frostmod.exe C:\path\frostmod.dll    (explicit DLL path)
+//
+//  Auto-start uses a per-user HKCU\...\Run entry (no admin). Because FrostMod already
+//  watches for the game and injects on launch, "run at startup" gives you the
+//  "when the game runs, FrostMod runs" behaviour with nothing to configure per-game.
 //
 //  Run as the same user as the game (and elevated if the game is elevated).
 // ============================================================================
@@ -229,6 +236,45 @@ static void TailLog(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+// auto-start at login: a HKCU Run entry (no admin needed) so FrostMod is always
+// watching and injects the moment MX Bikes launches - however you start the game.
+// ---------------------------------------------------------------------------
+static const char* kRunKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char* kRunVal = "FrostMod";
+
+static bool InstallStartup() {
+    char exe[MAX_PATH];
+    if (!GetModuleFileNameA(nullptr, exe, sizeof(exe))) return false;
+    // Run minimized at login (--startup) so it's out of the way but still available.
+    std::string cmd = "\"" + std::string(exe) + "\" --startup";
+    HKEY hk;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &hk, nullptr) != ERROR_SUCCESS) return false;
+    LONG r = RegSetValueExA(hk, kRunVal, 0, REG_SZ,
+                            (const BYTE*)cmd.c_str(), (DWORD)cmd.size() + 1);
+    RegCloseKey(hk);
+    return r == ERROR_SUCCESS;
+}
+
+static bool UninstallStartup() {
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS)
+        return true;   // key absent => nothing to remove
+    LONG r = RegDeleteValueA(hk, kRunVal);
+    RegCloseKey(hk);
+    return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+}
+
+static bool IsStartupInstalled() {
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS)
+        return false;
+    LONG r = RegQueryValueExA(hk, kRunVal, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(hk);
+    return r == ERROR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetConsoleTitleA("FrostMod");
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -241,6 +287,9 @@ int main(int argc, char** argv) {
     bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
+    bool installStartup   = false; // --install-startup: run automatically at login
+    bool uninstallStartup = false; // --uninstall-startup: stop running at login
+    bool startupMode      = false; // --startup: launched by the login entry (start minimized)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -251,7 +300,24 @@ int main(int argc, char** argv) {
         else if (a == "--dump-serverlist")       dumpList = true;
         else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
         else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
+        else if (a == "--install-startup")       installStartup = true;
+        else if (a == "--uninstall-startup")     uninstallStartup = true;
+        else if (a == "--startup")               startupMode = true;
         else                                     dllPath = a;
+    }
+
+    // --uninstall-startup is a one-shot: remove the login entry and exit.
+    if (uninstallStartup) {
+        bool ok = UninstallStartup();
+        printf(ok ? "[+] FrostMod will no longer start automatically at login.\n"
+                  : "[!] Could not remove the startup entry (registry error).\n");
+        return ok ? 0 : 1;
+    }
+
+    // Launched by the login entry: tuck the console into the taskbar so it isn't in
+    // your face every time you log in (it's still there if you want to watch it).
+    if (startupMode) {
+        if (HWND con = GetConsoleWindow()) ShowWindow(con, SW_MINIMIZE);
     }
 
     // default DLL path: frostmod.dll next to this exe
@@ -303,6 +369,20 @@ int main(int argc, char** argv) {
     } else {
         printf("[*] server filter: OFF (--no-filter-servers).\n");
         DeleteFileA(filterFlag.c_str());
+    }
+
+    // --install-startup: register the login entry now, then keep running (so it's
+    // active immediately AND every future login). It just runs THIS exe minimized.
+    if (installStartup) {
+        if (InstallStartup())
+            printf("[+] auto-start ENABLED: FrostMod will launch at login and inject into\n"
+                   "    MX Bikes whenever it starts - no need to run this manually again.\n"
+                   "    (Undo any time with:  frostmod.exe --uninstall-startup)\n");
+        else
+            printf("[!] auto-start: could not write the login entry (registry error).\n");
+    } else {
+        printf("[*] auto-start: %s  (enable with:  frostmod.exe --install-startup)\n",
+               IsStartupInstalled() ? "ON - runs at login" : "off");
     }
 
     // cross-process triggers (the DLL watches these named events).

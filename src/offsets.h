@@ -12,17 +12,25 @@
 namespace mxb {
 
 // ---- content / virtual-filesystem functions ----------------------------------
-// fcn.140158be0 : scan a folder, recurse subdirs, glob *.pkz, mount each.
-//   signature: int64 __fastcall(void* out_status, char* dir_path,
-//                               char* extra_ext, void* out_buf_0x108)
+// fcn.140158be0 : GENERIC virtual-filesystem DIRECTORY WALKER, NOT the pkz loader.
+//   Runtime capture shows it is called as (out_status, dir_path, ext, out_buf)
+//   with ext='/' (list subdirs), 'cfg', 'pnt', ... but NEVER 'pkz'. By the time it
+//   runs the .pkz are already mounted and appear as virtual dirs it walks. So
+//   replaying/calling it can never MOUNT a newly added .pkz - that was the wrong
+//   function. Kept only for reference / diagnostics.
 constexpr uintptr_t RVA_SCAN_FOLDER   = 0x158be0;
 
 // fcn.140159340 : reset+rebuild the content-directory registry from a path list.
 //   frees [0x140396760], zeroes count [0x140396754], reallocs, rebuilds.
 //   signature: int64 __fastcall(void* path_list, void* arg2)
+//   NOTE: not called at startup (never captured), so we can't replay it.
 constexpr uintptr_t RVA_REGISTRY_RESET = 0x159340;
 
-// (reference only - not called directly by this mod)
+// fcn.14015a9e0 : the actual "MOUNT ONE .pkz into the VFS" function - this is what
+//   we need to call for a newly-added file to make it live. Signature UNKNOWN
+//   (probably (context, char* pkz_path[, flags])). frostmod.exe --probe-mount hooks
+//   it to log its args at startup and reveal which arg is the path. Then a reload
+//   can mount the new pkz + rebuild the registry.
 constexpr uintptr_t RVA_MOUNT_ONE_PKZ = 0x15a9e0;  // fcn.14015a9e0
 constexpr uintptr_t RVA_VFS_LOOKUP    = 0x157920;  // fcn.140157920
 

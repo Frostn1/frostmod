@@ -226,6 +226,24 @@ int64_t __fastcall hkReset(void* a0, void* a1) {
     return g_origReset(a0, a1);
 }
 
+// PROBE (opt-in via frostmod.exe --probe-mount): capture how the real pkz-mount
+// function (0x15a9e0) is called, to learn which arg is the .pkz path. Observe-only
+// pass-through; we log each arg as a string so a readable path reveals itself.
+// Declared with 4 register args (safe for the near-certain <=4-arg mount fn).
+using MountPkz_t = int64_t(__fastcall*)(void*, void*, void*, void*);
+MountPkz_t g_origMount = nullptr;
+
+int64_t __fastcall hkMount(void* a0, void* a1, void* a2, void* a3) {
+    static std::atomic<int> n{0};
+    int i = n.fetch_add(1);
+    if (i < 48) {   // first calls only, avoid spam
+        Log("[mount] #%d 0x15a9e0(rcx=%p('%s') rdx=%p('%s') r8=%p('%s') r9=%p('%s'))",
+            i, a0, SafeStr(a0).c_str(), a1, SafeStr(a1).c_str(),
+            a2, SafeStr(a2).c_str(), a3, SafeStr(a3).c_str());
+    }
+    return g_origMount(a0, a1, a2, a3);
+}
+
 // ---------------------------------------------------------------------------
 // SERVER FILTER hook (RE PENDING) - hide spam/"ghost" servers from the browser.
 //
@@ -674,6 +692,27 @@ DWORD WINAPI Init(LPVOID) {
                 "(unverified - it has no signature).",
                 (long long)delta, (size_t)(resetAddr - g_base));
         InstallHook((void*)resetAddr, &hkReset, (void**)&g_origReset, "registryReset");
+
+        // OPT-IN PROBE: if frostmod.exe --probe-mount left the flag next to us, hook
+        // the real .pkz-mount function (0x15a9e0, apply the same delta) to log how it's
+        // called - so we can learn which arg is the path and build a real reload.
+        char probe[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(probe, g_logPath);
+            if (char* s = strrchr(probe, '\\')) { *(s + 1) = 0; strcat_s(probe, "frostmod_probe.flag"); }
+        }
+        if (probe[0] && GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
+            uintptr_t mountAddr = g_base + mxb::RVA_MOUNT_ONE_PKZ + delta;
+            uint8_t *b2, *e2;
+            if (GetExecRange(g_base, &b2, &e2) && (uint8_t*)mountAddr >= b2 && (uint8_t*)mountAddr < e2) {
+                Log("[probe] --probe-mount active: hooking pkz-mount @ RVA 0x%zx to log its args.",
+                    (size_t)(mountAddr - g_base));
+                InstallHook((void*)mountAddr, &hkMount, (void**)&g_origMount, "mountPkz(0x15a9e0)");
+            } else {
+                Log("[probe] mount RVA 0x%zx is outside .text; not hooking.",
+                    (size_t)mxb::RVA_MOUNT_ONE_PKZ);
+            }
+        }
     } else {
         Log("[init] content hooks NOT installed - reload is unavailable on this build "
             "until offsets.h is updated. (mods listing + logs still work.)");

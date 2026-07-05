@@ -236,12 +236,14 @@ int main(int argc, char** argv) {
     std::string modsPath;
     long warmupMs = 400;     // delay after seeing the process before injecting;
                              // small = catch the startup scan. Override with --wait.
+    bool probeMount = false; // --probe-mount: hook the pkz-mount fn to log its args
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--process" && i + 1 < argc)    processName = argv[++i];
         else if (a == "--mods" && i + 1 < argc)  modsPath = argv[++i];
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
+        else if (a == "--probe-mount")           probeMount = true;
         else                                     dllPath = a;
     }
 
@@ -269,6 +271,16 @@ int main(int argc, char** argv) {
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
     printf("[*] log   : %s\n", logPath.c_str());
     printf("=============================================\n");
+
+    // --probe-mount: leave a flag next to the dll so it hooks the pkz-mount fn and
+    // logs its args (experimental RE probe). Remove it otherwise so it's not stale.
+    std::string probeFlag = ExeDir() + "frostmod_probe.flag";
+    if (probeMount) {
+        if (FILE* f = nullptr; fopen_s(&f, probeFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --probe-mount ON: DLL will hook the pkz-mount fn and log [mount] args.\n");
+    } else {
+        DeleteFileA(probeFlag.c_str());
+    }
 
     // cross-process triggers (the DLL watches these named events).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");

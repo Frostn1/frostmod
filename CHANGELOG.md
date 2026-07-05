@@ -2,6 +2,9 @@
 
 ## 2026-07-05
 ### Changed
+- **Key RE finding:** early-load capture proved `0x158be0` is a generic **VFS directory walker** (called with ext `/`, `cfg`, `pnt` — never `pkz`), not the pkz loader. By the time it runs the `.pkz` are already mounted and appear as virtual dirs it walks, so replaying/calling it can never mount a newly-added track — which is why every reload strategy failed. Corrected the `offsets.h` labels; the real target is the pkz-**mount** function (`0x15a9e0`).
+- Added `frostmod.exe --probe-mount`: leaves a flag so the DLL hooks the pkz-mount function (`0x15a9e0`) and logs its args (`[mount] …`) at startup — to reveal which arg is the `.pkz` path so a real mount-based reload can be built. Observe-only pass-through, opt-in (default off).
+
 - Reload is now a cycle-able **multi-strategy** experiment: `A` replay the captured `.pkz` scan, `A+` reset + replay `.pkz` (default), `A++` reset + replay every captured content scan, `B` construct + directly call the scanner (`<savePath>\mods`, ext `pkz`, fresh buffers — works without a capture). Cycle with `F7` in-game or `S` in the console (`Local\FrostModCycle` event); the active strategy is logged. `hkScan` now stores all distinct `(dir,ext)` scans (`g_scans`), and every replay/direct call goes through SEH-guarded wrappers so a wrong-argument attempt logs `FAULTED - caught` instead of crashing the game.
 
 ### Added

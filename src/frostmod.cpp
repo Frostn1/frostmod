@@ -40,6 +40,7 @@
 #include <set>
 #include <cstring>
 #include <intrin.h>   // _ReturnAddress (find the walk's caller)
+#include <GL/gl.h>    // in-game overlay (immediate-mode GL, drawn in the swap hook)
 
 #include "MinHook.h"
 #include "offsets.h"
@@ -491,11 +492,14 @@ static int64_t SafeCallContentInit() {
     __except (EXCEPTION_EXECUTE_HANDLER) { return -0x1EAD; }
 }
 
+void SetStatus(const char* s, unsigned ms);   // in-game overlay status (defined below)
+
 void DoReloadOnGameThread() {
     if (!g_contentInit) {
         Log("[reload] ABORT: content-load routine (RVA 0x%zx) not resolved on this build - "
             "offsets.h didn't match it (see the [sig] lines). Reload unavailable.",
             (size_t)mxb::RVA_CONTENT_INIT);
+        SetStatus("reload unavailable (offsets mismatch)", 5000);
         return;
     }
     Log("[reload] running on game thread - re-running the content load (fcn.1400ef210)...");
@@ -503,14 +507,102 @@ void DoReloadOnGameThread() {
     Log("[reload] content load returned %lld.%s", (long long)r,
         r == -0x1EAD ? "  (FAULTED - caught; the game may be unstable)"
                      : "  Newly added tracks/skins should now be listed.");
+    SetStatus(r == -0x1EAD ? "reload FAULTED (caught)" : "reloaded - new content listed", 5000);
 }
 
 void RequestReload() {
     Log("[ui] reload requested");
+    SetStatus("reloading mods...", 10000);
     // Also re-read the server-filter blocklist, so editing it takes effect without
     // restarting the game (the next server-list refresh uses the new rules).
     frostmod::serverfilter::Reload();
     EnqueueGameThreadTask(DoReloadOnGameThread);
+}
+
+// ---------------------------------------------------------------------------
+// in-game overlay - a small corner hint drawn with immediate-mode GL inside the
+// wglSwapBuffers hook. Shows "FrostMod - F8: reload mods", and a transient status
+// line after a reload. F7 toggles it. No mouse - F8 (or console R) does the reload.
+// If the game runs a core GL profile the fixed-function calls are no-ops (overlay
+// just stays hidden); everything is wrapped in push/pop so we never disturb the game.
+// ---------------------------------------------------------------------------
+std::atomic<bool>      g_overlayOn{true};
+std::atomic<ULONGLONG> g_statusUntil{0};        // show g_statusText until this tick
+std::mutex             g_statusMutex;
+char                   g_statusText[128] = {0};
+
+void SetStatus(const char* s, unsigned ms) {
+    std::lock_guard<std::mutex> lk(g_statusMutex);
+    strncpy_s(g_statusText, s, _TRUNCATE);
+    g_statusUntil.store(GetTickCount64() + ms);
+}
+
+// GL bitmap font built from a GDI font via wglUseFontBitmaps. Needs a current GL
+// context, so we build it lazily on the first overlay draw.
+GLuint g_fontBase  = 0;
+bool   g_fontTried = false;
+
+void EnsureFont(HDC hdc) {
+    if (g_fontTried) return;
+    g_fontTried = true;
+    HFONT font = CreateFontA(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    if (!font) return;
+    HGDIOBJ old = SelectObject(hdc, font);
+    GLuint base = glGenLists(256);
+    if (base && wglUseFontBitmaps(hdc, 0, 256, base)) g_fontBase = base;
+    else if (base)                                    glDeleteLists(base, 256);
+    SelectObject(hdc, old);
+    DeleteObject(font);
+    Log("[overlay] font %s", g_fontBase ? "ready" : "unavailable (hint text hidden)");
+}
+
+void GlText(int x, int y, const char* s) {
+    if (!g_fontBase || !s || !*s) return;
+    glRasterPos2i(x, y);
+    glListBase(g_fontBase);
+    glCallLists((GLsizei)strlen(s), GL_UNSIGNED_BYTE, s);
+}
+
+void DrawOverlay(HDC hdc) {
+    if (!g_overlayOn.load()) return;
+    EnsureFont(hdc);
+
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    const int w = vp[2], h = vp[3];
+    if (w <= 0 || h <= 0) return;
+
+    char line[128];
+    if (GetTickCount64() < g_statusUntil.load()) {
+        std::lock_guard<std::mutex> lk(g_statusMutex);
+        strncpy_s(line, g_statusText, _TRUNCATE);
+    } else {
+        strcpy_s(line, "FrostMod  -  F8: reload mods");
+    }
+
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, w, 0, h, -1, 1);                  // origin bottom-left
+    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); glDisable(GL_TEXTURE_2D);
+    glDisable(GL_LIGHTING);   glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // background pill, top-left corner
+    const int bw = 250, bh = 24, x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.70f);
+    glBegin(GL_QUADS);
+      glVertex2i(x0, y0); glVertex2i(x1, y0); glVertex2i(x1, y1); glVertex2i(x0, y1);
+    glEnd();
+
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
+    GlText(x0 + 8, y0 + 7, line);
+
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+    glPopAttrib();
 }
 
 // ---------------------------------------------------------------------------
@@ -536,12 +628,15 @@ void Tick() {
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // In-game hotkeys (work in fullscreen): F8 = reload,
+    // In-game hotkeys (work in fullscreen): F8 = reload, F7 = toggle the overlay,
     // F9 = dump the server list right now (handy while the browser is on screen).
-    static bool prevF8 = false, prevF9 = false;
+    static bool prevF8 = false, prevF7 = false, prevF9 = false;
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) RequestReload();
     prevF8 = f8;
+    bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (f7 && !prevF7) { bool on = !g_overlayOn.load(); g_overlayOn.store(on); Log("[overlay] %s", on ? "shown" : "hidden"); }
+    prevF7 = f7;
     bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (f9 && !prevF9) { Log("[srvlist] manual dump (F9)"); DumpServerListBlob(true); }
     prevF9 = f9;
@@ -576,7 +671,7 @@ void Tick() {
 }
 
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
-BOOL WINAPI hkWglSwapBuffers(HDC hdc)   { Tick(); return g_origWglSwapBuffers(hdc); }
+BOOL WINAPI hkWglSwapBuffers(HDC hdc)   { Tick(); DrawOverlay(hdc); return g_origWglSwapBuffers(hdc); }
 
 // ---------------------------------------------------------------------------
 // the floating UI window (its own thread + message loop)

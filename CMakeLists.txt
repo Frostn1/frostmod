@@ -21,7 +21,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
-add_library(frostmod SHARED src/frostmod.cpp)
+add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp)
 target_link_libraries(frostmod PRIVATE minhook gdi32 user32)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")

@@ -106,6 +106,23 @@ check the log and the notes in `frostmod.cpp`.
 
 Offline use only. Don't inject during online sessions.
 
+## Server-list spam filter (client-side)
+
+MX Bikes gets its online server list from the master server
+(`master.mx-bikes.com`, UDP 54200). FrostMod can hide junk / ad "ghost" servers
+from *your* browser — purely client-side, nobody else is affected.
+
+Rules live in `frostmod_serverfilter.txt` (created next to the binaries, with docs,
+on first run). You can hide by name substring, name regex, too-many-from-one-IP,
+password-locked, or empty. Edit the file and press `R` (or reload) to apply it live.
+Hidden servers are logged as `[filter] hid '<name>' (<reason>)`.
+
+Status: the rule engine + config are done, but the game-side hook that feeds
+server entries through the filter needs the server-list function reverse-engineered
+(the `RVA_SRV_*` / `SIG_SRV_LIST_ADD` placeholders in `src/offsets.h`, and the
+SERVER FILTER block in `src/frostmod.cpp`). Until that's filled in, the filter loads
+its config but doesn't hide anything yet.
+
 ## License
 
 FrostMod is under the MIT License — see LICENSE. It bundles MinHook

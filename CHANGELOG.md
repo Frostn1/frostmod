@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-05
+### Added
+- Server-list spam filter (client-side), scaffolded. New `serverfilter` module (`src/serverfilter.{h,cpp}`) with a config-driven rule engine (name substring, name regex, max-per-IP per refresh, hide-locked, hide-empty), reading `frostmod_serverfilter.txt` (created with docs + sensible ad-name defaults on first run). Loaded on DLL init and hot-reloaded on `R`. The game-side hook that feeds server entries in is stubbed behind `RVA_SRV_*` / `SIG_SRV_LIST_ADD` placeholders in `offsets.h` (RE pending) — until filled in, config loads but nothing is hidden.
+
 ## 2026-07-03
 ### Added
 - Early injection + deferred hooking to catch the one-time startup mods scan. Testing showed `0x158be0` is a generic scanner and only `ui`/`str` ran through it after our (2s-late) injection — the mods/`pkz` scan happens earlier. Now `frostmod.exe` injects ~400ms after the game appears (override with `--wait <ms>`), and the DLL waits for SteamStub to decrypt the code (`WaitForScanner`) before installing content hooks, so it's hooked before the game runs its scan. Render hooks now wait for `opengl32` to load (it isn't mapped that early). Injection retries a few times since a just-launched process can briefly reject it. Compile-time stamp added to exe/dll output to catch stale builds.

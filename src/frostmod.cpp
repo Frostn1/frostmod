@@ -41,6 +41,7 @@
 
 #include "MinHook.h"
 #include "offsets.h"
+#include "serverfilter.h"
 
 // ---------------------------------------------------------------------------
 // small logging helper -> <dll folder>\frostmod.log  (and OutputDebugString)
@@ -92,6 +93,9 @@ void Log(const char* fmt, ...) {
         }
     }
 }
+
+// adapter so serverfilter (which takes a plain void(*)(const char*)) logs here
+void SfLog(const char* msg) { Log("%s", msg); }
 
 // ---------------------------------------------------------------------------
 // game-thread task queue: UI thread enqueues, render thread drains
@@ -203,6 +207,45 @@ int64_t __fastcall hkReset(void* a0, void* a1) {
 }
 
 // ---------------------------------------------------------------------------
+// SERVER FILTER hook (RE PENDING) - hide spam/"ghost" servers from the browser.
+//
+// The rule engine (serverfilter::ShouldHide) + config are DONE. What's missing is
+// the game-side hook: the function that adds one parsed server entry to the list.
+// Once the RE prompt returns RVA_SRV_LIST_ADD + the ServerEntry field offsets +
+// SIG_SRV_LIST_ADD (see offsets.h), finish this in ~4 steps:
+//
+//   1) Declare the original's prototype (match the RE'd calling convention/args):
+//        using SrvAdd_t = int64_t(__fastcall*)(void* list, void* entry /*, ...*/);
+//        SrvAdd_t g_origSrvAdd = nullptr;
+//
+//   2) Extract fields from the entry pointer using the offsets, then ask the engine:
+//        int64_t __fastcall hkSrvAdd(void* list, void* entry) {
+//            auto at = [&](uintptr_t off){ return (char*)entry + off; };
+//            frostmod::serverfilter::ServerInfo si;
+//            si.name = mxb::SRV_NAME_IS_PTR ? SafeStr(*(void**)at(mxb::SRV_OFF_NAME))
+//                                           : SafeStr(at(mxb::SRV_OFF_NAME));
+//            si.ip         = SafeStr(at(mxb::SRV_OFF_IP));      // adjust if IP is a u32
+//            si.port       = *(uint16_t*)at(mxb::SRV_OFF_PORT);
+//            si.players    = *(int*)at(mxb::SRV_OFF_PLAYERS);
+//            si.maxPlayers = *(int*)at(mxb::SRV_OFF_MAXPLR);
+//            si.locked     = (*(uint32_t*)at(mxb::SRV_OFF_FLAGS)) & LOCK_BIT;
+//            std::string why = frostmod::serverfilter::ShouldHide(si);
+//            if (!why.empty()) {
+//                Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
+//                return 0;   // <-- the "did not add" return value; confirm via RE
+//            }
+//            return g_origSrvAdd(list, entry);
+//        }
+//
+//   3) In Init, resolve the address by signature (reuse the ResolveScanner pattern
+//      with SIG_SRV_LIST_ADD) and InstallHook it - only if RVA_SRV_LIST_ADD != 0.
+//
+//   4) Wrap field reads in the existing SafeStr/SEH style; never trust a pointer.
+//
+// Until wired, serverfilter still loads its config so you can curate the blocklist.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // the reload action - runs ON THE GAME THREAD (called from the swap hook)
 // ---------------------------------------------------------------------------
 // Strategy B (default): reset the registry, then re-run the scan, replaying the
@@ -248,6 +291,9 @@ void DoReloadOnGameThread() {
 
 void RequestReload() {
     Log("[ui] reload requested");
+    // Also re-read the server-filter blocklist, so editing it takes effect without
+    // restarting the game (the next server-list refresh uses the new rules).
+    frostmod::serverfilter::Reload();
     EnqueueGameThreadTask(DoReloadOnGameThread);
 }
 
@@ -540,6 +586,21 @@ DWORD WINAPI Init(LPVOID) {
                         (void**)&g_origWglSwapBuffers, "opengl32!wglSwapBuffers");
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
+    }
+
+    // Server-browser spam filter: load rules from <dll folder>\frostmod_serverfilter.txt
+    // (created with docs on first run). The actual hook that feeds entries in is
+    // wired once the server-list function is RE'd - see the SERVER FILTER block above.
+    {
+        std::string cfg = g_logPath;
+        if (size_t s = cfg.find_last_of("\\/"); s != std::string::npos)
+            cfg = cfg.substr(0, s + 1) + "frostmod_serverfilter.txt";
+        else
+            cfg = "frostmod_serverfilter.txt";
+        frostmod::serverfilter::Init(cfg, &SfLog);
+        if (mxb::RVA_SRV_LIST_ADD == 0)
+            Log("[filter] rules loaded, but the server-list hook isn't wired yet "
+                "(RVA_SRV_LIST_ADD is 0 - needs RE). Filtering is inert for now.");
     }
 
     Log("[init] ready. If you started frostmod.exe BEFORE the game, watch for a [capture] "

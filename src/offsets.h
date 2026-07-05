@@ -36,4 +36,29 @@ constexpr char SIG_SCAN_FOLDER[] =
     "\x40\x53\x56\x57\x41\x54\x41\x55\x41\x56\x48\x81\xEC\xF8\x07\x00\x00\x48\x8B\x05";
 constexpr char SIG_SCAN_FOLDER_MASK[] = "xxxxxxxxxxxxxxxxxxxx";
 
+// ---- online server list (spam/"ghost" server filter) -------------------------
+// TODO(RE PENDING): the master server (master.mx-bikes.com, UDP 54200) sends the
+// server list; we want to hook the client's own "add a parsed server entry to the
+// browser list" function so serverfilter can hide spam entries. Fill these in from
+// the RE deliverable, then wire the hook in frostmod.cpp (see the SERVER FILTER
+// block there). While these are 0, the filter loads its config but installs no
+// hook (inert).
+constexpr uintptr_t RVA_SRV_LIST_ADD   = 0x0;   // fn that appends/shows one server entry
+constexpr uintptr_t RVA_SRV_PARSE      = 0x0;   // fn that parses the master reply (optional)
+constexpr uintptr_t RVA_SRV_ARRAY_BASE = 0x0;   // ServerEntry* global (optional, for in-place)
+constexpr uintptr_t RVA_SRV_ARRAY_COUNT= 0x0;   // int32 count (optional)
+
+// ServerEntry field offsets (fill from RE). Used by the hook to read name/ip/etc.
+constexpr uintptr_t SRV_OFF_NAME    = 0x0;      // char[] inline OR char* (note which!)
+constexpr bool      SRV_NAME_IS_PTR = false;    // true if SRV_OFF_NAME holds a char*
+constexpr uintptr_t SRV_OFF_IP      = 0x0;      // char[]/char* host, or u32 (note which!)
+constexpr uintptr_t SRV_OFF_PORT    = 0x0;      // u16
+constexpr uintptr_t SRV_OFF_PLAYERS = 0x0;      // int/u16
+constexpr uintptr_t SRV_OFF_MAXPLR  = 0x0;      // int/u16
+constexpr uintptr_t SRV_OFF_FLAGS   = 0x0;      // password/locked bit lives here
+
+// AOB signature for RVA_SRV_LIST_ADD's prologue (fill from RE, like SIG_SCAN_FOLDER).
+constexpr char SIG_SRV_LIST_ADD[]     = "";
+constexpr char SIG_SRV_LIST_ADD_MASK[]= "";
+
 } // namespace mxb

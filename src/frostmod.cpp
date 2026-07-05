@@ -5,9 +5,9 @@
 //  ------------
 //  MX Bikes reads the mods/content folders once at startup and mounts every
 //  .pkz into an in-memory virtual filesystem. New files dropped in while the
-//  game runs are ignored until a restart. FrostMod adds a small floating
-//  window with a "Reload Mods" button that re-triggers the game's own content
-//  scan so newly added tracks/skins register live.
+//  game runs are ignored until a restart. FrostMod re-triggers the game's own
+//  content scan (via an in-game overlay + F8, or the frostmod.exe console 'R') so
+//  newly added tracks/skins/bikes register live, with no loading screen.
 //
 //  How the reload works (see README + offsets.h for the RE details)
 //  ----------------------------------------------------------------
@@ -756,63 +756,8 @@ void Tick() {
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
 BOOL WINAPI hkWglSwapBuffers(HDC hdc)   { Tick(); DrawOverlay(hdc); return g_origWglSwapBuffers(hdc); }
 
-// ---------------------------------------------------------------------------
-// the floating UI window (its own thread + message loop)
-// ---------------------------------------------------------------------------
-constexpr int ID_BTN_RELOAD = 1001;
-HWND g_hwnd = nullptr;
-
-LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND:
-        if (LOWORD(wp) == ID_BTN_RELOAD) { RequestReload(); return 0; }
-        break;
-    case WM_CTLCOLORSTATIC:
-        SetBkColor((HDC)wp, RGB(24, 26, 32));
-        SetTextColor((HDC)wp, RGB(120, 200, 255));
-        return (LRESULT)GetStockObject(DC_BRUSH);
-    case WM_DESTROY:
-        return 0;
-    }
-    return DefWindowProcA(h, msg, wp, lp);
-}
-
-DWORD WINAPI UiThread(LPVOID) {
-    WNDCLASSA wc{};
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = GetModuleHandleA(nullptr);
-    wc.lpszClassName = "FrostModWindow";
-    wc.hbrBackground = CreateSolidBrush(RGB(24, 26, 32));
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassA(&wc);
-
-    g_hwnd = CreateWindowExA(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        "FrostModWindow", "FrostMod",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        60, 60, 200, 120,
-        nullptr, nullptr, wc.hInstance, nullptr);
-
-    CreateWindowA("STATIC", "FrostMod",   // (plain ASCII: the console/GDI code page
-                  WS_CHILD | WS_VISIBLE | SS_CENTER,  //  can't render a UTF-8 snowflake)
-                  10, 10, 170, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-
-    CreateWindowA("BUTTON", "Reload Mods",
-                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  30, 42, 130, 34,
-                  g_hwnd, (HMENU)(intptr_t)ID_BTN_RELOAD, wc.hInstance, nullptr);
-
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
-    Log("[ui] floating window created (also: press F8 in-game to reload)");
-
-    MSG m;
-    while (GetMessageA(&m, nullptr, 0, 0)) {
-        TranslateMessage(&m);
-        DispatchMessageA(&m);
-    }
-    return 0;
-}
+// (The old floating Win32 "Reload Mods" window was removed - reload is now driven
+//  by the in-game overlay + F8 hotkey and the frostmod.exe console 'R'.)
 
 // ---------------------------------------------------------------------------
 // signature (AOB) validation - is offsets.h actually correct for THIS build?
@@ -965,8 +910,6 @@ DWORD WINAPI Init(LPVOID) {
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
     Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
-
-    CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
 
     // CONTENT hooks first and ASAP - they're timing-critical: we must be hooked
     // before the game's one-time startup mods scan. Wait for the code to be

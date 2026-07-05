@@ -12,7 +12,7 @@
 //    3. Streams frostmod.log (what the injected DLL writes) to this console in
 //       real time, so you can see the capture / reload activity.
 //    4. Press  R  to reload mods,  Q  (or Ctrl+C) to quit. Reload also works
-//       from inside the game (F8 / the floating window).
+//       from inside the game (F8, or the in-game overlay hint).
 //
 //  The log lives NEXT TO the binaries (frostmod.exe + frostmod.dll are in the
 //  same folder), so the exe and the injected dll always agree on the file even

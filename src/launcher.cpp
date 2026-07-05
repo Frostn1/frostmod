@@ -296,9 +296,9 @@ int main(int argc, char** argv) {
     std::string filterFlag = ExeDir() + "frostmod_filter.flag";
     if (filterSrv) {
         if (FILE* f = nullptr; fopen_s(&f, filterFlag.c_str(), "w") == 0 && f) fclose(f);
-        printf("[*] --filter-servers ON: DLL will DUMP the server list read-only when you open the\n"
-               "    online browser - watch for the [srv] table below (name, players, ping, WOULD-HIDE).\n"
-               "    Nothing is hidden yet; this is the safe preview so we can verify the filter.\n");
+        printf("[*] --filter-servers ON: DLL will HIDE cheat/ad 'ghost' servers from the online\n"
+               "    browser (via the game's own row-skip). Every row is logged below as [srv] ...\n"
+               "    HIDE (skipped) or keep (shown). Edit frostmod_serverfilter.txt to tune the rules.\n");
     } else {
         DeleteFileA(filterFlag.c_str());
     }

@@ -136,6 +136,12 @@ void DrainGameThreadTasks() {
 // resolved game addresses + captured call arguments
 // ---------------------------------------------------------------------------
 uintptr_t g_base = 0;
+// Build drift: (address where the scanner signature was actually found) minus its
+// expected RVA. 0 when offsets.h matches this build exactly; nonzero when the game
+// binary shifted (a game update, or SteamStub unpacking to a different layout).
+// EVERY fixed RVA we use must add this, or it points at the wrong bytes on a build
+// that differs from the one offsets.h was RE'd against (e.g. a friend's PC).
+intptr_t g_sigDelta = 0;
 
 // fcn.140158be0 - folder scanner  (4 register args, no stack args)
 using ScanFolder_t = int64_t(__fastcall*)(void*, void*, void*, void*);
@@ -359,6 +365,11 @@ size_t BlobHeadBytes() {
     return nz;
 }
 
+// forward decls (defined later near setup) - AOB scan helpers the filter uses to
+// self-locate its hook site across game builds.
+bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end);
+uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* mask);
+
 // ---------------------------------------------------------------------------
 // SERVER FILTER - hide spam/"ghost" servers from the browser.
 //
@@ -412,48 +423,48 @@ static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
 // label; when false the hook is a read-only PREVIEW (logs [srv] but hides nothing).
 bool g_sbHideEnabled = true;
 
-// The asm stub calls this once per server row during the populate loop. It reads the
-// record (name @ +0x86, cap @ +0xC8, current @ +0xCC, ping @ +0xDC), logs it, and
-// RETURNS true if the row should be hidden - the stub then jmps to the game's own
-// row-skip label 0x0ACE68, exactly as the stock hide-empty/name filters do. RE
-// confirmed there is no pre-build source array to filter (the list lives in the UI
-// widget behind the message manager), and that skip-at-emit keeps the displayed list
-// self-consistent (SELECTED/INFO indices are displayed-row positions). We never write
-// to the record itself. rowOff (= r15*stride) is used only to detect a new pass.
-extern "C" bool SB_FilterEntry(void* entry, uint64_t rowOff) {
-    if (!entry) return false;
+// The asm stub calls this once per server row at the LOOP TOP (0x0AB960), BEFORE the
+// row is written to the widget (the first setCellText @ 0x0ABA03). Args: index = r14
+// (0-based row index within this pass), gameRsp = rsp at the hook. The per-pass record
+// lives at gameRsp + index*stride (name @ +0x86, cap @ +0xC8, current @ +0xCC, ping @
+// +0xDC). We read + log it and RETURN true to HIDE - the stub then jmps to 0x0ACE68,
+// so the game skips straight to the loop increment and NEVER writes any cell for this
+// row, i.e. the row is never created (same as the game's own name-search filter). We
+// never write to the record.
+extern "C" bool SB_SuppressRow(uint64_t index, void* gameRsp) {
+    if (!gameRsp) return false;
+    char* base = (char*)gameRsp + (size_t)index * mxb::SBE_STRIDE;   // this row's record
 
-    if (rowOff < (uint64_t)mxb::SBE_STRIDE) {        // row 0 => new populate pass
+    if (index == 0) {                                // new populate pass (r14 restarts at 0)
         g_sbRow = 0;
-        g_sbHexLeft = 2;
+        g_sbHexLeft = 1;                             // one hex window to re-confirm the record
         Log("[srv] ===== server-list pass (%s) =====",
             g_sbHideEnabled ? "hiding cheat/ad spam" : "PREVIEW - nothing hidden");
     }
 
-    char raw[0xE0];                                  // header incl. cap@0xC8/cur@0xCC/ping@0xDC
-    size_t n = SafeReadBytes((const char*)entry, raw, sizeof(raw));
+    char raw[0xE0];
+    size_t n = SafeReadBytes(base, raw, sizeof(raw));
 
-    SBNums nums = SafeReadSBNums(entry);             // .players=+0xCC(current) .maxPlayers=+0xC8(cap)
-    int ping = SafeReadInt((const int*)((char*)entry + mxb::SBE_PING));
-    int type = SafeReadInt((const int*)((char*)entry + mxb::SBE_TYPE));
+    SBNums nums = SafeReadSBNums(base);              // .players=+0xCC(current) .maxPlayers=+0xC8(cap)
+    int ping = SafeReadInt((const int*)(base + mxb::SBE_PING));
     bool pingUnresolved = ((uint32_t)ping == mxb::SBE_PING_UNJOINABLE);
 
     char name[128] = "";
-    SafeCopyStr((char*)entry + mxb::SBE_NAME, name, sizeof(name));   // name @ +0x86 (confirmed)
+    SafeCopyStr(base + mxb::SBE_NAME, name, sizeof(name));           // name @ +0x86
 
     frostmod::serverfilter::ServerInfo si;
     si.name       = name;
     si.players    = nums.players;                    // current
     si.maxPlayers = nums.maxPlayers;                 // capacity
-    si.unjoinable = false;   // ping is UNRESOLVED at build time ("---" for all) -> don't filter on it
+    si.unjoinable = false;   // ping is unresolved at build time ("---" for all) -> don't filter on it
     std::string why = frostmod::serverfilter::ShouldHide(si);
     bool hide = !why.empty() && g_sbHideEnabled;
 
     char pingStr[16];
     if (pingUnresolved) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
     const char* tag = hide ? "HIDE" : (why.empty() ? "keep" : "WOULD-HIDE(preview)");
-    Log("[srv] #%02d '%s' cur=%d cap=%d ping=%s type=%d | %s%s%s",
-        g_sbRow, si.name.c_str(), nums.players, nums.maxPlayers, pingStr, type,
+    Log("[srv] #%02llu '%s' cur=%d cap=%d ping=%s | %s%s%s",
+        (unsigned long long)index, si.name.c_str(), nums.players, nums.maxPlayers, pingStr,
         tag, why.empty() ? "" : ": ", why.c_str());
 
     if (g_sbHexLeft > 0) { LogHexWindow(raw, n); --g_sbHexLeft; }
@@ -461,27 +472,52 @@ extern "C" bool SB_FilterEntry(void* entry, uint64_t rowOff) {
     return hide;
 }
 
-// The populate emit is INLINE. We splice the game's own hide-empty branch
-//   0x0ABAB6:  cmp [rsp+rdi+0xCC], r12d    (entry = rsp+rdi, CURRENT players @ +0xCC)
-// with a MinHook hook to a hand-built stub that computes rsp+rdi (the entry) and rdi
-// (the row offset = r15*stride), calls SB_FilterEntry to LOG + decide, restores all
-// registers/flags byte-for-byte, and then:
-//   * hide  -> jmp 0x0ACE68 (the game's own row-skip label; skip-at-emit keeps the
-//              displayed list + counters consistent, exactly like stock hide-empty)
-//   * keep  -> run the original cmp via the trampoline (normal flow)
-// RE-confirmed r12d==0, so we can't reuse the stock cmp for arbitrary names; we take
-// the skip branch ourselves. The stub never writes to the record.
+// We hook the per-server LOOP TOP (0x0AB960: `cmp byte [0x4C8F60], r12b`) with a
+// MinHook detour to a hand-built stub that reads r14 (the index) + rsp, calls
+// SB_SuppressRow, restores all registers/flags byte-for-byte, then:
+//   * hide -> jmp 0x0ACE68  (loop increment; no cell is written -> row never created)
+//   * keep -> run the original cmp via the trampoline, continue normally
+// This is BEFORE the row-creating setCellText (0x0ABA03), which is the only place a
+// row can be suppressed (a cell-write auto-extends the widget - there is no addRow).
 void* g_sbTramp = nullptr;
 
 bool InstallServerFilterHook() {
-    uintptr_t target = g_base + mxb::RVA_SB_HIDE_EMPTY_BR;   // 0x0ABAB6
+    // Hook the loop TOP (0x0AB960). It's a fixed RVA, but a friend's mxbikes.exe can
+    // differ from the build offsets.h was RE'd against, so we SELF-LOCATE it (the mod
+    // reload already does this via the scanner AOB+delta - the filter must too, or it
+    // silently no-ops). Confirm each candidate by matching SB_POPULATE_LOOP_BYTES (the
+    // `cmp byte [rip+..], r12b` opcode+modrm) before touching it.
+    auto verify = [](uintptr_t addr) -> bool {
+        unsigned char here[sizeof(mxb::SB_POPULATE_LOOP_BYTES)];
+        return SafeReadBytes((const char*)addr, (char*)here, sizeof(here)) == sizeof(here)
+            && memcmp(here, mxb::SB_POPULATE_LOOP_BYTES, sizeof(here)) == 0;
+    };
 
-    // verify the splice site really is the expected cmp before touching it
-    unsigned char here[sizeof(mxb::SB_HIDE_EMPTY_BYTES)];
-    if (SafeReadBytes((const char*)target, (char*)here, sizeof(here)) < sizeof(here) ||
-        memcmp(here, mxb::SB_HIDE_EMPTY_BYTES, sizeof(here)) != 0) {
-        Log("[filter] site 0x%zx isn't the expected cmp - build changed? not hooking.",
-            (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+    // candidate 1: the fixed RVA adjusted by the scanner's build-drift delta.
+    uintptr_t target     = g_base + mxb::RVA_SB_POPULATE_LOOP + g_sigDelta;
+    uintptr_t skipTarget = g_base + mxb::RVA_SB_ROW_SKIP_TGT  + g_sigDelta;
+    const char* how = "fixed RVA+delta";
+
+    // candidate 2: AOB-scan .text for the browser command (SIG_SB_LAN_CMD) and place
+    // the hook at its known in-function offset. Survives non-uniform drift.
+    if (!verify(target)) {
+        uint8_t *b, *e, *lan = nullptr;
+        if (GetExecRange(g_base, &b, &e))
+            lan = PatternScan(b, e, mxb::SIG_SB_LAN_CMD, mxb::SIG_SB_LAN_CMD_MASK);
+        if (lan) {
+            target     = (uintptr_t)lan + (mxb::RVA_SB_POPULATE_LOOP - mxb::RVA_SB_LAN_CMD);
+            skipTarget = (uintptr_t)lan + (mxb::RVA_SB_ROW_SKIP_TGT  - mxb::RVA_SB_LAN_CMD);
+            how = "AOB(LAN_CMD)";
+            Log("[filter] fixed RVA didn't match; AOB-relocated LAN_CMD to RVA 0x%zx.",
+                (size_t)((uintptr_t)lan - g_base));
+        }
+    }
+
+    if (!verify(target)) {
+        Log("[filter] could NOT locate the browser loop-top on this build - filter NOT "
+            "installed (mod reload is unaffected). Probed RVA 0x%zx, delta 0x%zx. The "
+            "server-browser code differs from offsets.h; send frostmod.log to update it.",
+            (size_t)(target - g_base), (size_t)g_sigDelta);
         return false;
     }
 
@@ -492,38 +528,36 @@ bool InstallServerFilterHook() {
     // register the hook first so MinHook builds the trampoline (detour = our stub);
     // we then fill the stub bytes (which reference the trampoline), then enable.
     if (MH_CreateHook((void*)target, stub, &g_sbTramp) != MH_OK) {
-        Log("[filter] MH_CreateHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+        Log("[filter] MH_CreateHook failed @ RVA 0x%zx", (size_t)(target - g_base));
         VirtualFree(stub, 0, MEM_RELEASE); return false;
     }
-
-    const uint64_t skipTarget = g_base + mxb::RVA_SB_ROW_SKIP_TGT;   // 0x0ACE68
 
     size_t o = 0;
     auto b  = [&](unsigned char x){ stub[o++] = x; };
     auto b8 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) b((unsigned char)(v >> (i * 8))); };
-    // Save volatiles+flags, call SB_FilterEntry(entry, rdi) to LOG + decide, restore
-    // everything, then branch on the returned hide flag. rsp is parked in RBP
-    // (non-volatile -> callee must preserve it) across the call; a volatile reg would
-    // be corrupted by the callback's work (Log/std::string/regex).
+    // Save volatiles+flags, call SB_SuppressRow(r14 index, gameRsp) to LOG + decide,
+    // restore everything, then branch on the returned hide flag. rsp is parked in RBP
+    // (non-volatile -> callee must preserve it); a volatile reg would be corrupted by
+    // the callback's work (Log/std::string/regex). r14 (the loop index) is nonvolatile
+    // and read before the call. 9 pushes = 0x48, so game_rsp = rsp+0x48.
     b(0x50);                                             // push rax
-    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x08);             // lea rax,[rsp+rdi+8]  (entry ptr; +8 for the push)
     b(0x51);b(0x52);b(0x41);b(0x50);b(0x41);b(0x51);     // push rcx,rdx,r8,r9
     b(0x41);b(0x52);b(0x41);b(0x53);                     // push r10,r11
     b(0x9C);                                             // pushfq
     b(0x55);                                             // push rbp   (save caller's rbp)
-    b(0x48);b(0x89);b(0xC1);                             // mov rcx,rax   (arg1 = entry)
-    b(0x48);b(0x89);b(0xFA);                             // mov rdx,rdi   (arg2 = row offset; rdi nonvolatile)
+    b(0x44);b(0x89);b(0xF1);                             // mov ecx,r14d  (arg1 = row index, zero-extended)
+    b(0x48);b(0x8D);b(0x54);b(0x24);b(0x48);             // lea rdx,[rsp+0x48]  (arg2 = game_rsp)
     b(0x48);b(0x89);b(0xE5);                             // mov rbp,rsp   (park rsp in rbp; survives the call)
     b(0x48);b(0x83);b(0xE4);b(0xF0);                     // and rsp,-16   (align)
     b(0x48);b(0x83);b(0xEC);b(0x20);                     // sub rsp,0x20  (shadow)
-    b(0x48);b(0xB8);b8((uint64_t)&SB_FilterEntry);       // mov rax, &SB_FilterEntry
+    b(0x48);b(0xB8);b8((uint64_t)&SB_SuppressRow);       // mov rax, &SB_SuppressRow
     b(0xFF);b(0xD0);                                     // call rax  (bool hide -> al)
     b(0x48);b(0x89);b(0xEC);                             // mov rsp,rbp   (restore rsp -> saved-rbp slot)
     b(0x5D);                                             // pop rbp    (restore caller's rbp)
     b(0x84);b(0xC0);                                     // test al,al   (al = hide; rax not yet restored)
     size_t jnzPos = o;
     b(0x75);b(0x00);                                     // jnz .hide  (rel8 patched below)
-    // ---- KEEP path: restore flags+regs, continue into the original cmp (trampoline) ----
+    // ---- KEEP path: restore flags+regs, continue into the original loop top (trampoline) ----
     size_t keepStart = o;
     b(0x9D);                                             // popfq
     b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax
@@ -534,17 +568,17 @@ bool InstallServerFilterHook() {
     b(0x9D);                                             // popfq
     b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax
     b(0xFF);b(0x25);b(0x00);b(0x00);b(0x00);b(0x00);     // jmp [rip+0] -> skip slot
-    b8(skipTarget);                                      // 0x0ACE68 (row-skip)
+    b8(skipTarget);                                      // 0x0ACE68 (row-skip: row never created)
 
     if (MH_EnableHook((void*)target) != MH_OK) {
-        Log("[filter] MH_EnableHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+        Log("[filter] MH_EnableHook failed @ RVA 0x%zx", (size_t)(target - g_base));
         return false;
     }
-    Log("[filter] server-filter hook LIVE @ 0x%zx. Mode=%s -> jmp 0x%zx to skip. "
-        "Watch [srv] lines: HIDE = skipped, keep = shown.",
-        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR,
+    Log("[filter] server-filter hook LIVE @ loop-top RVA 0x%zx via %s (delta 0x%zx). "
+        "Mode=%s -> jmp RVA 0x%zx (skip before row-create). [srv]: HIDE=removed, keep=shown.",
+        (size_t)(target - g_base), how, (size_t)g_sigDelta,
         g_sbHideEnabled ? "HIDE" : "PREVIEW",
-        (size_t)mxb::RVA_SB_ROW_SKIP_TGT);
+        (size_t)(skipTarget - g_base));
     return true;
 }
 
@@ -945,6 +979,10 @@ DWORD WINAPI Init(LPVOID) {
     // decrypted (SteamStub), then hook.
     intptr_t delta = 0;
     uintptr_t scanAddr = WaitForScanner(&delta, 30000 /*ms*/);
+    g_sigDelta = delta;   // share the build-drift with every other fixed-RVA consumer
+    if (delta)
+        Log("[sig] build drift detected: delta = 0x%zx (fixed RVAs are adjusted by this).",
+            (size_t)delta);
     if (scanAddr) {
         InstallHook((void*)scanAddr, &hkScan, (void**)&g_origScan, "scanFolder");
 
@@ -1060,10 +1098,10 @@ DWORD WINAPI Init(LPVOID) {
             cfg = "frostmod_serverfilter.txt";
         frostmod::serverfilter::Init(cfg, &SfLog);
 
-        // OPT-IN (frostmod.exe --filter-servers): install the populate-loop filter that
-        // logs every server row and skips (hides) the ones matching the rules via the
-        // game's own row-skip label. Mid-function hook, so gated behind a flag. Scope is
-        // cheat/ad ghosts by default (serverfilter config v3); see SB_FilterEntry.
+        // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
+        // every server row and skips (hides) the ones matching the rules BEFORE the row
+        // is created. Mid-function hook, so gated behind a flag. Scope is cheat/ad ghosts
+        // by default (serverfilter config v3); see SB_SuppressRow.
         char fflag[MAX_PATH] = {0};
         if (g_logPath[0]) {
             strcpy_s(fflag, g_logPath);

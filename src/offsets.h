@@ -111,12 +111,24 @@ constexpr uintptr_t RVA_SB_SELECTED_INDEX = 0x4C8FC8; // selected row
 constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // JOIN connect struct
 
 // ---- hook / patch points ----
+// THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write
+// auto-extends the widget, there is no separate addRow. So to hide a row we must skip
+// BEFORE 0x0ABA03. The game does exactly this with its name-search filter: strstr miss
+// -> jmp 0x0ACE68 at 0x0AB9D3. We mirror it by hooking the LOOP TOP (0x0AB960) and
+// jmp'ing to 0x0ACE68 for spam rows, so the cells are never written = the row never
+// appears. (Hooking 0x0ABAB6/hide-empty was too LATE - the row was already committed.)
 constexpr uintptr_t RVA_SB_LAN_CMD        = 0x0AB530; // clear+build+populate (LAN)
 constexpr uintptr_t RVA_SB_WORLD_CMD      = 0x0AA260; // string dispatch (world)
-constexpr uintptr_t RVA_SB_POPULATE_LOOP  = 0x0AB960; // per-server emit loop (inside LAN_CMD)
-constexpr uintptr_t RVA_SB_ROW_SKIP_TGT   = 0x0ACE68; // jump here to SKIP a row (counts stay sane)
-constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABAB6; // game's own skip branch (cmp maxplayers)
+constexpr uintptr_t RVA_SB_POPULATE_LOOP  = 0x0AB960; // per-server loop TOP - our hook site
+constexpr uintptr_t RVA_SB_ROW_CREATE     = 0x0ABA03; // first setCellText (row is committed here)
+constexpr uintptr_t RVA_SB_ROW_SKIP_TGT   = 0x0ACE68; // jump here to SKIP a row (row never created)
+constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABAB6; // game's hide-empty cmp (AFTER row create; unused now)
 constexpr uintptr_t RVA_SB_BUILD_CLEAR    = 0x0AB59C; // ListBegin + zero counts + ListClear
+
+// bytes at the loop top 0x0AB960: cmp byte [rip+disp32], r12b. We verify the 3-byte
+// opcode+modrm (44 38 25); the disp32 that follows is RIP-relative and build-specific,
+// so it is intentionally NOT part of the check.
+constexpr unsigned char SB_POPULATE_LOOP_BYTES[] = {0x44, 0x38, 0x25};
 constexpr uintptr_t RVA_SB_REFRESHLIST    = 0x0AB6A8; // ID_REFRESHLIST branch (LAN)
 
 // SB_Entry (working copy) field offsets. Confirmed from the populate loop disasm

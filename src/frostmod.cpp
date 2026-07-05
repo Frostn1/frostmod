@@ -45,6 +45,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "serverfilter.h"
+#include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
 // small logging helper -> <dll folder>\frostmod.log  (and OutputDebugString)
@@ -369,6 +370,10 @@ size_t BlobHeadBytes() {
 // callback the loop-splice stub will call: read the fields (SafeCopyStr for the
 // inline name), build a ServerInfo, ask serverfilter. Returns true => SKIP the row.
 // The powerful default: ping == 0xFFFFFFFF ("---") means unjoinable = ghost/ad.
+// Actually perform the row-skip? Off = detect-only (safe). Flip to true once the
+// 0x0ACE68 skip state is understood so hiding doesn't crash.
+bool g_filterHideEnabled = false;
+
 // ---------------------------------------------------------------------------
 // POD, no C++ objects -> SEH is allowed here (a function that must unwind C++
 // objects can't use __try). Reads the numeric SB_Entry fields safely.
@@ -399,6 +404,16 @@ extern "C" bool SB_ShouldHideEntry(void* entry) {   // extern "C": easy to call 
 
     std::string why = frostmod::serverfilter::ShouldHide(si);
     if (why.empty()) return false;
+
+    // The detection is solid, but actually taking the game's row-skip (0x0ACE68)
+    // crashes the list build - it isn't set up in this context (hide-empty off), and
+    // faking the row's fields doesn't help. Until 0x0ACE68's required state is known
+    // (RE), run DETECT-ONLY: log what we WOULD hide, but don't skip (no crash).
+    if (!g_filterHideEnabled) {
+        Log("[filter] WOULD hide '%s' (%s) - detect-only; skip disabled pending RE of 0x0ACE68",
+            si.name.c_str(), why.c_str());
+        return false;
+    }
     Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
     return true;
 }
@@ -579,7 +594,7 @@ void DrawOverlay(HDC hdc) {
         std::lock_guard<std::mutex> lk(g_statusMutex);
         strncpy_s(line, g_statusText, _TRUNCATE);
     } else {
-        strcpy_s(line, "FrostMod  -  F8: reload mods");
+        strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: reload mods");
     }
 
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -870,7 +885,7 @@ DWORD WINAPI Init(LPVOID) {
     // __DATE__/__TIME__ = when THIS dll was compiled. If this timestamp isn't
     // recent, you're running a stale frostmod.dll (rebuild failed to overwrite it,
     // usually because the game had it locked). Close the game before rebuilding.
-    Log("=============== FrostMod loading (dll built " __DATE__ " " __TIME__ ") ===============");
+    Log("=============== FrostMod v" FROSTMOD_VERSION " loading (dll built " __DATE__ " " __TIME__ ") ===============");
 
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // mxbikes.exe
     Log("[init] module base = %p", (void*)g_base);

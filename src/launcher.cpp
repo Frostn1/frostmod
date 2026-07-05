@@ -37,6 +37,7 @@
 #include <cstring>        // strrchr / strcmp / _stricmp / _strnicmp
 #include <string>
 #include <set>
+#include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
 // graceful shutdown
@@ -268,7 +269,7 @@ int main(int argc, char** argv) {
                      GetFileAttributesA(modsPath.c_str()) != INVALID_FILE_ATTRIBUTES;
     const std::string logPath = LogPath();
 
-    printf("================== FrostMod ==================\n");
+    printf("============== FrostMod v" FROSTMOD_VERSION " ==============\n");
     printf("[*] build : " __DATE__ " " __TIME__ "  (this exe)\n");
     printf("[*] DLL   : %s\n", dllPath.c_str());
     printf("[*] mods  : %s%s\n", modsPath.empty() ? "<unknown>" : modsPath.c_str(),

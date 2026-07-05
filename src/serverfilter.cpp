@@ -29,7 +29,9 @@ struct Rules {
     int  maxPerIP  = 0;                        // 0 = disabled
     bool hideLocked = false;
     bool hideEmpty  = false;
-    bool hideUnjoinable = true;                // ping "---" ghost/ad servers (default ON)
+    bool hideUnjoinable = false;               // ping "---": USELESS at list-build time (the
+                                               // browser shows "---" for EVERY server until pings
+                                               // resolve), so OFF by default - it would hide all.
 };
 Rules g_rules;
 
@@ -70,18 +72,27 @@ const char* kDefaultConfig =
     "#   regex: <pattern>  hide a server whose NAME matches this ECMAScript regex\n"
     "#   maxPerIP: <n>     hide servers past <n> from the same IP per refresh (0=off)\n"
     "#   hideLocked: 0|1   hide password-locked servers\n"
-    "#   hideEmpty: 0|1    hide servers with 0 players\n"
-    "#   hideUnjoinable: 0|1  hide servers whose ping shows '---' (ghost/ad spam)\n"
+    "#   hideEmpty: 0|1    hide servers with 0 CURRENT players (many legit servers are\n"
+    "#                     just empty right now, so leave this OFF unless you want that)\n"
+    "#   hideUnjoinable: 0|1  hide servers whose ping shows '---'. NOTE: the browser shows\n"
+    "#                     '---' for EVERY server until pings resolve, so at list-build\n"
+    "#                     time this hides ALL of them. Keep it OFF - filter by name.\n"
     "#\n"
-    "# --- defaults: hide unjoinable ghost servers + obvious ad names. ---\n"
-    "hideUnjoinable: 1\n"
-    "regex: (https?://|www\\.|discord(\\.gg)?|t\\.me/|\\.gg/|telegram|join us)\n"
-    "maxPerIP: 5\n"
-    "hideLocked: 0\n"
+    "# --- defaults: hide ad/spam servers by NAME (the reliable signal). ---\n"
+    "hideUnjoinable: 0\n"
     "hideEmpty: 0\n"
-    "# Examples you can uncomment:\n"
+    "hideLocked: 0\n"
+    "maxPerIP: 0\n"
+    "# obvious ad hosts seen in the wild (note: 'cbrhosting.com' the AD host, which is\n"
+    "# distinct from the legit 'CBRSERVERS.COM' race servers - substring stays precise):\n"
+    "name: cbrhosting.com\n"
+    "name: kaizo.pro\n"
+    "name: cheap dedi\n"
+    "name: server hosting\n"
+    "regex: (https?://|www\\.|discord(\\.gg)?|t\\.me/|\\.gg/|telegram|join us)\n"
+    "# Add your own below - one per line, case-insensitive:\n"
     "# name: free vbucks\n"
-    "# name: [ad]\n";
+    "# name: 50% off\n";
 
 void writeDefaultIfMissing() {
     if (GetFileAttributesA(g_path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
@@ -156,7 +167,9 @@ void Init(const std::string& configPath, LogFn log) {
 std::string ShouldHide(const ServerInfo& s) {
     std::lock_guard<std::mutex> lk(g_mx);
 
-    // The strongest ghost/ad signal: the server can't actually be joined (ping "---").
+    // ping "---" was assumed to be the ghost/ad signal, but at list-build time the
+    // browser shows "---" for EVERY server (pings aren't resolved yet), so this is off
+    // by default - the NAME rules below are the reliable signal.
     if (g_rules.hideUnjoinable && s.unjoinable) return "unjoinable (ping ---)";
 
     const std::string n = lower(s.name);

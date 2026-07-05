@@ -63,11 +63,15 @@ constexpr char SIG_SCAN_FOLDER_MASK[] = "xxxxxxxxxxxxxxxxxxxx";
 // (which keeps the game's counts consistent).
 //
 //   struct SB_Entry {                     // stride 0x1D8
-//       char name[~0x80];  // +0x00  display name (col0)
-//       u32  players;      // +0xC8
-//       u32  maxplayers;   // +0xCC   (==0 => empty)
-//       u32  ping;         // +0xD8   (0xFFFFFFFF => "---" == UNJOINABLE / ghost)
-//       u32  type_status;  // +0x100  category/status enum
+//       ...                // +0x84  2-byte field (port/id); precedes the name
+//       char name[...];    // +0x86  display name  (CONFIRMED by the read-only dump)
+//       u32  maxplayers;   // +0xC8  capacity       (32/42/... - the CAP)
+//       u32  players;      // +0xCC  current players (==0 => empty; the game's own
+//                          //        hide-empty cmp at 0x0ABAB6 tests THIS field)
+//       u32  ping;         // +0xDC  (0xFFFFFFFF => "---"; but UNRESOLVED at list-build
+//                          //        time -> "---" for EVERY server here, so useless
+//                          //        as a build-time filter signal. Name is the signal.)
+//       u32  type_status;  // +0x100 category/status enum
 //   };
 //   struct SB_Connect { u64 host_lo; u64 host_hi; u16 port(+0x10); u8 flag(+0x12); };
 //     (filled on JOIN, msg 0x385 -> RVA_SB_CONNECT_TARGET; flag = password/lock bit)
@@ -115,12 +119,17 @@ constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABAB6; // game's own skip branch 
 constexpr uintptr_t RVA_SB_BUILD_CLEAR    = 0x0AB59C; // ListBegin + zero counts + ListClear
 constexpr uintptr_t RVA_SB_REFRESHLIST    = 0x0AB6A8; // ID_REFRESHLIST branch (LAN)
 
-// SB_Entry (working copy) field offsets. Confirmed from the populate loop disasm:
-//   at 0x0ABAB6 the entry is addressed as [rsp + rdi + field] (entries are a stack
-//   buffer, rdi = per-row offset). players +0xC8, maxplayers +0xCC, and the field
-//   compared to 0xFFFFFFFF (shown "---" = unjoinable) is +0xDC (NOT 0xD8).
-constexpr int SBE_STRIDE = 0x1D8, SBE_NAME = 0x00, SBE_PLAYERS = 0xC8,
-              SBE_MAXPLAYERS = 0xCC, SBE_PING = 0xDC, SBE_TYPE = 0x100;
+// SB_Entry (working copy) field offsets. Confirmed from the populate loop disasm
+// AND the runtime read-only dump ([srv.hex]):
+//   entry = [rsp + rdi] (stack buffer, rdi = per-row offset). NAME is at +0x86 (the
+//   dump showed the name text starting there on every row; the 2 bytes at +0x84 are
+//   a binary field that only *looks* like ASCII sometimes). +0xC8 is the CAPACITY
+//   (max) and +0xCC the CURRENT player count (0 => empty; the game's own hide-empty
+//   cmp at 0x0ABAB6 tests +0xCC) - earlier these two were swapped. +0xDC is the
+//   ping, but it is unresolved at build time (== "---" for everyone) so we don't
+//   filter on it.
+constexpr int SBE_STRIDE = 0x1D8, SBE_NAME = 0x86, SBE_MAXPLAYERS = 0xC8,
+              SBE_PLAYERS = 0xCC, SBE_PING = 0xDC, SBE_TYPE = 0x100;
 constexpr uint32_t SBE_PING_UNJOINABLE = 0xFFFFFFFFu; // ping value shown as "---"
 
 // exact bytes at RVA_SB_HIDE_EMPTY_BR: cmp [rsp+rdi+0xCC], r12d (8 bytes). The

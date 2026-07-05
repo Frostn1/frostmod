@@ -388,31 +388,8 @@ static SBNums SafeReadSBNums(void* entry) {
     return f;
 }
 
-// The name reads empty at +0x00, so the offset is wrong. Rather than guess, scan
-// the entry HEADER (bytes [0, players@0xC8)) for the LONGEST printable-ASCII run -
-// a server name is the longest human-readable string in the header. Returns the
-// byte offset it was found at (or -1). Operates on an already-copied buffer (no SEH).
-static int FindPrintableName(const char* buf, size_t len, char* out, size_t cap) {
-    int bestOff = -1, bestLen = 0;
-    for (size_t i = 0; i < len; ) {
-        unsigned char c = (unsigned char)buf[i];
-        if (c >= 0x20 && c < 0x7F) {
-            size_t j = i;
-            while (j < len && (unsigned char)buf[j] >= 0x20 && (unsigned char)buf[j] < 0x7F) ++j;
-            if ((int)(j - i) > bestLen) { bestLen = (int)(j - i); bestOff = (int)i; }
-            i = j;
-        } else ++i;
-    }
-    out[0] = 0;
-    if (bestOff < 0 || bestLen < 3) return -1;
-    int n = bestLen; if ((size_t)n >= cap) n = (int)cap - 1;
-    for (int k = 0; k < n; ++k) out[k] = buf[bestOff + k];
-    out[n] = 0;
-    return bestOff;
-}
-
 // Log a hex+ASCII window of the copied entry header so we can eyeball field layout
-// (esp. where the name really lives). Read-only.
+// (name @ +0x86, cap @ +0xC8, current @ +0xCC, ping @ +0xDC). Read-only.
 static void LogHexWindow(const char* buf, size_t len) {
     for (size_t off = 0; off < len; off += 16) {
         char line[96]; int p = 0; char ascii[17]; int a = 0;
@@ -440,34 +417,34 @@ extern "C" void SB_DumpEntry(void* entry, uint64_t rowOff) {
 
     if (rowOff < (uint64_t)mxb::SBE_STRIDE) {        // row 0 => new browser populate pass
         g_sbRow = 0;
-        g_sbHexLeft = 4;                             // hex-dump first 4 rows to locate the name
+        g_sbHexLeft = 3;                             // a few hex windows to re-confirm the layout
         Log("[srv] ===== server-list dump (READ-ONLY; nothing is hidden) =====");
     }
 
-    char raw[0xC8];                                  // header up to players@0xC8
+    char raw[0xE0];                                  // header incl. cap@0xC8/cur@0xCC/ping@0xDC
     size_t n = SafeReadBytes((const char*)entry, raw, sizeof(raw));
 
-    SBNums nums = SafeReadSBNums(entry);
+    SBNums nums = SafeReadSBNums(entry);             // .players=+0xCC(current) .maxPlayers=+0xC8(cap)
     int ping = SafeReadInt((const int*)((char*)entry + mxb::SBE_PING));
     int type = SafeReadInt((const int*)((char*)entry + mxb::SBE_TYPE));
-    bool unj = ((uint32_t)ping == mxb::SBE_PING_UNJOINABLE);
+    bool pingUnresolved = ((uint32_t)ping == mxb::SBE_PING_UNJOINABLE);
 
-    char name[128];
-    int nameOff = FindPrintableName(raw, n, name, sizeof(name));
+    char name[128] = "";
+    SafeCopyStr((char*)entry + mxb::SBE_NAME, name, sizeof(name));   // name @ +0x86 (confirmed)
 
     frostmod::serverfilter::ServerInfo si;
-    si.name       = (nameOff >= 0) ? name : "";
-    si.players    = nums.players;
-    si.maxPlayers = nums.maxPlayers;
-    si.unjoinable = unj;
+    si.name       = name;
+    si.players    = nums.players;                    // current
+    si.maxPlayers = nums.maxPlayers;                 // capacity
+    si.unjoinable = false;   // ping is UNRESOLVED at build time ("---" for all) -> don't filter on it
     std::string why = frostmod::serverfilter::ShouldHide(si);
 
     char pingStr[16];
-    if (unj) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
+    if (pingUnresolved) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
     std::string verdict = why.empty() ? std::string("keep") : ("WOULD-HIDE: " + why);
 
-    Log("[srv] #%02d name@0x%X='%s' P=%d/%d ping=%s type=%d | %s",
-        g_sbRow, nameOff, si.name.c_str(), nums.players, nums.maxPlayers,
+    Log("[srv] #%02d '%s' cur=%d cap=%d ping=%s type=%d | %s",
+        g_sbRow, si.name.c_str(), nums.players, nums.maxPlayers,
         pingStr, type, verdict.c_str());
 
     if (g_sbHexLeft > 0) { LogHexWindow(raw, n); --g_sbHexLeft; }
@@ -475,7 +452,7 @@ extern "C" void SB_DumpEntry(void* entry, uint64_t rowOff) {
 }
 
 // The populate emit is INLINE. We splice the game's hide-empty branch
-//   0x0ABAB6:  cmp [rsp+rdi+0xCC], r12d    (entry = rsp+rdi, maxplayers @ +0xCC)
+//   0x0ABAB6:  cmp [rsp+rdi+0xCC], r12d    (entry = rsp+rdi, CURRENT players @ +0xCC)
 // with a MinHook hook to a hand-built stub that computes rsp+rdi (the entry) and
 // rdi (the row offset), calls SB_DumpEntry to LOG the row, restores all registers
 // and flags untouched, and continues into the original cmp via the trampoline.

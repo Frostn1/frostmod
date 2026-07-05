@@ -2,6 +2,7 @@
 
 ## 2026-07-05
 ### Changed
+- **README reconstructed.** Reframed FrostMod as a small client-side *toolkit* — live mod reload **and** the server-list filter **and** the in-game overlay — rather than "just a mods reloader." Removed the now-stale docs (the floating window, the `F7`/`S` reload-strategy cycling, and the old "replay the captured scan + reset the registry" mechanism) and described the current surgical content-load reload. Same length and style.
 - **Server-filter default scope narrowed to cheat/ghost ads (config v3).** Per the chosen scope, the active default rules now target only the kaizo-style cheat-shop floods (`BUY CHE4TS … WWW.KAlZ0.PR0`) via a leet-tolerant regex `(che[a4]ts|k[a4][il1]z[o0]|\.pr0\b)` plus readable `che4ts`/`kaizo`/`kalz0` names. The hosting-ad, discord/URL, and streamer rules are shipped as **commented, opt-in** examples (uncomment to also hide). Config bumped to `v3` so the auto-upgrade regenerates it (old file → `.bak`).
 
 ### Removed

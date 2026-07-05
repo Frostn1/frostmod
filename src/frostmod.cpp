@@ -194,6 +194,41 @@ std::string SafeStr(void* p) {
 }
 
 // ---------------------------------------------------------------------------
+// DIAGNOSTIC: log the CALL STACK of the boot content scans.
+//
+// The function that BUILDS the game's track/bike list calls the walker through
+// the engine's API dispatcher (fcn.140120CC0, invoked via the global fn-ptr
+// qword_140566C48), so static xrefs can't find it. A runtime stack walk does:
+// it shows the whole chain  walker <- dispatcher <- LOADER <- boot-init. The
+// frame with a small rva (< 0x1000000 -> inside mxbikes.exe, ~14MB) that sits
+// just above the dispatcher IS the content-loader = the reload target. Logged
+// for the first several DISTINCT scans only; harmless, no game state touched.
+// ---------------------------------------------------------------------------
+using RtlCaptureStackBackTrace_t = USHORT(NTAPI*)(ULONG, ULONG, PVOID*, PULONG);
+std::atomic<int> g_stackShots{0};
+
+void LogScanCallers(const std::string& dir, const std::string& ext) {
+    static RtlCaptureStackBackTrace_t cap = []() -> RtlCaptureStackBackTrace_t {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        return nt ? (RtlCaptureStackBackTrace_t)GetProcAddress(nt, "RtlCaptureStackBackTrace")
+                  : nullptr;
+    }();
+    if (!cap || g_stackShots.fetch_add(1) >= 16) return;   // first few scans only
+
+    void* frames[24] = {0};
+    USHORT n = cap(1 /*skip LogScanCallers itself*/, 24, frames, nullptr);
+    std::string chain;
+    char b[80];
+    for (USHORT i = 0; i < n; ++i) {
+        uintptr_t rva = (uintptr_t)frames[i] - g_base;
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "%s0x%zx%s",
+                    i ? " <- " : "", (size_t)rva, (rva < 0x1000000) ? "" : "(ext)");
+        chain += b;
+    }
+    Log("[stack] dir='%s' ext='%s': %s", dir.c_str(), ext.c_str(), chain.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // hooks that CAPTURE the game's own content-load calls
 // ---------------------------------------------------------------------------
 int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
@@ -222,6 +257,9 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
                 dir.c_str(), ext.c_str(), a0, a1, a2, a3);
         else if (isNew && count == 6)
             Log("[capture] ...(further startup scans still recorded, logging suppressed)");
+
+        // Pin the content-loader: log who called us (up through the API dispatcher).
+        if (isNew) LogScanCallers(dir, ext);
     }
 
     // Keep the args of the ".pkz" scan as the primary replay target - that's the

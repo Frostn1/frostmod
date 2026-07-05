@@ -271,13 +271,21 @@ int64_t __fastcall hkMount(void* a0, void* a1, void* a2, void* a3) {
 using MpMsg_t = int64_t(__fastcall*)(void*, void*, void*, void*);
 MpMsg_t g_origMpMsg = nullptr;
 
-void DumpServerListBlob() {
+// force=false: only logs when the blob is non-empty AND changed since last dump
+// (so the per-frame auto-dump doesn't spam). force=true: always logs (manual key).
+void DumpServerListBlob(bool force) {
     static char buf[8193];
     size_t n = SafeReadBytes((const char*)(g_base + mxb::RVA_MP_LIST_BLOB), buf, sizeof(buf) - 1);
-    // trim to the meaningful content: stop at a run of 8 zero bytes
     size_t end = 0, zeros = 0;
     for (size_t i = 0; i < n; ++i) { if (buf[i] == 0) { if (++zeros >= 8) break; } else { zeros = 0; end = i + 1; } }
-    if (end == 0) { Log("[srvlist] blob empty/unreadable"); return; }
+    if (end == 0) { if (force) Log("[srvlist] blob empty/unreadable"); return; }
+
+    uint32_t sum = 2166136261u;                     // FNV-1a over the meaningful bytes
+    for (size_t i = 0; i < end; ++i) sum = (sum ^ (uint8_t)buf[i]) * 16777619u;
+    static uint32_t lastSum = 0;
+    if (!force && sum == lastSum) return;           // unchanged -> skip
+    lastSum = sum;
+
     Log("[srvlist] ==== server-list blob (%zu bytes) - records below ====", end);
     for (size_t i = 0; i < end; i += 800) {
         char chunk[801];
@@ -299,7 +307,7 @@ int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
     // whether opening the browser drives state toward 3 (list-complete).
     if (c < 6 || st != lastState)
         Log("[srvlist] master handler call#%d state=%d", c, st);
-    if (st == 3 && lastState != 3) DumpServerListBlob();   // list just completed
+    if (st == 3 && lastState != 3) DumpServerListBlob(false);   // list just completed
     lastState = st;
     return r;
 }
@@ -511,7 +519,8 @@ HANDLE g_reloadEvent = nullptr;   // R in the console -> reload
 HANDLE g_cycleEvent  = nullptr;   // S in the console -> cycle reload strategy
 HANDLE g_dumpEvent   = nullptr;   // D in the console -> dump the server-list blob now
 
-void DumpServerListBlob();        // fwd (defined near hkMpMsg)
+void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
+// g_origMpMsg (defined above) is non-null once --dump-serverlist hooked the handler
 
 void Tick() {
     // Heartbeat: prove the render hook is actually firing. If you never see this
@@ -520,14 +529,26 @@ void Tick() {
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // In-game hotkeys (work in fullscreen): F8 = reload, F7 = cycle strategy.
-    static bool prevF8 = false, prevF7 = false;
+    // In-game hotkeys (work in fullscreen): F8 = reload, F7 = cycle strategy,
+    // F9 = dump the server list right now (handy while the browser is on screen).
+    static bool prevF8 = false, prevF7 = false, prevF9 = false;
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) RequestReload();
     prevF8 = f8;
     bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (f7 && !prevF7) CycleStrategy();
     prevF7 = f7;
+    bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9 && !prevF9) { Log("[srvlist] manual dump (F9)"); DumpServerListBlob(true); }
+    prevF9 = f9;
+
+    // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
+    // just opening the online browser captures it, no key press / console focus.
+    if (g_origMpMsg) {
+        static ULONGLONG lastCheck = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastCheck > 1000) { lastCheck = now; DumpServerListBlob(false); }
+    }
 
     // Same, driven from the frostmod.exe console (R / S).
     if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0) {
@@ -537,7 +558,7 @@ void Tick() {
     if (g_cycleEvent && WaitForSingleObject(g_cycleEvent, 0) == WAIT_OBJECT_0)
         CycleStrategy();
     if (g_dumpEvent && WaitForSingleObject(g_dumpEvent, 0) == WAIT_OBJECT_0) {
-        Log("[srvlist] manual dump (D)"); DumpServerListBlob();
+        Log("[srvlist] manual dump (D)"); DumpServerListBlob(true);
     }
 
     DrainGameThreadTasks();

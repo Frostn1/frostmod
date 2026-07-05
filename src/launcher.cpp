@@ -399,7 +399,8 @@ int main(int argc, char** argv) {
                    "  frostmod.exe FIRST, then launch the game, and watch for a [capture] line\n"
                    "  during loading. If you injected into an already-running game, the scan was\n"
                    "  already done: quit the game (leave this running) and relaunch it.\n");
-            printf("\n--- live log ---   [R] reload  [S] strategy  [D] dump server-list  [Q]/Ctrl+C quit\n");
+            printf("\n--- live log ---   [R] reload  [S] strategy  [D]/F9-in-game dump  [Q]/Ctrl+C quit\n");
+            printf("    (with --dump-serverlist, opening the online browser auto-dumps the list)\n");
         }
 
         // ---- monitor the running, injected game ----------------------------

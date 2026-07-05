@@ -11,32 +11,43 @@
 
 namespace mxb {
 
-// ---- content / virtual-filesystem functions ----------------------------------
-// fcn.140158be0 : GENERIC virtual-filesystem DIRECTORY WALKER, NOT the pkz loader.
-//   Runtime capture shows it is called as (out_status, dir_path, ext, out_buf)
-//   with ext='/' (list subdirs), 'cfg', 'pnt', ... but NEVER 'pkz'. By the time it
-//   runs the .pkz are already mounted and appear as virtual dirs it walks. So
-//   replaying/calling it can never MOUNT a newly added .pkz - that was the wrong
-//   function. Kept only for reference / diagnostics.
+// ---- content loading (RE'd from IDA - see CHANGELOG 2026-07-05) ---------------
+// KEY: MX Bikes reads content LIVE from disk every scan (no persistent pkz mount).
+// A newly-dropped .pkz is already visible to a fresh scan; the game just runs the
+// content scan ONCE at startup and the menus cache it. So "reload" = re-run the
+// game's own content-load, NOT mount/replay anything.
+//
+// fcn.1400ef210 : the boot content-load + app-init routine (called once from
+//   WinMain). Reads the mods folder, then for each content type clears its list
+//   and rescans BOTH the game dir and the mods folder. Signature:
+//     int64 __fastcall(int mode, int64, int64, int64)
+//   WARNING: it also re-inits Steam/input/sound and transitions to the UI, so
+//   calling it wholesale mid-game is heavy (a soft restart to the menu). Used as
+//   the reload target for now; the surgical per-category loaders are safer (TODO).
+constexpr uintptr_t RVA_CONTENT_INIT  = 0xef210;   // fcn.1400ef210
+
+// fcn.140158be0 : generic VFS directory walker (out_status, dir, ext, out_buf).
+//   Reads the filesystem live (findfirst + fopen each .pkz). We hook it only to
+//   observe the boot scans ([capture]); it is NOT a reload target.
 constexpr uintptr_t RVA_SCAN_FOLDER   = 0x158be0;
 
-// fcn.140159340 : reset+rebuild the content-directory registry from a path list.
-//   frees [0x140396760], zeroes count [0x140396754], reallocs, rebuilds.
-//   signature: int64 __fastcall(void* path_list, void* arg2)
-//   NOTE: not called at startup (never captured), so we can't replay it.
-constexpr uintptr_t RVA_REGISTRY_RESET = 0x159340;
+// Reference-only RVAs kept for the opt-in --probe-mount diagnostic (see frostmod.cpp).
+// These were part of the abandoned "mount the new .pkz" reload approach; the probe
+// still uses them to observe how the game opens archives. NOT used by the reload.
+constexpr uintptr_t RVA_REGISTRY_RESET = 0x159340;  // fcn.140159340 (restrict registry)
+constexpr uintptr_t RVA_MOUNT_ONE_PKZ  = 0x15a9e0;  // fcn.14015a9e0 (6-arg .pkz iterator)
+constexpr uintptr_t RVA_VFS_LOOKUP     = 0x157920;  // fcn.140157920
+constexpr uintptr_t RVA_REG_BASE       = 0x396760;  // RegEntry* (0x20c each)
+constexpr uintptr_t RVA_REG_COUNT      = 0x396754;  // int32 count
 
-// fcn.14015a9e0 : the actual "MOUNT ONE .pkz into the VFS" function - this is what
-//   we need to call for a newly-added file to make it live. Signature UNKNOWN
-//   (probably (context, char* pkz_path[, flags])). frostmod.exe --probe-mount hooks
-//   it to log its args at startup and reveal which arg is the path. Then a reload
-//   can mount the new pkz + rebuild the registry.
-constexpr uintptr_t RVA_MOUNT_ONE_PKZ = 0x15a9e0;  // fcn.14015a9e0
-constexpr uintptr_t RVA_VFS_LOOKUP    = 0x157920;  // fcn.140157920
-
-// ---- global VFS registry (for inspection / advanced strategies) --------------
-constexpr uintptr_t RVA_REG_BASE      = 0x396760;  // RegEntry* (0x20c each)
-constexpr uintptr_t RVA_REG_COUNT     = 0x396754;  // int32 count
+// Per-category content loaders live inside fcn.1400ef210 as repeated
+//   { clear list globals; loader(gameDir); loader(modsDir); } blocks. The TRACK
+//   list is qword_14109de98 (stride 1220, count dword_140f43298). RVA of the track
+//   loader (the sub that writes dword_140f43298) is still to be pinned - then a
+//   surgical reload can rebuild just the track list without the full re-init.
+constexpr uintptr_t RVA_TRACK_LOADER  = 0x000000;  // TODO: xref writer of 0x140f43298
+constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count
+constexpr uintptr_t RVA_TRACK_LIST    = 0x1109de98;// track array (stride 1220)
 
 // AOB signature for the scanner prologue (fallback if RVA drifts across updates).
 // 40 53 56 57 41 54 41 55 41 56 48 81 EC F8 07 00 00 48 8B 05 ?? ?? ?? ??

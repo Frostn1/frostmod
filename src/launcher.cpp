@@ -302,7 +302,6 @@ int main(int argc, char** argv) {
 
     // cross-process triggers (the DLL watches these named events).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
-    HANDLE cycleEvent  = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModCycle");
     HANDLE dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
 
     // base name of the DLL (for the "already loaded?" check)
@@ -403,12 +402,10 @@ int main(int argc, char** argv) {
                 printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
             else
                 for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
-            printf("\nIMPORTANT: MX Bikes scans the mods folder only ONCE, at startup.\n"
-                   "  For reload to work, FrostMod must be loaded BEFORE that scan - i.e. start\n"
-                   "  frostmod.exe FIRST, then launch the game, and watch for a [capture] line\n"
-                   "  during loading. If you injected into an already-running game, the scan was\n"
-                   "  already done: quit the game (leave this running) and relaunch it.\n");
-            printf("\n--- live log ---   [R] reload  [S] strategy  [D]/F9-in-game dump  [Q]/Ctrl+C quit\n");
+            printf("\nRELOAD: press R (or F8 in-game) after dropping a .pkz into the mods folder.\n"
+                   "  FrostMod re-runs the game's content-load so new tracks/skins register.\n"
+                   "  NOTE: this re-runs the game's init - expect a brief return to the menu.\n");
+            printf("\n--- live log ---   [R] reload  [D]/F9-in-game dump  [Q]/Ctrl+C quit\n");
             printf("    (with --dump-serverlist, opening the online browser auto-dumps the list)\n");
         }
 
@@ -437,13 +434,11 @@ int main(int argc, char** argv) {
             known.swap(current);
         }
 
-        // keyboard: R = reload, S = cycle reload strategy, Q = quit
+        // keyboard: R = reload, D = dump server list, Q = quit
         if (_kbhit()) {
             int c = _getch();
             if (c == 'r' || c == 'R') {
                 if (reloadEvent) { SetEvent(reloadEvent); printf("[you] reload requested (R)\n"); }
-            } else if (c == 's' || c == 'S') {
-                if (cycleEvent) { SetEvent(cycleEvent); printf("[you] cycle reload strategy (S) - watch the log\n"); }
             } else if (c == 'd' || c == 'D') {
                 if (dumpEvent) { SetEvent(dumpEvent); printf("[you] dump server-list blob (D) - watch for [srvlist]\n"); }
             } else if (c == 'q' || c == 'Q') {
@@ -455,7 +450,6 @@ int main(int argc, char** argv) {
     }
 
     if (reloadEvent) CloseHandle(reloadEvent);
-    if (cycleEvent)  CloseHandle(cycleEvent);
     if (dumpEvent)   CloseHandle(dumpEvent);
     return 0;
 }

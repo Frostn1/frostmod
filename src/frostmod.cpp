@@ -404,16 +404,17 @@ extern "C" bool SB_ShouldHideEntry(void* entry) {   // extern "C": easy to call 
     return true;
 }
 
-// The populate emit is INLINE (a loop, not a per-row call). We splice the game's
-// hide-empty branch (0x0ABAB6: `cmp [rsp+rdi+0xCC], r12d`, entry = rsp+rdi) with a
-// MinHook hook to a hand-built stub that: captures rsp+rdi, calls SB_ShouldHideEntry,
-// and if it returns true jumps to the row-skip target (0x0ACE68); otherwise runs the
-// original cmp (via the trampoline) so the game's own empty-check still decides.
+// The populate emit is INLINE. We splice the game's hide-empty branch
+//   0x0ABAB6:  cmp [rsp+rdi+0xCC], r12d    (entry = rsp+rdi, maxplayers @ +0xCC)
+//   0x0ABABE:  jz  <row-skip>              (skip the row when equal)
+// with a MinHook hook to a hand-built stub that: computes rsp+rdi, calls
+// SB_ShouldHideEntry, and if it says HIDE, writes r12d into [entry+0xCC] so the
+// game's OWN cmp/jz then skips the row through its normal, consistent path (no
+// control-flow surgery from us = no desync). Always continues via the trampoline.
 void* g_sbTramp = nullptr;
 
 bool InstallServerFilterHook() {
     uintptr_t target = g_base + mxb::RVA_SB_HIDE_EMPTY_BR;   // 0x0ABAB6
-    uintptr_t skip   = g_base + mxb::RVA_SB_ROW_SKIP_TGT;    // 0x0ACE68
 
     // verify the splice site really is the expected cmp before touching it
     unsigned char here[sizeof(mxb::SB_HIDE_EMPTY_BYTES)];
@@ -449,24 +450,23 @@ bool InstallServerFilterHook() {
     b(0x48);b(0x83);b(0xEC);b(0x20);                     // sub rsp,0x20  (shadow)
     b(0x48);b(0xB8);b8((uint64_t)&SB_ShouldHideEntry);   // mov rax, &SB_ShouldHideEntry
     b(0xFF);b(0xD0);                                     // call rax
-    b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp)
+    b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp -> post-pushfq)
     b(0x84);b(0xC0);                                     // test al,al
-    b(0x74);b(0x12);                                     // jz show (+0x12)
-    // hide path: restore + jmp skip
-    b(0x9D);b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58);
-    b(0xFF);b(0x25);b(0x12);b(0x00);b(0x00);b(0x00);     // jmp [rip+0x12] -> skip slot
-    // show path (jz target): restore + jmp trampoline
-    b(0x9D);b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58);
-    b(0xFF);b(0x25);b(0x08);b(0x00);b(0x00);b(0x00);     // jmp [rip+0x08] -> tramp slot
-    b8((uint64_t)skip);                                  // skip slot
+    b(0x74);b(0x0C);                                     // jz +0x0C  (skip the hide-write)
+    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x40);             // lea rax,[rsp+rdi+0x40]  (entry; rsp now -0x40)
+    b(0x44);b(0x89);b(0xA0);b(0xCC);b(0x00);b(0x00);b(0x00); // mov [rax+0xCC], r12d  (force maxplayers==r12d)
+    // restore regs+flags, then continue into the original cmp (trampoline)
+    b(0x9D);                                             // popfq
+    b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax
+    b(0xFF);b(0x25);b(0x00);b(0x00);b(0x00);b(0x00);     // jmp [rip+0] -> tramp slot
     b8((uint64_t)g_sbTramp);                             // tramp slot
 
     if (MH_EnableHook((void*)target) != MH_OK) {
         Log("[filter] MH_EnableHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
         return false;
     }
-    Log("[filter] server-filter hook LIVE @ populate loop 0x%zx (entry=rsp+rdi). "
-        "Unjoinable/spam rows will be dropped from the browser.",
+    Log("[filter] server-filter hook LIVE @ 0x%zx (entry=rsp+rdi; hides via the game's "
+        "own row-skip). Unjoinable/spam servers will drop from the browser.",
         (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
     return true;
 }

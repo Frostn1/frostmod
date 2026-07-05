@@ -294,6 +294,7 @@ int main(int argc, char** argv) {
     // cross-process triggers (the DLL watches these named events).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     HANDLE cycleEvent  = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModCycle");
+    HANDLE dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
 
     // base name of the DLL (for the "already loaded?" check)
     std::string dllName = dllPath;
@@ -398,7 +399,7 @@ int main(int argc, char** argv) {
                    "  frostmod.exe FIRST, then launch the game, and watch for a [capture] line\n"
                    "  during loading. If you injected into an already-running game, the scan was\n"
                    "  already done: quit the game (leave this running) and relaunch it.\n");
-            printf("\n--- live log ---   [R] reload   [S] cycle strategy   [Q]/Ctrl+C quit\n");
+            printf("\n--- live log ---   [R] reload  [S] strategy  [D] dump server-list  [Q]/Ctrl+C quit\n");
         }
 
         // ---- monitor the running, injected game ----------------------------
@@ -433,6 +434,8 @@ int main(int argc, char** argv) {
                 if (reloadEvent) { SetEvent(reloadEvent); printf("[you] reload requested (R)\n"); }
             } else if (c == 's' || c == 'S') {
                 if (cycleEvent) { SetEvent(cycleEvent); printf("[you] cycle reload strategy (S) - watch the log\n"); }
+            } else if (c == 'd' || c == 'D') {
+                if (dumpEvent) { SetEvent(dumpEvent); printf("[you] dump server-list blob (D) - watch for [srvlist]\n"); }
             } else if (c == 'q' || c == 'Q') {
                 break;
             }
@@ -443,5 +446,6 @@ int main(int argc, char** argv) {
 
     if (reloadEvent) CloseHandle(reloadEvent);
     if (cycleEvent)  CloseHandle(cycleEvent);
+    if (dumpEvent)   CloseHandle(dumpEvent);
     return 0;
 }

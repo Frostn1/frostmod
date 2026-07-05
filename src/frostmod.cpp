@@ -39,6 +39,7 @@
 #include <atomic>
 #include <set>
 #include <cstring>
+#include <intrin.h>   // _ReturnAddress (find the walk's caller)
 
 #include "MinHook.h"
 #include "offsets.h"
@@ -288,7 +289,13 @@ void DumpServerListBlob() {
 int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
     int64_t r = g_origMpMsg(a0, a1, a2, a3);
     static int lastState = -1;
+    static std::atomic<int> calls{0};
     int st = SafeReadInt((const int*)(g_base + mxb::RVA_MP_STATE));
+    int c = calls.fetch_add(1);
+    // show the handler firing (first few) and every state change, so we can see
+    // whether opening the browser drives state toward 3 (list-complete).
+    if (c < 6 || st != lastState)
+        Log("[srvlist] master handler call#%d state=%d", c, st);
     if (st == 3 && lastState != 3) DumpServerListBlob();   // list just completed
     lastState = st;
     return r;
@@ -499,6 +506,9 @@ wglSwapBuffers_t g_origWglSwapBuffers = nullptr;
 // the render thread). "Local\..." scopes them to the logon session. Created in Init.
 HANDLE g_reloadEvent = nullptr;   // R in the console -> reload
 HANDLE g_cycleEvent  = nullptr;   // S in the console -> cycle reload strategy
+HANDLE g_dumpEvent   = nullptr;   // D in the console -> dump the server-list blob now
+
+void DumpServerListBlob();        // fwd (defined near hkMpMsg)
 
 void Tick() {
     // Heartbeat: prove the render hook is actually firing. If you never see this
@@ -523,6 +533,9 @@ void Tick() {
     }
     if (g_cycleEvent && WaitForSingleObject(g_cycleEvent, 0) == WAIT_OBJECT_0)
         CycleStrategy();
+    if (g_dumpEvent && WaitForSingleObject(g_dumpEvent, 0) == WAIT_OBJECT_0) {
+        Log("[srvlist] manual dump (D)"); DumpServerListBlob();
+    }
 
     DrainGameThreadTasks();
 }
@@ -737,6 +750,7 @@ DWORD WINAPI Init(LPVOID) {
     // triggers shared with frostmod.exe: R = reload, S = cycle strategy.
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     g_cycleEvent  = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModCycle");
+    g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
     Log("[init] reload strategy = %s  (F7 in-game or S in the console cycles it)",
         StrategyName(g_strategy.load()));

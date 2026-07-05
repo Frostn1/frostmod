@@ -545,37 +545,75 @@ bool InstallServerFilterHook() {
 // ---------------------------------------------------------------------------
 // the reload action - runs ON THE GAME THREAD (called from the swap hook)
 // ---------------------------------------------------------------------------
-// The reload re-runs the game's own content-load routine (fcn.1400ef210) on the
-// game thread. That routine clears and rebuilds EVERY content list from disk, so a
-// newly dropped .pkz registers live - no mounting, no captured-scan replay (the old
-// A/A+/A++/B strategies were removed: they called the wrong function; see CHANGELOG).
+// SURGICAL reload: replicate ONLY the content-load section of the game's boot init
+// (fcn.1400ef210) - every content list is cleared and rescanned from disk (tracks,
+// bikes, tyres, helmets, boots, gloves, suits, ...), but the input/sound/Steam
+// re-init and the UI transition that follow it are skipped. So new mods of ANY type
+// appear with no loading screen and no bounce to the menu.
 //
-// CAVEAT: fcn.1400ef210 is also the app's boot init - it re-inits input/sound/Steam
-// and returns to the UI, i.e. this is effectively a "soft restart to the menu". It's
-// SEH-guarded so a fault is caught rather than crashing. The lighter per-category
-// reload (rebuild just the track list, no re-init) is the planned follow-up once the
-// track loader is pinned (offsets.h RVA_TRACK_LOADER).
-static int64_t SafeCallContentInit() {
-    __try { return g_contentInit(0, 0, 0, 0); }   // mode 0 -> rescan + return to UI
-    __except (EXCEPTION_EXECUTE_HANDLER) { return -0x1EAD; }
+// The section (transcribed verbatim from fcn.1400ef210) uses two loader shapes:
+//   SC  self-contained: clears its own list, scans game+mods dirs. Called with
+//       ignored args -> we call (0,0).
+//   DIR scan(dir): the game zeroes 3 list globals inline, then calls it once per
+//       dir. We do the same - zero the 3, then scan &String (game dir = "") + &mods.
+// RVAs are relative to g_base (module base). Each helper is SEH-guarded so a bad
+// call/write on a mismatched build is caught rather than crashing the game.
+using LoaderSC_t  = int64_t(__fastcall*)(int64_t, int64_t);
+using LoaderDir_t = int64_t(__fastcall*)(const void*);
+
+static void RL_SC (uintptr_t fn) { __try { ((LoaderSC_t)fn)(0, 0); }   __except (EXCEPTION_EXECUTE_HANDLER) {} }
+static void RL_Z32(uintptr_t p)  { __try { *(volatile int*)p = 0; }     __except (EXCEPTION_EXECUTE_HANDLER) {} }
+static void RL_Z64(uintptr_t p)  { __try { *(volatile int64_t*)p = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+static void RL_Dir(uintptr_t fn, const void* gameDir, const void* mods) {
+    __try {
+        ((LoaderDir_t)fn)(gameDir);
+        if (mods && *(const char*)mods) ((LoaderDir_t)fn)(mods);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 void SetStatus(const char* s, unsigned ms);   // in-game overlay status (defined below)
 
 void DoReloadOnGameThread() {
-    if (!g_contentInit) {
-        Log("[reload] ABORT: content-load routine (RVA 0x%zx) not resolved on this build - "
-            "offsets.h didn't match it (see the [sig] lines). Reload unavailable.",
-            (size_t)mxb::RVA_CONTENT_INIT);
+    if (!g_contentInit) {   // g_contentInit resolved <=> offsets match this build
+        Log("[reload] ABORT: offsets didn't match this build (see the [sig] lines). "
+            "Reload unavailable.");
         SetStatus("reload unavailable (offsets mismatch)", 5000);
         return;
     }
-    Log("[reload] running on game thread - re-running the content load (fcn.1400ef210)...");
-    int64_t r = SafeCallContentInit();
-    Log("[reload] content load returned %lld.%s", (long long)r,
-        r == -0x1EAD ? "  (FAULTED - caught; the game may be unstable)"
-                     : "  Newly added tracks/skins should now be listed.");
-    SetStatus(r == -0x1EAD ? "reload FAULTED (caught)" : "reloaded - new content listed", 5000);
+    const uintptr_t b = g_base;
+    const void* S = (const void*)(b + 0x3333EB);   // "String" = "" (game dir = cwd)
+    const void* M = (const void*)(b + 0xE54B44);   // byte_140E54B44 = mods folder path
+    auto SC  = [&](uintptr_t rva){ RL_SC(b + rva); };
+    auto DIR = [&](uintptr_t z1, uintptr_t z2, uintptr_t z3, uintptr_t rva){
+        RL_Z32(b + z1); RL_Z32(b + z2); RL_Z64(b + z3); RL_Dir(b + rva, S, M);
+    };
+
+    Log("[reload] surgical content reload (no re-init, no menu bounce)...");
+
+    SC(0x2460);                                     // tracks
+    SC(0x1CE00);
+    DIR(0xF3DC80, 0x109DEC4, 0xF3DC48, 0x1B790);
+    SC(0x3100);                                     // bikes
+    SC(0x3FA0);
+    SC(0x171D0);
+    DIR(0x109DE88, 0xF3DC40, 0xF4EDF8, 0x17320);
+    DIR(0xF3DB9C, 0xF3DC9C, 0xF4EDA0, 0x17950);
+    SC(0x17F80);
+    DIR(0xF48620, 0xF3DB64, 0x109E090, 0x18360);
+    DIR(0x10A30F4, 0xF4EDDC, 0xF3DC28, 0x189C0);
+    DIR(0xF4EE00, 0x109DE90, 0xF48610, 0x19060);
+    SC(0x1BDD0);
+    DIR(0xF3DB50, 0x109DEA8, 0xF3DC90, 0x19330);
+    DIR(0x109DEA4, 0xF3DC8C, 0xF48658, 0x1AE10);
+    SC(0x1B420);
+    SC(0x19DA0);
+    DIR(0xF48660, 0xF4EDE0, 0xF432A0, 0x1A110);
+    DIR(0xF3DC58, 0xF432B4, 0xF48208, 0x1A770);
+    DIR(0x106BB28, 0x109DEB0, 0xF432A8, 0x1C140);
+    DIR(0xF432C0, 0xF48608, 0xF4EDD0, 0x1C450);
+
+    Log("[reload] done - all content lists rebuilt from disk.");
+    SetStatus("reloaded - new mods listed", 5000);
 }
 
 void RequestReload() {

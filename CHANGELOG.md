@@ -1,6 +1,9 @@
 # Changelog
 
 ## 2026-07-05
+### Changed
+- **Server filter stepped back to a crash-proof READ-ONLY dump.** Actually skipping rows kept crashing the browser: the populate loop's post-loop `DISPLAY_COUNT += RAW count` (`0x0ACE68`) re-counts a skipped row, so the list is later indexed past its end — and decrementing `DISPLAY_COUNT` per hidden row still wasn't enough. So `--filter-servers` now installs a **pure observer** at `0x0ABAB6` (`SB_DumpEntry`): it logs every server row to the console/log — index, best-guess name + offset, players, ping, type, and the filter verdict (`keep` / `WOULD-HIDE: reason`) — and **writes nothing back to the game**. It also dumps a hex+ASCII window (`[srv.hex]`) of the first few entries so we can finally pin the real `SB_Entry` name offset (name reads empty at `+0x00`). The name is now auto-located by scanning the entry header for the longest printable-ASCII run. The asm stub was also hardened: it parks `rsp` in the non-volatile `rbp` (not the volatile `r10`) across the call, so `SB_DumpEntry`'s work can't corrupt the return path. Once the dump confirms the fields, hiding can be rebuilt on solid ground.
+
 ### Added
 - **Version string** (`FROSTMOD_VERSION`, new `src/version.h` shared by the DLL + launcher): shown in the in-game overlay (`FrostMod v0.9.0 — F8: reload mods`), the DLL load banner, and the `frostmod.exe` console header — one source of truth so they never drift.
 - **In-game overlay** (OpenGL, drawn in the `wglSwapBuffers` hook): a small top-left corner hint — `FrostMod — F8: reload mods` — visible in fullscreen, plus a transient status line after a reload (`reloading… → reloaded — new content listed`). **F7** toggles it, **F8** reloads. Text is built once via `wglUseFontBitmaps` (Segoe UI); the whole draw is `glPushAttrib`/matrix push-pop guarded so it never disturbs the game's rendering, and it no-ops silently if the game ever runs a core GL profile. DLL now links `opengl32`.

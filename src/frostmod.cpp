@@ -366,16 +366,12 @@ size_t BlobHeadBytes() {
 // 0x1D8) and a populate loop (RVA_SB_POPULATE_LOOP) emits one row each, with a
 // row-skip target (RVA_SB_ROW_SKIP_TGT) that keeps the game's counts consistent.
 //
-// Given a pointer to the current SB_Entry, this decides show/hide. It's the exact
-// callback the loop-splice stub will call: read the fields (SafeCopyStr for the
-// inline name), build a ServerInfo, ask serverfilter. Returns true => SKIP the row.
-// The powerful default: ping == 0xFFFFFFFF ("---") means unjoinable = ghost/ad.
-// Actually perform the row-skip? The 0x0ACE68 skip target is a loop-continue, and
-// after the loop DISPLAY_COUNT (0x4C8F48) += the RAW count - so a skipped row that
-// isn't added still gets counted, and the list is later indexed past its end
-// (crash). The stub compensates by decrementing DISPLAY_COUNT per hidden row, so
-// hiding is now safe.
-bool g_filterHideEnabled = true;
+// STEP BACK (2026-07-05): actually skipping rows crashed the list build (the
+// game's post-loop `DISPLAY_COUNT += RAW count` desyncs the index no matter how we
+// compensate). So this is now a PURE READ-ONLY DUMP: the hook observes every row,
+// logs its fields + best-guess name + the filter VERDICT (keep / WOULD-HIDE), and
+// never mutates a thing. Crash-proof by construction, and it doubles as the tool to
+// finally pin the real SB_Entry name offset (see the [srv.hex] windows).
 
 // ---------------------------------------------------------------------------
 // POD, no C++ objects -> SEH is allowed here (a function that must unwind C++
@@ -392,42 +388,98 @@ static SBNums SafeReadSBNums(void* entry) {
     return f;
 }
 
-extern "C" bool SB_ShouldHideEntry(void* entry) {   // extern "C": easy to call from an asm stub
-    if (!entry) return false;
+// The name reads empty at +0x00, so the offset is wrong. Rather than guess, scan
+// the entry HEADER (bytes [0, players@0xC8)) for the LONGEST printable-ASCII run -
+// a server name is the longest human-readable string in the header. Returns the
+// byte offset it was found at (or -1). Operates on an already-copied buffer (no SEH).
+static int FindPrintableName(const char* buf, size_t len, char* out, size_t cap) {
+    int bestOff = -1, bestLen = 0;
+    for (size_t i = 0; i < len; ) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c >= 0x20 && c < 0x7F) {
+            size_t j = i;
+            while (j < len && (unsigned char)buf[j] >= 0x20 && (unsigned char)buf[j] < 0x7F) ++j;
+            if ((int)(j - i) > bestLen) { bestLen = (int)(j - i); bestOff = (int)i; }
+            i = j;
+        } else ++i;
+    }
+    out[0] = 0;
+    if (bestOff < 0 || bestLen < 3) return -1;
+    int n = bestLen; if ((size_t)n >= cap) n = (int)cap - 1;
+    for (int k = 0; k < n; ++k) out[k] = buf[bestOff + k];
+    out[n] = 0;
+    return bestOff;
+}
+
+// Log a hex+ASCII window of the copied entry header so we can eyeball field layout
+// (esp. where the name really lives). Read-only.
+static void LogHexWindow(const char* buf, size_t len) {
+    for (size_t off = 0; off < len; off += 16) {
+        char line[96]; int p = 0; char ascii[17]; int a = 0;
+        p += sprintf_s(line + p, sizeof(line) - p, "+0x%03zX: ", off);
+        for (size_t k = 0; k < 16; ++k) {
+            if (off + k < len) {
+                unsigned char c = (unsigned char)buf[off + k];
+                p += sprintf_s(line + p, sizeof(line) - p, "%02X ", c);
+                ascii[a++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+            } else p += sprintf_s(line + p, sizeof(line) - p, "   ");
+        }
+        ascii[a] = 0;
+        Log("[srv.hex] %s|%s|", line, ascii);
+    }
+}
+
+static int g_sbRow = 0;      // running row index within the current populate pass
+static int g_sbHexLeft = 0;  // hex windows still to dump this pass (to find name off)
+
+// extern "C" + fixed name: the asm stub calls this by address, once per row. rowOff
+// is rdi (row * stride) so we can detect the start of a fresh populate pass (row 0)
+// and reset the per-pass state. NOTHING here writes to the game.
+extern "C" void SB_DumpEntry(void* entry, uint64_t rowOff) {
+    if (!entry) return;
+
+    if (rowOff < (uint64_t)mxb::SBE_STRIDE) {        // row 0 => new browser populate pass
+        g_sbRow = 0;
+        g_sbHexLeft = 4;                             // hex-dump first 4 rows to locate the name
+        Log("[srv] ===== server-list dump (READ-ONLY; nothing is hidden) =====");
+    }
+
+    char raw[0xC8];                                  // header up to players@0xC8
+    size_t n = SafeReadBytes((const char*)entry, raw, sizeof(raw));
 
     SBNums nums = SafeReadSBNums(entry);
-    if (!nums.ok) return false;                     // bad read -> never hide/crash
+    int ping = SafeReadInt((const int*)((char*)entry + mxb::SBE_PING));
+    int type = SafeReadInt((const int*)((char*)entry + mxb::SBE_TYPE));
+    bool unj = ((uint32_t)ping == mxb::SBE_PING_UNJOINABLE);
+
+    char name[128];
+    int nameOff = FindPrintableName(raw, n, name, sizeof(name));
 
     frostmod::serverfilter::ServerInfo si;
-    char nameBuf[256];
-    if (SafeCopyStr((char*)entry + mxb::SBE_NAME, nameBuf, sizeof(nameBuf))) si.name = nameBuf;
+    si.name       = (nameOff >= 0) ? name : "";
     si.players    = nums.players;
     si.maxPlayers = nums.maxPlayers;
-    si.unjoinable = nums.unjoinable;
-
+    si.unjoinable = unj;
     std::string why = frostmod::serverfilter::ShouldHide(si);
-    if (why.empty()) return false;
 
-    // The detection is solid, but actually taking the game's row-skip (0x0ACE68)
-    // crashes the list build - it isn't set up in this context (hide-empty off), and
-    // faking the row's fields doesn't help. Until 0x0ACE68's required state is known
-    // (RE), run DETECT-ONLY: log what we WOULD hide, but don't skip (no crash).
-    if (!g_filterHideEnabled) {
-        Log("[filter] WOULD hide '%s' (%s) - detect-only; skip disabled pending RE of 0x0ACE68",
-            si.name.c_str(), why.c_str());
-        return false;
-    }
-    Log("[filter] hid '%s' (%s)", si.name.c_str(), why.c_str());
-    return true;
+    char pingStr[16];
+    if (unj) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
+    std::string verdict = why.empty() ? std::string("keep") : ("WOULD-HIDE: " + why);
+
+    Log("[srv] #%02d name@0x%X='%s' P=%d/%d ping=%s type=%d | %s",
+        g_sbRow, nameOff, si.name.c_str(), nums.players, nums.maxPlayers,
+        pingStr, type, verdict.c_str());
+
+    if (g_sbHexLeft > 0) { LogHexWindow(raw, n); --g_sbHexLeft; }
+    ++g_sbRow;
 }
 
 // The populate emit is INLINE. We splice the game's hide-empty branch
 //   0x0ABAB6:  cmp [rsp+rdi+0xCC], r12d    (entry = rsp+rdi, maxplayers @ +0xCC)
-//   0x0ABABE:  jz  <row-skip>              (skip the row when equal)
-// with a MinHook hook to a hand-built stub that: computes rsp+rdi, calls
-// SB_ShouldHideEntry, and if it says HIDE, writes r12d into [entry+0xCC] so the
-// game's OWN cmp/jz then skips the row through its normal, consistent path (no
-// control-flow surgery from us = no desync). Always continues via the trampoline.
+// with a MinHook hook to a hand-built stub that computes rsp+rdi (the entry) and
+// rdi (the row offset), calls SB_DumpEntry to LOG the row, restores all registers
+// and flags untouched, and continues into the original cmp via the trampoline.
+// The stub writes NOTHING back to the game - it's a pure observer.
 void* g_sbTramp = nullptr;
 
 bool InstallServerFilterHook() {
@@ -456,29 +508,25 @@ bool InstallServerFilterHook() {
     size_t o = 0;
     auto b  = [&](unsigned char x){ stub[o++] = x; };
     auto b8 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) b((unsigned char)(v >> (i * 8))); };
+    // PURE OBSERVER: save volatiles+flags, call SB_DumpEntry(entry, rdi) to LOG the
+    // row, restore everything byte-for-byte, then run the original cmp. No writes.
+    // rsp is parked in RBP (non-volatile -> the callee must preserve it) across the
+    // call; saving it in a volatile reg would be corrupted by SB_DumpEntry's work.
     b(0x50);                                             // push rax
-    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x08);             // lea rax,[rsp+rdi+8]  (entry ptr)
+    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x08);             // lea rax,[rsp+rdi+8]  (entry ptr; +8 for the push)
     b(0x51);b(0x52);b(0x41);b(0x50);b(0x41);b(0x51);     // push rcx,rdx,r8,r9
     b(0x41);b(0x52);b(0x41);b(0x53);                     // push r10,r11
     b(0x9C);                                             // pushfq
-    b(0x48);b(0x89);b(0xC1);                             // mov rcx,rax   (arg = entry)
-    b(0x49);b(0x89);b(0xE2);                             // mov r10,rsp   (save rsp)
+    b(0x55);                                             // push rbp   (save caller's rbp)
+    b(0x48);b(0x89);b(0xC1);                             // mov rcx,rax   (arg1 = entry)
+    b(0x48);b(0x89);b(0xFA);                             // mov rdx,rdi   (arg2 = row offset; rdi nonvolatile)
+    b(0x48);b(0x89);b(0xE5);                             // mov rbp,rsp   (park rsp in rbp; survives the call)
     b(0x48);b(0x83);b(0xE4);b(0xF0);                     // and rsp,-16   (align)
     b(0x48);b(0x83);b(0xEC);b(0x20);                     // sub rsp,0x20  (shadow)
-    b(0x48);b(0xB8);b8((uint64_t)&SB_ShouldHideEntry);   // mov rax, &SB_ShouldHideEntry
+    b(0x48);b(0xB8);b8((uint64_t)&SB_DumpEntry);         // mov rax, &SB_DumpEntry
     b(0xFF);b(0xD0);                                     // call rax
-    b(0x4C);b(0x89);b(0xD4);                             // mov rsp,r10   (restore rsp -> post-pushfq)
-    b(0x84);b(0xC0);                                     // test al,al
-    b(0x74);b(0x1F);                                     // jz +0x1F  (skip the hide-writes)
-    b(0x48);b(0x8D);b(0x44);b(0x3C);b(0x40);             // lea rax,[rsp+rdi+0x40]  (entry; rsp now -0x40)
-    // Force players=maxplayers=r12d so the game's own cmp/jz skips (hides) this row.
-    b(0x44);b(0x89);b(0xA0);b(0xC8);b(0x00);b(0x00);b(0x00); // mov [rax+0xC8], r12d  (players    = r12d)
-    b(0x44);b(0x89);b(0xA0);b(0xCC);b(0x00);b(0x00);b(0x00); // mov [rax+0xCC], r12d  (maxplayers = r12d)
-    // Compensate the count: the loop adds RAW count to DISPLAY_COUNT after, so a
-    // skipped-but-counted row would over-count and later crash the list index.
-    b(0x48);b(0xB8);b8((uint64_t)(g_base + mxb::RVA_SB_DISPLAY_COUNT)); // mov rax, &DISPLAY_COUNT
-    b(0xFF);b(0x08);                                     // dec dword [rax]  (DISPLAY_COUNT--)
-    // restore regs+flags, then continue into the original cmp (trampoline)
+    b(0x48);b(0x89);b(0xEC);                             // mov rsp,rbp   (restore rsp -> saved-rbp slot)
+    b(0x5D);                                             // pop rbp    (restore caller's rbp)
     b(0x9D);                                             // popfq
     b(0x41);b(0x5B);b(0x41);b(0x5A);b(0x41);b(0x59);b(0x41);b(0x58);b(0x5A);b(0x59);b(0x58); // pop r11..rax
     b(0xFF);b(0x25);b(0x00);b(0x00);b(0x00);b(0x00);     // jmp [rip+0] -> tramp slot
@@ -488,9 +536,9 @@ bool InstallServerFilterHook() {
         Log("[filter] MH_EnableHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
         return false;
     }
-    Log("[filter] server-filter hook LIVE @ 0x%zx (entry=rsp+rdi). Mode=%s.",
-        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR,
-        g_filterHideEnabled ? "HIDE" : "DETECT-ONLY (safe; [filter] WOULD hide ...)");
+    Log("[filter] server-list dump hook LIVE @ 0x%zx (entry=rsp+rdi). Mode=DUMP "
+        "(read-only; open the online browser to see the [srv] table).",
+        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
     return true;
 }
 
@@ -1025,8 +1073,9 @@ DWORD WINAPI Init(LPVOID) {
             cfg = "frostmod_serverfilter.txt";
         frostmod::serverfilter::Init(cfg, &SfLog);
 
-        // OPT-IN (frostmod.exe --filter-servers): splice the populate loop so the
-        // rules actually hide rows. Mid-function hook, so gated behind a flag.
+        // OPT-IN (frostmod.exe --filter-servers): install the read-only populate-loop
+        // observer that dumps every server row + the filter verdict. Mid-function
+        // hook, so gated behind a flag. (No hiding - pure preview; see SB_DumpEntry.)
         char fflag[MAX_PATH] = {0};
         if (g_logPath[0]) {
             strcpy_s(fflag, g_logPath);
@@ -1036,7 +1085,7 @@ DWORD WINAPI Init(LPVOID) {
             InstallServerFilterHook();
         else
             Log("[filter] rules loaded (inert). Run frostmod.exe --filter-servers to "
-                "install the populate-loop hook and actually hide servers.");
+                "install the read-only dump hook and preview the server list ([srv]).");
     }
 
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "

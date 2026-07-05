@@ -297,12 +297,13 @@ void DumpServerListBlob(bool force) {
     Log("[srvlist] ==== end blob ====");
 }
 
+std::atomic<int> g_mpCalls{0};   // how many times the master handler has fired
+
 int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
     int64_t r = g_origMpMsg(a0, a1, a2, a3);
     static int lastState = -1;
-    static std::atomic<int> calls{0};
     int st = SafeReadInt((const int*)(g_base + mxb::RVA_MP_STATE));
-    int c = calls.fetch_add(1);
+    int c = g_mpCalls.fetch_add(1);
     // show the handler firing (first few) and every state change, so we can see
     // whether opening the browser drives state toward 3 (list-complete).
     if (c < 6 || st != lastState)
@@ -310,6 +311,14 @@ int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
     if (st == 3 && lastState != 3) DumpServerListBlob(false);   // list just completed
     lastState = st;
     return r;
+}
+
+// Peek how many meaningful (non-zero) bytes are at the head of the list blob.
+size_t BlobHeadBytes() {
+    char tmp[64];
+    size_t n = SafeReadBytes((const char*)(g_base + mxb::RVA_MP_LIST_BLOB), tmp, sizeof(tmp));
+    size_t nz = 0; for (size_t i = 0; i < n; ++i) if (tmp[i]) nz = i + 1;
+    return nz;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,10 +553,19 @@ void Tick() {
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
     // just opening the online browser captures it, no key press / console focus.
+    // Also print a periodic status line so we can see WHY it stays empty: does the
+    // handler ever fire, does the master state advance, are masters configured?
     if (g_origMpMsg) {
-        static ULONGLONG lastCheck = 0;
+        static ULONGLONG lastCheck = 0, lastStatus = 0;
         ULONGLONG now = GetTickCount64();
         if (now - lastCheck > 1000) { lastCheck = now; DumpServerListBlob(false); }
+        if (now - lastStatus > 3000) {
+            lastStatus = now;
+            int st = SafeReadInt((const int*)(g_base + mxb::RVA_MP_STATE));
+            int ep = SafeReadInt((const int*)(g_base + mxb::RVA_MP_ENDPOINT_CNT));
+            Log("[srvlist] status: handlerCalls=%d mpState=%d masterEndpoints=%d blobHead=%zuB",
+                g_mpCalls.load(), st, ep, BlobHeadBytes());
+        }
     }
 
     // Same, driven from the frostmod.exe console (R / S).

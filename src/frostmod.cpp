@@ -483,9 +483,9 @@ bool InstallServerFilterHook() {
         Log("[filter] MH_EnableHook failed @ 0x%zx", (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
         return false;
     }
-    Log("[filter] server-filter hook LIVE @ 0x%zx (entry=rsp+rdi; hides via the game's "
-        "own row-skip). Unjoinable/spam servers will drop from the browser.",
-        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR);
+    Log("[filter] server-filter hook LIVE @ 0x%zx (entry=rsp+rdi). Mode=%s.",
+        (size_t)mxb::RVA_SB_HIDE_EMPTY_BR,
+        g_filterHideEnabled ? "HIDE" : "DETECT-ONLY (safe; [filter] WOULD hide ...)");
     return true;
 }
 

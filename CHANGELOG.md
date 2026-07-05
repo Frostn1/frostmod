@@ -2,6 +2,7 @@
 
 ## 2026-07-05
 ### Added
+- **First published release — v0.9.0.** `frostmod.exe` + `frostmod.dll` attached on the GitHub Releases page. Headline features: live mod reload (**F8** in-game / **R** in the console), the server-browser cheat/ad-ghost filter (`frostmod.exe --filter-servers`), and the in-game overlay (**F7**).
 - **Server-filter now actually HIDES (skip-at-emit).** A full IDA pass settled the mechanism: there is **no pre-build source array** to filter (the list lives in the UI list-widget behind the message manager `0x566C48`; `[rsp+0x86]` is already a per-build stack copy), and the game's own hide-empty/name filters work by **skipping at emit** — evaluating the record at `0x0ABAB6` and `jmp 0x0ACE68` (the row-skip label). RE also confirmed `r12d == 0` (stock branch = "maxplayers==0 → skip") and that skip-at-emit keeps the displayed list self-consistent (SELECTED/INFO indices are displayed-row positions), so **never** compact post-build. So `SB_FilterEntry` now returns a hide decision and the `0x0ABAB6` stub branches: **hide → `jmp 0x0ACE68`**, keep → original `cmp` via trampoline. This is exactly the stock skip path — the earlier crashes were the volatile-`r10` stack bug (already fixed by parking `rsp` in `rbp`), not the skip itself. Every row is still logged (`[srv] … HIDE` / `keep`). Default scope: cheat/ad ghosts only (config v3). `--filter-servers` now hides rather than previews.
 
 ### Changed

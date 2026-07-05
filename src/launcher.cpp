@@ -237,6 +237,7 @@ int main(int argc, char** argv) {
     long warmupMs = 400;     // delay after seeing the process before injecting;
                              // small = catch the startup scan. Override with --wait.
     bool probeMount = false; // --probe-mount: hook the pkz-mount fn to log its args
+    bool dumpList   = false; // --dump-serverlist: dump the master server-list blob
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -244,6 +245,7 @@ int main(int argc, char** argv) {
         else if (a == "--mods" && i + 1 < argc)  modsPath = argv[++i];
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else if (a == "--probe-mount")           probeMount = true;
+        else if (a == "--dump-serverlist")       dumpList = true;
         else                                     dllPath = a;
     }
 
@@ -280,6 +282,13 @@ int main(int argc, char** argv) {
         printf("[*] --probe-mount ON: DLL will hook the pkz-mount fn and log [mount] args.\n");
     } else {
         DeleteFileA(probeFlag.c_str());
+    }
+    std::string dumpFlag = ExeDir() + "frostmod_dumplist.flag";
+    if (dumpList) {
+        if (FILE* f = nullptr; fopen_s(&f, dumpFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --dump-serverlist ON: DLL will dump the master server-list blob ([srvlist]).\n");
+    } else {
+        DeleteFileA(dumpFlag.c_str());
     }
 
     // cross-process triggers (the DLL watches these named events).

@@ -2,6 +2,7 @@
 
 ## 2026-07-05
 ### Added
+- Master-protocol RE opens a **clean, code-cave-free** filter path: the server-list reply arrives as a **text blob** at `0x9E3AE0`, written by the opcode handler `0x2A10E0` (clean prologue + AOB). Added those offsets, the reader-primitive RVAs, and `SIG_MP_MSG_HANDLER`. New `frostmod.exe --dump-serverlist`: the DLL signature-validates + hooks `0x2A10E0` and dumps the blob once per completed list (`[srvlist] …`, NUL shown as `|`, newline as `/`) so we can see the record format — then a follow-up edits the blob to drop spam/unjoinable servers before the browser parses it, no mid-function splice needed. Off by default.
 - Server browser RE landed (from IDA): `offsets.h` now has the real networking + server-browser layout — `SB_Entry` fields (name `+0x00`, players `+0xC8`, maxplayers `+0xCC`, **ping `+0xD8` where `0xFFFFFFFF` = unjoinable**), the populate loop + row-skip target, UI-state globals, and AOB signatures for the LAN/world browser commands. `serverfilter` gains a **`hideUnjoinable`** rule (default ON) — the ping-"---" ghost/ad signal the user described — plus `SB_ShouldHideEntry()` in the DLL that reads an entry (SEH-guarded) and returns show/hide. Remaining to go live: a mid-function code-cave splice in the populate loop (needs the splice address + entry register + stolen bytes from RE).
 
 ### Changed

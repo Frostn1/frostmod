@@ -171,6 +171,19 @@ static bool SafeCopyStr(const void* p, char* out, size_t cap) {
     }
 }
 
+// SEH-guarded int read (POD, so __try is allowed here).
+static int SafeReadInt(const int* p) {
+    __try { return *p; } __except (EXCEPTION_EXECUTE_HANDLER) { return -0x7FFF; }
+}
+
+// SEH-guarded byte copy up to cap; returns bytes read (stops on the first fault).
+static size_t SafeReadBytes(const char* p, char* out, size_t cap) {
+    size_t n = 0;
+    __try { while (n < cap) { out[n] = p[n]; ++n; } }
+    __except (EXCEPTION_EXECUTE_HANDLER) { /* stop at n */ }
+    return n;
+}
+
 // Read a NUL-terminated string from a (possibly bogus) pointer, safely.
 std::string SafeStr(void* p) {
     if (!p) return "<null>";
@@ -242,6 +255,43 @@ int64_t __fastcall hkMount(void* a0, void* a1, void* a2, void* a3) {
             a2, SafeStr(a2).c_str(), a3, SafeStr(a3).c_str());
     }
     return g_origMount(a0, a1, a2, a3);
+}
+
+// ---------------------------------------------------------------------------
+// master server-list hook (the CLEAN filter target). 0x2A10E0 handles master
+// opcodes; when a HOSTED (server-list) reply completes, RVA_MP_STATE goes to 3
+// and the list text sits in the blob at RVA_MP_LIST_BLOB. We dump the blob once
+// per completed list so we can see its exact record format - then a follow-up can
+// edit the blob here (drop spam records) before the browser parses it, no cave.
+// ---------------------------------------------------------------------------
+using MpMsg_t = int64_t(__fastcall*)(void*, void*, void*, void*);
+MpMsg_t g_origMpMsg = nullptr;
+
+void DumpServerListBlob() {
+    static char buf[8193];
+    size_t n = SafeReadBytes((const char*)(g_base + mxb::RVA_MP_LIST_BLOB), buf, sizeof(buf) - 1);
+    // trim to the meaningful content: stop at a run of 8 zero bytes
+    size_t end = 0, zeros = 0;
+    for (size_t i = 0; i < n; ++i) { if (buf[i] == 0) { if (++zeros >= 8) break; } else { zeros = 0; end = i + 1; } }
+    if (end == 0) { Log("[srvlist] blob empty/unreadable"); return; }
+    Log("[srvlist] ==== server-list blob (%zu bytes) - records below ====", end);
+    for (size_t i = 0; i < end; i += 800) {
+        char chunk[801];
+        size_t m = end - i < 800 ? end - i : 800;
+        for (size_t j = 0; j < m; ++j) { char c = buf[i + j]; chunk[j] = (c == 0) ? '|' : (c == '\n' ? '/' : c); }
+        chunk[m] = 0;
+        Log("[srvlist] %s", chunk);   // NUL shown as '|', newline as '/'
+    }
+    Log("[srvlist] ==== end blob ====");
+}
+
+int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
+    int64_t r = g_origMpMsg(a0, a1, a2, a3);
+    static int lastState = -1;
+    int st = SafeReadInt((const int*)(g_base + mxb::RVA_MP_STATE));
+    if (st == 3 && lastState != 3) DumpServerListBlob();   // list just completed
+    lastState = st;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +804,36 @@ DWORD WINAPI Init(LPVOID) {
                         (void**)&g_origWglSwapBuffers, "opengl32!wglSwapBuffers");
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
+    }
+
+    // OPT-IN (frostmod.exe --dump-serverlist): hook the master opcode handler
+    // (signature-validated, clean prologue) and dump the server-list blob once per
+    // completed list, to learn its record format. Safe; off by default.
+    {
+        char flag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(flag, g_logPath);
+            if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_dumplist.flag"); }
+        }
+        if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            uint8_t *b3, *e3;
+            bool ok = GetExecRange(g_base, &b3, &e3);
+            uint8_t* mp = (uint8_t*)(g_base + mxb::RVA_MP_MSG_HANDLER);
+            size_t   sl = strlen(mxb::SIG_MP_MSG_HANDLER_MASK);
+            uint8_t* target = nullptr;
+            if (ok && mp >= b3 && mp + sl <= e3 &&
+                MatchAt(mp, mxb::SIG_MP_MSG_HANDLER, mxb::SIG_MP_MSG_HANDLER_MASK)) {
+                target = mp;
+                Log("[srvlist] master handler signature VERIFIED @ RVA 0x%zx.",
+                    (size_t)mxb::RVA_MP_MSG_HANDLER);
+            } else if (ok) {
+                target = PatternScan(b3, e3, mxb::SIG_MP_MSG_HANDLER, mxb::SIG_MP_MSG_HANDLER_MASK);
+                if (target) Log("[srvlist] master handler relocated to RVA 0x%zx.",
+                                (size_t)((uintptr_t)target - g_base));
+            }
+            if (target) InstallHook((void*)target, &hkMpMsg, (void**)&g_origMpMsg, "masterMsg(0x2A10E0)");
+            else        Log("[srvlist] master handler signature not found; not hooking.");
+        }
     }
 
     // Server-browser spam filter: load rules from <dll folder>\frostmod_serverfilter.txt

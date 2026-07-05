@@ -69,6 +69,22 @@ constexpr uintptr_t RVA_NET_DISPATCH     = 0x284450; // recv + per-peer dispatch
 constexpr uintptr_t RVA_NET_PEER_BASE    = 0x3993B0; // peer/conn table base (stride 0x5B4)
 constexpr uintptr_t RVA_NET_PEER_COUNT   = 0x3993AC; // peer count (cap 10)
 
+// ---- master protocol (opcode/text) - the CLEAN filter point ----
+// 0x2A10E0 handles master opcodes; its HOSTED case writes the server-list reply
+// as TEXT into the blob at 0x9E3AE0. Hooking 0x2A10E0 (clean prologue + AOB) and
+// editing that blob before the browser parses it lets us drop spam servers with
+// no code cave. Blob is records via read_str (NUL/\n) + read_u32.
+constexpr uintptr_t RVA_MP_MSG_HANDLER   = 0x2A10E0; // client opcode handler; HOSTED = server-list reply
+constexpr uintptr_t RVA_MP_REFRESH_DRV   = 0x2A6890; // sends GETLIST to masters, 3000ms refresh timer
+constexpr uintptr_t RVA_MP_ENDPOINT_ADD  = 0x2A8330; // append MASTER endpoint (not game servers), cap 10
+constexpr uintptr_t RVA_MP_ENDPOINT_BASE = 0x597560; // master endpoint array (stride 0x28, cap 10)
+constexpr uintptr_t RVA_MP_ENDPOINT_CNT  = 0x3D8014; // master endpoint count
+constexpr uintptr_t RVA_MP_LIST_BLOB     = 0x9E3AE0; // HOSTED payload text buffer (written by 0x2A10E0)
+constexpr uintptr_t RVA_MP_STATE         = 0x9D7AA4; // 0 idle /1 requesting /2 connected /3 list-complete
+constexpr uintptr_t RVA_MP_READ_INIT     = 0x2835A0; // reader: init
+constexpr uintptr_t RVA_MP_READ_U32      = 0x283490; // reader: read_u32
+constexpr uintptr_t RVA_MP_READ_STR      = 0x283800; // reader: read_str (inline NUL/\n-terminated)
+
 // ---- server browser UI state (.data) ----
 constexpr uintptr_t RVA_SB_CONNECTED_FLAG = 0x4C8F20; // master/list ready (0/1)
 constexpr uintptr_t RVA_SB_FILTER_FLAGS   = 0x4C8F44; // bit0 hide-empty, bit1 hide-full
@@ -100,5 +116,10 @@ constexpr char SIG_SB_LAN_CMD_MASK[]  = "xxxxxxxxxxxxxxx????xxxxxx????xxx";
 constexpr char SIG_SB_WORLD_CMD[] =
     "\x40\x53\x55\x56\x57\x48\x81\xEC\xF8\x05\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x84\x24\xD0\x05\x00\x00\x49\x8B";
 constexpr char SIG_SB_WORLD_CMD_MASK[] = "xxxxxxxxxxxxxxx????xxxxxxxxxxxxxx";
+
+// master opcode handler (writes the server-list blob) - the clean hook target
+constexpr char SIG_MP_MSG_HANDLER[] =
+    "\x40\x53\x56\x57\x48\x81\xEC\x20\x07\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x84\x24\x10\x07\x00";
+constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 
 } // namespace mxb

@@ -63,10 +63,16 @@ bool starts_with(const std::string& s, const char* p) {
     return s.size() >= n && _strnicmp(s.c_str(), p, n) == 0;
 }
 
+// Bump this when the shipped defaults change; the loader auto-rewrites an older
+// file (backing the old one up to .bak) so new rules land without a manual delete.
+constexpr const char* kConfigVersion = "# frostmod-filter v2";
+
 const char* kDefaultConfig =
+    "# frostmod-filter v2\n"
     "# FrostMod - server browser spam filter (client-side, your view only).\n"
     "# Hide junk / ad \"ghost\" servers from the MX Bikes list.\n"
     "# One rule per line; '#' starts a comment; matching is case-insensitive.\n"
+    "# (Edit freely. On a version bump this file is backed up to .bak and rewritten.)\n"
     "#\n"
     "#   name: <text>      hide a server whose NAME contains <text>\n"
     "#   regex: <pattern>  hide a server whose NAME matches this ECMAScript regex\n"
@@ -83,23 +89,49 @@ const char* kDefaultConfig =
     "hideEmpty: 0\n"
     "hideLocked: 0\n"
     "maxPerIP: 0\n"
-    "# obvious ad hosts seen in the wild (note: 'cbrhosting.com' the AD host, which is\n"
-    "# distinct from the legit 'CBRSERVERS.COM' race servers - substring stays precise):\n"
+    "# Ad/hosting spam + cheat ads seen in the live list. Kept PRECISE so the legit\n"
+    "# race servers ('CBRSERVERS.COM', 'CBR Demo Server', community '.com' names) stay:\n"
     "name: cbrhosting.com\n"
-    "name: kaizo.pro\n"
+    "name: mymxb\n"
     "name: cheap dedi\n"
     "name: server hosting\n"
+    "name: dedicated servers\n"
+    "name: rent your server\n"
+    "# cheat-shop ghost ads (they leetspeak 'kaizo.pro' as 'KAlZ0.PR0' to dodge a\n"
+    "# literal match, so cover the variants; the URL regex below is the real backstop):\n"
+    "name: che4ts\n"
+    "name: kaizo\n"
+    "name: kalz0\n"
     "regex: (https?://|www\\.|discord(\\.gg)?|t\\.me/|\\.gg/|telegram|join us)\n"
     "# Add your own below - one per line, case-insensitive:\n"
     "# name: free vbucks\n"
-    "# name: 50% off\n";
+    "# name: gtxgaming\n";
 
-void writeDefaultIfMissing() {
-    if (GetFileAttributesA(g_path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+// True if the on-disk file's first line is the current version sentinel.
+bool configIsCurrent() {
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_path.c_str(), "r") != 0 || !f) return false;
+    char first[128] = {0};
+    bool got = fgets(first, sizeof(first), f) != nullptr;
+    fclose(f);
+    return got && trim(first) == kConfigVersion;
+}
+
+// Write defaults if the file is missing OR from an older version. An out-of-date
+// file is backed up to <path>.bak first, so a user's edits are never silently lost.
+void ensureConfig() {
+    bool exists = GetFileAttributesA(g_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (exists && configIsCurrent()) return;
+    if (exists) {
+        std::string bak = g_path + ".bak";
+        DeleteFileA(bak.c_str());
+        MoveFileA(g_path.c_str(), bak.c_str());
+        logf("[filter] config out of date -> backed up old to %s, rewriting defaults", bak.c_str());
+    }
     if (FILE* f; fopen_s(&f, g_path.c_str(), "w") == 0 && f) {
         fputs(kDefaultConfig, f);
         fclose(f);
-        logf("[filter] wrote default config: %s", g_path.c_str());
+        logf("[filter] wrote %s config: %s", kConfigVersion, g_path.c_str());
     }
 }
 
@@ -159,7 +191,7 @@ void Init(const std::string& configPath, LogFn log) {
         std::lock_guard<std::mutex> lk(g_mx);
         g_path = configPath;
         g_log  = log;
-        writeDefaultIfMissing();
+        ensureConfig();
     }
     Reload();
 }

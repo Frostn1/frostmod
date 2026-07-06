@@ -42,6 +42,7 @@ treated as an explicit path to the DLL.
 
 | Flag | Argument | Default | What it does |
 |------|----------|---------|--------------|
+| `--no-update-check` | — | check **on** | Skip the startup check that asks GitHub whether a newer FrostMod release exists. |
 | `--wait <ms>` | milliseconds | `400` | Delay between spotting the game and injecting. Raise it (e.g. `--wait 2000`) if early injection ever destabilizes startup. |
 | `--dump-serverlist` | — | off | Log the raw master server-list blob to `[srvlist] …` lines (for tuning filter rules). |
 | `--probe-mount` | — | off | RE diagnostic only — logs the content-loader's arguments (`[mount] …`). Not needed for normal use. |

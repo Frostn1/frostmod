@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-06
+### Added
+- **Track library manager — step 1: F10 lists your on-disk tracks (active + inactive).** Toward activating/deactivating track `.pkz` files so `mods\tracks` stays lean. The launcher now writes `frostmod_mods.txt` so the DLL knows the mods folder; the DLL derives the inactive-tracks store as `…\MX Bikes\FrostMod Inactive Tracks` (a sibling of `mods`, **outside** the scanned tree so deactivated tracks are never loaded). **F10** recursively scans `mods\tracks\**\*.pkz` (active) and the inactive store (inactive) and logs them (`[trklib] [x]/[ ] …`). Read-only for now — no files are moved yet; next steps are the F10 keyboard overlay with checkboxes, then the move + JSON manifest (toggle many, then reload once).
+
 ## 2026-07-05
 ### Added
 - **Track switcher — step 1: F9 dumps the track list.** Toward an in-game track switcher (pick a track and load it without logging out of localhost), **F9** now reads the game's track array (`RVA_TRACK_LIST`, stride 1220, count at `RVA_TRACK_COUNT`) and logs each entry's folder/name strings + a hex window for the first few, so the entry layout can be pinned. (Server-list dump is no longer on F9; use the console `D` key or `--dump-serverlist`.) Next steps: an F9 overlay list with keyboard nav, then wiring the selected track to the game's load→bike/rider→join flow (RE pending).

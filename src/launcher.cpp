@@ -25,6 +25,7 @@
 //     frostmod.exe --install-startup       (run automatically at login from now on,
 //                                           minimized, and keep running now)
 //     frostmod.exe --uninstall-startup     (stop running at login)
+//     frostmod.exe --no-update-check       (don't check GitHub for a newer version)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
 //     frostmod.exe --process gpbikes.exe   (different game)
 //     frostmod.exe --mods "D:\path\mods"   (override the mods folder)
@@ -41,11 +42,17 @@
 #include <tlhelp32.h>
 #include <shlobj.h>       // SHGetFolderPathA / CSIDL_PERSONAL
 #include <conio.h>        // _kbhit / _getch
+#include <winhttp.h>      // GitHub update check
 #include <cstdio>
 #include <cstring>        // strrchr / strcmp / _stricmp / _strnicmp
 #include <string>
 #include <set>
 #include "version.h"    // FROSTMOD_VERSION
+
+// Where updates come from (public GitHub Releases).
+#define FROSTMOD_UPDATE_HOST L"api.github.com"
+#define FROSTMOD_UPDATE_PATH L"/repos/Frostn1/frostmod/releases/latest"
+#define FROSTMOD_RELEASES_URL "https://github.com/Frostn1/frostmod/releases/latest"
 
 // ---------------------------------------------------------------------------
 // graceful shutdown
@@ -275,6 +282,82 @@ static bool IsStartupInstalled() {
 }
 
 // ---------------------------------------------------------------------------
+// update check: ask the GitHub Releases API for the latest tag and, if it's newer
+// than this build, tell the user. Read-only (no self-modification) - safe.
+// ---------------------------------------------------------------------------
+// HTTPS GET via WinHTTP. Returns the response body, or "" on any failure (offline,
+// rate-limited, TLS error) - the caller treats "" as "no update info, skip".
+static std::string HttpsGet(const wchar_t* host, const wchar_t* path) {
+    std::string out;
+    HINTERNET hSes = WinHttpOpen(L"FrostMod-Updater",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSes) return out;
+    WinHttpSetTimeouts(hSes, 3000, 3000, 4000, 4000);  // don't hang startup on a bad network
+    if (HINTERNET hCon = WinHttpConnect(hSes, host, INTERNET_DEFAULT_HTTPS_PORT, 0)) {
+        if (HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path, nullptr,
+                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)) {
+            const wchar_t* hdrs = L"User-Agent: FrostMod\r\nAccept: application/vnd.github+json\r\n";
+            if (WinHttpSendRequest(hReq, hdrs, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hReq, nullptr)) {
+                for (;;) {
+                    DWORD avail = 0;
+                    if (!WinHttpQueryDataAvailable(hReq, &avail) || avail == 0) break;
+                    std::string chunk(avail, '\0');
+                    DWORD got = 0;
+                    if (!WinHttpReadData(hReq, &chunk[0], avail, &got) || got == 0) break;
+                    out.append(chunk.data(), got);
+                }
+            }
+            WinHttpCloseHandle(hReq);
+        }
+        WinHttpCloseHandle(hCon);
+    }
+    WinHttpCloseHandle(hSes);
+    return out;
+}
+
+// pull the first  "key": "value"  string out of a JSON blob (flat, good enough here).
+static std::string JsonString(const std::string& j, const char* key) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t p = j.find(k);            if (p == std::string::npos) return "";
+    p = j.find(':', p + k.size());   if (p == std::string::npos) return "";
+    p = j.find('"', p);              if (p == std::string::npos) return "";
+    size_t e = j.find('"', p + 1);   if (e == std::string::npos) return "";
+    return j.substr(p + 1, e - p - 1);
+}
+
+// compare dotted versions ("v0.9.3" vs "0.9.2"): >0 if a newer than b.
+static int VersionCompare(const std::string& a, const std::string& b) {
+    auto parse = [](const std::string& s, int v[3]) {
+        v[0] = v[1] = v[2] = 0;
+        const char* p = s.c_str();
+        if (*p == 'v' || *p == 'V') ++p;
+        sscanf_s(p, "%d.%d.%d", &v[0], &v[1], &v[2]);
+    };
+    int x[3], y[3]; parse(a, x); parse(b, y);
+    for (int i = 0; i < 3; ++i) if (x[i] != y[i]) return x[i] - y[i];
+    return 0;
+}
+
+static void CheckForUpdate() {
+    std::string body = HttpsGet(FROSTMOD_UPDATE_HOST, FROSTMOD_UPDATE_PATH);
+    if (body.empty()) return;                        // offline / rate-limited -> silent
+    std::string tag = JsonString(body, "tag_name");
+    if (tag.empty()) return;
+    if (VersionCompare(tag, FROSTMOD_VERSION) > 0) {
+        printf("\n  ============================================================\n");
+        printf("   UPDATE AVAILABLE:  %s   (you have v%s)\n", tag.c_str(), FROSTMOD_VERSION);
+        printf("   Download:  %s\n", FROSTMOD_RELEASES_URL);
+        printf("  ============================================================\n\n");
+    } else {
+        printf("[*] up to date (v%s).\n", FROSTMOD_VERSION);
+    }
+}
+
+// run the check off the main thread so a slow network never delays startup.
+static DWORD WINAPI UpdateCheckThread(LPVOID) { CheckForUpdate(); return 0; }
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetConsoleTitleA("FrostMod");
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -290,6 +373,7 @@ int main(int argc, char** argv) {
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
     bool startupMode      = false; // --startup: launched by the login entry (start minimized)
+    bool checkUpdate      = true;  // check GitHub for a newer release on startup
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -303,6 +387,7 @@ int main(int argc, char** argv) {
         else if (a == "--install-startup")       installStartup = true;
         else if (a == "--uninstall-startup")     uninstallStartup = true;
         else if (a == "--startup")               startupMode = true;
+        else if (a == "--no-update-check")       checkUpdate = false;
         else                                     dllPath = a;
     }
 
@@ -344,6 +429,12 @@ int main(int argc, char** argv) {
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
     printf("[*] log   : %s\n", logPath.c_str());
     printf("=============================================\n");
+
+    // Check GitHub for a newer release (off-thread so it never delays startup).
+    // Disable with --no-update-check. Silent if offline.
+    if (checkUpdate) {
+        if (HANDLE h = CreateThread(nullptr, 0, UpdateCheckThread, nullptr, 0, nullptr)) CloseHandle(h);
+    }
 
     // --probe-mount: leave a flag next to the dll so it hooks the pkz-mount fn and
     // logs its args (experimental RE probe). Remove it otherwise so it's not stale.

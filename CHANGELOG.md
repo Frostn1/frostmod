@@ -1,6 +1,9 @@
 # Changelog
 
 ## 2026-07-06
+### Added
+- **Update check.** On startup `frostmod.exe` asks the GitHub Releases API for the latest tag (off-thread via WinHTTP, so it never delays startup) and, if it's newer than the running build, prints an `UPDATE AVAILABLE: vX.Y.Z` banner with the download link. Read-only and silent when offline/rate-limited; disable with `--no-update-check`. (One-command self-install — `--update` — is the planned follow-up.)
+
 ### Changed
 - **Server-filter config is now YAML (`frostmod_serverfilter.yaml`) and much leaner.** Replaced the comment-heavy `frostmod_serverfilter.txt` with a short YAML file: scalar toggles (`hideUnjoinable`/`hideEmpty`/`hideLocked`/`maxPerIP`) plus two block lists (`names:` and `regex:`). A server is hidden if its name contains any `names` entry or matches any `regex` (case-insensitive). The default ships with just the cheat-ghost rules and a 3-line header instead of ~35 comment lines. The parser is a minimal YAML subset (`key: value` + `- item`), values may be quoted (single-quote regex to keep backslashes literal), and `#` still starts a comment. Config version bumped to v4 → the file auto-writes on first run; an old `.txt` is simply ignored (delete it if you like).
 

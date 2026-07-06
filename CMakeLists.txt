@@ -33,8 +33,9 @@ set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")
 # you trigger a reload (R). The CMake target is named frostmod_app to avoid a
 # clash with the DLL target, but its OUTPUT_NAME makes it build as frostmod.exe.
 add_executable(frostmod_app src/launcher.cpp)
-# shell32: SHGetFolderPath; advapi32: the HKCU Run-key (auto-start); user32: ShowWindow.
-target_link_libraries(frostmod_app PRIVATE shell32 advapi32 user32)
+# shell32: SHGetFolderPath; advapi32: the HKCU Run-key (auto-start); user32: ShowWindow;
+# winhttp: the GitHub update check/download.
+target_link_libraries(frostmod_app PRIVATE shell32 advapi32 user32 winhttp)
 set_target_properties(frostmod_app PROPERTIES OUTPUT_NAME "frostmod")
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

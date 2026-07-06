@@ -100,7 +100,7 @@ on your install — candidates: `…\steamapps\common\MX Bikes\plugins\` or
 - `serverfilter` (`src/serverfilter.{h,cpp}`) is a config-driven rule engine:
   **hide-unjoinable (ping "---", the ghost/ad signal — on by default)**, name
   substring, name regex, `maxPerIP` per refresh, `hideLocked`, `hideEmpty`. Rules
-  live in `frostmod_serverfilter.txt` next to the DLL (written with docs + defaults
+  live in `frostmod_serverfilter.yaml` next to the DLL (written with docs + defaults
   on first run); press `R` to hot-reload.
 - The RE is in `offsets.h`: the browser builds `SB_Entry` working copies
   (stride `0x1D8`; name `+0x00`, players `+0xC8`, maxplayers `+0xCC`, **ping `+0xD8`
@@ -129,7 +129,7 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 | Path | Purpose |
 |------|---------|
 | `<dll folder>\frostmod.log` | activity log (exe and dll share it) |
-| `<dll folder>\frostmod_serverfilter.txt` | filter rules (editable) |
+| `<dll folder>\frostmod_serverfilter.yaml` | filter rules (editable) |
 | `Local\FrostModReload` | named auto-reset event; cross-process reload trigger (`R`) |
 | `Local\FrostModCycle` | named auto-reset event; cross-process cycle-strategy trigger (`S`) |
 

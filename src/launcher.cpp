@@ -365,7 +365,7 @@ int main(int argc, char** argv) {
     if (filterSrv) {
         if (FILE* f = nullptr; fopen_s(&f, filterFlag.c_str(), "w") == 0 && f) fclose(f);
         printf("[*] server filter: ON - hides cheat/ad 'ghost' servers from the online browser\n"
-               "    (edit frostmod_serverfilter.txt to tune; pass --no-filter-servers to turn it off).\n");
+               "    (edit frostmod_serverfilter.yaml to tune; pass --no-filter-servers to turn it off).\n");
     } else {
         printf("[*] server filter: OFF (--no-filter-servers).\n");
         DeleteFileA(filterFlag.c_str());

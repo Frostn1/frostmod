@@ -1,6 +1,9 @@
 # Changelog
 
 ## 2026-07-06
+### Changed
+- **Server-filter config is now YAML (`frostmod_serverfilter.yaml`) and much leaner.** Replaced the comment-heavy `frostmod_serverfilter.txt` with a short YAML file: scalar toggles (`hideUnjoinable`/`hideEmpty`/`hideLocked`/`maxPerIP`) plus two block lists (`names:` and `regex:`). A server is hidden if its name contains any `names` entry or matches any `regex` (case-insensitive). The default ships with just the cheat-ghost rules and a 3-line header instead of ~35 comment lines. The parser is a minimal YAML subset (`key: value` + `- item`), values may be quoted (single-quote regex to keep backslashes literal), and `#` still starts a comment. Config version bumped to v4 → the file auto-writes on first run; an old `.txt` is simply ignored (delete it if you like).
+
 ### Added
 - **Track library manager — step 1: F10 lists your on-disk tracks (active + inactive).** Toward activating/deactivating track `.pkz` files so `mods\tracks` stays lean. The launcher now writes `frostmod_mods.txt` so the DLL knows the mods folder; the DLL derives the inactive-tracks store as `…\MX Bikes\FrostMod Inactive Tracks` (a sibling of `mods`, **outside** the scanned tree so deactivated tracks are never loaded). **F10** recursively scans `mods\tracks\**\*.pkz` (active) and the inactive store (inactive) and logs them (`[trklib] [x]/[ ] …`). Read-only for now — no files are moved yet; next steps are the F10 keyboard overlay with checkboxes, then the move + JSON manifest (toggle many, then reload once).
 

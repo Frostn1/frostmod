@@ -62,59 +62,43 @@ bool starts_with(const std::string& s, const char* p) {
     size_t n = strlen(p);
     return s.size() >= n && _strnicmp(s.c_str(), p, n) == 0;
 }
+// strip one pair of surrounding '...' or "..." quotes (YAML scalar), if present.
+std::string unquote(std::string v) {
+    if (v.size() >= 2 && (v.front() == '\'' || v.front() == '"') && v.back() == v.front())
+        v = v.substr(1, v.size() - 2);
+    return v;
+}
+// drop a trailing " # ..." YAML comment from a scalar value (not from quoted/list text).
+std::string stripComment(const std::string& v) {
+    for (size_t i = 1; i < v.size(); ++i)
+        if (v[i] == '#' && (v[i-1] == ' ' || v[i-1] == '\t')) return trim(v.substr(0, i));
+    return v;
+}
+bool truthy(const std::string& v) {
+    std::string t = lower(stripComment(v));
+    return t == "true" || t == "1" || t == "yes" || t == "on";
+}
 
 // Bump this when the shipped defaults change; the loader auto-rewrites an older
 // file (backing the old one up to .bak) so new rules land without a manual delete.
-constexpr const char* kConfigVersion = "# frostmod-filter v3";
+constexpr const char* kConfigVersion = "# frostmod-filter v4";
 
+// YAML. A server is hidden if its name contains any 'names' entry OR matches any
+// 'regex' (both case-insensitive). Kept short on purpose.
 const char* kDefaultConfig =
-    "# frostmod-filter v3\n"
-    "# FrostMod - server browser spam filter (client-side, your view only).\n"
-    "# Hide junk / ad \"ghost\" servers from the MX Bikes list.\n"
-    "# One rule per line; '#' starts a comment; matching is case-insensitive.\n"
-    "# (Edit freely. On a version bump this file is backed up to .bak and rewritten.)\n"
-    "#\n"
-    "#   name: <text>      hide a server whose NAME contains <text>\n"
-    "#   regex: <pattern>  hide a server whose NAME matches this ECMAScript regex\n"
-    "#   maxPerIP: <n>     hide servers past <n> from the same IP per refresh (0=off)\n"
-    "#   hideLocked: 0|1   hide password-locked servers\n"
-    "#   hideEmpty: 0|1    hide servers with 0 CURRENT players (many legit servers are\n"
-    "#                     just empty right now, so leave this OFF unless you want that)\n"
-    "#   hideUnjoinable: 0|1  hide servers whose ping shows '---'. NOTE: the browser shows\n"
-    "#                     '---' for EVERY server until pings resolve, so at list-build\n"
-    "#                     time this hides ALL of them. Keep it OFF - filter by name.\n"
-    "#\n"
-    "# --- DEFAULT SCOPE: cheat-shop 'ghost' ads only (what you asked to hide). ---\n"
-    "# The kaizo spam floods the list with dozens of unjoinable copies of e.g.\n"
-    "#   'BUY CHE4TS 4TH JULY 50% OFF WWW.KAlZ0.PR0'\n"
-    "# and leetspeaks the name (KAlZ0.PR0) to dodge a literal match, so match the\n"
-    "# variants with a regex; the plain names are a readable backstop.\n"
-    "hideUnjoinable: 0\n"
-    "hideEmpty: 0\n"
-    "hideLocked: 0\n"
-    "maxPerIP: 0\n"
-    "regex: (che[a4]ts|k[a4][il1]z[o0]|\\.pr0\\b)\n"
-    "name: che4ts\n"
-    "name: kaizo\n"
-    "name: kalz0\n"
-    "#\n"
-    "# --- OPTIONAL extra categories (OFF by default; uncomment to also hide). ---\n"
-    "# hosting / server-rental adverts (keep 'cbrhosting.com' PRECISE - it is NOT the\n"
-    "# legit 'CBRSERVERS.COM' race servers):\n"
-    "# name: cbrhosting.com\n"
-    "# name: mymxb\n"
-    "# name: cheap dedi\n"
-    "# name: server hosting\n"
-    "# name: dedicated servers\n"
-    "# name: rent your server\n"
-    "# discord / URL self-promo (also catches the kaizo 'WWW.' ads as a backstop):\n"
-    "# regex: (https?://|www\\.|discord(\\.gg)?|t\\.me/|\\.gg/|telegram|join us)\n"
-    "# streamer / social self-promo:\n"
-    "# name: on tiktok\n"
-    "# name: live on tiktok\n"
-    "# Add your own below - one per line, case-insensitive:\n"
-    "# name: free vbucks\n"
-    "# name: gtxgaming\n";
+    "# frostmod-filter v4\n"
+    "# FrostMod server filter - hide spam/ad servers from the online browser.\n"
+    "# Hidden if the name contains any 'names' entry or matches any 'regex'.\n"
+    "hideUnjoinable: false   # ping '---' - unreliable at list time, keep off\n"
+    "hideEmpty: false        # hide 0-player servers (many legit ones are just empty)\n"
+    "hideLocked: false       # hide password-locked servers\n"
+    "maxPerIP: 0             # 0 = off; else hide servers past N from one IP per refresh\n"
+    "names:                  # case-insensitive substrings\n"
+    "  - che4ts\n"
+    "  - kaizo\n"
+    "  - kalz0\n"
+    "regex:                  # ECMAScript regex; single-quote to keep backslashes literal\n"
+    "  - '(che[a4]ts|k[a4][il1]z[o0]|\\.pr0\\b)'\n";
 
 // True if the on-disk file's first line is the current version sentinel.
 bool configIsCurrent() {
@@ -144,39 +128,57 @@ void ensureConfig() {
     }
 }
 
+// Minimal YAML: `key: value` scalars, and `key:` followed by `  - item` block lists
+// for `names` / `regex`. '#' starts a comment; matching is case-insensitive.
 void parseInto(Rules& r) {
     FILE* f = nullptr;
     if (fopen_s(&f, g_path.c_str(), "r") != 0 || !f) {
         logf("[filter] could not open %s; no rules loaded.", g_path.c_str());
         return;
     }
+    enum { L_NONE, L_NAMES, L_REGEX } curList = L_NONE;
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
         std::string s = trim(line);
         if (s.empty() || s[0] == '#') continue;
 
-        if (starts_with(s, "name:")) {
-            std::string v = lower(trim(s.substr(5)));
-            if (!v.empty()) r.nameContains.push_back(v);
-        } else if (starts_with(s, "regex:")) {
-            std::string v = trim(s.substr(6));
+        if (s[0] == '-') {                                   // list item under names/regex
+            std::string v = unquote(trim(s.substr(1)));
             if (v.empty()) continue;
-            try {
-                r.regexes.emplace_back(v, std::regex::ECMAScript | std::regex::icase);
-                r.regexSrc.push_back(v);
-            } catch (const std::exception& e) {
-                logf("[filter] bad regex '%s' skipped (%s)", v.c_str(), e.what());
+            if (curList == L_NAMES) {
+                r.nameContains.push_back(lower(v));
+            } else if (curList == L_REGEX) {
+                try {
+                    r.regexes.emplace_back(v, std::regex::ECMAScript | std::regex::icase);
+                    r.regexSrc.push_back(v);
+                } catch (const std::exception& e) {
+                    logf("[filter] bad regex '%s' skipped (%s)", v.c_str(), e.what());
+                }
+            } else {
+                logf("[filter] '- %s' with no list key above it; ignored.", v.c_str());
             }
-        } else if (starts_with(s, "maxperip:")) {
-            r.maxPerIP = atoi(trim(s.substr(9)).c_str());
-        } else if (starts_with(s, "hidelocked:")) {
-            r.hideLocked = atoi(trim(s.substr(11)).c_str()) != 0;
-        } else if (starts_with(s, "hideempty:")) {
-            r.hideEmpty = atoi(trim(s.substr(10)).c_str()) != 0;
-        } else if (starts_with(s, "hideunjoinable:")) {
-            r.hideUnjoinable = atoi(trim(s.substr(15)).c_str()) != 0;
-        } else {
-            logf("[filter] ignoring unrecognized rule: %s", s.c_str());
+            continue;
+        }
+
+        size_t colon = s.find(':');
+        if (colon == std::string::npos) { logf("[filter] ignoring line: %s", s.c_str()); continue; }
+        std::string key = lower(trim(s.substr(0, colon)));
+        std::string val = trim(s.substr(colon + 1));
+        curList = L_NONE;
+        if      (key == "names")          curList = L_NAMES;
+        else if (key == "regex" || key == "regexes") curList = L_REGEX;
+        else if (key == "hideunjoinable") r.hideUnjoinable = truthy(val);
+        else if (key == "hideempty")      r.hideEmpty      = truthy(val);
+        else if (key == "hidelocked")     r.hideLocked     = truthy(val);
+        else if (key == "maxperip")       r.maxPerIP       = atoi(stripComment(val).c_str());
+        // Allow an inline scalar too (e.g. `names: foo`) for convenience.
+        else logf("[filter] ignoring unknown key: %s", key.c_str());
+
+        if ((curList == L_NAMES || curList == L_REGEX) && !val.empty() && val[0] != '#') {
+            std::string v = unquote(val);
+            if (curList == L_NAMES) r.nameContains.push_back(lower(v));
+            else { try { r.regexes.emplace_back(v, std::regex::ECMAScript | std::regex::icase);
+                         r.regexSrc.push_back(v); } catch (...) {} }
         }
     }
     fclose(f);

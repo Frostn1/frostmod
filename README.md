@@ -32,7 +32,7 @@ stays open as a console - listing the mods it finds and streaming its log.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
   console or **`F8`** in-game.
-- **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.txt`
+- **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.
 - **Quit** - `Q` or Ctrl+C.

@@ -1257,21 +1257,21 @@ DWORD WINAPI Init(LPVOID) {
         }
     }
 
-    // Server-browser spam filter: load rules from <dll folder>\frostmod_serverfilter.txt
+    // Server-browser spam filter: load rules from <dll folder>\frostmod_serverfilter.yaml
     // (created with docs on first run). The actual hook that feeds entries in is
     // wired once the server-list function is RE'd - see the SERVER FILTER block above.
     {
         std::string cfg = g_logPath;
         if (size_t s = cfg.find_last_of("\\/"); s != std::string::npos)
-            cfg = cfg.substr(0, s + 1) + "frostmod_serverfilter.txt";
+            cfg = cfg.substr(0, s + 1) + "frostmod_serverfilter.yaml";
         else
-            cfg = "frostmod_serverfilter.txt";
+            cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
         // is created. Mid-function hook, so gated behind a flag. Scope is cheat/ad ghosts
-        // by default (serverfilter config v3); see SB_SuppressRow.
+        // by default (serverfilter config v4, YAML); see SB_SuppressRow.
         char fflag[MAX_PATH] = {0};
         if (g_logPath[0]) {
             strcpy_s(fflag, g_logPath);

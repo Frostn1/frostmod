@@ -8,7 +8,7 @@
 //  view only. The actual hook that feeds entries in lives in frostmod.cpp and is
 //  wired up once the server-list function is reverse-engineered (see offsets.h).
 //
-//  Rules come from frostmod_serverfilter.txt (created with docs on first run).
+//  Rules come from frostmod_serverfilter.yaml (created with docs on first run).
 // ============================================================================
 #pragma once
 #include <string>

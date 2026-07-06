@@ -75,26 +75,32 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 | File | Purpose |
 |------|---------|
 | `frostmod.log` | The live log, streamed into the console. Falls back to `%TEMP%\frostmod.log` if that folder is read-only. |
-| `frostmod_serverfilter.txt` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
+| `frostmod_serverfilter.yaml` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
 | `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
 
-### Server-filter rules (`frostmod_serverfilter.txt`)
+### Server-filter rules (`frostmod_serverfilter.yaml`)
 
-One rule per line; `#` starts a comment; matching is case-insensitive.
+A small YAML file. A server is hidden if its name **contains any `names` entry** or
+**matches any `regex`** (both case-insensitive). Edit and reload (`R`) to apply.
 
-| Rule | Meaning |
-|------|---------|
-| `name: <text>` | Hide a server whose name contains `<text>`. |
-| `regex: <pattern>` | Hide a server whose name matches this ECMAScript regex. |
-| `maxPerIP: <n>` | Hide servers past `<n>` from the same IP per refresh (`0` = off). |
-| `hideLocked: 0\|1` | Hide password-locked servers. |
-| `hideEmpty: 0\|1` | Hide servers with 0 current players. |
-| `hideUnjoinable: 0\|1` | Hide servers whose ping shows `---`. Leave **off** — at list-build time the browser shows `---` for *every* server, so this would hide them all. |
+```yaml
+hideUnjoinable: false   # ping '---' - unreliable at list time, keep off
+hideEmpty: false        # hide 0-player servers
+hideLocked: false       # hide password-locked servers
+maxPerIP: 0             # 0 = off; else hide servers past N from one IP per refresh
+names:                  # case-insensitive substrings
+  - che4ts
+  - kaizo
+regex:                  # ECMAScript; single-quote to keep backslashes literal
+  - '(che[a4]ts|k[a4][il1]z[o0]|\.pr0\b)'
+```
 
-The shipped defaults target cheat/ad "ghost" spam only (so legit servers stay);
-extra categories (hosting ads, Discord/URL self-promo, etc.) ship commented-out —
-uncomment to also hide them. Every server is logged as `[srv] … HIDE` (hidden) or
-`keep` (shown) so you can see exactly what the rules did.
+The shipped defaults target cheat/ad "ghost" spam only (so legit servers stay) — add
+your own `names`/`regex` entries to hide more (hosting ads, Discord/URL self-promo, …).
+Every server is logged as `[srv] … HIDE` (hidden) or `keep` (shown) so you can see
+exactly what the rules did. `hideUnjoinable` shows `---` for *every* server at
+list-build time, so leaving it off is correct. The file is versioned: when the shipped
+defaults change it's rewritten and your old copy is kept as `.bak`.
 
 ## Run as a plugin instead
 

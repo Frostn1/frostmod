@@ -385,6 +385,15 @@ int main(int argc, char** argv) {
                IsStartupInstalled() ? "ON - runs at login" : "off");
     }
 
+    // Tell the DLL where the mods folder is (it can't reliably know on its own), so
+    // the in-game track library (F10) can find mods\tracks + the inactive-tracks store.
+    if (!modsPath.empty()) {
+        std::string modsInfo = ExeDir() + "frostmod_mods.txt";
+        if (FILE* f = nullptr; fopen_s(&f, modsInfo.c_str(), "w") == 0 && f) {
+            fputs(modsPath.c_str(), f); fclose(f);
+        }
+    }
+
     // cross-process triggers (the DLL watches these named events).
     HANDLE reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     HANDLE dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");

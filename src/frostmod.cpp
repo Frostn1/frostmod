@@ -65,6 +65,8 @@ char g_logPath[MAX_PATH] = {0};
 std::atomic<bool> g_initStarted{false};
 HMODULE g_selfModule = nullptr;
 char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin mode)
+char    g_modsPath[MAX_PATH] = {0};   // mods folder (from frostmod_mods.txt the launcher writes)
+char    g_inactivePath[MAX_PATH] = {0}; // <MX Bikes>\FrostMod Inactive Tracks (deactivated .pkz store)
 
 // Resolve the log path once, from the dll's own module handle (its folder is the
 // same folder as frostmod.exe). Called from DllMain before anything else logs.
@@ -456,6 +458,52 @@ void DumpTrackList() {
     }
     if (count > shown) Log("[tracks] (+%d more not shown)", count - shown);
     Log("[tracks] ===== end (F9) =====");
+}
+
+// ---------------------------------------------------------------------------
+// TRACK LIBRARY (F10) - activate/deactivate track .pkz files on disk so the mods
+// folder stays lean. Active = under <mods>\tracks\**; inactive = moved out to
+// <MX Bikes>\FrostMod Inactive Tracks (outside the scanned tree, so the game never
+// loads them). Phase A: read-only - just find + list them (no files touched yet).
+// ---------------------------------------------------------------------------
+// Collect *.pkz under `root`, returning paths RELATIVE to root (e.g. "motocross\X.pkz").
+static void FindPkzRecursive(const std::string& root, const std::string& rel,
+                             std::vector<std::string>& out) {
+    std::string dir = rel.empty() ? root : (root + "\\" + rel);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.') continue;            // "." / ".."
+        std::string childRel = rel.empty() ? fd.cFileName : (rel + "\\" + fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            FindPkzRecursive(root, childRel, out);
+        } else {
+            size_t L = strlen(fd.cFileName);
+            if (L > 4 && _stricmp(fd.cFileName + L - 4, ".pkz") == 0) out.push_back(childRel);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+void DumpTrackLibrary() {
+    if (!g_modsPath[0]) {
+        Log("[trklib] mods path unknown - run frostmod.exe so it writes frostmod_mods.txt.");
+        return;
+    }
+    std::string tracksRoot = std::string(g_modsPath) + "\\tracks";
+    std::vector<std::string> active, inactive;
+    FindPkzRecursive(tracksRoot, "", active);
+    if (g_inactivePath[0]) FindPkzRecursive(g_inactivePath, "", inactive);
+
+    Log("[trklib] ===== track library (F10) =====");
+    Log("[trklib] mods     = %s", g_modsPath);
+    Log("[trklib] inactive = %s", g_inactivePath);
+    Log("[trklib] ACTIVE (%zu):", active.size());
+    for (auto& r : active)   Log("[trklib]   [x] %s", r.c_str());
+    Log("[trklib] INACTIVE (%zu):", inactive.size());
+    for (auto& r : inactive) Log("[trklib]   [ ] %s", r.c_str());
+    Log("[trklib] ===== end (F10) =====");
 }
 
 static int  g_sbRow = 0;           // running row index within the current populate pass
@@ -863,8 +911,8 @@ void Tick() {
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
     // In-game hotkeys (work in fullscreen): F8 = reload, F7 = toggle the overlay,
-    // F9 = dump the server list right now (handy while the browser is on screen).
-    static bool prevF8 = false, prevF7 = false, prevF9 = false;
+    // F9 = dump the game's track list, F10 = dump the on-disk track library.
+    static bool prevF8 = false, prevF7 = false, prevF9 = false, prevF10 = false;
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) RequestReload();
     prevF8 = f8;
@@ -874,6 +922,9 @@ void Tick() {
     bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (f9 && !prevF9) { Log("[tracks] F9 pressed - dumping track list"); DumpTrackList(); }
     prevF9 = f9;
+    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10 && !prevF10) { Log("[trklib] F10 pressed - scanning track library"); DumpTrackLibrary(); }
+    prevF10 = f10;
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
     // just opening the online browser captures it, no key press / console focus.
@@ -1173,6 +1224,36 @@ DWORD WINAPI Init(LPVOID) {
             }
             if (target) InstallHook((void*)target, &hkMpMsg, (void**)&g_origMpMsg, "masterMsg(0x2A10E0)");
             else        Log("[srvlist] master handler signature not found; not hooking.");
+        }
+    }
+
+    // Track library (F10): learn the mods folder from frostmod_mods.txt (the launcher
+    // writes it next to us) and derive the inactive-tracks store as a sibling of mods,
+    // OUTSIDE the scanned tree so deactivated tracks are never loaded.
+    {
+        char info[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(info, g_logPath);
+            if (char* s = strrchr(info, '\\')) { *(s + 1) = 0; strcat_s(info, "frostmod_mods.txt"); }
+        }
+        if (info[0]) {
+            if (FILE* f; fopen_s(&f, info, "r") == 0 && f) {
+                if (fgets(g_modsPath, sizeof(g_modsPath), f)) {
+                    size_t L = strlen(g_modsPath);
+                    while (L && (g_modsPath[L-1] == '\n' || g_modsPath[L-1] == '\r' ||
+                                 g_modsPath[L-1] == ' '  || g_modsPath[L-1] == '\t')) g_modsPath[--L] = 0;
+                }
+                fclose(f);
+            }
+        }
+        if (g_modsPath[0]) {
+            strcpy_s(g_inactivePath, g_modsPath);
+            if (char* s = strrchr(g_inactivePath, '\\')) *s = 0;   // strip trailing "\mods"
+            strcat_s(g_inactivePath, "\\FrostMod Inactive Tracks");
+            Log("[trklib] mods=%s", g_modsPath);
+            Log("[trklib] inactive store=%s (press F10 to list the track library)", g_inactivePath);
+        } else {
+            Log("[trklib] mods path unknown yet (run frostmod.exe so it writes frostmod_mods.txt).");
         }
     }
 

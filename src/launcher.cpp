@@ -24,6 +24,7 @@
 //                                           mxbikes.exe, loads .\frostmod.dll.)
 //     frostmod.exe --install-startup       (run automatically at login from now on,
 //                                           minimized, and keep running now)
+//     frostmod.exe --update                (download + install the latest release)
 //     frostmod.exe --uninstall-startup     (stop running at login)
 //     frostmod.exe --no-update-check       (don't check GitHub for a newer version)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
@@ -43,6 +44,7 @@
 #include <shlobj.h>       // SHGetFolderPathA / CSIDL_PERSONAL
 #include <conio.h>        // _kbhit / _getch
 #include <winhttp.h>      // GitHub update check
+#include <shellapi.h>     // ShellExecuteA (relaunch after --update)
 #include <cstdio>
 #include <cstring>        // strrchr / strcmp / _stricmp / _strnicmp
 #include <string>
@@ -358,6 +360,132 @@ static void CheckForUpdate() {
 static DWORD WINAPI UpdateCheckThread(LPVOID) { CheckForUpdate(); return 0; }
 
 // ---------------------------------------------------------------------------
+// --update : download the latest release's frostmod.exe + frostmod.dll and swap
+// them in. The DLL is locked while the game runs, so we require it closed; the
+// running exe is replaced with the rename-self trick, then FrostMod relaunches.
+// ---------------------------------------------------------------------------
+// browser_download_url of the asset named `fileName` in the release JSON.
+static std::string FindAssetUrl(const std::string& j, const char* fileName) {
+    std::string q = std::string("\"") + fileName + "\"";
+    size_t p = j.find(q);                          if (p == std::string::npos) return "";
+    size_t u = j.find("\"browser_download_url\"", p); if (u == std::string::npos) return "";
+    size_t c = j.find(':', u);                     if (c == std::string::npos) return "";
+    size_t s = j.find('"', c);                     if (s == std::string::npos) return "";
+    size_t e = j.find('"', s + 1);                 if (e == std::string::npos) return "";
+    return j.substr(s + 1, e - s - 1);
+}
+
+// Download `url` (HTTPS, follows redirects - GitHub asset URLs 302 to a CDN) to a
+// file. Returns true only if it wrote a non-empty file with HTTP 200.
+static bool DownloadToFile(const std::string& url, const std::string& outPath) {
+    wchar_t wurl[2048] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, wurl, 2047);
+    URL_COMPONENTS uc; ZeroMemory(&uc, sizeof(uc)); uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {0}, path[1600] = {0};
+    uc.lpszHostName = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 1599;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return false;
+
+    bool ok = false;
+    HINTERNET hSes = WinHttpOpen(L"FrostMod-Updater", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (hSes) {
+        WinHttpSetTimeouts(hSes, 5000, 5000, 30000, 30000);
+        if (HINTERNET hCon = WinHttpConnect(hSes, host, uc.nPort, 0)) {
+            DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+            if (HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path, nullptr,
+                    WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags)) {
+                const wchar_t* ua = L"User-Agent: FrostMod\r\n";
+                if (WinHttpSendRequest(hReq, ua, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                    WinHttpReceiveResponse(hReq, nullptr)) {
+                    DWORD status = 0, sz = sizeof(status);
+                    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+                    if (status == 200) {
+                        FILE* f = nullptr;
+                        if (fopen_s(&f, outPath.c_str(), "wb") == 0 && f) {
+                            size_t total = 0;
+                            for (;;) {
+                                DWORD avail = 0;
+                                if (!WinHttpQueryDataAvailable(hReq, &avail) || avail == 0) break;
+                                std::string buf(avail, '\0'); DWORD got = 0;
+                                if (!WinHttpReadData(hReq, &buf[0], avail, &got) || got == 0) break;
+                                fwrite(buf.data(), 1, got, f); total += got;
+                            }
+                            fclose(f);
+                            ok = total > 0;
+                        }
+                    }
+                }
+                WinHttpCloseHandle(hReq);
+            }
+            WinHttpCloseHandle(hCon);
+        }
+        WinHttpCloseHandle(hSes);
+    }
+    if (!ok) DeleteFileA(outPath.c_str());
+    return ok;
+}
+
+static int DoUpdate() {
+    printf("[*] checking for the latest release...\n");
+    std::string body = HttpsGet(FROSTMOD_UPDATE_HOST, FROSTMOD_UPDATE_PATH);
+    if (body.empty()) { printf("[!] couldn't reach GitHub (offline?). Try again later.\n"); return 1; }
+    std::string tag = JsonString(body, "tag_name");
+    if (tag.empty()) { printf("[!] no release found on GitHub.\n"); return 1; }
+    if (VersionCompare(tag, FROSTMOD_VERSION) <= 0) {
+        printf("[+] already up to date (v%s is the latest).\n", FROSTMOD_VERSION);
+        return 0;
+    }
+    printf("[*] updating v%s -> %s\n", FROSTMOD_VERSION, tag.c_str());
+
+    // the DLL is loaded (and locked) while MX Bikes runs, so it must be closed.
+    if (FindProcess("mxbikes.exe")) {
+        printf("[!] MX Bikes is running - close it, then run  frostmod.exe --update  again.\n");
+        return 1;
+    }
+
+    std::string exeUrl = FindAssetUrl(body, "frostmod.exe");
+    std::string dllUrl = FindAssetUrl(body, "frostmod.dll");
+    if (exeUrl.empty() || dllUrl.empty()) {
+        printf("[!] release %s is missing the frostmod.exe/.dll assets. Grab it here:\n    %s\n",
+               tag.c_str(), FROSTMOD_RELEASES_URL);
+        return 1;
+    }
+
+    const std::string dir    = ExeDir();
+    const std::string exeNew = dir + "frostmod.exe.new";
+    const std::string dllNew = dir + "frostmod.dll.new";
+    printf("[*] downloading frostmod.dll ...\n");
+    if (!DownloadToFile(dllUrl, dllNew)) { printf("[!] dll download failed.\n"); return 1; }
+    printf("[*] downloading frostmod.exe ...\n");
+    if (!DownloadToFile(exeUrl, exeNew)) { printf("[!] exe download failed.\n"); DeleteFileA(dllNew.c_str()); return 1; }
+
+    // Both are downloaded + verified non-empty. Swap: dll first, then the running exe.
+    const std::string dll = dir + "frostmod.dll";
+    if (!MoveFileExA(dllNew.c_str(), dll.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        printf("[!] couldn't replace frostmod.dll (err %lu). Nothing changed. Manual: %s\n",
+               GetLastError(), FROSTMOD_RELEASES_URL);
+        DeleteFileA(exeNew.c_str()); DeleteFileA(dllNew.c_str());
+        return 1;
+    }
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, self, sizeof(self));
+    std::string old = std::string(self) + ".old";
+    DeleteFileA(old.c_str());
+    if (!MoveFileA(self, old.c_str()) ||
+        !MoveFileExA(exeNew.c_str(), self, MOVEFILE_REPLACE_EXISTING)) {
+        printf("[!] dll updated but the exe swap failed (err %lu). Get the new exe from:\n    %s\n",
+               GetLastError(), FROSTMOD_RELEASES_URL);
+        return 1;
+    }
+
+    printf("[+] updated to %s. Relaunching FrostMod...\n", tag.c_str());
+    ShellExecuteA(nullptr, "open", self, nullptr, dir.c_str(), SW_SHOWNORMAL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetConsoleTitleA("FrostMod");
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -374,6 +502,7 @@ int main(int argc, char** argv) {
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
     bool startupMode      = false; // --startup: launched by the login entry (start minimized)
     bool checkUpdate      = true;  // check GitHub for a newer release on startup
+    bool doUpdate         = false; // --update: download + install the latest release
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -388,8 +517,18 @@ int main(int argc, char** argv) {
         else if (a == "--uninstall-startup")     uninstallStartup = true;
         else if (a == "--startup")               startupMode = true;
         else if (a == "--no-update-check")       checkUpdate = false;
+        else if (a == "--update")                doUpdate = true;
         else                                     dllPath = a;
     }
+
+    // Clean up leftovers from a previous self-update (a running exe can't delete
+    // itself, so the freshly-launched copy clears the old one here). Best-effort.
+    DeleteFileA((ExeDir() + "frostmod.exe.old").c_str());
+    DeleteFileA((ExeDir() + "frostmod.exe.new").c_str());
+    DeleteFileA((ExeDir() + "frostmod.dll.new").c_str());
+
+    // --update is a one-shot: download + install the latest release, then exit.
+    if (doUpdate) return DoUpdate();
 
     // --uninstall-startup is a one-shot: remove the login entry and exit.
     if (uninstallStartup) {

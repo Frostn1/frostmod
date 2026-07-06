@@ -417,6 +417,47 @@ static void LogHexWindow(const char* buf, size_t len) {
     }
 }
 
+// Log every printable-ASCII run (>=3 chars) with its offset - to locate string
+// fields (folder/name) inside an unknown struct at runtime.
+static void LogPrintableRuns(const char* tag, const char* buf, size_t len) {
+    for (size_t i = 0; i < len; ) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c >= 0x20 && c < 0x7F) {
+            char run[160]; size_t k = 0, j = i;
+            while (j < len && (unsigned char)buf[j] >= 0x20 && (unsigned char)buf[j] < 0x7F
+                   && k < sizeof(run) - 1) run[k++] = buf[j++];
+            run[k] = 0;
+            if (k >= 3) Log("%s +0x%03zX '%s'", tag, i, run);
+            i = j;
+        } else ++i;
+    }
+}
+
+// F9 (phase 1): read the game's track array (RVA_TRACK_LIST, stride TRACK_STRIDE,
+// count at RVA_TRACK_COUNT) and log each entry's printable strings + a hex window for
+// the first few. This confirms we can read the list and pins the folder/name offsets,
+// so the next step is an in-game keyboard-driven track switcher.
+void DumpTrackList() {
+    int count = SafeReadInt((const int*)(g_base + mxb::RVA_TRACK_COUNT));
+    Log("[tracks] ===== track list (count=%d, stride=%d) =====", count, mxb::TRACK_STRIDE);
+    if (count <= 0 || count > 100000) {
+        Log("[tracks] count looks wrong - the array/count offset may not fit this build.");
+        return;
+    }
+    const uintptr_t base = g_base + mxb::RVA_TRACK_LIST;
+    const int shown = count < 60 ? count : 60;
+    for (int i = 0; i < shown; ++i) {
+        char raw[0x140];
+        size_t n = SafeReadBytes((const char*)(base + (size_t)i * mxb::TRACK_STRIDE),
+                                 raw, sizeof(raw));
+        char tag[24]; sprintf_s(tag, "[tracks] #%03d", i);
+        LogPrintableRuns(tag, raw, n);
+        if (i < 3) LogHexWindow(raw, n);   // hex for the first few to pin field offsets
+    }
+    if (count > shown) Log("[tracks] (+%d more not shown)", count - shown);
+    Log("[tracks] ===== end (F9) =====");
+}
+
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
 // When true, matching rows are actually skipped (hidden) via the game's own row-skip
@@ -831,7 +872,7 @@ void Tick() {
     if (f7 && !prevF7) { bool on = !g_overlayOn.load(); g_overlayOn.store(on); Log("[overlay] %s", on ? "shown" : "hidden"); }
     prevF7 = f7;
     bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (f9 && !prevF9) { Log("[srvlist] manual dump (F9)"); DumpServerListBlob(true); }
+    if (f9 && !prevF9) { Log("[tracks] F9 pressed - dumping track list"); DumpTrackList(); }
     prevF9 = f9;
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so

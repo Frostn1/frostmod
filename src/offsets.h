@@ -48,6 +48,10 @@ constexpr uintptr_t RVA_REG_COUNT      = 0x396754;  // int32 count
 constexpr uintptr_t RVA_TRACK_LOADER  = 0x000000;  // TODO: xref writer of 0x140f43298
 constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count
 constexpr uintptr_t RVA_TRACK_LIST    = 0x1109de98;// track array (stride 1220)
+constexpr int       TRACK_STRIDE      = 1220;      // 0x4C4 bytes per track entry
+// Track entry field offsets (folder name / display name) - TBD from the F9 [tracks]
+// dump + RE. Filled in once the entry layout is confirmed at runtime.
+constexpr int TRK_FOLDER = -1, TRK_NAME = -1;      // -1 = not yet pinned
 
 // AOB signature for the scanner prologue (fallback if RVA drifts across updates).
 // 40 53 56 57 41 54 41 55 41 56 48 81 EC F8 07 00 00 48 8B 05 ?? ?? ?? ??

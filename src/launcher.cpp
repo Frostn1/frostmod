@@ -497,6 +497,7 @@ int main(int argc, char** argv) {
                              // small = catch the startup scan. Override with --wait.
     bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
+    bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
@@ -511,6 +512,7 @@ int main(int argc, char** argv) {
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else if (a == "--probe-mount")           probeMount = true;
         else if (a == "--dump-serverlist")       dumpList = true;
+        else if (a == "--switch-live")           switchLive = true;
         else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
         else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
         else if (a == "--install-startup")       installStartup = true;
@@ -590,6 +592,14 @@ int main(int argc, char** argv) {
         printf("[*] --dump-serverlist ON: DLL will dump the master server-list blob ([srvlist]).\n");
     } else {
         DeleteFileA(dumpFlag.c_str());
+    }
+    std::string switchFlag = ExeDir() + "frostmod_trackswitch.flag";
+    if (switchLive) {
+        if (FILE* f = nullptr; fopen_s(&f, switchFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --switch-live ON: track switcher (F8>3) will REALLY load the picked track.\n"
+               "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n");
+    } else {
+        DeleteFileA(switchFlag.c_str());
     }
     std::string filterFlag = ExeDir() + "frostmod_filter.flag";
     if (filterSrv) {

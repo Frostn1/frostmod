@@ -630,9 +630,16 @@ static void SB_CallLoadEnter() {
     __except (EXCEPTION_EXECUTE_HANDLER) { Log("[switch] load+enter FAULTED - caught (state may be wrong)."); }
 }
 
-// Switch the localhost map to the track at `idx` in the game's array. Logs the fields
-// it uses (so +0x33C can be verified), writes the name config, and queues the heavy
-// load+enter on the game thread (like the reload). SEH-guarded throughout.
+// Live switch is OFF unless frostmod_trackswitch.flag exists (set by --switch-live).
+// fcn.1400BB510 manipulates the testing-menu widgets, so calling it MID-RIDE crashes
+// (the fault can also land a frame later, past our SEH). Default: read + log only, so
+// F8>3>Enter is always safe; arm the flag to test the real switch FROM THE TESTING
+// MENU (where those widgets exist).
+bool g_swLiveLoad = false;
+
+// Switch the localhost map to the track at `idx`. Always logs the fields it would use
+// (so +0x33C can be verified safely); only writes the config + calls the loader when
+// the live-load flag is armed.
 void LoadTrackByIndex(int idx) {
     uintptr_t arr = 0;
     SafeReadBytes((const char*)(g_base + mxb::RVA_TRACK_LIST), (char*)&arr, sizeof(arr));
@@ -645,8 +652,14 @@ void LoadTrackByIndex(int idx) {
     SafeCopyStr(entry + mxb::TRK_RESOLVER_NAME, resolver, sizeof(resolver));
     Log("[switch] request #%d: folder='%s' disp='%s' resolver@0x33C='%s'", idx, folder, disp, resolver);
 
+    if (!g_swLiveLoad) {
+        Log("[switch] live load DISABLED (safe). fcn.1400BB510 crashes mid-ride - it needs the "
+            "testing-menu state. Arm with 'frostmod.exe --switch-live' and try FROM THE TESTING MENU.");
+        SetStatus("switch preview only (see log; --switch-live to arm)", 6000);
+        return;
+    }
     if (!SB_WriteSessionCfg(entry)) { Log("[switch] couldn't write session config."); return; }
-    Log("[switch] cfg set (+0x00='%s', +0x20='%s'); queuing load+enter on the game thread...",
+    Log("[switch] LIVE: cfg set (+0x00='%s', +0x20='%s'); queuing load+enter on the game thread...",
         folder, resolver);
     EnqueueGameThreadTask([] {
         Log("[switch] -> fcn.1400BB510 (load+enter)...");
@@ -1654,6 +1667,20 @@ DWORD WINAPI Init(LPVOID) {
         else
             Log("[filter] rules loaded (inert). Run frostmod.exe --filter-servers to "
                 "install the read-only dump hook and preview the server list ([srv]).");
+    }
+
+    // Track switcher live-load: opt-in via frostmod_trackswitch.flag (--switch-live),
+    // because calling fcn.1400BB510 outside the testing menu crashes. Default off ->
+    // the switcher is a safe field preview.
+    {
+        char sflag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(sflag, g_logPath);
+            if (char* s = strrchr(sflag, '\\')) { *(s + 1) = 0; strcat_s(sflag, "frostmod_trackswitch.flag"); }
+        }
+        g_swLiveLoad = sflag[0] && GetFileAttributesA(sflag) != INVALID_FILE_ATTRIBUTES;
+        Log("[switch] live load %s.", g_swLiveLoad ? "ARMED (--switch-live) - try from the testing menu"
+                                                   : "off (safe preview) - arm with --switch-live");
     }
 
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "

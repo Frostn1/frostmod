@@ -54,7 +54,22 @@ constexpr uintptr_t RVA_TRACK_LIST    = 0x109de98; // qword: pointer to track ar
 constexpr int       TRACK_STRIDE      = 1220;      // 0x4C4 bytes per track entry
 // Track entry field offsets, confirmed from the F9 [tracks] dump (all 85 entries):
 //   +0x00 folder/id, +0x20 DISPLAY name, +0x60 short name, +0xB0 preview image.
+// +0x33C is the "resolver name" fcn.1400BB510 compares against the session config's
+// 2nd name (to be confirmed at runtime; may differ from +0x20 display).
 constexpr int TRK_FOLDER = 0x00, TRK_NAME = 0x20, TRK_SHORT = 0x60, TRK_IMAGE = 0xB0;
+constexpr int TRK_RESOLVER_NAME = 0x33C;
+
+// ---- localhost/testing "switch to this track" (RE'd) ---------------------------
+// fcn.1400BB510 loads the configured track + enters the testing session. It takes NO
+// args: it reads the session name config at 0xE4B540 (+0x00 folder, +0x20 2nd name),
+// name-matches it across the track array to re-derive the selected index (0x4CA3D4),
+// then calls the data loader fcn.140005A20(ecx=index). So to switch tracks we WRITE
+// the name config (folder + entry+0x33C) and call 0xBB510 - setting the index alone
+// won't survive. HEAVY (disk I/O + heap + UI) -> game thread only, from menu context.
+constexpr uintptr_t RVA_TRK_LOAD_ENTER  = 0xBB510; // fcn.1400BB510: load track + enter session
+constexpr uintptr_t RVA_TRK_DATA_LOADER = 0x5A20;  // fcn.140005A20(ecx=index): data loader it calls
+constexpr uintptr_t RVA_TRK_SEL_INDEX   = 0x4CA3D4;// int32 selected index (re-derived from name cfg)
+constexpr uintptr_t RVA_TRK_SESSION_CFG = 0xE4B540;// name cfg: +0x00 folder, +0x20 2nd name
 
 // AOB signature for the scanner prologue (fallback if RVA drifts across updates).
 // 40 53 56 57 41 54 41 55 41 56 48 81 EC F8 07 00 00 48 8B 05 ?? ?? ?? ??

@@ -39,6 +39,7 @@
 #include <atomic>
 #include <set>
 #include <cstring>
+#include <algorithm>  // std::sort (track manager list)
 #include <intrin.h>   // _ReturnAddress (find the walk's caller)
 #include <GL/gl.h>    // in-game overlay (immediate-mode GL, drawn in the swap hook)
 
@@ -454,22 +455,28 @@ void DumpTrackList() {
 
     const int shown = count < 80 ? count : 80;
     for (int i = 0; i < shown; ++i) {
-        char raw[0x140];
-        size_t n = SafeReadBytes((const char*)(base + (size_t)i * mxb::TRACK_STRIDE),
-                                 raw, sizeof(raw));
-        char tag[24]; sprintf_s(tag, "[tracks] #%03d", i);
-        LogPrintableRuns(tag, raw, n);
-        if (i < 3) LogHexWindow(raw, n);   // hex for the first few to pin field offsets
+        char* e = (char*)(base + (size_t)i * mxb::TRACK_STRIDE);
+        char folder[80] = "", disp[80] = "", resolver[80] = "";
+        SafeCopyStr(e + mxb::TRK_FOLDER,        folder,   sizeof(folder));
+        SafeCopyStr(e + mxb::TRK_NAME,          disp,     sizeof(disp));
+        SafeCopyStr(e + mxb::TRK_RESOLVER_NAME, resolver, sizeof(resolver));
+        // These 3 fields are what the switcher uses: folder + resolver(+0x33C) go into
+        // the session name-config; disp(+0x20) is what we show. Verify +0x33C here.
+        Log("[tracks] #%03d folder='%s' | disp='%s' | resolver@0x33C='%s'",
+            i, folder, disp, resolver);
     }
     if (count > shown) Log("[tracks] (+%d more not shown)", count - shown);
     Log("[tracks] ===== end (F9) =====");
 }
 
 // ---------------------------------------------------------------------------
-// TRACK LIBRARY (F10) - activate/deactivate track .pkz files on disk so the mods
-// folder stays lean. Active = under <mods>\tracks\**; inactive = moved out to
-// <MX Bikes>\FrostMod Inactive Tracks (outside the scanned tree, so the game never
-// loads them). Phase A: read-only - just find + list them (no files touched yet).
+// TRACK MANAGER (F8 menu > "Track manager") - activate/deactivate track .pkz files
+// on disk so the mods folder stays lean. Active = under <mods>\tracks\**; inactive =
+// moved out to <MX Bikes>\FrostMod Inactive Tracks (outside the scanned tree, so the
+// game never loads it). Open the list, toggle rows, Apply -> the changed .pkz are
+// moved between the two trees and the game reloads once. Everything runs on the
+// render thread (Tick polls input, DrawOverlay draws it), so the list state below
+// needs no lock.
 // ---------------------------------------------------------------------------
 // Collect *.pkz under `root`, returning paths RELATIVE to root (e.g. "motocross\X.pkz").
 static void FindPkzRecursive(const std::string& root, const std::string& rel,
@@ -491,9 +498,33 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
     FindClose(h);
 }
 
-void DumpTrackLibrary() {
+void RequestReload();                          // fwd (defined with the reload code below)
+void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
+
+// One track in the manager list. `active` = current on-disk state (true => the .pkz
+// lives under mods\tracks); `staged` = the state the user wants after Apply.
+struct TrackEntry { std::string rel; bool active; bool staged; };   // rel = "motocross\\X.pkz"
+static std::vector<TrackEntry> g_trk;          // combined active+inactive, sorted by rel
+static int  g_trkCursor = 0;                   // highlighted row
+static int  g_trkTop    = 0;                   // first visible row (scroll offset)
+static std::atomic<bool> g_trkOpen{false};     // manager open? (Tick + DrawOverlay both read)
+static const int kTrkVisible = 16;             // rows shown at once (the list scrolls)
+
+// Track SWITCHER (F8 > 3): pick from the game's LOADED track array and switch the
+// localhost/testing map to it. Distinct from the manager above (that moves files on
+// disk); this lists what's currently loaded and re-enters the session on the chosen
+// track. Names cached on open; the row index == the game's array index.
+static std::vector<std::string> g_swNames;     // display names for the visible list
+static int  g_swCursor = 0, g_swTop = 0;
+static std::atomic<bool> g_swOpen{false};
+
+// (Re)scan both trees into g_trk and open the manager. Active tracks come from
+// mods\tracks, inactive from the store; deduped by rel (a rel present in both is an
+// anomaly -> keep the active copy). staged starts == active (no pending change).
+void OpenTrackManager() {
     if (!g_modsPath[0]) {
-        Log("[trklib] mods path unknown - run frostmod.exe so it writes frostmod_mods.txt.");
+        Log("[trklib] cannot open - mods path unknown (run frostmod.exe so it writes frostmod_mods.txt).");
+        SetStatus("track manager: mods path unknown", 4000);
         return;
     }
     std::string tracksRoot = std::string(g_modsPath) + "\\tracks";
@@ -501,15 +532,152 @@ void DumpTrackLibrary() {
     FindPkzRecursive(tracksRoot, "", active);
     if (g_inactivePath[0]) FindPkzRecursive(g_inactivePath, "", inactive);
 
-    Log("[trklib] ===== track library (F10) =====");
-    Log("[trklib] mods     = %s", g_modsPath);
-    Log("[trklib] inactive = %s", g_inactivePath);
-    Log("[trklib] ACTIVE (%zu):", active.size());
-    for (auto& r : active)   Log("[trklib]   [x] %s", r.c_str());
-    Log("[trklib] INACTIVE (%zu):", inactive.size());
-    for (auto& r : inactive) Log("[trklib]   [ ] %s", r.c_str());
-    Log("[trklib] ===== end (F10) =====");
+    g_trk.clear();
+    for (auto& r : active) g_trk.push_back({ r, true, true });
+    for (auto& r : inactive) {
+        bool dup = false;
+        for (auto& e : g_trk) if (_stricmp(e.rel.c_str(), r.c_str()) == 0) { dup = true; break; }
+        if (dup) { Log("[trklib] '%s' is BOTH active and inactive - keeping the active copy.", r.c_str()); continue; }
+        g_trk.push_back({ r, false, false });
+    }
+    std::sort(g_trk.begin(), g_trk.end(), [](const TrackEntry& a, const TrackEntry& b) {
+        return _stricmp(a.rel.c_str(), b.rel.c_str()) < 0;
+    });
+
+    g_trkCursor = 0; g_trkTop = 0;
+    g_trkOpen.store(true);
+    Log("[trklib] track manager opened - %zu tracks (%zu active, %zu inactive).",
+        g_trk.size(), active.size(), g_trk.size() - active.size());
 }
+
+void CloseTrackManager() { g_trkOpen.store(false); }
+
+// Create every missing directory along a file's parent path (kernel32 only, so no
+// shell32 dependency). e.g. "...\FrostMod Inactive Tracks\motocross\X.pkz" creates the
+// "motocross" folder. Already-exists is ignored.
+static void EnsureDirTree(const char* filePath) {
+    char dir[MAX_PATH];
+    strncpy_s(dir, filePath, _TRUNCATE);
+    char* slash = strrchr(dir, '\\');
+    if (!slash) return;                         // no directory part
+    *slash = 0;                                 // dir = the parent folder
+    for (char* p = dir; *p; ++p) {
+        if (*p == '\\' && p != dir) {           // create each intermediate segment
+            *p = 0; CreateDirectoryA(dir, nullptr); *p = '\\';
+        }
+    }
+    CreateDirectoryA(dir, nullptr);             // and the leaf folder
+}
+
+// Apply the staged toggles: move each changed .pkz between mods\tracks and the store,
+// then (only if something actually moved) reload once so the game re-scans. A move that
+// fails (e.g. the .pkz is held open because you're on that track) is logged and skipped,
+// never fatal, and its stage is reverted so the list stays truthful.
+void ApplyTrackChanges() {
+    std::string tracksRoot = std::string(g_modsPath) + "\\tracks";
+    int moved = 0, failed = 0, changed = 0;
+    for (auto& e : g_trk) {
+        if (e.staged == e.active) continue;
+        ++changed;
+        std::string activePath   = tracksRoot + "\\" + e.rel;
+        std::string inactivePath = std::string(g_inactivePath) + "\\" + e.rel;
+        const std::string& src = e.active ? activePath : inactivePath;   // deactivate: out of active
+        const std::string& dst = e.active ? inactivePath : activePath;   // activate:   into active
+        EnsureDirTree(dst.c_str());
+        if (MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED)) {
+            e.active = e.staged; ++moved;
+            Log("[trklib] %s: %s", e.staged ? "ACTIVATED  " : "deactivated", e.rel.c_str());
+        } else {
+            e.staged = e.active; ++failed;                               // revert stage on failure
+            Log("[trklib] MOVE FAILED (err %lu) for '%s' - skipped (file in use?).",
+                GetLastError(), e.rel.c_str());
+        }
+    }
+
+    CloseTrackManager();
+    if (moved > 0) {
+        Log("[trklib] applied: %d moved, %d failed - reloading.", moved, failed);
+        RequestReload();                        // rebuild content lists live (its own status/bar)
+        if (failed) SetStatus("track manager: some moves failed (see log)", 5000);
+    } else if (changed > 0) {
+        SetStatus("track manager: moves failed (see log)", 5000);
+    } else {
+        SetStatus("track manager: no changes", 3000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TRACK SWITCHER load path (RE'd - see offsets.h RVA_TRK_*). fcn.1400BB510 loads the
+// track named in the session config [0xE4B540] and re-enters the session; it takes
+// NO args and re-derives the index by name-match, so we WRITE the name config (folder
+// + resolver-name entry+0x33C) then call it ON THE GAME THREAD.
+// ---------------------------------------------------------------------------
+// POD + SEH: copy this entry's folder (+0x00) and resolver-name (+0x33C) into the
+// session name config, exactly as the game does on a row-select.
+static bool SB_WriteSessionCfg(const char* entry) {
+    __try {
+        char* cfg = (char*)(g_base + mxb::RVA_TRK_SESSION_CFG);
+        const char* f = entry + mxb::TRK_FOLDER;
+        const char* r = entry + mxb::TRK_RESOLVER_NAME;
+        int i = 0; for (; i < 0x1F && f[i]; ++i) cfg[i]        = f[i]; cfg[i]        = 0; // +0x00 folder
+        i = 0;     for (; i < 0x3F && r[i]; ++i) cfg[0x20 + i] = r[i]; cfg[0x20 + i] = 0; // +0x20 2nd name
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// POD + SEH: call the load-and-enter routine (no args). Runs on the game thread.
+static void SB_CallLoadEnter() {
+    __try { ((void (*)())(g_base + mxb::RVA_TRK_LOAD_ENTER))(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[switch] load+enter FAULTED - caught (state may be wrong)."); }
+}
+
+// Switch the localhost map to the track at `idx` in the game's array. Logs the fields
+// it uses (so +0x33C can be verified), writes the name config, and queues the heavy
+// load+enter on the game thread (like the reload). SEH-guarded throughout.
+void LoadTrackByIndex(int idx) {
+    uintptr_t arr = 0;
+    SafeReadBytes((const char*)(g_base + mxb::RVA_TRACK_LIST), (char*)&arr, sizeof(arr));
+    if (!arr) { Log("[switch] no track array pointer."); return; }
+    char* entry = (char*)(arr + (size_t)idx * mxb::TRACK_STRIDE);
+
+    char folder[80] = "", disp[80] = "", resolver[80] = "";
+    SafeCopyStr(entry + mxb::TRK_FOLDER,        folder,   sizeof(folder));
+    SafeCopyStr(entry + mxb::TRK_NAME,          disp,     sizeof(disp));
+    SafeCopyStr(entry + mxb::TRK_RESOLVER_NAME, resolver, sizeof(resolver));
+    Log("[switch] request #%d: folder='%s' disp='%s' resolver@0x33C='%s'", idx, folder, disp, resolver);
+
+    if (!SB_WriteSessionCfg(entry)) { Log("[switch] couldn't write session config."); return; }
+    Log("[switch] cfg set (+0x00='%s', +0x20='%s'); queuing load+enter on the game thread...",
+        folder, resolver);
+    EnqueueGameThreadTask([] {
+        Log("[switch] -> fcn.1400BB510 (load+enter)...");
+        SB_CallLoadEnter();
+        Log("[switch] load+enter returned.");
+    });
+    char st[128]; sprintf_s(st, "switching to %s...", disp[0] ? disp : folder);
+    SetStatus(st, 8000);
+}
+
+// (Re)read the game's loaded track array and open the switcher.
+void OpenSwitcher() {
+    int count = SafeReadInt((const int*)(g_base + mxb::RVA_TRACK_COUNT));
+    if (count <= 0 || count > 100000) { Log("[switch] track count looks wrong (%d).", count);
+        SetStatus("switcher: no tracks", 4000); return; }
+    uintptr_t arr = 0;
+    SafeReadBytes((const char*)(g_base + mxb::RVA_TRACK_LIST), (char*)&arr, sizeof(arr));
+    if (!arr) { Log("[switch] no track array pointer."); return; }
+
+    g_swNames.clear();
+    g_swNames.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        char nm[80] = "";
+        SafeCopyStr((const char*)(arr + (size_t)i * mxb::TRACK_STRIDE) + mxb::TRK_NAME, nm, sizeof(nm));
+        g_swNames.push_back(nm[0] ? nm : "(unnamed)");
+    }
+    g_swCursor = 0; g_swTop = 0;
+    g_swOpen.store(true);
+    Log("[switch] switcher opened - %d tracks. Up/Down, Enter=load, Esc=close.", count);
+}
+void CloseSwitcher() { g_swOpen.store(false); }
 
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
@@ -800,9 +968,10 @@ char                   g_statusText[128] = {0};
 struct MenuItem { char key; const char* label; };
 static const MenuItem kMenu[] = {
     { '1', "Reload mods" },
-    { '2', "Track library  (log)" },
-    { '3', "Track list  (log)" },
-    { '4', "Toggle this overlay" },
+    { '2', "Track manager" },
+    { '3', "Switch track (localhost)" },
+    { '4', "Track list  (log)" },
+    { '5', "Toggle this overlay" },
 };
 static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
 
@@ -846,10 +1015,90 @@ static void FillRect(int x0, int y0, int x1, int y1) {
     glEnd();
 }
 
+// The track-manager panel (top-left, like the menu but taller + scrolled). Cursor row
+// is prefixed '>' and highlighted; [x]/[ ] is the STAGED active/inactive state; a
+// trailing '*' (amber) marks a row whose staged state differs from disk (pending move).
+static void DrawTrackManager(int w, int h, int lh) {
+    const int n = (int)g_trk.size();
+    if (g_trkCursor < g_trkTop)                g_trkTop = g_trkCursor;           // scroll up
+    if (g_trkCursor >= g_trkTop + kTrkVisible) g_trkTop = g_trkCursor - kTrkVisible + 1; // down
+    if (g_trkTop < 0) g_trkTop = 0;
+
+    const int shown = n < kTrkVisible ? n : kTrkVisible;
+    const int rows  = shown + 3;                 // title + list + spacer + footer
+    const int bw = 560, bh = rows * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int pending = 0; for (auto& e : g_trk) if (e.staged != e.active) ++pending;
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    char title[96];
+    sprintf_s(title, "FrostMod - Track Manager   (%d tracks, %d staged)", n, pending);
+    GlText(x0 + 8, y, title); y -= lh;
+
+    for (int i = g_trkTop; i < g_trkTop + shown && i < n; ++i) {
+        const TrackEntry& e = g_trk[i];
+        bool cur = (i == g_trkCursor);
+        if (cur) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4); }
+        char row[160];
+        sprintf_s(row, "%s [%c] %s%s", cur ? ">" : " ", e.staged ? 'x' : ' ',
+                  e.rel.c_str(), (e.staged != e.active) ? "  *" : "");
+        if (e.staged != e.active) glColor4f(1.0f, 0.85f, 0.45f, 1.0f);   // amber = pending change
+        else                      glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        GlText(x0 + 8, y, row); y -= lh;
+    }
+
+    y -= 2;
+    glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+    char foot[128];
+    sprintf_s(foot, "  Up/Down move   Space toggle   Enter apply+reload   Esc cancel   [%d-%d/%d]",
+              n ? g_trkTop + 1 : 0, g_trkTop + shown, n);
+    GlText(x0 + 8, y, foot);
+}
+
+// The track switcher panel: scrolled list of the loaded tracks' display names; Enter
+// loads the highlighted one into the localhost session.
+static void DrawSwitcher(int w, int h, int lh) {
+    const int n = (int)g_swNames.size();
+    if (g_swCursor < g_swTop)                g_swTop = g_swCursor;
+    if (g_swCursor >= g_swTop + kTrkVisible) g_swTop = g_swCursor - kTrkVisible + 1;
+    if (g_swTop < 0) g_swTop = 0;
+
+    const int shown = n < kTrkVisible ? n : kTrkVisible;
+    const int rows  = shown + 3;
+    const int bw = 480, bh = rows * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    char title[96]; sprintf_s(title, "FrostMod - Switch Track (localhost)   (%d tracks)", n);
+    GlText(x0 + 8, y, title); y -= lh;
+
+    for (int i = g_swTop; i < g_swTop + shown && i < n; ++i) {
+        bool cur = (i == g_swCursor);
+        if (cur) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4); }
+        char row[160]; sprintf_s(row, "%s %s", cur ? ">" : " ", g_swNames[i].c_str());
+        glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        GlText(x0 + 8, y, row); y -= lh;
+    }
+
+    y -= 2;
+    glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+    char foot[128];
+    sprintf_s(foot, "  Up/Down move   Enter load   Esc cancel   [%d-%d/%d]",
+              n ? g_swTop + 1 : 0, g_swTop + shown, n);
+    GlText(x0 + 8, y, foot);
+}
+
 void DrawOverlay(HDC hdc) {
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
-    if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()) return;
+    if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
+        && !g_trkOpen.load() && !g_swOpen.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -860,6 +1109,8 @@ void DrawOverlay(HDC hdc) {
     static unsigned frame = 0; ++frame;              // advances every presented frame
     const bool reloading = g_reloadActive.load();
     const bool menu      = g_menuOpen.load() && !reloading;
+    const bool trk       = g_trkOpen.load() && !reloading;
+    const bool sw        = g_swOpen.load()  && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -884,7 +1135,11 @@ void DrawOverlay(HDC hdc) {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     const int lh = 18;                           // line height
-    if (menu) {
+    if (trk) {
+        DrawTrackManager(w, h, lh);
+    } else if (sw) {
+        DrawSwitcher(w, h, lh);
+    } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
         const int rows = kMenuCount + 2;         // title + items + footer
         const int bw = 260, bh = rows * lh + 8;
@@ -943,9 +1198,10 @@ void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
 void MenuAction(int d) {
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
-    case 2: DumpTrackLibrary(); g_menuOpen.store(false); break;   // [trklib] to the log (WIP: list UI)
-    case 3: DumpTrackList();    g_menuOpen.store(false); break;   // [tracks] to the log (WIP: switcher)
-    case 4: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
+    case 2: g_menuOpen.store(false); OpenTrackManager(); break;   // manage track files (list UI)
+    case 3: g_menuOpen.store(false); OpenSwitcher();     break;   // switch the localhost map
+    case 4: DumpTrackList();    g_menuOpen.store(false); break;   // [tracks] to the log (verify fields)
+    case 5: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     default: break;
     }
@@ -964,9 +1220,15 @@ void Tick() {
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
-        bool open = !g_menuOpen.load();
-        g_menuOpen.store(open);
-        Log("[menu] %s", open ? "opened (press a number; Esc/F8 to close)" : "closed");
+        if (g_trkOpen.load()) {                              // F8 also closes an open list
+            CloseTrackManager(); Log("[trklib] track manager closed (F8).");
+        } else if (g_swOpen.load()) {
+            CloseSwitcher(); Log("[switch] switcher closed (F8).");
+        } else {
+            bool open = !g_menuOpen.load();
+            g_menuOpen.store(open);
+            Log("[menu] %s", open ? "opened (press a number; Esc/F8 to close)" : "closed");
+        }
     }
     prevF8 = f8;
     if (g_menuOpen.load()) {
@@ -978,6 +1240,62 @@ void Tick() {
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
         prevEsc = esc;
+    }
+
+    // Track manager (F8 > 2): modal keyboard list. Up/Down move (with held-key repeat so
+    // a long list scrolls), Space toggles the cursor row's staged active/inactive, Enter
+    // applies (moves the .pkz + reloads, closing the list), Esc cancels. Its own state is
+    // mutually exclusive with the menu above (opening it clears g_menuOpen), so the two
+    // input blocks never fight.
+    if (g_trkOpen.load()) {
+        static bool pUp = false, pDown = false, pSpace = false, pEnter = false, pEscT = false;
+        static ULONGLONG upNext = 0, downNext = 0;
+        const int n = (int)g_trk.size();
+        const ULONGLONG now = GetTickCount64();
+        bool up    = (GetAsyncKeyState(VK_UP)     & 0x8000) != 0;
+        bool down  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) != 0;
+        bool space = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
+        bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        bool esc   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        // edge on first press, then auto-repeat: initial 350ms delay, 90ms cadence
+        auto step = [&](bool held, bool prev, ULONGLONG& nextAt) -> bool {
+            if (held && !prev)         { nextAt = now + 350; return true; }
+            if (held && now >= nextAt) { nextAt = now + 90;  return true; }
+            return false;
+        };
+        if (n) {
+            if (step(up,   pUp,   upNext))   g_trkCursor = (g_trkCursor - 1 + n) % n;   // wraps
+            if (step(down, pDown, downNext)) g_trkCursor = (g_trkCursor + 1)     % n;
+            if (space && !pSpace) { TrackEntry& e = g_trk[g_trkCursor]; e.staged = !e.staged; }
+        }
+        if (enter && !pEnter)    ApplyTrackChanges();        // moves + reload; closes the manager
+        else if (esc && !pEscT) { CloseTrackManager(); Log("[trklib] track manager closed (Esc)."); }
+        pUp = up; pDown = down; pSpace = space; pEnter = enter; pEscT = esc;
+    }
+
+    // Track switcher (F8 > 3): Up/Down move (held-key repeat), Enter loads the
+    // highlighted track into the localhost session, Esc cancels.
+    if (g_swOpen.load()) {
+        static bool sUp = false, sDown = false, sEnter = false, sEsc = false;
+        static ULONGLONG sUpNext = 0, sDownNext = 0;
+        const int n = (int)g_swNames.size();
+        const ULONGLONG now = GetTickCount64();
+        bool up    = (GetAsyncKeyState(VK_UP)     & 0x8000) != 0;
+        bool down  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) != 0;
+        bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        bool esc   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        auto step = [&](bool held, bool prev, ULONGLONG& nextAt) -> bool {
+            if (held && !prev)         { nextAt = now + 350; return true; }
+            if (held && now >= nextAt) { nextAt = now + 90;  return true; }
+            return false;
+        };
+        if (n) {
+            if (step(up,   sUp,   sUpNext))   g_swCursor = (g_swCursor - 1 + n) % n;
+            if (step(down, sDown, sDownNext)) g_swCursor = (g_swCursor + 1)     % n;
+        }
+        if (enter && !sEnter && n) { int idx = g_swCursor; CloseSwitcher(); LoadTrackByIndex(idx); }
+        else if (esc && !sEsc)     { CloseSwitcher(); Log("[switch] switcher closed (Esc)."); }
+        sUp = up; sDown = down; sEnter = enter; sEsc = esc;
     }
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
@@ -1305,7 +1623,7 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(g_inactivePath, '\\')) *s = 0;   // strip trailing "\mods"
             strcat_s(g_inactivePath, "\\FrostMod Inactive Tracks");
             Log("[trklib] mods=%s", g_modsPath);
-            Log("[trklib] inactive store=%s (F8 menu > 2 to list the track library)", g_inactivePath);
+            Log("[trklib] inactive store=%s (F8 menu > 2 opens the track manager)", g_inactivePath);
         } else {
             Log("[trklib] mods path unknown yet (run frostmod.exe so it writes frostmod_mods.txt).");
         }

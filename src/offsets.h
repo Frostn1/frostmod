@@ -46,8 +46,11 @@ constexpr uintptr_t RVA_REG_COUNT      = 0x396754;  // int32 count
 //   loader (the sub that writes dword_140f43298) is still to be pinned - then a
 //   surgical reload can rebuild just the track list without the full re-init.
 constexpr uintptr_t RVA_TRACK_LOADER  = 0x000000;  // TODO: xref writer of 0x140f43298
-constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count
-constexpr uintptr_t RVA_TRACK_LIST    = 0x1109de98;// track array (stride 1220)
+constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count (dword_140f43298)
+// qword_14109de98 -> RVA 0x109de98. It's a QWORD *pointer* to the heap track array
+// (count*1220 is far too big to be inline), so deref it before indexing. (Was
+// mistranscribed as 0x1109de98 - an extra digit - which read as unmapped memory.)
+constexpr uintptr_t RVA_TRACK_LIST    = 0x109de98; // qword: pointer to track array
 constexpr int       TRACK_STRIDE      = 1220;      // 0x4C4 bytes per track entry
 // Track entry field offsets (folder name / display name) - TBD from the F9 [tracks]
 // dump + RE. Filled in once the entry layout is confirmed at runtime.

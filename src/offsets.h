@@ -52,9 +52,9 @@ constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count (dword_1
 // mistranscribed as 0x1109de98 - an extra digit - which read as unmapped memory.)
 constexpr uintptr_t RVA_TRACK_LIST    = 0x109de98; // qword: pointer to track array
 constexpr int       TRACK_STRIDE      = 1220;      // 0x4C4 bytes per track entry
-// Track entry field offsets (folder name / display name) - TBD from the F9 [tracks]
-// dump + RE. Filled in once the entry layout is confirmed at runtime.
-constexpr int TRK_FOLDER = -1, TRK_NAME = -1;      // -1 = not yet pinned
+// Track entry field offsets, confirmed from the F9 [tracks] dump (all 85 entries):
+//   +0x00 folder/id, +0x20 DISPLAY name, +0x60 short name, +0xB0 preview image.
+constexpr int TRK_FOLDER = 0x00, TRK_NAME = 0x20, TRK_SHORT = 0x60, TRK_IMAGE = 0xB0;
 
 // AOB signature for the scanner prologue (fallback if RVA drifts across updates).
 // 40 53 56 57 41 54 41 55 41 56 48 81 EC F8 07 00 00 48 8B 05 ?? ?? ?? ??

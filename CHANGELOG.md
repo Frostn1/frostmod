@@ -1,6 +1,10 @@
 # Changelog
 
 ## 2026-07-06
+### Changed
+- **In-game F-keys consolidated into one F8 menu.** Instead of a separate F-key per feature, **F8** now opens a small FrostMod menu (top-left); press an item's number to run it (`1` reload, `2` track library, `3` track list, `4` toggle the hint), `Esc`/`F8` to close. New features become a row in the menu rather than yet another F-key. The corner hint now reads `F8: menu`; the menu always draws while open (so you can't hide the overlay and lose the way back).
+- **Track entry layout confirmed** (from the F9 dump): `+0x00` folder/id, `+0x20` display name, `+0x60` short name, `+0xB0` preview image — filled into `offsets.h` (`TRK_FOLDER/TRK_NAME/TRK_SHORT/TRK_IMAGE`), so the track-library/switcher UIs can show real names.
+
 ### Added
 - **One-command update (`frostmod.exe --update`).** Downloads the latest release's `frostmod.exe` + `frostmod.dll` (WinHTTP, following GitHub's CDN redirects), verifies both, then swaps them in — the DLL directly (must close MX Bikes first, since it's locked while the game runs) and the running exe via the rename-self trick — and relaunches. Downloads to `.new` files and only swaps if both succeed, so a failed/interrupted download leaves your install untouched; stale `.old`/`.new` files are cleaned on next launch.
 - **Update check.** On startup `frostmod.exe` asks the GitHub Releases API for the latest tag (off-thread via WinHTTP, so it never delays startup) and, if it's newer than the running build, prints an `UPDATE AVAILABLE: vX.Y.Z` banner with the download link (`frostmod.exe --update` installs it). Read-only and silent when offline/rate-limited; disable with `--no-update-check`.

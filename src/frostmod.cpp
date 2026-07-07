@@ -790,9 +790,21 @@ void RequestReload() {
 // just stays hidden); everything is wrapped in push/pop so we never disturb the game.
 // ---------------------------------------------------------------------------
 std::atomic<bool>      g_overlayOn{true};
+std::atomic<bool>      g_menuOpen{false};       // F8 opens the FrostMod action menu
 std::atomic<ULONGLONG> g_statusUntil{0};        // show g_statusText until this tick
 std::mutex             g_statusMutex;
 char                   g_statusText[128] = {0};
+
+// The FrostMod menu (F8). One entry per action - press its key. New features add a
+// row here instead of another global F-key. Keep labels short (they set the width).
+struct MenuItem { char key; const char* label; };
+static const MenuItem kMenu[] = {
+    { '1', "Reload mods" },
+    { '2', "Track library  (log)" },
+    { '3', "Track list  (log)" },
+    { '4', "Toggle this overlay" },
+};
+static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
 
 void SetStatus(const char* s, unsigned ms) {
     std::lock_guard<std::mutex> lk(g_statusMutex);
@@ -835,7 +847,9 @@ static void FillRect(int x0, int y0, int x1, int y1) {
 }
 
 void DrawOverlay(HDC hdc) {
-    if (!g_overlayOn.load()) return;
+    // The menu always draws (even if the corner hint was toggled off), so it's never
+    // possible to hide the overlay and lose the way back to it.
+    if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -845,21 +859,20 @@ void DrawOverlay(HDC hdc) {
 
     static unsigned frame = 0; ++frame;              // advances every presented frame
     const bool reloading = g_reloadActive.load();
+    const bool menu      = g_menuOpen.load() && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
     char line[128];
     if (reloading) {
         static const char spin[4] = {'|', '/', '-', '\\'};
-        // spinner animates on each PRESENTED frame (so if a step blocks a frame, it
-        // just pauses that frame - you still see it's mid-reload, not crashed).
         sprintf_s(line, "%c  Reloading mods...  %d%%", spin[(frame / 3) % 4],
                   total ? (done * 100 / total) : 0);
     } else if (GetTickCount64() < g_statusUntil.load()) {
         std::lock_guard<std::mutex> lk(g_statusMutex);
         strncpy_s(line, g_statusText, _TRUNCATE);
     } else {
-        strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: reload mods");
+        strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
     }
 
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -870,21 +883,38 @@ void DrawOverlay(HDC hdc) {
     glDisable(GL_LIGHTING);   glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // background pill, top-left corner (taller while reloading, to fit the bar)
-    const int bw = 250, bh = reloading ? 38 : 24;
-    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
-    glColor4f(0.04f, 0.05f, 0.08f, 0.72f);
-    FillRect(x0, y0, x1, y1);
-
-    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
-    GlText(x0 + 8, y1 - 17, line);               // text near the top of the pill
-
-    if (reloading) {                             // progress bar along the bottom
-        const int bx0 = x0 + 8, bx1 = x1 - 8, by0 = y0 + 7, by1 = by0 + 6;
-        glColor4f(1.0f, 1.0f, 1.0f, 0.18f);      // track
-        FillRect(bx0, by0, bx1, by1);
-        glColor4f(0.47f, 0.78f, 1.0f, 0.95f);    // fill
-        FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
+    const int lh = 18;                           // line height
+    if (menu) {
+        // The action menu: title + one row per item + a footer. Press a row's key.
+        const int rows = kMenuCount + 2;         // title + items + footer
+        const int bw = 260, bh = rows * lh + 8;
+        const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+        glColor4f(0.04f, 0.05f, 0.08f, 0.86f);
+        FillRect(x0, y0, x1, y1);
+        int y = y1 - 17;
+        glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+        GlText(x0 + 8, y, "FrostMod v" FROSTMOD_VERSION "  -  menu"); y -= lh;
+        glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        for (int i = 0; i < kMenuCount; ++i) {
+            char row[96]; sprintf_s(row, "  %c   %s", kMenu[i].key, kMenu[i].label);
+            GlText(x0 + 8, y, row); y -= lh;
+        }
+        glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+        GlText(x0 + 8, y, "  F8 / Esc   close");
+    } else {
+        // compact pill: hint / status, or the reload progress bar
+        const int bw = 250, bh = reloading ? 38 : 24;
+        const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+        glColor4f(0.04f, 0.05f, 0.08f, 0.72f);
+        FillRect(x0, y0, x1, y1);
+        glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
+        GlText(x0 + 8, y1 - 17, line);
+        if (reloading) {                             // progress bar along the bottom
+            const int bx0 = x0 + 8, bx1 = x1 - 8, by0 = y0 + 7, by1 = by0 + 6;
+            glColor4f(1.0f, 1.0f, 1.0f, 0.18f); FillRect(bx0, by0, bx1, by1);
+            glColor4f(0.47f, 0.78f, 1.0f, 0.95f);
+            FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
+        }
     }
 
     glMatrixMode(GL_PROJECTION); glPopMatrix();
@@ -908,6 +938,19 @@ HANDLE g_dumpEvent   = nullptr;   // D in the console -> dump the server-list bl
 void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
 // g_origMpMsg (defined above) is non-null once --dump-serverlist hooked the handler
 
+// Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
+// a new feature - no new global F-key needed. Most actions close the menu after.
+void MenuAction(int d) {
+    switch (d) {
+    case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
+    case 2: DumpTrackLibrary(); g_menuOpen.store(false); break;   // [trklib] to the log (WIP: list UI)
+    case 3: DumpTrackList();    g_menuOpen.store(false); break;   // [tracks] to the log (WIP: switcher)
+    case 4: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
+              Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
+    default: break;
+    }
+}
+
 void Tick() {
     // Heartbeat: prove the render hook is actually firing. If you never see this
     // line in frostmod.log, the game isn't calling the SwapBuffers we hooked, so
@@ -915,21 +958,27 @@ void Tick() {
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // In-game hotkeys (work in fullscreen): F8 = reload, F7 = toggle the overlay,
-    // F9 = dump the game's track list, F10 = dump the on-disk track library.
-    static bool prevF8 = false, prevF7 = false, prevF9 = false, prevF10 = false;
+    // In-game UI: F8 opens the FrostMod MENU (top-left); while it's open, press an
+    // item's number to run it, or Esc/F8 to close. One key (F8) instead of a growing
+    // pile of F-keys - new features are rows in kMenu[] / MenuAction().
+    static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (f8 && !prevF8) RequestReload();
+    if (f8 && !prevF8) {
+        bool open = !g_menuOpen.load();
+        g_menuOpen.store(open);
+        Log("[menu] %s", open ? "opened (press a number; Esc/F8 to close)" : "closed");
+    }
     prevF8 = f8;
-    bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (f7 && !prevF7) { bool on = !g_overlayOn.load(); g_overlayOn.store(on); Log("[overlay] %s", on ? "shown" : "hidden"); }
-    prevF7 = f7;
-    bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (f9 && !prevF9) { Log("[tracks] F9 pressed - dumping track list"); DumpTrackList(); }
-    prevF9 = f9;
-    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10 && !prevF10) { Log("[trklib] F10 pressed - scanning track library"); DumpTrackLibrary(); }
-    prevF10 = f10;
+    if (g_menuOpen.load()) {
+        for (int d = 1; d <= 9; ++d) {                       // digit -> menu action
+            bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;
+            if (k && !prevDigit[d] && d <= kMenuCount) MenuAction(d);
+            prevDigit[d] = k;
+        }
+        bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        if (esc && !prevEsc) g_menuOpen.store(false);
+        prevEsc = esc;
+    }
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
     // just opening the online browser captures it, no key press / console focus.
@@ -1256,7 +1305,7 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(g_inactivePath, '\\')) *s = 0;   // strip trailing "\mods"
             strcat_s(g_inactivePath, "\\FrostMod Inactive Tracks");
             Log("[trklib] mods=%s", g_modsPath);
-            Log("[trklib] inactive store=%s (press F10 to list the track library)", g_inactivePath);
+            Log("[trklib] inactive store=%s (F8 menu > 2 to list the track library)", g_inactivePath);
         } else {
             Log("[trklib] mods path unknown yet (run frostmod.exe so it writes frostmod_mods.txt).");
         }

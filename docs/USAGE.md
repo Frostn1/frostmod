@@ -60,14 +60,19 @@ treated as an explicit path to the DLL.
 
 ### In-game (works in fullscreen)
 
-| Key | Action |
-|-----|--------|
-| `F8` | Reload mods |
-| `F7` | Show/hide the overlay |
-| `F9` | Dump the current server list to the log |
+Press **`F8`** to open the FrostMod **menu** (top-left). While it's open, press an
+item's number; `Esc` or `F8` closes it. Everything lives here instead of a separate
+F-key per feature.
 
-Reloading (any of `R` / `F8`) rescans your content from disk and makes new
-tracks, bikes, and skins appear immediately — no restart, no loading screen.
+| In the menu | Action |
+|-------------|--------|
+| `1` | Reload mods (rescans content from disk, with a progress bar) |
+| `2` | Track library → log (activate/deactivate UI is in progress) |
+| `3` | Track list → log |
+| `4` | Show/hide the corner hint |
+
+Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
+immediately — no restart, no loading screen.
 
 ## Files
 

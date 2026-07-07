@@ -726,10 +726,11 @@ int main(int argc, char** argv) {
                 printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
             else
                 for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
-            printf("\nRELOAD: press R (or F8 in-game) after dropping a .pkz into the mods folder.\n"
-                   "  FrostMod re-runs the game's content-load so new tracks/skins register.\n"
-                   "  NOTE: this re-runs the game's init - expect a brief return to the menu.\n");
-            printf("\n--- live log ---   [R] reload  [D]/F9-in-game dump  [Q]/Ctrl+C quit\n");
+            printf("\nRELOAD: press R here, or F8 in-game (opens the FrostMod menu) -> 1.\n"
+                   "  FrostMod re-runs the game's content-load so new tracks/skins register,\n"
+                   "  with an on-screen progress bar (no freeze).\n");
+            printf("\nIN-GAME: F8 = FrostMod menu (top-left). Press a number for an action.\n");
+            printf("\n--- live log ---   [R] reload   [Q]/Ctrl+C quit\n");
             printf("    (with --dump-serverlist, opening the online browser auto-dumps the list)\n");
         }
 

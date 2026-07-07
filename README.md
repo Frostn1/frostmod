@@ -31,7 +31,7 @@ Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`, and
 stays open as a console - listing the mods it finds and streaming its log.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
-  console or **`F8`** in-game.
+  console, or **`F8`** in-game to open the FrostMod menu and pick **Reload**.
 - **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.

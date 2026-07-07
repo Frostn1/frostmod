@@ -446,8 +446,13 @@ void DumpTrackList() {
         Log("[tracks] count looks wrong - the array/count offset may not fit this build.");
         return;
     }
-    const uintptr_t base = g_base + mxb::RVA_TRACK_LIST;
-    const int shown = count < 60 ? count : 60;
+    // RVA_TRACK_LIST is a qword POINTER to the heap array - deref it, then index.
+    uintptr_t base = 0;
+    SafeReadBytes((const char*)(g_base + mxb::RVA_TRACK_LIST), (char*)&base, sizeof(base));
+    Log("[tracks] array ptr @ RVA 0x%zx = 0x%zx", (size_t)mxb::RVA_TRACK_LIST, (size_t)base);
+    if (!base) { Log("[tracks] null array pointer - offset wrong for this build."); return; }
+
+    const int shown = count < 80 ? count : 80;
     for (int i = 0; i < shown; ++i) {
         char raw[0x140];
         size_t n = SafeReadBytes((const char*)(base + (size_t)i * mxb::TRACK_STRIDE),

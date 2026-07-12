@@ -8,7 +8,7 @@ ways**, and runs the same code either way.
 
 | Mode | How | Entry point | Notes |
 |------|-----|-------------|-------|
-| **PiBoSo plugin** (recommended) | Drop `frostmod.dll` in MX Bikes' `plugins` folder | game calls `Startup()` | Loaded by the game at startup — before the one-time mods scan — with no injector, no `CreateRemoteThread`, no SteamStub timing race. |
+| **PiBoSo plugin** (recommended) | Drop `frostmod.dlo` in MX Bikes' `plugins` folder (or run `frostmod.exe --install-plugin`) | game calls `Startup()` | Loaded by the game at startup — before the one-time mods scan — with no injector, no `CreateRemoteThread`, no SteamStub timing race. |
 | **Injected** | Run `frostmod.exe` | `DllMain` | Fallback / dev loop. Streams the log to a console, watches the mods folder, re-injects on relaunch. |
 
 Both paths call `EnsureInit()`, which starts `Init()` **exactly once** (guarded by
@@ -32,17 +32,22 @@ update changes them, the game will reject the plugin and these must be updated.*
 
 All exports are `extern "C" __declspec(dllexport)` (undecorated names on x64).
 
-**Optional callbacks are intentionally omitted.** The engine only calls exports
-that exist, so we implement just the five above. Available for future use:
-`Draw()` (a sanctioned in-game overlay — quads + strings), `RunTelemetry()`,
-`RaceEvent/RaceSession/RaceClassification`, `SpectateVehicles/Cameras`. None of
-them expose the server list or the mods directory, which is why filtering and
-refreshing are done with function hooks (below), not through the API.
+We also implement the optional **`Draw()`** callback (`void Draw(int state, int* nQuads,
+void** quads, int* nStrings, void** strings)`) — the sanctioned overlay path. On
+track/spectate/replay the game calls it and we hand back arrays of quads + strings
+(normalized `0..1` coords, ABGR color) for the engine to render; see *Feature 3* below.
+The remaining callbacks stay omitted (`RunTelemetry()`,
+`RaceEvent/RaceSession/RaceClassification`, `SpectateVehicles/Cameras`). None of them
+expose the server list or the mods directory, which is why filtering and refreshing are
+done with function hooks (below), not through the API.
 
-### Where the DLL goes
-Drop `frostmod.dll` into MX Bikes' **`plugins`** folder. Exact location to confirm
-on your install — candidates: `…\steamapps\common\MX Bikes\plugins\` or
-`Documents\PiBoSo\MX Bikes\plugins\`. (TODO: confirm + whether an `.ini` is needed.)
+### Where the plugin goes
+The plugin file is **`frostmod.dlo`** (a byte-for-byte copy of `frostmod.dll` — the game
+auto-loads plugins named `*.dlo`). Drop it into MX Bikes'
+**`<install>\plugins\`** folder, next to `mxbikes.exe` (e.g.
+`…\steamapps\common\MX Bikes\plugins\`) — no `.ini` needed. Or run
+**`frostmod.exe --install-plugin`** to copy it there for you (auto-detects a running
+game, or pass the folder: `--install-plugin "…\MX Bikes"`).
 
 ## Init sequence (`Init`, on its own thread)
 
@@ -115,6 +120,25 @@ on your install — candidates: `…\steamapps\common\MX Bikes\plugins\` or
   `RVA_SB_ROW_SKIP_TGT`, else runs the stolen bytes and returns. To author it
   safely we need, at the splice site (near `RVA_SB_HIDE_EMPTY_BR`): the exact
   address, the register holding the `SB_Entry` pointer, and the overwritten bytes.
+
+## Feature 3 — in-game overlay (hybrid render path)
+
+The overlay (status pill, reload progress bar, F8 menu, track manager/switcher) has
+**two renderers over one shared state**, chosen automatically:
+
+- **Sanctioned `Draw()`** — used on track/spectate/replay in plugin mode.
+  `BuildOverlayDrawLists()` fills static quad/string arrays in normalized `0..1` space
+  (ABGR color) and `Draw()` hands them to the engine. No GL, resolution-independent, and
+  it can't silently hide on a non-GL/core context.
+- **GL fallback (`DrawOverlay`)** — immediate-mode GL drawn from the `wglSwapBuffers` hook.
+  Covers the cases `Draw()` doesn't fire: **menus / the server browser** (the engine only
+  calls `Draw()` in-world) and **injected mode** (no plugin exports are called).
+
+`Draw()` bumps `g_drawCalls`; the swap hook draws the GL overlay **only** when that counter
+didn't advance since the previous frame — so on track the sanctioned path owns the frame
+(no double image) and everywhere else the GL path takes over. Input (`Tick()`, polled from
+the swap hook) is unchanged and feeds both. Font/size for `Draw()` strings assume the engine
+default (index 1); quads (panels, highlight, progress bar) need no font.
 
 ## Offsets & signature validation
 

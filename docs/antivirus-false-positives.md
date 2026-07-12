@@ -103,7 +103,7 @@ own sites — treat them as best-available.
 
 ### Ready-to-paste justification
 
-> **Subject:** False positive on signed open-source software — FrostMod
+> **Subject:** False positive on open-source software — FrostMod
 >
 > Your engine flags the following files from my open-source project FrostMod, a
 > mod loader / in-game overlay for the game MX Bikes. These are false positives.

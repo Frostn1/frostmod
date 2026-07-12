@@ -1,32 +1,19 @@
 // ============================================================================
-//  FrostMod - on-demand mods-folder reloader for MX Bikes
+//  FrostMod - on-demand mods-folder reloader for MX Bikes.
 //
-//  What it does
-//  ------------
-//  MX Bikes reads the mods/content folders once at startup and mounts every
-//  .pkz into an in-memory virtual filesystem. New files dropped in while the
-//  game runs are ignored until a restart. FrostMod re-triggers the game's own
-//  content scan (via an in-game overlay + F8, or the frostmod.exe console 'R') so
-//  newly added tracks/skins/bikes register live, with no loading screen.
+//  MX Bikes scans its content folders once at startup; .pkz files added later
+//  are ignored until a restart. FrostMod re-triggers the game's own content
+//  scan (in-game F8 menu, or 'R' in frostmod.exe) so new tracks/skins/bikes
+//  register live, with no loading screen.
 //
-//  How the reload works (see README + offsets.h for the RE details)
-//  ----------------------------------------------------------------
-//  The game's folder scanner is fcn.140158be0 (RVA 0x158be0) and the registry
-//  reset is fcn.140159340 (RVA 0x159340). Rather than guess their argument
-//  formats, FrostMod HOOKS both and RECORDS the arguments the first time the
-//  game itself calls them (at startup, or when a content menu re-scans). The
-//  reload button then REPLAYS those recorded calls on the game's render thread.
-//
-//  IMPORTANT: for capture to happen, the game must call the scanner at least
-//  once while FrostMod is loaded. If you inject after launch and have never
-//  opened a content/track menu, click Reload once you have (watch frostmod.log).
-//  If you inject at launch (proxy DLL), startup capture happens automatically.
-//
-//  Threading: the UI runs on its own thread; the actual game calls are queued
-//  and executed inside the SwapBuffers hook (the render thread) so we never
-//  mutate the VFS while the game is reading it.
+//  The reload replays the content-load section of the game's boot routine one
+//  step per frame on the render thread (see kReloadSteps / AdvanceReload), so
+//  the VFS is never mutated while the game reads it and the overlay can show a
+//  progress bar. See README + offsets.h for the RE details.
 // ============================================================================
 
+#include <winsock2.h>   // must precede <windows.h> so it doesn't pull in winsock1
+#include <ws2tcpip.h>   // addrinfo (master-capture: --capture-master)
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -39,9 +26,9 @@
 #include <atomic>
 #include <set>
 #include <cstring>
-#include <algorithm>  // std::sort (track manager list)
-#include <intrin.h>   // _ReturnAddress (find the walk's caller)
-#include <GL/gl.h>    // in-game overlay (immediate-mode GL, drawn in the swap hook)
+#include <algorithm>
+#include <intrin.h>   // _ReturnAddress
+#include <GL/gl.h>    // immediate-mode GL overlay
 
 #include "MinHook.h"
 #include "offsets.h"
@@ -49,11 +36,9 @@
 #include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
-// small logging helper -> <dll folder>\frostmod.log  (and OutputDebugString)
-//
-// We log NEXT TO the dll (frostmod.exe reads the same folder) rather than to
-// %TEMP%, because a Steam-launched game can have a different %TEMP% than the
-// launcher, which would hide our output. Falls back to %TEMP% if read-only.
+// logging -> <dll folder>\frostmod.log (+ OutputDebugString). Next to the dll,
+// not %TEMP%, so the exe and injected dll agree on the file even when a
+// Steam-launched game has a different %TEMP%. Falls back to %TEMP% if read-only.
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -95,7 +80,7 @@ void Log(const char* fmt, ...) {
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
 
-    // fall back to %TEMP% if InitLogPath hasn't run yet for some reason
+    // fall back to %TEMP% if InitLogPath hasn't run yet
     char temp[MAX_PATH];
     const char* path = g_logPath[0] ? g_logPath
                      : (GetTempPathA(sizeof(temp), temp) ? (strcat_s(temp, "frostmod.log"), temp) : nullptr);
@@ -166,10 +151,9 @@ struct CapturedCall {
 };
 CapturedCall g_resetArgs;  // last args seen for the registry reset (probe only)
 
-// Every DISTINCT (dir, ext) scan the game made at startup, so a reload can replay
-// just the mods (.pkz) scan or all content scans. NOTE: a0 (status) and a3 (out
-// buf) were the game's *stack* buffers at capture time; a1 (dir) and a2 (ext)
-// point into the module's data and stay valid. Replay strategies account for that.
+// Every DISTINCT (dir, ext) scan the game made at startup. Diagnostic capture only
+// (the reload uses kReloadSteps, not these): a0 (status)/a3 (out buf) were the
+// game's stack buffers at capture time; a1 (dir)/a2 (ext) point into module data.
 struct ScanCall { void* a0{}; void* a1{}; void* a2{}; void* a3{}; std::string dir, ext; };
 std::mutex g_scansMutex;
 std::vector<ScanCall> g_scans;
@@ -253,9 +237,8 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
     std::string dir = SafeStr(a1);
     std::string ext = SafeStr(a2);
 
-    // Record each DISTINCT (dir, ext) once and keep its args so a reload can replay
-    // it. We still store ALL of them, but only LOG the first few - the startup scan
-    // fires hundreds of times and used to bury everything else (e.g. [srvlist]).
+    // Record each DISTINCT (dir, ext) once; store all, but only LOG the first few
+    // (the startup scan fires hundreds of times and would bury everything else).
     {
         bool isNew = false;
         size_t count = 0;
@@ -351,8 +334,7 @@ int64_t __fastcall hkMpMsg(void* a0, void* a1, void* a2, void* a3) {
     static int lastState = -1;
     int st = SafeReadInt((const int*)(g_base + mxb::RVA_MP_STATE));
     int c = g_mpCalls.fetch_add(1);
-    // show the handler firing (first few) and every state change, so we can see
-    // whether opening the browser drives state toward 3 (list-complete).
+    // first few calls + every state change (does opening the browser drive state to 3?)
     if (c < 6 || st != lastState)
         Log("[srvlist] master handler call#%d state=%d", c, st);
     if (st == 3 && lastState != 3) DumpServerListBlob(false);   // list just completed
@@ -402,9 +384,9 @@ static SBNums SafeReadSBNums(void* entry) {
     return f;
 }
 
-// Log a hex+ASCII window of the copied entry header so we can eyeball field layout
-// (name @ +0x86, cap @ +0xC8, current @ +0xCC, ping @ +0xDC). Read-only.
-static void LogHexWindow(const char* buf, size_t len) {
+// Log a hex+ASCII window of a byte buffer under a caller-chosen tag - so we can
+// eyeball field layout (e.g. name @ +0x86, cap @ +0xC8) or a raw wire packet.
+static void LogHexTag(const char* tag, const char* buf, size_t len) {
     for (size_t off = 0; off < len; off += 16) {
         char line[96]; int p = 0; char ascii[17]; int a = 0;
         p += sprintf_s(line + p, sizeof(line) - p, "+0x%03zX: ", off);
@@ -416,9 +398,10 @@ static void LogHexWindow(const char* buf, size_t len) {
             } else p += sprintf_s(line + p, sizeof(line) - p, "   ");
         }
         ascii[a] = 0;
-        Log("[srv.hex] %s|%s|", line, ascii);
+        Log("%s %s|%s|", tag, line, ascii);
     }
 }
+static void LogHexWindow(const char* buf, size_t len) { LogHexTag("[srv.hex]", buf, len); }
 
 // Log every printable-ASCII run (>=3 chars) with its offset - to locate string
 // fields (folder/name) inside an unknown struct at runtime.
@@ -436,10 +419,9 @@ static void LogPrintableRuns(const char* tag, const char* buf, size_t len) {
     }
 }
 
-// F9 (phase 1): read the game's track array (RVA_TRACK_LIST, stride TRACK_STRIDE,
-// count at RVA_TRACK_COUNT) and log each entry's printable strings + a hex window for
-// the first few. This confirms we can read the list and pins the folder/name offsets,
-// so the next step is an in-game keyboard-driven track switcher.
+// Read the game's track array (RVA_TRACK_LIST, stride TRACK_STRIDE, count at
+// RVA_TRACK_COUNT) and log each entry's fields. Confirms the array read and pins the
+// folder/name offsets the switcher relies on.
 void DumpTrackList() {
     int count = SafeReadInt((const int*)(g_base + mxb::RVA_TRACK_COUNT));
     Log("[tracks] ===== track list (count=%d, stride=%d) =====", count, mxb::TRACK_STRIDE);
@@ -505,8 +487,13 @@ void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay 
 // lives under mods\tracks); `staged` = the state the user wants after Apply.
 struct TrackEntry { std::string rel; bool active; bool staged; };   // rel = "motocross\\X.pkz"
 static std::vector<TrackEntry> g_trk;          // combined active+inactive, sorted by rel
-static int  g_trkCursor = 0;                   // highlighted row
-static int  g_trkTop    = 0;                   // first visible row (scroll offset)
+// The cursor/scroll index into g_trkView (the filtered list), NOT g_trk directly: with a
+// search query active only the matching rows are visible, and the cursor walks those.
+static std::vector<int> g_trkView;             // indices into g_trk matching g_trkQuery (visible rows)
+static std::string g_trkQuery;                 // lowercase search text; empty = show every track
+static bool g_trkSearch = false;               // true = typing into the search box (keys build g_trkQuery)
+static int  g_trkCursor = 0;                   // highlighted row (index into g_trkView)
+static int  g_trkTop    = 0;                   // first visible row (scroll offset, into g_trkView)
 static std::atomic<bool> g_trkOpen{false};     // manager open? (Tick + DrawOverlay both read)
 static const int kTrkVisible = 16;             // rows shown at once (the list scrolls)
 
@@ -517,6 +504,50 @@ static const int kTrkVisible = 16;             // rows shown at once (the list s
 static std::vector<std::string> g_swNames;     // display names for the visible list
 static int  g_swCursor = 0, g_swTop = 0;
 static std::atomic<bool> g_swOpen{false};
+
+// Direct connect (F8 > 6): type an IP[:port] and JOIN that server directly (no browser).
+// A one-line text box like the track search; on Enter we write SB_CONNECT_TARGET and call
+// the game's JOIN-initiator on the game thread. State is touched only on the render thread
+// (Tick + both draw paths), like the switcher/manager state above.
+static std::atomic<bool> g_dcOpen{false};      // direct-connect box open?
+static std::string       g_dcInput;            // typed "ip[:port]" (digits . : only)
+static std::string       g_dcError;            // last parse error (shown red); "" = none
+static bool              g_dcPrimed = false;   // first-frame key latch done? (swallows the '6')
+static const size_t      kDcMax = 21;          // "255.255.255.255:65535"
+
+// Case-insensitive substring test. `needleLower` MUST already be lowercase (g_trkQuery
+// is built lowercased); each haystack char is folded on the fly so there's no locale /
+// tolower() dependency and no allocation.
+static bool ContainsCI(const std::string& hay, const std::string& needleLower) {
+    const size_t n = hay.size(), m = needleLower.size();
+    if (m == 0) return true;
+    if (m > n)  return false;
+    for (size_t i = 0; i + m <= n; ++i) {
+        size_t j = 0;
+        for (; j < m; ++j) {
+            char c = hay[i + j];
+            if (c >= 'A' && c <= 'Z') c += 32;      // fold to lowercase
+            if (c != needleLower[j]) break;
+        }
+        if (j == m) return true;
+    }
+    return false;
+}
+
+// Rebuild g_trkView (the visible rows) from g_trk + the current search query, then
+// re-clamp the cursor/scroll into the new, possibly-shorter list. Called on open and
+// after every query edit. Empty query => every row is visible.
+static void RebuildTrackView() {
+    g_trkView.clear();
+    g_trkView.reserve(g_trk.size());
+    for (int i = 0; i < (int)g_trk.size(); ++i)
+        if (g_trkQuery.empty() || ContainsCI(g_trk[i].rel, g_trkQuery))
+            g_trkView.push_back(i);
+    const int vn = (int)g_trkView.size();
+    if (g_trkCursor >= vn) g_trkCursor = vn ? vn - 1 : 0;   // keep cursor in range
+    if (g_trkCursor < 0)   g_trkCursor = 0;
+    g_trkTop = 0;                                            // filter change -> back to top
+}
 
 // (Re)scan both trees into g_trk and open the manager. Active tracks come from
 // mods\tracks, inactive from the store; deduped by rel (a rel present in both is an
@@ -545,6 +576,8 @@ void OpenTrackManager() {
     });
 
     g_trkCursor = 0; g_trkTop = 0;
+    g_trkQuery.clear(); g_trkSearch = false;    // fresh open: no filter, not typing
+    RebuildTrackView();                         // g_trkView = every row (query empty)
     g_trkOpen.store(true);
     Log("[trklib] track manager opened - %zu tracks (%zu active, %zu inactive).",
         g_trk.size(), active.size(), g_trk.size() - active.size());
@@ -559,14 +592,12 @@ static void EnsureDirTree(const char* filePath) {
     char dir[MAX_PATH];
     strncpy_s(dir, filePath, _TRUNCATE);
     char* slash = strrchr(dir, '\\');
-    if (!slash) return;                         // no directory part
-    *slash = 0;                                 // dir = the parent folder
+    if (!slash) return;
+    *slash = 0;                                 // dir = parent folder
     for (char* p = dir; *p; ++p) {
-        if (*p == '\\' && p != dir) {           // create each intermediate segment
-            *p = 0; CreateDirectoryA(dir, nullptr); *p = '\\';
-        }
+        if (*p == '\\' && p != dir) { *p = 0; CreateDirectoryA(dir, nullptr); *p = '\\'; }
     }
-    CreateDirectoryA(dir, nullptr);             // and the leaf folder
+    CreateDirectoryA(dir, nullptr);
 }
 
 // Apply the staged toggles: move each changed .pkz between mods\tracks and the store,
@@ -691,6 +722,128 @@ void OpenSwitcher() {
     Log("[switch] switcher opened - %d tracks. Up/Down, Enter=load, Esc=close.", count);
 }
 void CloseSwitcher() { g_swOpen.store(false); }
+
+// ---------------------------------------------------------------------------
+// DIRECT CONNECT (F8 > 6) - join a server by IP:port without the browser.
+// See offsets.h "direct connect": we WRITE SB_CONNECT_TARGET (0xE53DE0) from the
+// typed endpoint, then CALL the JOIN-initiator (RVA_SB_JOIN_INIT) on the game
+// thread. Until that RVA is pinned the whole path logs + no-ops (DoDirectConnect).
+// ---------------------------------------------------------------------------
+bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end);   // fwd (defined below)
+
+// Parse "ip[:port]" into a dotted IPv4 + port. Accepts exactly four 0..255 octets and
+// an optional :port (1..65535, default MXB_DEFAULT_PORT). Digits and dots only - the
+// input box never lets letters in, so hostnames aren't handled here (resolve first).
+// On any malformed field returns false and points *err at a short reason.
+static bool ParseEndpoint(const std::string& in, char* host, size_t hostCap,
+                          uint16_t* port, const char** err) {
+    *err = nullptr;
+    std::string h = in, p;
+    size_t colon = in.rfind(':');
+    if (colon != std::string::npos) { h = in.substr(0, colon); p = in.substr(colon + 1); }
+    if (h.empty()) { *err = "enter an IP (e.g. 1.2.3.4:54200)"; return false; }
+
+    int octets = 0, val = -1, digits = 0;             // walk h; a trailing sentinel flushes octet 4
+    for (size_t i = 0; i <= h.size(); ++i) {
+        char c = (i < h.size()) ? h[i] : '.';
+        if (c == '.') {
+            if (digits == 0 || val > 255) { *err = "bad IPv4 address"; return false; }
+            ++octets; val = -1; digits = 0;
+        } else if (c >= '0' && c <= '9') {
+            val = (val < 0 ? 0 : val) * 10 + (c - '0');
+            if (++digits > 3) { *err = "bad IPv4 address"; return false; }
+        } else { *err = "IP: digits and dots only"; return false; }
+    }
+    if (octets != 4) { *err = "IPv4 needs 4 octets"; return false; }
+
+    long portv = mxb::MXB_DEFAULT_PORT;
+    if (!p.empty()) {
+        portv = 0;
+        for (char c : p) {
+            if (c < '0' || c > '9') { *err = "bad port"; return false; }
+            portv = portv * 10 + (c - '0');
+            if (portv > 65535) { *err = "port > 65535"; return false; }
+        }
+        if (portv < 1) { *err = "bad port"; return false; }
+    }
+    strncpy_s(host, hostCap, h.c_str(), _TRUNCATE);
+    *port = (uint16_t)portv;
+    return true;
+}
+
+// POD + SEH: write the endpoint into the game's JOIN target struct. Host goes in as
+// inline ASCII (16-byte field; the resolve-host getaddrinfo path consumes a string) -
+// see offsets.h SBC_HOST if a build stores it packed instead. flag=0 (no password).
+static bool SB_WriteConnectTarget(const char* host, uint16_t port) {
+    __try {
+        char* t = (char*)(g_base + mxb::RVA_SB_CONNECT_TARGET);
+        for (int i = 0; i < 16; ++i) t[mxb::SBC_HOST + i] = 0;         // clear host_lo/host_hi
+        for (int i = 0; i < 15 && host[i]; ++i) t[mxb::SBC_HOST + i] = host[i];
+        *(uint16_t*)(t + mxb::SBC_PORT) = port;
+        t[mxb::SBC_FLAG] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// POD + SEH: call the connect-initiator at the already-resolved address. Game thread only.
+static void SB_CallJoinInit(uintptr_t fn) {
+    __try { ((void (*)())fn)(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[connect] JOIN-init FAULTED - caught (connect may have failed)."); }
+}
+
+// Fire the connect: validate the initiator RVA lands in .text, then queue the write +
+// call on the game thread (the initiator touches game state, exactly like the switcher).
+// If RVA_SB_JOIN_INIT is still 0 we log the intended target and no-op - safe to ship.
+void DoDirectConnect(const char* host, uint16_t port) {
+    if (mxb::RVA_SB_JOIN_INIT == 0) {
+        Log("[connect] would connect to %s:%u, but RVA_SB_JOIN_INIT is not pinned "
+            "(offsets.h) - no-op. Set the initiator RVA to enable direct connect.", host, port);
+        char st[96]; sprintf_s(st, "direct connect: %s:%u (initiator RVA unset - see log)", host, port);
+        SetStatus(st, 6000);
+        return;
+    }
+    uintptr_t ji = g_base + mxb::RVA_SB_JOIN_INIT + g_sigDelta;   // same build-drift adjust as content-init
+    uint8_t *cb, *ce;
+    if (!GetExecRange(g_base, &cb, &ce) || (uint8_t*)ji < cb || (uint8_t*)ji >= ce) {
+        Log("[connect] JOIN-init RVA 0x%zx is outside .text - refusing to call.", (size_t)mxb::RVA_SB_JOIN_INIT);
+        SetStatus("direct connect: bad initiator RVA (see log)", 5000);
+        return;
+    }
+    Log("[connect] target %s:%u - writing SB_CONNECT_TARGET, queuing JOIN on the game thread.", host, port);
+    std::string hs(host);
+    EnqueueGameThreadTask([hs, port, ji] {
+        if (!SB_WriteConnectTarget(hs.c_str(), port)) { Log("[connect] couldn't write target struct."); return; }
+        Log("[connect] -> JOIN-init (connecting to %s:%u)...", hs.c_str(), port);
+        SB_CallJoinInit(ji);
+        Log("[connect] JOIN-init returned.");
+    });
+    char st[96]; sprintf_s(st, "connecting to %s:%u ...", host, port);
+    SetStatus(st, 8000);
+}
+
+// Enter pressed in the box: parse; on error keep the box open (so it can be fixed),
+// otherwise close and fire the connect.
+static void AttemptDirectConnect() {
+    char host[16] = "";
+    uint16_t port = 0;
+    const char* err = nullptr;
+    if (!ParseEndpoint(g_dcInput, host, sizeof(host), &port, &err)) {
+        g_dcError = err ? err : "invalid";
+        Log("[connect] rejected '%s': %s", g_dcInput.c_str(), g_dcError.c_str());
+        return;
+    }
+    g_dcOpen.store(false);                 // close before firing (DoDirectConnect owns feedback)
+    DoDirectConnect(host, port);
+}
+
+void OpenDirectConnect() {
+    g_dcInput.clear();
+    g_dcError.clear();
+    g_dcPrimed = false;                    // first dc frame latches held keys (swallows the menu '6')
+    g_dcOpen.store(true);
+    Log("[connect] direct connect: type IP[:port], Enter=connect, Esc=cancel (default port %u).",
+        (unsigned)mxb::MXB_DEFAULT_PORT);
+}
+void CloseDirectConnect() { g_dcOpen.store(false); }
 
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
@@ -964,11 +1117,10 @@ void RequestReload() {
 }
 
 // ---------------------------------------------------------------------------
-// in-game overlay - a small corner hint drawn with immediate-mode GL inside the
-// wglSwapBuffers hook. Shows "FrostMod - F8: reload mods", and a transient status
-// line after a reload. F7 toggles it. No mouse - F8 (or console R) does the reload.
-// If the game runs a core GL profile the fixed-function calls are no-ops (overlay
-// just stays hidden); everything is wrapped in push/pop so we never disturb the game.
+// in-game overlay - a corner hint drawn with immediate-mode GL inside the
+// wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
+// On a core GL profile the fixed-function calls are no-ops (overlay stays hidden);
+// everything is push/pop-wrapped so the game's GL state is never disturbed.
 // ---------------------------------------------------------------------------
 std::atomic<bool>      g_overlayOn{true};
 std::atomic<bool>      g_menuOpen{false};       // F8 opens the FrostMod action menu
@@ -985,6 +1137,7 @@ static const MenuItem kMenu[] = {
     { '3', "Switch track (localhost)" },
     { '4', "Track list  (log)" },
     { '5', "Toggle this overlay" },
+    { '6', "Direct connect (IP)" },
 };
 static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
 
@@ -1032,14 +1185,17 @@ static void FillRect(int x0, int y0, int x1, int y1) {
 // is prefixed '>' and highlighted; [x]/[ ] is the STAGED active/inactive state; a
 // trailing '*' (amber) marks a row whose staged state differs from disk (pending move).
 static void DrawTrackManager(int w, int h, int lh) {
-    const int n = (int)g_trk.size();
+    const int total = (int)g_trk.size();          // all tracks (staged count is over these)
+    const int vn    = (int)g_trkView.size();      // visible rows after the search filter
     if (g_trkCursor < g_trkTop)                g_trkTop = g_trkCursor;           // scroll up
     if (g_trkCursor >= g_trkTop + kTrkVisible) g_trkTop = g_trkCursor - kTrkVisible + 1; // down
     if (g_trkTop < 0) g_trkTop = 0;
 
-    const int shown = n < kTrkVisible ? n : kTrkVisible;
-    const int rows  = shown + 3;                 // title + list + spacer + footer
-    const int bw = 560, bh = rows * lh + 8;
+    const int shown     = vn < kTrkVisible ? vn : kTrkVisible;
+    const int listLines = vn == 0 ? 1 : shown;    // reserve a line for the "(no matches)" text
+    const bool hasFind  = g_trkSearch || !g_trkQuery.empty();
+    const int rows  = listLines + (hasFind ? 4 : 3);  // title [+search] + list + spacer + footer
+    const int bw = 600, bh = rows * lh + 8;            // wide enough for the key-hint footer
     const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
     glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
     FillRect(x0, y0, x1, y1);
@@ -1047,13 +1203,28 @@ static void DrawTrackManager(int w, int h, int lh) {
     int pending = 0; for (auto& e : g_trk) if (e.staged != e.active) ++pending;
     int y = y1 - 17;
     glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
-    char title[96];
-    sprintf_s(title, "FrostMod - Track Manager   (%d tracks, %d staged)", n, pending);
+    char title[112];
+    sprintf_s(title, "FrostMod - Track Manager   (%d/%d shown, %d staged)", vn, total, pending);
     GlText(x0 + 8, y, title); y -= lh;
 
-    for (int i = g_trkTop; i < g_trkTop + shown && i < n; ++i) {
-        const TrackEntry& e = g_trk[i];
-        bool cur = (i == g_trkCursor);
+    // Search box: shown while typing OR whenever a filter is active. A blinking-free
+    // caret '_' in search mode makes it obvious the manager is capturing keystrokes.
+    if (hasFind) {
+        char sline[160];
+        sprintf_s(sline, "  Search: %s%s", g_trkQuery.c_str(), g_trkSearch ? "_" : "");
+        if (g_trkSearch) glColor4f(0.55f, 0.95f, 0.75f, 1.0f);   // green while typing
+        else             glColor4f(0.70f, 0.78f, 0.90f, 1.0f);   // dim once committed
+        GlText(x0 + 8, y, sline); y -= lh;
+    }
+
+    if (vn == 0) {
+        glColor4f(0.80f, 0.62f, 0.62f, 1.0f);
+        GlText(x0 + 8, y, g_trkQuery.empty() ? "  (no tracks found)" : "  (no matches)");
+        y -= lh;
+    }
+    for (int vi = g_trkTop; vi < g_trkTop + shown && vi < vn; ++vi) {
+        const TrackEntry& e = g_trk[g_trkView[vi]];         // map view row -> real entry
+        bool cur = (vi == g_trkCursor);
         if (cur) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4); }
         char row[160];
         sprintf_s(row, "%s [%c] %s%s", cur ? ">" : " ", e.staged ? 'x' : ' ',
@@ -1065,9 +1236,12 @@ static void DrawTrackManager(int w, int h, int lh) {
 
     y -= 2;
     glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
-    char foot[128];
-    sprintf_s(foot, "  Up/Down move   Space toggle   Enter apply+reload   Esc cancel   [%d-%d/%d]",
-              n ? g_trkTop + 1 : 0, g_trkTop + shown, n);
+    char foot[160];
+    if (g_trkSearch)
+        sprintf_s(foot, "  type to filter   Backspace del   Enter done   Esc clear   [%d matches]", vn);
+    else
+        sprintf_s(foot, "  Up/Down  Space toggle  A all  F find  Enter apply  Esc close   [%d-%d/%d]",
+                  vn ? g_trkTop + 1 : 0, g_trkTop + shown, vn);
     GlText(x0 + 8, y, foot);
 }
 
@@ -1107,11 +1281,36 @@ static void DrawSwitcher(int w, int h, int lh) {
     GlText(x0 + 8, y, foot);
 }
 
+// The direct-connect panel: a single IP:port text line (green, with a caret) plus an
+// optional red error line. Mirrors the track-search box styling.
+static void DrawDirectConnect(int w, int h, int lh) {
+    const bool hasErr = !g_dcError.empty();
+    const int rows = hasErr ? 4 : 3;             // title + input [+ error] + footer
+    const int bw = 420, bh = rows * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    GlText(x0 + 8, y, "FrostMod - Direct Connect"); y -= lh;
+    char inl[96]; sprintf_s(inl, "  IP:  %s_", g_dcInput.c_str());
+    glColor4f(0.55f, 0.95f, 0.75f, 1.0f);        // green input line + caret
+    GlText(x0 + 8, y, inl); y -= lh;
+    if (hasErr) {
+        char el[128]; sprintf_s(el, "  ! %s", g_dcError.c_str());
+        glColor4f(0.95f, 0.55f, 0.55f, 1.0f);
+        GlText(x0 + 8, y, el); y -= lh;
+    }
+    glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+    GlText(x0 + 8, y, "  digits . :   Enter connect   Esc cancel");
+}
+
 void DrawOverlay(HDC hdc) {
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
-        && !g_trkOpen.load() && !g_swOpen.load()) return;
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -1124,6 +1323,7 @@ void DrawOverlay(HDC hdc) {
     const bool menu      = g_menuOpen.load() && !reloading;
     const bool trk       = g_trkOpen.load() && !reloading;
     const bool sw        = g_swOpen.load()  && !reloading;
+    const bool dc        = g_dcOpen.load()  && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -1152,6 +1352,8 @@ void DrawOverlay(HDC hdc) {
         DrawTrackManager(w, h, lh);
     } else if (sw) {
         DrawSwitcher(w, h, lh);
+    } else if (dc) {
+        DrawDirectConnect(w, h, lh);
     } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
         const int rows = kMenuCount + 2;         // title + items + footer
@@ -1191,6 +1393,297 @@ void DrawOverlay(HDC hdc) {
 }
 
 // ---------------------------------------------------------------------------
+// Sanctioned overlay path: the PiBoSo Draw() callback (see the export below).
+// On track/spectate/replay the game calls Draw() and renders the quads+strings
+// we hand it - no GL, no SwapBuffers draw, resolution-independent. We mirror the
+// same panels DrawOverlay() builds, but in the engine's normalized 0..1 space
+// (top-left origin, ABGR colors). In menus - where Draw() is NOT called - and in
+// injected mode, the GL DrawOverlay() path still runs; g_drawCalls lets the swap
+// hook suppress the GL draw whenever Draw() is live, so there is never a double
+// image. Input (Tick, via the swap hook) is unchanged and drives both paths.
+// ---------------------------------------------------------------------------
+std::atomic<uint64_t> g_drawCalls{0};   // ++ each Draw(); the swap hook watches it
+
+// PiBoSo draw items (from mxb_example.c). The engine reads these AFTER Draw()
+// returns, so the arrays handed back must persist - they are the static ones below.
+struct SPluginQuad_t {
+    float         m_aafPos[4][2];   // 4 corners, normalized 0..1, counter-clockwise
+    int           m_iSprite;        // 1-based sprite; 0 = solid fill with m_ulColor
+    unsigned long m_ulColor;        // ABGR
+};
+struct SPluginString_t {
+    char          m_szString[100];
+    float         m_afPos[2];       // normalized 0..1 (top-left origin)
+    int           m_iFont;          // 1-based font index (1 = engine default)
+    float         m_fSize;
+    int           m_iJustify;       // 0 left, 1 center, 2 right
+    unsigned long m_ulColor;        // ABGR
+};
+
+static SPluginQuad_t   g_drawQuads[64];
+static SPluginString_t g_drawStrs[64];
+static int             g_nDrawQuads = 0, g_nDrawStrs = 0;
+
+// our glColor4f palette -> ABGR (so both renderers share exactly one set of colors)
+static unsigned long ToABGR(float r, float g, float b, float a) {
+    auto c = [](float v) { int i = (int)(v * 255.0f + 0.5f); return (unsigned long)(i < 0 ? 0 : i > 255 ? 255 : i); };
+    return (c(a) << 24) | (c(b) << 16) | (c(g) << 8) | c(r);
+}
+
+static void DQuad(float x0, float y0, float x1, float y1, unsigned long abgr) {
+    if (g_nDrawQuads >= (int)(sizeof(g_drawQuads) / sizeof(g_drawQuads[0]))) return;
+    SPluginQuad_t& q = g_drawQuads[g_nDrawQuads++];
+    q.m_aafPos[0][0] = x0; q.m_aafPos[0][1] = y0;   // top-left
+    q.m_aafPos[1][0] = x0; q.m_aafPos[1][1] = y1;   // bottom-left
+    q.m_aafPos[2][0] = x1; q.m_aafPos[2][1] = y1;   // bottom-right
+    q.m_aafPos[3][0] = x1; q.m_aafPos[3][1] = y0;   // top-right
+    q.m_iSprite = 0;
+    q.m_ulColor = abgr;
+}
+
+static void DText(float x, float y, const char* s, unsigned long abgr, float size) {
+    if (g_nDrawStrs >= (int)(sizeof(g_drawStrs) / sizeof(g_drawStrs[0])) || !s || !*s) return;
+    SPluginString_t& t = g_drawStrs[g_nDrawStrs++];
+    strncpy_s(t.m_szString, s, _TRUNCATE);
+    t.m_afPos[0] = x; t.m_afPos[1] = y;
+    t.m_iFont = 1; t.m_fSize = size; t.m_iJustify = 0; t.m_ulColor = abgr;
+}
+
+// Fill g_drawQuads/g_drawStrs from the same overlay state DrawOverlay() reads.
+// Normalized-coord mirror of DrawOverlay: quads are backgrounds/highlights/bars
+// (no font needed), strings are labels (font index 1). Panel widths are fractions
+// tuned to match the GL layout's proportions - adjust here if text overflows.
+static void BuildOverlayDrawLists() {
+    g_nDrawQuads = 0; g_nDrawStrs = 0;
+    if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load()) return;
+
+    const bool reloading = g_reloadActive.load();
+    const bool menu = g_menuOpen.load() && !reloading;
+    const bool trk  = g_trkOpen.load()  && !reloading;
+    const bool sw   = g_swOpen.load()   && !reloading;
+    const bool dc   = g_dcOpen.load()   && !reloading;
+    const int  done = g_reloadDone.load(), total = kReloadStepCount;
+    const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
+
+    const float MX = 0.010f, MY = 0.014f;   // top-left anchor
+    const float LH = 0.028f, FS = 0.021f;   // line height, font size (normalized)
+    const float PADX = 0.006f;
+
+    const unsigned long cPanel = ToABGR(0.04f, 0.05f, 0.08f, 0.90f);
+    const unsigned long cBlue  = ToABGR(0.47f, 0.78f, 1.0f, 1.0f);
+    const unsigned long cWhite = ToABGR(0.90f, 0.94f, 1.0f, 1.0f);
+    const unsigned long cGray  = ToABGR(0.60f, 0.66f, 0.76f, 1.0f);
+    const unsigned long cAmber = ToABGR(1.0f,  0.85f, 0.45f, 1.0f);
+    const unsigned long cHi    = ToABGR(0.47f, 0.78f, 1.0f, 0.18f);
+
+    if (trk) {
+        const int total_t = (int)g_trk.size();
+        const int vn      = (int)g_trkView.size();
+        if (g_trkCursor < g_trkTop)                g_trkTop = g_trkCursor;
+        if (g_trkCursor >= g_trkTop + kTrkVisible) g_trkTop = g_trkCursor - kTrkVisible + 1;
+        if (g_trkTop < 0) g_trkTop = 0;
+        const int  shown     = vn < kTrkVisible ? vn : kTrkVisible;
+        const bool hasFind   = g_trkSearch || !g_trkQuery.empty();
+        const int  listLines = vn == 0 ? 1 : shown;
+        const int  rows      = listLines + (hasFind ? 4 : 3);
+        const float w = 0.46f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        int pending = 0; for (auto& e : g_trk) if (e.staged != e.active) ++pending;
+        float y = MY + 0.006f;
+        char title[112];
+        sprintf_s(title, "FrostMod - Track Manager   (%d/%d shown, %d staged)", vn, total_t, pending);
+        DText(MX + PADX, y, title, cBlue, FS); y += LH;
+        if (hasFind) {
+            char sline[160]; sprintf_s(sline, "  Search: %s%s", g_trkQuery.c_str(), g_trkSearch ? "_" : "");
+            DText(MX + PADX, y, sline, g_trkSearch ? ToABGR(0.55f, 0.95f, 0.75f, 1.0f)
+                                                   : ToABGR(0.70f, 0.78f, 0.90f, 1.0f), FS);
+            y += LH;
+        }
+        if (vn == 0) {
+            DText(MX + PADX, y, g_trkQuery.empty() ? "  (no tracks found)" : "  (no matches)",
+                  ToABGR(0.80f, 0.62f, 0.62f, 1.0f), FS);
+            y += LH;
+        }
+        for (int vi = g_trkTop; vi < g_trkTop + shown && vi < vn; ++vi) {
+            const TrackEntry& e = g_trk[g_trkView[vi]];
+            bool cur = (vi == g_trkCursor);
+            if (cur) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            char row[160];
+            sprintf_s(row, "%s [%c] %s%s", cur ? ">" : " ", e.staged ? 'x' : ' ',
+                      e.rel.c_str(), (e.staged != e.active) ? "  *" : "");
+            DText(MX + PADX, y, row, (e.staged != e.active) ? cAmber : cWhite, FS); y += LH;
+        }
+        y += 0.004f;
+        char foot[160];
+        if (g_trkSearch)
+            sprintf_s(foot, "  type to filter   Backspace del   Enter done   Esc clear   [%d matches]", vn);
+        else
+            sprintf_s(foot, "  Up/Down  Space toggle  A all  F find  Enter apply  Esc close   [%d-%d/%d]",
+                      vn ? g_trkTop + 1 : 0, g_trkTop + shown, vn);
+        DText(MX + PADX, y, foot, cGray, FS);
+    } else if (sw) {
+        const int n = (int)g_swNames.size();
+        if (g_swCursor < g_swTop)                g_swTop = g_swCursor;
+        if (g_swCursor >= g_swTop + kTrkVisible) g_swTop = g_swCursor - kTrkVisible + 1;
+        if (g_swTop < 0) g_swTop = 0;
+        const int shown = n < kTrkVisible ? n : kTrkVisible;
+        const int rows  = shown + 3;
+        const float w = 0.36f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        char title[96]; sprintf_s(title, "FrostMod - Switch Track (localhost)   (%d tracks)", n);
+        DText(MX + PADX, y, title, cBlue, FS); y += LH;
+        for (int i = g_swTop; i < g_swTop + shown && i < n; ++i) {
+            bool cur = (i == g_swCursor);
+            if (cur) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            char row[160]; sprintf_s(row, "%s %s", cur ? ">" : " ", g_swNames[i].c_str());
+            DText(MX + PADX, y, row, cWhite, FS); y += LH;
+        }
+        y += 0.004f;
+        char foot[128];
+        sprintf_s(foot, "  Up/Down move   Enter load   Esc cancel   [%d-%d/%d]",
+                  n ? g_swTop + 1 : 0, g_swTop + shown, n);
+        DText(MX + PADX, y, foot, cGray, FS);
+    } else if (dc) {
+        const bool hasErr = !g_dcError.empty();
+        const int rows = hasErr ? 4 : 3;
+        const float w = 0.32f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        DText(MX + PADX, y, "FrostMod - Direct Connect", cBlue, FS); y += LH;
+        char inl[96]; sprintf_s(inl, "  IP:  %s_", g_dcInput.c_str());
+        DText(MX + PADX, y, inl, ToABGR(0.55f, 0.95f, 0.75f, 1.0f), FS); y += LH;
+        if (hasErr) {
+            char el[128]; sprintf_s(el, "  ! %s", g_dcError.c_str());
+            DText(MX + PADX, y, el, ToABGR(0.95f, 0.55f, 0.55f, 1.0f), FS); y += LH;
+        }
+        DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
+    } else if (menu) {
+        const int rows = kMenuCount + 2;
+        const float w = 0.22f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.86f));
+        float y = MY + 0.006f;
+        DText(MX + PADX, y, "FrostMod v" FROSTMOD_VERSION "  -  menu", cBlue, FS); y += LH;
+        for (int i = 0; i < kMenuCount; ++i) {
+            char row[96]; sprintf_s(row, "  %c   %s", kMenu[i].key, kMenu[i].label);
+            DText(MX + PADX, y, row, cWhite, FS); y += LH;
+        }
+        DText(MX + PADX, y, "  F8 / Esc   close", cGray, FS);
+    } else {
+        char line[128];
+        if (reloading) {
+            static const char spin[4] = {'|', '/', '-', '\\'};
+            unsigned f = (unsigned)g_drawCalls.load();
+            sprintf_s(line, "%c  Reloading mods...  %d%%", spin[(f / 3) % 4], total ? (done * 100 / total) : 0);
+        } else if (GetTickCount64() < g_statusUntil.load()) {
+            std::lock_guard<std::mutex> lk(g_statusMutex);
+            strncpy_s(line, g_statusText, _TRUNCATE);
+        } else {
+            strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
+        }
+        const float w = 0.20f, h = reloading ? 0.060f : 0.034f;
+        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.72f));
+        DText(MX + PADX, MY + 0.006f, line, cBlue, FS);
+        if (reloading) {
+            const float bx0 = MX + PADX, bx1 = MX + w - PADX, by0 = MY + h - 0.014f, by1 = by0 + 0.008f;
+            DQuad(bx0, by0, bx1, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.18f));
+            DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(0.47f, 0.78f, 1.0f, 0.95f));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MASTER CAPTURE  (opt-in: frostmod.exe --capture-master)
+//
+// Reverse-engineer the master protocol before building the mimic master server.
+// We hook the ws2_32 EXPORTS (standard, stable signatures - offset-drift-proof,
+// unlike the game's internal net wrappers, and no signature to author) and log
+// ONLY the datagrams to/from the master: UDP 54200, or the IP master.mx-bikes.com
+// resolved to. Read-only - every packet passes through untouched.
+//
+// Works even while the real master is DOWN: the client still SENDs GETLIST (~3s
+// cadence) and a local `mxbikes.exe --dedicated` still SENDs REGISTER - both are
+// captured on the outbound side regardless of any reply. The HOSTED reply format
+// is captured later against our own daemon during bring-up.
+//
+// If the game uses WSASendTo/WSARecvFrom instead of classic sendto/recvfrom, the
+// [cap] getaddrinfo line still fires (the host resolves) but no [cap] SEND/RECV
+// will - that's the signal to add the WSA variants.
+// ---------------------------------------------------------------------------
+static const uint16_t kMasterPort = 54200;   // 0xD3B8 - the master server-list port
+std::atomic<uint32_t> g_capMasterIp{0};       // master IPv4 as stored in sockaddr (net order); 0 = unknown
+std::atomic<int>      g_capLeft{300};          // cap total [cap] dumps so the log can't run away
+
+using sendto_t      = int (WSAAPI*)(SOCKET, const char*, int, int, const sockaddr*, int);
+using recvfrom_t    = int (WSAAPI*)(SOCKET, char*, int, int, sockaddr*, int*);
+using getaddrinfo_t = int (WSAAPI*)(const char*, const char*, const addrinfo*, addrinfo**);
+static sendto_t      g_origSendto      = nullptr;
+static recvfrom_t    g_origRecvfrom    = nullptr;
+static getaddrinfo_t g_origGetaddrinfo = nullptr;
+
+// AF_INET sockaddr parsed by hand, so we need no ws2_32 calls (no WSAStartup/link):
+//   +0 family(u16 host order)  +2 port(u16 big-endian)  +4 addr(4 bytes, net order)
+static bool CapIsMaster(const void* sa) {
+    if (!sa) return false;
+    const unsigned char* p = (const unsigned char*)sa;
+    if ((uint16_t)(p[0] | (p[1] << 8)) != AF_INET) return false;
+    uint16_t port = (uint16_t)((p[2] << 8) | p[3]);
+    if (port == kMasterPort) return true;
+    uint32_t ip; memcpy(&ip, p + 4, 4);
+    uint32_t m = g_capMasterIp.load();
+    return m && ip == m;
+}
+
+static void CapLog(const char* dir, const void* sa, const char* buf, int len) {
+    if (g_capLeft.load() <= 0) return;
+    g_capLeft.fetch_sub(1);
+    const unsigned char* p = (const unsigned char*)sa;
+    uint16_t port = (uint16_t)((p[2] << 8) | p[3]);
+    Log("[cap] %s %u.%u.%u.%u:%u  len=%d", dir, p[4], p[5], p[6], p[7], port, len);
+    int n = len; if (n < 0) n = 0; if (n > 512) n = 512;   // clamp the dump
+    if (n) { LogHexTag("[cap.hex]", buf, (size_t)n); LogPrintableRuns("[cap.str]", buf, (size_t)n); }
+}
+
+int WSAAPI hkSendto(SOCKET s, const char* buf, int len, int flags, const sockaddr* to, int tolen) {
+    if (CapIsMaster(to)) CapLog("SEND", to, buf, len);
+    return g_origSendto(s, buf, len, flags, to, tolen);
+}
+int WSAAPI hkRecvfrom(SOCKET s, char* buf, int len, int flags, sockaddr* from, int* fromlen) {
+    int r = g_origRecvfrom(s, buf, len, flags, from, fromlen);
+    if (r > 0 && CapIsMaster(from)) CapLog("RECV", from, buf, r);
+    return r;
+}
+int WSAAPI hkGetaddrinfo(const char* node, const char* service, const addrinfo* hints, addrinfo** res) {
+    int r = g_origGetaddrinfo(node, service, hints, res);
+    auto containsCI = [](const char* hay, const char* nee) {
+        if (!hay) return false;
+        auto lc = [](char c) { return (c >= 'A' && c <= 'Z') ? char(c + 32) : c; };
+        for (const char* h = hay; *h; ++h) {
+            const char* a = h; const char* b = nee;
+            while (*a && *b && lc(*a) == lc(*b)) { ++a; ++b; }
+            if (!*b) return true;
+        }
+        return false;
+    };
+    if (node && containsCI(node, "mx-bikes")) {
+        Log("[cap] getaddrinfo node='%s' service='%s' rc=%d", node, service ? service : "(null)", r);
+        if (r == 0 && res) {
+            for (addrinfo* ai = *res; ai; ai = ai->ai_next) {
+                if (ai->ai_family == AF_INET && ai->ai_addr && ai->ai_addrlen >= 8) {
+                    const unsigned char* p = (const unsigned char*)ai->ai_addr;
+                    Log("[cap]   resolved -> %u.%u.%u.%u", p[4], p[5], p[6], p[7]);
+                    uint32_t ip; memcpy(&ip, p + 4, 4);
+                    uint32_t expected = 0;
+                    g_capMasterIp.compare_exchange_strong(expected, ip);   // latch the first
+                }
+            }
+        }
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // SwapBuffers hooks - our per-frame tick on the render thread
 // ---------------------------------------------------------------------------
 using SwapBuffers_t    = BOOL(WINAPI*)(HDC);
@@ -1216,20 +1709,19 @@ void MenuAction(int d) {
     case 4: DumpTrackList();    g_menuOpen.store(false); break;   // [tracks] to the log (verify fields)
     case 5: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
+    case 6: g_menuOpen.store(false); OpenDirectConnect(); break;   // join a server by IP
     default: break;
     }
 }
 
 void Tick() {
-    // Heartbeat: prove the render hook is actually firing. If you never see this
-    // line in frostmod.log, the game isn't calling the SwapBuffers we hooked, so
-    // F8 / reload can't run - that's the thing to fix, not the reload itself.
+    // Heartbeat: proves the render hook fires. No [tick] line in the log => the game
+    // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // In-game UI: F8 opens the FrostMod MENU (top-left); while it's open, press an
-    // item's number to run it, or Esc/F8 to close. One key (F8) instead of a growing
-    // pile of F-keys - new features are rows in kMenu[] / MenuAction().
+    // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
+    // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
@@ -1237,6 +1729,8 @@ void Tick() {
             CloseTrackManager(); Log("[trklib] track manager closed (F8).");
         } else if (g_swOpen.load()) {
             CloseSwitcher(); Log("[switch] switcher closed (F8).");
+        } else if (g_dcOpen.load()) {
+            CloseDirectConnect(); Log("[connect] direct connect closed (F8).");
         } else {
             bool open = !g_menuOpen.load();
             g_menuOpen.store(open);
@@ -1255,35 +1749,68 @@ void Tick() {
         prevEsc = esc;
     }
 
-    // Track manager (F8 > 2): modal keyboard list. Up/Down move (with held-key repeat so
-    // a long list scrolls), Space toggles the cursor row's staged active/inactive, Enter
-    // applies (moves the .pkz + reloads, closing the list), Esc cancels. Its own state is
-    // mutually exclusive with the menu above (opening it clears g_menuOpen), so the two
-    // input blocks never fight.
+    // Track manager (F8 > 2): modal keyboard list with two sub-modes.
+    //   NAV (default): Up/Down move the cursor over the *filtered* view (held-key repeat so
+    //     a long list scrolls); Space toggles the cursor row's staged state; A selects /
+    //     unselects ALL rows in the current view; F (or '/') opens the search box; Enter
+    //     applies (moves the .pkz + reloads, closing the list); Esc closes.
+    //   SEARCH (after F / '/'): typed letters/digits/space build g_trkQuery and the list
+    //     filters live; Backspace deletes; Enter commits (back to NAV, filter kept); Esc
+    //     clears the query and returns to NAV.
+    // One prevKey[] edge table serves both modes. Enter/Esc are polled in both branches so
+    // a key held across a mode switch can't double-fire (it must be released + pressed
+    // again). Its state is mutually exclusive with the menu above (opening it clears
+    // g_menuOpen), so the two input blocks never fight.
     if (g_trkOpen.load()) {
-        static bool pUp = false, pDown = false, pSpace = false, pEnter = false, pEscT = false;
+        static bool prevKey[256] = {false};
         static ULONGLONG upNext = 0, downNext = 0;
-        const int n = (int)g_trk.size();
         const ULONGLONG now = GetTickCount64();
-        bool up    = (GetAsyncKeyState(VK_UP)     & 0x8000) != 0;
-        bool down  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) != 0;
-        bool space = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
-        bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-        bool esc   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        // edge on first press, then auto-repeat: initial 350ms delay, 90ms cadence
-        auto step = [&](bool held, bool prev, ULONGLONG& nextAt) -> bool {
-            if (held && !prev)         { nextAt = now + 350; return true; }
-            if (held && now >= nextAt) { nextAt = now + 90;  return true; }
-            return false;
+        auto keyDown = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+        // Fresh press since last frame (always updates prevKey so mode switches stay clean).
+        auto edge = [&](int vk) { bool k = keyDown(vk); bool e = k && !prevKey[vk]; prevKey[vk] = k; return e; };
+        // Edge, then auto-repeat while held: initial 350ms delay, 90ms cadence.
+        auto repeat = [&](int vk, ULONGLONG& nextAt) {
+            bool k = keyDown(vk), fire = false;
+            if (k && !prevKey[vk])       { nextAt = now + 350; fire = true; }
+            else if (k && now >= nextAt) { nextAt = now + 90;  fire = true; }
+            prevKey[vk] = k; return fire;
         };
-        if (n) {
-            if (step(up,   pUp,   upNext))   g_trkCursor = (g_trkCursor - 1 + n) % n;   // wraps
-            if (step(down, pDown, downNext)) g_trkCursor = (g_trkCursor + 1)     % n;
-            if (space && !pSpace) { TrackEntry& e = g_trk[g_trkCursor]; e.staged = !e.staged; }
+        const int vn = (int)g_trkView.size();
+
+        if (g_trkSearch) {                                    // ---- SEARCH: build the query
+            bool changed = false;
+            for (int vk = 'A'; vk <= 'Z'; ++vk) if (edge(vk)) { g_trkQuery.push_back((char)(vk + 32)); changed = true; }
+            for (int vk = '0'; vk <= '9'; ++vk) if (edge(vk)) { g_trkQuery.push_back((char)vk);         changed = true; }
+            if (edge(VK_SPACE))                        { g_trkQuery.push_back(' '); changed = true; }
+            if (edge(VK_BACK) && !g_trkQuery.empty())  { g_trkQuery.pop_back();      changed = true; }
+            if (edge(VK_RETURN)) {                            // commit; keep the filter
+                g_trkSearch = false;
+                Log("[trklib] search committed: \"%s\" (%d matches).", g_trkQuery.c_str(), vn);
+            } else if (edge(VK_ESCAPE)) {                     // cancel; drop the filter
+                g_trkSearch = false;
+                if (!g_trkQuery.empty()) { g_trkQuery.clear(); changed = true; }
+            }
+            if (changed) RebuildTrackView();
+        } else {                                             // ---- NAV: move / toggle / apply
+            if (vn) {
+                if (repeat(VK_UP,   upNext))   g_trkCursor = (g_trkCursor - 1 + vn) % vn;   // wraps
+                if (repeat(VK_DOWN, downNext)) g_trkCursor = (g_trkCursor + 1)      % vn;
+            }
+            if (edge(VK_SPACE) && vn) {                        // toggle the cursor row
+                TrackEntry& e = g_trk[g_trkView[g_trkCursor]]; e.staged = !e.staged;
+            }
+            if (edge('A') && vn) {                             // select / unselect all in view
+                bool allStaged = true;
+                for (int vi = 0; vi < vn; ++vi) if (!g_trk[g_trkView[vi]].staged) { allStaged = false; break; }
+                const bool target = !allStaged;               // all staged -> clear; else set all
+                for (int vi = 0; vi < vn; ++vi) g_trk[g_trkView[vi]].staged = target;
+                Log("[trklib] %s all %d shown track(s).", target ? "selected" : "unselected", vn);
+            }
+            const bool find = edge('F'), slash = edge(VK_OEM_2);  // both, so prevKey stays fresh
+            if (find || slash) { g_trkSearch = true; Log("[trklib] search: type to filter, Enter=done, Esc=clear."); }
+            if (edge(VK_RETURN))      ApplyTrackChanges();    // moves + reload; closes the manager
+            else if (edge(VK_ESCAPE)) { CloseTrackManager(); Log("[trklib] track manager closed (Esc)."); }
         }
-        if (enter && !pEnter)    ApplyTrackChanges();        // moves + reload; closes the manager
-        else if (esc && !pEscT) { CloseTrackManager(); Log("[trklib] track manager closed (Esc)."); }
-        pUp = up; pDown = down; pSpace = space; pEnter = enter; pEscT = esc;
     }
 
     // Track switcher (F8 > 3): Up/Down move (held-key repeat), Enter loads the
@@ -1309,6 +1836,34 @@ void Tick() {
         if (enter && !sEnter && n) { int idx = g_swCursor; CloseSwitcher(); LoadTrackByIndex(idx); }
         else if (esc && !sEsc)     { CloseSwitcher(); Log("[switch] switcher closed (Esc)."); }
         sUp = up; sDown = down; sEnter = enter; sEsc = esc;
+    }
+
+    // Direct connect (F8 > 6): one-line IP:port text box. Digits (top row + numpad),
+    // '.', and ':' build g_dcInput; Backspace deletes; Enter parses + connects; Esc
+    // cancels. On the first frame we latch the currently-held keys so the '6' that
+    // opened the box (handled by the menu digit block) isn't captured as input.
+    if (g_dcOpen.load()) {
+        static bool dcPrev[256] = {false};
+        auto keyDown = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+        if (!g_dcPrimed) {
+            for (int vk = 0; vk < 256; ++vk) dcPrev[vk] = keyDown(vk);
+            g_dcPrimed = true;
+        }
+        auto edge = [&](int vk) { bool k = keyDown(vk); bool e = k && !dcPrev[vk]; dcPrev[vk] = k; return e; };
+        bool changed = false;
+        auto emit = [&](char c) { if (g_dcInput.size() < kDcMax) { g_dcInput.push_back(c); changed = true; } };
+
+        for (int vk = '0'; vk <= '9'; ++vk)                 if (edge(vk)) emit((char)vk);
+        for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; ++vk)   if (edge(vk)) emit((char)('0' + (vk - VK_NUMPAD0)));
+        const bool dot1 = edge(VK_OEM_PERIOD), dot2 = edge(VK_DECIMAL);   // both, so dcPrev stays fresh
+        if (dot1 || dot2) emit('.');
+        if (edge(VK_OEM_1)) emit(':');                       // ';:' key -> port separator
+        if (edge(VK_BACK) && !g_dcInput.empty()) { g_dcInput.pop_back(); changed = true; }
+
+        const bool enter = edge(VK_RETURN), esc = edge(VK_ESCAPE);   // both, so dcPrev stays fresh
+        if (changed) g_dcError.clear();                      // editing clears the last error
+        if (enter)     AttemptDirectConnect();               // parse + connect (keeps box open on error)
+        else if (esc) { CloseDirectConnect(); Log("[connect] direct connect closed (Esc)."); }
     }
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
@@ -1342,10 +1897,18 @@ void Tick() {
 }
 
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
-BOOL WINAPI hkWglSwapBuffers(HDC hdc)   { Tick(); DrawOverlay(hdc); return g_origWglSwapBuffers(hdc); }
-
-// (The old floating Win32 "Reload Mods" window was removed - reload is now driven
-//  by the in-game overlay + F8 hotkey and the frostmod.exe console 'R'.)
+BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
+    Tick();
+    // Draw the GL overlay only when the sanctioned Draw() path is NOT feeding the
+    // engine this frame. On track the game calls Draw() every frame (g_drawCalls
+    // advances) -> skip GL, no double image. In menus / injected mode Draw() never
+    // fires (count is stable) -> GL draws the overlay as before.
+    static uint64_t lastDraw = 0;
+    uint64_t now = g_drawCalls.load(std::memory_order_relaxed);
+    if (now == lastDraw) DrawOverlay(hdc);
+    lastDraw = now;
+    return g_origWglSwapBuffers(hdc);
+}
 
 // ---------------------------------------------------------------------------
 // signature (AOB) validation - is offsets.h actually correct for THIS build?
@@ -1612,6 +2175,34 @@ DWORD WINAPI Init(LPVOID) {
         }
     }
 
+    // OPT-IN (frostmod.exe --capture-master): sniff the master protocol to RE the
+    // login / GETLIST / REGISTER / HOSTED wire format before we build the mimic
+    // master. Hooks the ws2_32 exports and logs only master (UDP 54200 / resolved
+    // master IP) traffic as [cap]/[cap.hex]/[cap.str]. Read-only. Off by default.
+    {
+        char flag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(flag, g_logPath);
+            if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_capture.flag"); }
+        }
+        if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            if (HMODULE ws = LoadLibraryA("ws2_32.dll")) {
+                if (auto p = GetProcAddress(ws, "sendto"))
+                    InstallHook((void*)p, &hkSendto, (void**)&g_origSendto, "ws2_32!sendto");
+                if (auto p = GetProcAddress(ws, "recvfrom"))
+                    InstallHook((void*)p, &hkRecvfrom, (void**)&g_origRecvfrom, "ws2_32!recvfrom");
+                if (auto p = GetProcAddress(ws, "getaddrinfo"))
+                    InstallHook((void*)p, &hkGetaddrinfo, (void**)&g_origGetaddrinfo, "ws2_32!getaddrinfo");
+                Log("[cap] --capture-master ARMED (UDP %u). Open the online browser (client) and/or run "
+                    "`mxbikes.exe --dedicated`, then send frostmod.log back. If you see a [cap] getaddrinfo "
+                    "line but no SEND/RECV, the game uses WSASendTo/WSARecvFrom - tell me and I'll add those.",
+                    (unsigned)kMasterPort);
+            } else {
+                Log("[cap] --capture-master: could not load ws2_32.dll; capture not installed.");
+            }
+        }
+    }
+
     // Track library (F10): learn the mods folder from frostmod_mods.txt (the launcher
     // writes it next to us) and derive the inactive-tracks store as a sibling of mods,
     // OUTSIDE the scanned tree so deactivated tracks are never loaded.
@@ -1720,8 +2311,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 // our hooks installed before the one-time mods scan, no injector needed. The
 // game validates the plugin via GetModID + the two version numbers (must match
 // this MX Bikes build: "mxbikes", data 8, interface 9 - from mxb_example.c).
-// Optional data/telemetry callbacks are intentionally omitted; the game only
-// calls the exports that exist. See docs/PLUGIN.md.
+// We also implement the optional Draw() callback as the sanctioned overlay path
+// (on track/spectate/replay); other data/telemetry callbacks are omitted, and the
+// game only calls the exports that exist. See docs/PLUGIN.md.
 // ---------------------------------------------------------------------------
 extern "C" {
 
@@ -1747,6 +2339,21 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 __declspec(dllexport) void Shutdown() {
     Log("[plugin] Shutdown() requested by game.");
     // MinHook hooks are torn down with the process; nothing required here.
+}
+
+// Optional. Called each frame while on track (0), spectating (1), or in a replay
+// (2) - NOT in menus. We build our overlay as quads+strings and hand the engine
+// the (persistent) arrays to render. Bumping g_drawCalls tells the swap hook the
+// sanctioned path is live so it skips the GL fallback (no double image). The
+// out-arrays stay valid after return because they are static.
+__declspec(dllexport) void Draw(int /*_iState*/, int* _piNumQuads, void** _ppQuad,
+                                int* _piNumString, void** _ppString) {
+    g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    BuildOverlayDrawLists();
+    if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
+    if (_ppQuad)      *_ppQuad      = g_drawQuads;
+    if (_piNumString) *_piNumString = g_nDrawStrs;
+    if (_ppString)    *_ppString    = g_drawStrs;
 }
 
 } // extern "C"

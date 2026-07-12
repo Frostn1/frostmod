@@ -111,3 +111,15 @@ if(FROSTMOD_SIGN)
             COMMENT "Authenticode-signing $<TARGET_FILE:${_frostmod_target}>")
     endforeach()
 endif()
+
+# --- frostmod.dlo (PiBoSo plugin artifact) ------------------------------------
+# MX Bikes auto-loads plugins named *.dlo from its plugins\ folder, so plugin mode
+# needs a frostmod.dlo. It is a byte-for-byte copy of frostmod.dll (identical PE, so
+# any Authenticode signature carries over verbatim): injected mode loads the .dll,
+# plugin mode the .dlo. This runs LAST so it copies the FINAL binary - after the
+# signing step above when FROSTMOD_SIGN=ON, so the .dlo is signed too.
+add_custom_command(TARGET frostmod POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:frostmod>" "$<TARGET_FILE_DIR:frostmod>/frostmod.dlo"
+    VERBATIM
+    COMMENT "Copying frostmod.dll -> frostmod.dlo (PiBoSo plugin)")

@@ -25,6 +25,9 @@
 //     frostmod.exe --install-startup       (run automatically at login from now on,
 //                                           minimized, and keep running now)
 //     frostmod.exe --update                (download + install the latest release)
+//     frostmod.exe --install-plugin [dir]  (copy frostmod.dlo into <MX Bikes>\plugins\
+//                                           so the game loads it at startup, no injector;
+//                                           dir optional - taken from a running game)
 //     frostmod.exe --uninstall-startup     (stop running at login)
 //     frostmod.exe --no-update-check       (don't check GitHub for a newer version)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
@@ -187,7 +190,7 @@ static void EnumPkz(const std::string& dir, std::set<std::string>& out) {
         if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
         std::string fullPath = dir + "\\" + fd.cFileName;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            EnumPkz(fullPath, out);                        // recurse into subfolders
+            EnumPkz(fullPath, out);
         } else {
             const char* ext = strrchr(fd.cFileName, '.');
             if (ext && _stricmp(ext, ".pkz") == 0) out.insert(fullPath);
@@ -480,8 +483,89 @@ static int DoUpdate() {
         return 1;
     }
 
+    // Keep the plugin-mode copy fresh: frostmod.dlo is a byte-identical copy of the
+    // dll (see CMake). Users running in plugin mode re-run --install-plugin after.
+    CopyFileA(dll.c_str(), (dir + "frostmod.dlo").c_str(), FALSE);
+
     printf("[+] updated to %s. Relaunching FrostMod...\n", tag.c_str());
+    printf("[*] plugin mode? re-run  frostmod.exe --install-plugin  to refresh the installed .dlo.\n");
     ShellExecuteA(nullptr, "open", self, nullptr, dir.c_str(), SW_SHOWNORMAL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --install-plugin : copy frostmod.dlo into <MX Bikes>\plugins\ so the game loads
+// it at startup (no injector, no CreateRemoteThread). The install folder is taken
+// from the arg, else derived from a running mxbikes.exe (reusing FindProcess).
+// ---------------------------------------------------------------------------
+static bool CopyDirRecursive(const std::string& srcDir, const std::string& dstDir) {
+    CreateDirectoryA(dstDir.c_str(), nullptr);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((srcDir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        std::string s = srcDir + "\\" + fd.cFileName, d = dstDir + "\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok &= CopyDirRecursive(s, d);
+        else ok &= (CopyFileA(s.c_str(), d.c_str(), FALSE) != 0);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+// Install folder of a running mxbikes.exe (dir containing the exe), or "" if not up.
+static std::string GameDirFromProcess(const char* processName) {
+    DWORD pid = FindProcess(processName);
+    if (!pid) return "";
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return "";
+    char path[MAX_PATH] = {0}; DWORD sz = MAX_PATH;
+    std::string dir;
+    if (QueryFullProcessImageNameA(proc, 0, path, &sz))
+        if (char* slash = strrchr(path, '\\')) { *slash = 0; dir = path; }
+    CloseHandle(proc);
+    return dir;
+}
+
+static int DoInstallPlugin(std::string gameDir, const char* processName) {
+    if (gameDir.empty()) {
+        gameDir = GameDirFromProcess(processName);
+        if (gameDir.empty()) {
+            printf("[!] couldn't find MX Bikes. Start the game first, or pass its folder:\n"
+                   "      frostmod.exe --install-plugin \"C:\\...\\steamapps\\common\\MX Bikes\"\n");
+            return 1;
+        }
+        printf("[*] found MX Bikes at: %s\n", gameDir.c_str());
+    }
+    while (!gameDir.empty() && (gameDir.back() == '\\' || gameDir.back() == '/')) gameDir.pop_back();
+
+    if (GetFileAttributesA((gameDir + "\\mxbikes.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
+        printf("[!] note: mxbikes.exe not found in that folder - installing anyway.\n");
+
+    std::string src = ExeDir() + "frostmod.dlo";
+    if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        printf("[!] frostmod.dlo not found next to frostmod.exe. Reinstall the FrostMod package.\n");
+        return 1;
+    }
+    std::string plugins = gameDir + "\\plugins";
+    CreateDirectoryA(plugins.c_str(), nullptr);
+    std::string dst = plugins + "\\frostmod.dlo";
+    if (!CopyFileA(src.c_str(), dst.c_str(), FALSE)) {
+        DWORD e = GetLastError();
+        if (e == ERROR_SHARING_VIOLATION)
+            printf("[!] frostmod.dlo is in use - close MX Bikes, then run --install-plugin again.\n");
+        else
+            printf("[!] couldn't copy frostmod.dlo to %s (err %lu).\n", plugins.c_str(), e);
+        return 1;
+    }
+    // ship a data folder too if we have one (custom font/textures for the Draw() overlay)
+    std::string dataSrc = ExeDir() + "frostmod_data";
+    if (GetFileAttributesA(dataSrc.c_str()) != INVALID_FILE_ATTRIBUTES)
+        CopyDirRecursive(dataSrc, plugins + "\\frostmod_data");
+
+    printf("[+] installed plugin: %s\n"
+           "    Restart MX Bikes - it loads frostmod.dlo at startup (no injector needed).\n", dst.c_str());
     return 0;
 }
 
@@ -497,6 +581,7 @@ int main(int argc, char** argv) {
                              // small = catch the startup scan. Override with --wait.
     bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
+    bool captureMaster = false; // --capture-master: sniff master protocol (RE for the mimic master)
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
@@ -504,14 +589,21 @@ int main(int argc, char** argv) {
     bool startupMode      = false; // --startup: launched by the login entry (start minimized)
     bool checkUpdate      = true;  // check GitHub for a newer release on startup
     bool doUpdate         = false; // --update: download + install the latest release
+    bool doInstallPlugin  = false; // --install-plugin: copy frostmod.dlo into plugins\
+    std::string gameDirArg;        // optional install folder for --install-plugin
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--process" && i + 1 < argc)    processName = argv[++i];
+        else if (a == "--install-plugin") {
+            doInstallPlugin = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') gameDirArg = argv[++i];
+        }
         else if (a == "--mods" && i + 1 < argc)  modsPath = argv[++i];
         else if (a == "--wait" && i + 1 < argc)  warmupMs = atol(argv[++i]);
         else if (a == "--probe-mount")           probeMount = true;
         else if (a == "--dump-serverlist")       dumpList = true;
+        else if (a == "--capture-master")        captureMaster = true;
         else if (a == "--switch-live")           switchLive = true;
         else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
         else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
@@ -531,6 +623,9 @@ int main(int argc, char** argv) {
 
     // --update is a one-shot: download + install the latest release, then exit.
     if (doUpdate) return DoUpdate();
+
+    // --install-plugin is a one-shot: copy frostmod.dlo into <game>\plugins\, exit.
+    if (doInstallPlugin) return DoInstallPlugin(gameDirArg, processName);
 
     // --uninstall-startup is a one-shot: remove the login entry and exit.
     if (uninstallStartup) {
@@ -592,6 +687,15 @@ int main(int argc, char** argv) {
         printf("[*] --dump-serverlist ON: DLL will dump the master server-list blob ([srvlist]).\n");
     } else {
         DeleteFileA(dumpFlag.c_str());
+    }
+    std::string captureFlag = ExeDir() + "frostmod_capture.flag";
+    if (captureMaster) {
+        if (FILE* f = nullptr; fopen_s(&f, captureFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --capture-master ON: DLL will log master (UDP 54200) traffic to [cap] lines\n"
+               "    (RE for the mimic master). Open the online browser and/or run mxbikes.exe\n"
+               "    --dedicated, then share frostmod.log.\n");
+    } else {
+        DeleteFileA(captureFlag.c_str());
     }
     std::string switchFlag = ExeDir() + "frostmod_trackswitch.flag";
     if (switchLive) {

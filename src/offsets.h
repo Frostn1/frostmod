@@ -132,6 +132,33 @@ constexpr uintptr_t RVA_SB_NAME_FILTER    = 0x4C8F60; // uppercased name-filter 
 constexpr uintptr_t RVA_SB_SELECTED_INDEX = 0x4C8FC8; // selected row
 constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // JOIN connect struct
 
+// ---- direct connect (FrostMod feature: JOIN a server by IP:port) --------------
+// On a normal browser JOIN the game fills SB_CONNECT_TARGET (0xE53DE0) - host, port,
+// flag - then calls a connect-initiator that reads it, resolves the host
+// (RVA_NET_RESOLVE_HOST) and starts the UDP handshake. Direct connect replicates
+// that: WRITE the target from a typed IP:port, then CALL the initiator on the game
+// thread. Everything is built EXCEPT the initiator's RVA - set RVA_SB_JOIN_INIT and
+// direct connect goes live; until it is 0 the feature logs the target and no-ops
+// (safe to ship). Field offsets within SB_Connect:
+constexpr int SBC_HOST = 0x00;   // host: 16 bytes (host_lo/host_hi). We write the
+                                 // dotted IPv4 as inline ASCII (resolve-host takes a
+                                 // node string). If a build stores it packed instead,
+                                 // change SB_WriteConnectTarget in frostmod.cpp.
+constexpr int SBC_PORT = 0x10;   // u16 port
+constexpr int SBC_FLAG = 0x12;   // u8 password/lock flag (we write 0)
+constexpr uint16_t MXB_DEFAULT_PORT = 54200; // 0xD3B8; used when :port is omitted
+
+// TODO(pin me): the connect-initiator - the fn that consumes SB_CONNECT_TARGET and
+// starts the connection. Pin STATICALLY (Ghidra / static IDA, no debugger needed):
+//   1. Go to the global at 0x140E53DE0 (base 0x140000000 + RVA 0xE53DE0). List code xrefs.
+//   2. The WRITER is the browser-JOIN / msg-0x385 handler (stores host/port/flag).
+//   3. The READER that feeds the value toward getaddrinfo (RVA_NET_RESOLVE_HOST
+//      0x2854E0) or the sendto wrapper (RVA_NET_SENDTO_W 0x284BD0) is the initiator -
+//      it may be a sub the writer calls right after populating the struct.
+//   4. Put its RVA here; note whether it reads the global directly (0-arg, what we
+//      assume) or takes a *target. While there, confirm SBC_HOST is inline ASCII.
+constexpr uintptr_t RVA_SB_JOIN_INIT = 0x000000; // 0 = not pinned yet (feature no-ops)
+
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write
 // auto-extends the widget, there is no separate addRow. So to hide a row we must skip

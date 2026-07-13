@@ -32,7 +32,10 @@ jobs:
       - name: Verify outputs exist
         shell: pwsh
         run: |
+          # MSVC is a multi-config generator, so RUNTIME_OUTPUT_DIRECTORY .../bin
+          # gets the config appended: build/bin/Release.
+          $bin = 'build/bin/Release'
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo') {
-            if (-not (Test-Path "build/bin/$f")) { Write-Error "missing build/bin/$f"; exit 1 }
+            if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
           }
-          Get-ChildItem build/bin
+          Get-ChildItem $bin

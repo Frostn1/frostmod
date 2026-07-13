@@ -43,10 +43,14 @@ jobs:
       - name: Collect binaries
         shell: pwsh
         run: |
+          # MSVC is a multi-config generator, so the binaries land in
+          # build/bin/Release (the config is appended to RUNTIME_OUTPUT_DIRECTORY).
+          $bin = 'build/bin/Release'
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/bin/frostmod.exe dist/
-          Copy-Item build/bin/frostmod.dll dist/
-          Copy-Item build/bin/frostmod.dlo dist/
+          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo') {
+            if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
+            Copy-Item "$bin/$f" dist/
+          }
           Get-ChildItem dist
 
       - name: Upload build artifact

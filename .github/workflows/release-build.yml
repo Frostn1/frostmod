@@ -2,7 +2,8 @@ name: Build Windows Release
 
 # Builds the x64 frostmod.exe / frostmod.dll / frostmod.dlo on a Windows runner.
 # On a published GitHub Release it attaches those three files as release assets
-# (the exact names frostmod.exe --update looks for on releases/latest).
+# (the exact names frostmod.exe --update looks for on releases/latest) PLUS a
+# ready-to-run Release.zip (binaries + default server-filter config + README).
 # Can also be run manually (workflow_dispatch) to produce a build artifact only.
 on:
   release:
@@ -53,6 +54,77 @@ jobs:
           }
           Get-ChildItem dist
 
+      # Build a ready-to-run bundle: the three binaries + the default server-filter
+      # config + a short README, zipped as FrostMod/ so it extracts tidily. The
+      # config is extracted from src/serverfilter.cpp (kDefaultConfig) so the shipped
+      # file is byte-identical to what the DLL writes on first run - single source of
+      # truth, no drift. Flag files (frostmod_*.flag) are opt-in runtime toggles and
+      # are deliberately NOT bundled.
+      - name: Package Release.zip
+        shell: pwsh
+        run: |
+          $stage = 'staging/FrostMod'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/frostmod.exe, dist/frostmod.dll, dist/frostmod.dlo $stage
+
+          # --- default server-filter config, extracted from the C++ source ---------
+          $src = Get-Content src/serverfilter.cpp -Raw
+          # Match the whole run of adjacent "..." string literals up to the terminating
+          # ';'. Matching the literal run (not '.*?;') avoids stopping on a ';' that
+          # appears inside a config comment, e.g. "maxPerIP: 0  # 0 = off; else ...".
+          $m = [regex]::Match($src, 'kDefaultConfig\s*=\s*((?:\s*"(?:[^"\\]|\\.)*")+)\s*;', 'Singleline')
+          if (-not $m.Success) { Write-Error 'could not find kDefaultConfig in src/serverfilter.cpp'; exit 1 }
+          $sb = [System.Text.StringBuilder]::new()
+          foreach ($lit in [regex]::Matches($m.Groups[1].Value, '"((?:[^"\\]|\\.)*)"')) {
+            $unescaped = [regex]::Replace($lit.Groups[1].Value, '\\(.)', {
+              param($e)
+              switch ($e.Groups[1].Value) { 'n' {"`n"} 't' {"`t"} '"' {'"'} '\' {'\'} default {$e.Groups[1].Value} }
+            })
+            [void]$sb.Append($unescaped)
+          }
+          if ($sb.Length -eq 0) { Write-Error 'extracted server-filter config is empty'; exit 1 }
+          # Guard against a partial extraction (the config ends with the regex block).
+          if ($sb -notmatch '(?m)^regex:') { Write-Error 'extracted server-filter config looks truncated (no regex: block)'; exit 1 }
+          # Write with CRLF so the .yaml opens cleanly in Notepad.
+          $yaml = $sb.ToString() -replace "`r?`n", "`r`n"
+          Set-Content -Path "$stage/frostmod_serverfilter.yaml" -Value $yaml -NoNewline -Encoding utf8
+
+          # --- README --------------------------------------------------------------
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
+                 else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
+          $readme = @(
+            "FrostMod $tag - in-game overlay / mod loader for MX Bikes"
+            "https://github.com/Frostn1/frostmod"
+            ""
+            "QUICK START"
+            "  1. Keep frostmod.exe and frostmod.dll together in this folder."
+            "  2. Run frostmod.exe. It waits for MX Bikes and loads the overlay;"
+            "     press F8 in-game to open the FrostMod menu."
+            ""
+            "PLUGIN MODE (no injection)"
+            "  frostmod.exe --install-plugin"
+            "     copies frostmod.dlo into <MX Bikes>\plugins\ so the game loads it"
+            "     at startup - no injector."
+            ""
+            "SERVER FILTER"
+            "  frostmod_serverfilter.yaml (this folder) hides spam/ad servers from the"
+            "  online browser. Edit it to tune the rules, or delete it to regenerate"
+            "  the defaults on next run. Turn it off with: frostmod.exe --no-filter-servers"
+            ""
+            "UPDATE"
+            "  frostmod.exe --update      downloads and installs the latest release."
+            ""
+            "NOTE: these binaries are not code-signed, so Windows SmartScreen or your"
+            "antivirus may warn on first run. FrostMod is open source - build it"
+            "yourself or use plugin mode if you prefer. See the project page."
+          ) -join "`r`n"
+          Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
+
+          Compress-Archive -Path $stage -DestinationPath dist/Release.zip -Force
+          Get-ChildItem dist
+          Write-Host "--- Release.zip contents ---"
+          Get-ChildItem $stage | Select-Object Name, Length
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,11 +132,11 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Attach binaries to the release
+      - name: Attach binaries + Release.zip to the release
         if: github.event_name == 'release'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" `
-            dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo --clobber
+            dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip --clobber

@@ -1,5 +1,11 @@
 # FrostMod
 
+[![Latest release](https://img.shields.io/github/v/release/Frostn1/frostmod?sort=semver)](https://github.com/Frostn1/frostmod/releases/latest)
+[![Release date](https://img.shields.io/github/release-date/Frostn1/frostmod)](https://github.com/Frostn1/frostmod/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Frostn1/frostmod/total)](https://github.com/Frostn1/frostmod/releases)
+[![License: MIT](https://img.shields.io/github/license/Frostn1/frostmod)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue)](#build)
+
 FrostMod is a client-side toolkit for MX Bikes.
 
 ## Features

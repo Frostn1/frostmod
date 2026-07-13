@@ -25,7 +25,7 @@
 //     frostmod.exe --install-startup       (run automatically at login from now on,
 //                                           minimized, and keep running now)
 //     frostmod.exe --update                (download + install the latest release)
-//     frostmod.exe --install-plugin [dir]  (copy frostmod.dlo into <MX Bikes>\plugins\
+//     frostmod.exe --install-plugin [dir]  (copy frostmod.dlo into <MX Bikes>\plugins,
 //                                           so the game loads it at startup, no injector;
 //                                           dir optional - taken from a running game)
 //     frostmod.exe --uninstall-startup     (stop running at login)
@@ -589,7 +589,7 @@ int main(int argc, char** argv) {
     bool startupMode      = false; // --startup: launched by the login entry (start minimized)
     bool checkUpdate      = true;  // check GitHub for a newer release on startup
     bool doUpdate         = false; // --update: download + install the latest release
-    bool doInstallPlugin  = false; // --install-plugin: copy frostmod.dlo into plugins\
+    bool doInstallPlugin  = false; // --install-plugin: copy frostmod.dlo into plugins dir
     std::string gameDirArg;        // optional install folder for --install-plugin
 
     for (int i = 1; i < argc; ++i) {

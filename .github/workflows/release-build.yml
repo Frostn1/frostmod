@@ -1,0 +1,66 @@
+name: Build Windows Release
+
+# Builds the x64 frostmod.exe / frostmod.dll / frostmod.dlo on a Windows runner.
+# On a published GitHub Release it attaches those three files as release assets
+# (the exact names frostmod.exe --update looks for on releases/latest).
+# Can also be run manually (workflow_dispatch) to produce a build artifact only.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to upload assets onto the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # frostmod.exe --update compares the release tag to FROSTMOD_VERSION and can
+      # relaunch-loop if they disagree, so refuse to ship a tag that doesn't match
+      # src/version.h. Strips a leading "v" and any -prerelease/+build suffix.
+      - name: Verify tag matches FROSTMOD_VERSION
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}" -replace '^v','' -replace '[-+].*$',''
+          $ver = (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "release tag -> $tag ; version.h -> $ver"
+          if ($tag -ne $ver) {
+            Write-Error "Release tag ($tag) != FROSTMOD_VERSION ($ver). Bump src/version.h and CMakeLists.txt, retag, and re-release."
+            exit 1
+          }
+
+      - name: Configure (CMake, x64)
+        run: cmake -B build -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/bin/frostmod.exe dist/
+          Copy-Item build/bin/frostmod.dll dist/
+          Copy-Item build/bin/frostmod.dlo dist/
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frostmod-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach binaries to the release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" `
+            dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo --clobber

@@ -1,0 +1,38 @@
+name: CI
+
+# Build-only sanity check: compiles the x64 exe/dll/dlo on every push and PR so
+# breakage is caught before release time. Does NOT publish anything.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, x64)
+        run: cmake -B build -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Verify outputs exist
+        shell: pwsh
+        run: |
+          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo') {
+            if (-not (Test-Path "build/bin/$f")) { Write-Error "missing build/bin/$f"; exit 1 }
+          }
+          Get-ChildItem build/bin

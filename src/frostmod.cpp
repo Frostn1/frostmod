@@ -906,7 +906,11 @@ static void MsWriteActive(const std::string& bike, const std::string& name) {
     fwrite(name.c_str(), 1, name.size(), f); fclose(f);
 }
 
-// Scan <mods>\bikes for subfolders that have a model.edf (i.e. real bikes), sorted.
+// Scan <mods>\bikes for subfolders that are model-swappable, sorted. A bike qualifies if
+// it has a loose model.edf (a real bike) OR a "FrostMod Models" library folder. The library
+// check matters when the ACTIVE variant is an Original whose set has no loose model.edf (e.g.
+// the stock mesh lives in a .pkz): without it, swapping back to Original would drop the bike
+// off the list and leave its remaining variants unreachable.
 static void MsScanBikes() {
     g_msBikes.clear();
     WIN32_FIND_DATAA fd;
@@ -916,7 +920,8 @@ static void MsScanBikes() {
         if (fd.cFileName[0] == '.') continue;
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::string bike = fd.cFileName;
-        if (MsFileExists(MsActiveEdf(bike))) g_msBikes.push_back(bike);
+        if (MsFileExists(MsActiveEdf(bike)) || MsDirExists(MsLibDir(bike)))
+            g_msBikes.push_back(bike);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
     std::sort(g_msBikes.begin(), g_msBikes.end(),

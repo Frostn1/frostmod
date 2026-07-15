@@ -6,6 +6,8 @@
 ### Changed
 - **F8 menu decluttered to focus on model swap.** The menu now shows only `1 Reload mods`, `2 Toggle this overlay`, and `3 Bike model swap`. Track manager, Switch track, Track list, and Direct connect are hidden from the menu (their code is kept intact and simply not wired to a row, so any can be re-exposed by re-adding its `kMenu[]` entry + `MenuAction` case). Updated the F8-menu table in `docs/USAGE.md` to match. (`src/frostmod.cpp`, `docs/USAGE.md`.)
 - **Release v0.9.5.** Bumped `FROSTMOD_VERSION` 0.9.4 → 0.9.5 (`src/version.h` + `CMakeLists.txt`). First full release since v0.9.3 — bundles the Bike Model Swap tool, the FrostServer dedicated-server companion (0.9.4, previously only an rc1 pre-release), and the direct-connect RE corrections.
+### Fixed
+- **Model-swap list no longer drops bikes whose active model is an Original without a loose `model.edf`.** `MsScanBikes` keyed list-membership solely on a loose `<Bike>\model.edf`, so a bike whose stock mesh lives in a `.pkz` (no root `model.edf`) vanished from F8 → `3` once swapped back to Original — stranding its remaining variants. Membership now also matches any bike that has a `FrostMod Models\` library folder, so swap-managed bikes stay listed and reachable regardless of whether the active set has a loose `model.edf`. (`src/frostmod.cpp`.)
 
 ## 2026-07-14
 ### Changed

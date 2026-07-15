@@ -16,6 +16,11 @@ FrostMod is a client-side toolkit for MX Bikes.
   your list. Purely client-side, nobody else is affected.
 - **In-game overlay** - a small status hint that shows FrostMod is live and
   reports each reload.
+- **FrostServer (dedicated servers)** - a server-side companion plugin that
+  publishes the track a server is running plus its mxb-mods.com download link, so
+  a client can fetch and install that track without leaving the game. The server
+  side ships now; the one-click client download button is in progress. See
+  [FrostServer](#frostserver-dedicated-servers).
 
 ## Build
 
@@ -29,7 +34,8 @@ normal Command Prompt won't have `cl.exe` on `PATH`), then from the project root
     cmake --build build --config Release
 
 This outputs `frostmod.exe` (the launcher you run) and `frostmod.dll` to
-`build\bin`.
+`build\bin`, plus the `frostserver.dll` / `frostserver.dlo` / `frostserver.exe`
+server-side companion (see [FrostServer](#frostserver-dedicated-servers)).
 
 ## Usage
 
@@ -51,6 +57,25 @@ You can also run it as a **PiBoSo plugin**: drop `frostmod.dlo` into MX Bikes'
 injector needed. Run `frostmod.exe --install-plugin` to copy it there for you.
 In plugin mode the in-game overlay renders through the game's sanctioned `Draw()`
 callback. See [docs/PLUGIN.md](docs/PLUGIN.md).
+
+
+## FrostServer (dedicated servers)
+
+**FrostServer** is FrostMod's server-side companion — a separate deliverable for
+people who run an MX Bikes **dedicated server**. Drop `frostserver.dlo` into the
+server's `plugins` folder and it publishes, over a tiny read-only HTTP API, the
+track the server is currently running and a mxb-mods.com link to download it (you
+set the per-track links in `frostserver.yaml`). A FrostMod client can then fetch
+that link and install the track — via the
+[MXB App](https://github.com/Frostn1/mxb-app) — so players join without hunting
+the map down and restarting the game.
+
+A standalone `frostserver.exe` serves the same API with no game attached, for
+testing (`frostserver.exe --track "Some Track Name"`). Full HTTP contract, config
+format, and setup are in [docs/FROSTSERVER.md](docs/FROSTSERVER.md).
+
+> The server side (this) ships now. The one-click **Download this map** button in
+> the client's server browser is the next step.
 
 
 ## Troubleshooting

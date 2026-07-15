@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-14
+### Changed
+- **Release v0.9.4.** Bumped `FROSTMOD_VERSION` 0.9.3 → 0.9.4 (`src/version.h` + `CMakeLists.txt`) — the first release to ship the FrostServer dedicated-server companion.
+### Added
+- **README — FrostServer section.** Documented the server-side companion in `README.md`: a Features bullet, a new "FrostServer (dedicated servers)" section, and the new build outputs, all linking to `docs/FROSTSERVER.md`.
+- **Release packaging for FrostServer.** The Windows release CI now also builds and attaches `frostserver.exe` / `frostserver.dll` / `frostserver.dlo` plus a ready-to-run `FrostServer.zip` (plugin + standalone tester + README) to each published release, alongside the existing FrostMod assets. (`.github/workflows/release-build.yml`.)
+
 ## 2026-07-13
 ### Added
 - **FrostServer — dedicated-server map/link API (`frostserver.dlo` / `frostserver.exe`).** New server-side companion that runs as a PiBoSo plugin on an MX Bikes dedicated server. It learns the running track via the sanctioned `RaceEvent()` callback — track name is `m_szTrackName` (+0x68), confirmed against the decompiled server plugin loader (resolver `0x14012A4F0`; race forwarder in the server module `0x14028FF81`; the `-dedicated` flag `0x565E64` gates only startup, never the plugin/race dispatch) — and serves a tiny read-only HTTP API so FrostMod clients can ask *what map are you running and where do I download it?* — returning a mxb-mods.com link the admin configures per track in `frostserver.yaml` (written with docs on first run, next to the plugin). Endpoints: `GET /frostserver/info` (current map + link, `currentMap:null` when idle), `GET /frostserver/maps` (the full configured table), `GET /health`. Default port `54210`. Ships with diagnostic callbacks (`EventInit`/`RaceSession`/`RaceAddEntry` + a raw ASCII-field dump on every event) so the first run on a real dedicated server empirically confirms which callbacks fire and where the track name sits. New CMake targets `frostserver` (→ `frostserver.dll`/`.dlo`, links `ws2_32`) and `frostserver_app` (→ `frostserver.exe`, standalone tester via `FROSTSERVER_EXE`, seed a track with `--track "Name"`), both signed when `-DFROSTMOD_SIGN=ON`. This is the server half of the "download a server's map without leaving the game" flow; the client button + MXB App `mxbapp://` handoff are separate follow-ups that consume this contract. Full HTTP contract + admin setup in `docs/FROSTSERVER.md`. `src/frostserver.cpp`, `CMakeLists.txt`, `docs/FROSTSERVER.md`.

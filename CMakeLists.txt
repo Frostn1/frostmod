@@ -41,6 +41,8 @@ endfunction()
 
 frostmod_version_rc(FROSTMOD_DLL_RC VFT_DLL "frostmod.dll" "FrostMod in-game overlay / mod loader for MX Bikes")
 frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for MX Bikes")
+frostmod_version_rc(FROSTSERVER_DLL_RC VFT_DLL "frostserver.dlo" "FrostServer - dedicated-server map/link API for MX Bikes")
+frostmod_version_rc(FROSTSERVER_EXE_RC VFT_APP "frostserver.exe" "FrostServer standalone - map/link API for MX Bikes")
 
 # --- MinHook (function hooking) ------------------------------------------------
 include(FetchContent)
@@ -69,9 +71,24 @@ add_executable(frostmod_app src/launcher.cpp ${FROSTMOD_EXE_RC})
 target_link_libraries(frostmod_app PRIVATE shell32 advapi32 user32 winhttp)
 set_target_properties(frostmod_app PROPERTIES OUTPUT_NAME "frostmod")
 
+# --- frostserver (dedicated-server companion) ---------------------------------
+# frostserver.dlo is a PiBoSo plugin loaded INTO the MX Bikes dedicated server:
+# it learns the running track (RaceEvent callback) and serves a tiny read-only
+# HTTP API (track name + configured mxb-mods link) that FrostMod clients query.
+# The same source also builds a standalone frostserver.exe (FROSTSERVER_EXE) that
+# serves the API with no game attached, for testing the client / MXB App flow.
+add_library(frostserver SHARED src/frostserver.cpp ${FROSTSERVER_DLL_RC})
+target_link_libraries(frostserver PRIVATE ws2_32)
+set_target_properties(frostserver PROPERTIES OUTPUT_NAME "frostserver" PREFIX "")
+
+add_executable(frostserver_app src/frostserver.cpp ${FROSTSERVER_EXE_RC})
+target_compile_definitions(frostserver_app PRIVATE FROSTSERVER_EXE)
+target_link_libraries(frostserver_app PRIVATE ws2_32)
+set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
+
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).
-set_target_properties(frostmod frostmod_app PROPERTIES
+set_target_properties(frostmod frostmod_app frostserver frostserver_app PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -102,7 +119,7 @@ if(FROSTMOD_SIGN)
     else()
         message(FATAL_ERROR "FROSTMOD_SIGN=ON but neither FROSTMOD_SIGN_PFX nor FROSTMOD_SIGN_SHA1 is set.")
     endif()
-    foreach(_frostmod_target frostmod frostmod_app)
+    foreach(_frostmod_target frostmod frostmod_app frostserver frostserver_app)
         add_custom_command(TARGET ${_frostmod_target} POST_BUILD
             COMMAND "${FROSTMOD_SIGNTOOL}" sign /fd SHA256 ${_frostmod_sign_id}
                     /tr "${FROSTMOD_SIGN_TIMESTAMP_URL}" /td SHA256
@@ -123,3 +140,11 @@ add_custom_command(TARGET frostmod POST_BUILD
             "$<TARGET_FILE:frostmod>" "$<TARGET_FILE_DIR:frostmod>/frostmod.dlo"
     VERBATIM
     COMMENT "Copying frostmod.dll -> frostmod.dlo (PiBoSo plugin)")
+
+# frostserver.dlo - the server-side plugin artifact (byte-for-byte copy of the
+# frostserver.dll, same as frostmod.dlo). Runs LAST so it inherits any signature.
+add_custom_command(TARGET frostserver POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:frostserver>" "$<TARGET_FILE_DIR:frostserver>/frostserver.dlo"
+    VERBATIM
+    COMMENT "Copying frostserver.dll -> frostserver.dlo (PiBoSo server plugin)")

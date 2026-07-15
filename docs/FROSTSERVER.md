@@ -119,6 +119,32 @@ not just the current one (e.g. to pre-download the rotation).
 Steps 2–4 are separate work items (MXB App deep link; client button + the
 per-row server-IP RE). FrostServer (step 1) is the contract they build against.
 
+## Why `RaceEvent` is reliable on a dedicated server (RE provenance)
+
+Confirmed against the decompiled `mxbikes.exe` (image base `0x140000000`), so we
+don't need a live server to trust the mechanism:
+
+- **Plugins load on the dedicated build.** The `.dlo` loader (`0x14012A4F0`,
+  enumerated at `0x14012A9B7`) resolves exports by name and appends each plugin
+  struct (stride `0x118`) to a global list — **base `0x565CC0`, count
+  `0x565CB8`**. `RaceEvent` is stored at `plugin+0x68`.
+- **The fan-out is unconditional.** Dispatcher `0x14012AE70` loops that list and
+  calls `[plugin+0x68](data, size)` for every loaded plugin — no client/dedicated
+  gate. It is invoked from the shared engine command bus (case `0x140127EA1`), the
+  same bus that runs the dedicated path's content-scan / track-registry work, so
+  it executes headless.
+- **The `-dedicated` flag (`0x565E64`) gates only startup init**, never the
+  plugin/race dispatch.
+- **Track field:** `SPluginsRaceEvent_t.m_szTrackName` at `+0x68`
+  (event `m_iType == 6`), struct size `0xD0` (208).
+
+One link — the server session object's vtable call at `0x14028FF81` that posts the
+race-event command onto that bus — is assigned at runtime and can't be read
+statically, but it lives in the server/session module and passes the RaceEvent
+type, feeding the proven dispatcher. FrostServer's diagnostic callbacks
+(`EventInit`/`RaceSession`/`RaceAddEntry` + the raw ASCII-field dump) confirm this
+last inch on the first real dedicated-server run.
+
 ## Build
 
 Built by the FrostMod CMake project alongside the client:

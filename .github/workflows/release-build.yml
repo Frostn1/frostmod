@@ -1,9 +1,10 @@
 name: Build Windows Release
 
-# Builds the x64 frostmod.exe / frostmod.dll / frostmod.dlo on a Windows runner.
-# On a published GitHub Release it attaches those three files as release assets
-# (the exact names frostmod.exe --update looks for on releases/latest) PLUS a
-# ready-to-run Release.zip (binaries + default server-filter config + README).
+# Builds the x64 frostmod.exe / frostmod.dll / frostmod.dlo (client) and the
+# frostserver.exe / frostserver.dll / frostserver.dlo (dedicated-server companion)
+# on a Windows runner. On a published GitHub Release it attaches the frostmod
+# files (the exact names frostmod.exe --update looks for on releases/latest) PLUS
+# a ready-to-run Release.zip, and the frostserver files PLUS a FrostServer.zip.
 # Can also be run manually (workflow_dispatch) to produce a build artifact only.
 on:
   release:
@@ -48,7 +49,8 @@ jobs:
           # build/bin/Release (the config is appended to RUNTIME_OUTPUT_DIRECTORY).
           $bin = 'build/bin/Release'
           New-Item -ItemType Directory -Force dist | Out-Null
-          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo') {
+          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
+                         'frostserver.exe','frostserver.dll','frostserver.dlo') {
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
             Copy-Item "$bin/$f" dist/
           }
@@ -125,6 +127,47 @@ jobs:
           Write-Host "--- Release.zip contents ---"
           Get-ChildItem $stage | Select-Object Name, Length
 
+      # Server-admin bundle: the plugin (.dlo) + the standalone tester (.exe) +
+      # a short README. frostserver writes its own frostserver.yaml next to the
+      # plugin on first run, so no config is bundled.
+      - name: Package FrostServer.zip
+        shell: pwsh
+        run: |
+          $stage = 'staging/FrostServer'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/frostserver.dlo, dist/frostserver.exe $stage
+
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
+                 else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
+          $readme = @(
+            "FrostServer $tag - dedicated-server map/link API for MX Bikes"
+            "https://github.com/Frostn1/frostmod  (full docs: docs/FROSTSERVER.md)"
+            ""
+            "WHAT IT IS"
+            "  A companion for MX Bikes DEDICATED servers. It publishes the track the"
+            "  server is running plus a mxb-mods.com download link over a tiny read-only"
+            "  HTTP API, so FrostMod clients can grab a server's map without leaving the"
+            "  game."
+            ""
+            "INSTALL (plugin)"
+            "  1. Copy frostserver.dlo into your dedicated server's plugins\ folder."
+            "  2. Start the server, load a track, then edit frostserver.yaml (written"
+            "     next to the plugin) to map each track name to its mxb-mods.com page."
+            "     Restart the server to apply."
+            "  3. API: http://<server-ip>:54210/frostserver/info"
+            ""
+            "TEST WITHOUT A SERVER"
+            "  frostserver.exe --track `"Some Track Name`""
+            "     serves the same API with no game attached."
+            ""
+            "NOTE: unsigned binaries; Windows SmartScreen/AV may warn on first run."
+          ) -join "`r`n"
+          Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
+
+          Compress-Archive -Path $stage -DestinationPath dist/FrostServer.zip -Force
+          Write-Host "--- FrostServer.zip contents ---"
+          Get-ChildItem $stage | Select-Object Name, Length
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -139,4 +182,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" `
-            dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip --clobber
+            dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
+            dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip --clobber

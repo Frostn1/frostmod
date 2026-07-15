@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-15
+### Added
+- **In-game Bike Model Swap (F8 menu > 3).** New overlay tool to swap a bike's model live. In MX Bikes a bike at `<mods>\bikes\<Bike>\` is loose files, and a "model" is the whole top-level file set — `model.edf` (the mesh) **plus** its `.hrc`/`.cfg` lineup/alignment, which are tuned to that mesh and travel with it; only `paints\` (universal liveries) stays put. The tool is a two-level list: pick a bike, then pick a model variant. Variants are folders in a per-bike library `<Bike>\FrostMod Models\<Name>\` (each holding a full file set); applying one **auto-backs-up** the current set into the library (reversible — pick `Original` to restore) and moves the chosen variant's files into the bike folder, then reloads content so the new model shows without a restart. Move failures (e.g. files held open while riding that bike) roll back and abort with the bike intact. Keys: Up/Down move, Enter choose/swap, Esc back/close. (`src/frostmod.cpp`.)
+### Changed
+- **F8 menu decluttered to focus on model swap.** The menu now shows only `1 Reload mods`, `2 Toggle this overlay`, and `3 Bike model swap`. Track manager, Switch track, Track list, and Direct connect are hidden from the menu (their code is kept intact and simply not wired to a row, so any can be re-exposed by re-adding its `kMenu[]` entry + `MenuAction` case). Updated the F8-menu table in `docs/USAGE.md` to match. (`src/frostmod.cpp`, `docs/USAGE.md`.)
+- **Release v0.9.5.** Bumped `FROSTMOD_VERSION` 0.9.4 → 0.9.5 (`src/version.h` + `CMakeLists.txt`). First full release since v0.9.3 — bundles the Bike Model Swap tool, the FrostServer dedicated-server companion (0.9.4, previously only an rc1 pre-release), and the direct-connect RE corrections.
+
 ## 2026-07-14
 ### Changed
 - **Release v0.9.4.** Bumped `FROSTMOD_VERSION` 0.9.3 → 0.9.4 (`src/version.h` + `CMakeLists.txt`) — the first release to ship the FrostServer dedicated-server companion.

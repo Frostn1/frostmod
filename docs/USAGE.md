@@ -68,9 +68,25 @@ F-key per feature.
 | In the menu | Action |
 |-------------|--------|
 | `1` | Reload mods (rescans content from disk, with a progress bar) |
-| `2` | Track library → log (activate/deactivate UI is in progress) |
-| `3` | Track list → log |
-| `4` | Show/hide the corner hint |
+| `2` | Toggle the corner hint overlay |
+| `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
+
+### Bike model swap (menu `3`)
+
+In MX Bikes a bike lives at `mods\bikes\<Bike>\` as loose files. A "model" is the whole
+top-level file set — `model.edf` (the mesh) **and** its `.hrc`/`.cfg` lineup/alignment files,
+which are tuned to that mesh and swap together. Only `paints\` (universal liveries) stays put.
+
+1. Add each alternative model as a **folder** in the bike's library:
+   `mods\bikes\<Bike>\FrostMod Models\<Name>\`, containing that model's full file set
+   (`model.edf` + its `.hrc`/`.cfg`). Create the `FrostMod Models` folder if it isn't there.
+2. F8 → `3`, pick the **bike**, then pick a **variant**. Enter swaps its files in and reloads
+   — the new model appears without a restart.
+3. The model you were using is auto-saved back into the library (as `Original` on the first
+   swap), so you can always pick it again to revert. `paints\` is never touched.
+
+If the model files are locked (you're currently riding that bike), the swap rolls back with
+the bike left intact and asks you to exit the bike first.
 
 Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
 immediately — no restart, no loading screen.

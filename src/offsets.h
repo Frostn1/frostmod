@@ -130,34 +130,39 @@ constexpr uintptr_t RVA_SB_INFO_INDEX     = 0x4C8F54; // SERVERINFO index (-1)
 constexpr uintptr_t RVA_SB_RAW_COUNT      = 0x4C8F58; // raw server count (loop bound)
 constexpr uintptr_t RVA_SB_NAME_FILTER    = 0x4C8F60; // uppercased name-filter string
 constexpr uintptr_t RVA_SB_SELECTED_INDEX = 0x4C8FC8; // selected row
-constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // JOIN connect struct
+constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // connect OUTPUT/state (see below)
 
 // ---- direct connect (FrostMod feature: JOIN a server by IP:port) --------------
-// On a normal browser JOIN the game fills SB_CONNECT_TARGET (0xE53DE0) - host, port,
-// flag - then calls a connect-initiator that reads it, resolves the host
-// (RVA_NET_RESOLVE_HOST) and starts the UDP handshake. Direct connect replicates
-// that: WRITE the target from a typed IP:port, then CALL the initiator on the game
-// thread. Everything is built EXCEPT the initiator's RVA - set RVA_SB_JOIN_INIT and
-// direct connect goes live; until it is 0 the feature logs the target and no-ops
-// (safe to ship). Field offsets within SB_Connect:
-constexpr int SBC_HOST = 0x00;   // host: 16 bytes (host_lo/host_hi). We write the
-                                 // dotted IPv4 as inline ASCII (resolve-host takes a
-                                 // node string). If a build stores it packed instead,
-                                 // change SB_WriteConnectTarget in frostmod.cpp.
-constexpr int SBC_PORT = 0x10;   // u16 port
-constexpr int SBC_FLAG = 0x12;   // u8 password/lock flag (we write 0)
-constexpr uint16_t MXB_DEFAULT_PORT = 54200; // 0xD3B8; used when :port is omitted
-
-// TODO(pin me): the connect-initiator - the fn that consumes SB_CONNECT_TARGET and
-// starts the connection. Pin STATICALLY (Ghidra / static IDA, no debugger needed):
-//   1. Go to the global at 0x140E53DE0 (base 0x140000000 + RVA 0xE53DE0). List code xrefs.
-//   2. The WRITER is the browser-JOIN / msg-0x385 handler (stores host/port/flag).
-//   3. The READER that feeds the value toward getaddrinfo (RVA_NET_RESOLVE_HOST
-//      0x2854E0) or the sendto wrapper (RVA_NET_SENDTO_W 0x284BD0) is the initiator -
-//      it may be a sub the writer calls right after populating the struct.
-//   4. Put its RVA here; note whether it reads the global directly (0-arg, what we
-//      assume) or takes a *target. While there, confirm SBC_HOST is inline ASCII.
-constexpr uintptr_t RVA_SB_JOIN_INIT = 0x000000; // 0 = not pinned yet (feature no-ops)
+// CORRECTED MODEL (capstone xref sweep, 2026-07-12 - r2's cached project returned 0xFF
+// for these regions; capstone on the raw file is the source of truth). The earlier
+// "fill 0xE53DE0 and call a connect fn" plan is DEAD:
+//   * 0xE53DE0 is connect OUTPUT/state, NOT a settable input. All 29 code refs are
+//     RESETS (6 writer sites store -1/0 sentinels: 0x5FEA9, 0x9210A, 0x921BF, 0xF0F8A,
+//     0x111FB3, 0x11A374) or `lea &struct` pointer-passes. NO site LOADS its fields to
+//     drive a socket, and the 16-byte +0x00 field is written only as raw bytes -> a
+//     PACKED binary address (the resolved/connected addr), not an ASCII host you set.
+//   * The browser JOIN writes a DIFFERENT struct at rbx+0xE54030 (mov [rbx+0xE54030],
+//     ax @ 0x0AA3A8). "msg 0x385 fills 0xE53DE0" was a struct mix-up.
+//   * The connection is initiated by the engine COMMAND BUS - a runtime fn-ptr at
+//     [0x140566C48] - with command 0x389. The JOIN handler (~0x0F0Exx) does:
+//         lea r8,  [rsp+0x200]     ; r8 = the REAL input (likely ASCII host / host:port)
+//         lea rdx, [0x140E53DE0]   ; rdx = the OUTPUT target struct
+//         mov ecx, 0x389           ; cmd id
+//         call [0x140566C48]       ; -> eax (0 = fail -> struct reset)
+//     Dispatch sites: 0x0F0FD3 (call instr 0x0F0FE7) and 0x0EEF63 (0x0EEF6F).
+//   * Net layer, downstream of the bus (via the fn-ptr, NOT statically linkable):
+//     resolve_host 0x2854E0 <- 0x28422E ; sendto 0x284BD0 <- 0x283DC0.
+// Driving cmd 0x389 is NOT a cold call: it needs the LIVE bus + menu state (the handler
+// validates the server's track vs the local track array [0x140F43298] first) and the
+// correct r8. Open unknowns before we can dispatch: (a) the r8 param layout; (b) whether
+// the bus can be driven outside the menu JOIN flow.
+// NEXT STEP (x64dbg): bp 0x0F0FE7 (and 0x0EEF6F); on hit dump [r8], confirm rdx ==
+// 0x140E53DE0, step over, dump 16B @ 0xE53DE0 (now the packed addr). That settles the
+// input format. Until then direct connect is PREVIEW-only (parses + logs, no dispatch).
+constexpr uintptr_t RVA_CMD_BUS_PTR   = 0x566C48; // [0x140566C48] engine command-bus fn-ptr
+constexpr int       CMD_JOIN          = 0x389;    // bus cmd id that initiates the connect
+constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0FE7;  // the `call [bus]` inside the JOIN handler
+constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is omitted
 
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write

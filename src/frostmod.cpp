@@ -725,11 +725,12 @@ void CloseSwitcher() { g_swOpen.store(false); }
 
 // ---------------------------------------------------------------------------
 // DIRECT CONNECT (F8 > 6) - join a server by IP:port without the browser.
-// See offsets.h "direct connect": we WRITE SB_CONNECT_TARGET (0xE53DE0) from the
-// typed endpoint, then CALL the JOIN-initiator (RVA_SB_JOIN_INIT) on the game
-// thread. Until that RVA is pinned the whole path logs + no-ops (DoDirectConnect).
+// PREVIEW step: parse + validate the endpoint and log it. The actual connect is NOT
+// wired yet - see offsets.h "direct connect": 0xE53DE0 is connect OUTPUT (reset-to-
+// sentinel, packed binary addr), not a settable target, and the real initiator is the
+// engine command bus [0x566C48] cmd 0x389, which needs live menu state and an r8 input
+// whose layout is still unknown (runtime dump pending). So DoDirectConnect no-ops.
 // ---------------------------------------------------------------------------
-bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end);   // fwd (defined below)
 
 // Parse "ip[:port]" into a dotted IPv4 + port. Accepts exactly four 0..255 octets and
 // an optional :port (1..65535, default MXB_DEFAULT_PORT). Digits and dots only - the
@@ -771,53 +772,20 @@ static bool ParseEndpoint(const std::string& in, char* host, size_t hostCap,
     return true;
 }
 
-// POD + SEH: write the endpoint into the game's JOIN target struct. Host goes in as
-// inline ASCII (16-byte field; the resolve-host getaddrinfo path consumes a string) -
-// see offsets.h SBC_HOST if a build stores it packed instead. flag=0 (no password).
-static bool SB_WriteConnectTarget(const char* host, uint16_t port) {
-    __try {
-        char* t = (char*)(g_base + mxb::RVA_SB_CONNECT_TARGET);
-        for (int i = 0; i < 16; ++i) t[mxb::SBC_HOST + i] = 0;         // clear host_lo/host_hi
-        for (int i = 0; i < 15 && host[i]; ++i) t[mxb::SBC_HOST + i] = host[i];
-        *(uint16_t*)(t + mxb::SBC_PORT) = port;
-        t[mxb::SBC_FLAG] = 0;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-// POD + SEH: call the connect-initiator at the already-resolved address. Game thread only.
-static void SB_CallJoinInit(uintptr_t fn) {
-    __try { ((void (*)())fn)(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[connect] JOIN-init FAULTED - caught (connect may have failed)."); }
-}
-
-// Fire the connect: validate the initiator RVA lands in .text, then queue the write +
-// call on the game thread (the initiator touches game state, exactly like the switcher).
-// If RVA_SB_JOIN_INIT is still 0 we log the intended target and no-op - safe to ship.
+// PREVIEW-only (see offsets.h "direct connect" - CORRECTED MODEL): the connect is NOT
+// "write a struct + call a function". 0xE53DE0 is connect OUTPUT (reset-to-sentinel,
+// packed binary addr), nothing reads it to drive a socket. The real initiator is the
+// engine command bus [0x566C48] cmd 0x389 (JOIN handler ~0x0F0Exx), which needs the
+// live bus + menu state and an r8 input whose layout is still unknown (runtime dump
+// pending). So for now we validate + log the endpoint and DO NOT touch memory or
+// dispatch anything. Wiring the bus call is the next step once the r8 format is known.
 void DoDirectConnect(const char* host, uint16_t port) {
-    if (mxb::RVA_SB_JOIN_INIT == 0) {
-        Log("[connect] would connect to %s:%u, but RVA_SB_JOIN_INIT is not pinned "
-            "(offsets.h) - no-op. Set the initiator RVA to enable direct connect.", host, port);
-        char st[96]; sprintf_s(st, "direct connect: %s:%u (initiator RVA unset - see log)", host, port);
-        SetStatus(st, 6000);
-        return;
-    }
-    uintptr_t ji = g_base + mxb::RVA_SB_JOIN_INIT + g_sigDelta;   // same build-drift adjust as content-init
-    uint8_t *cb, *ce;
-    if (!GetExecRange(g_base, &cb, &ce) || (uint8_t*)ji < cb || (uint8_t*)ji >= ce) {
-        Log("[connect] JOIN-init RVA 0x%zx is outside .text - refusing to call.", (size_t)mxb::RVA_SB_JOIN_INIT);
-        SetStatus("direct connect: bad initiator RVA (see log)", 5000);
-        return;
-    }
-    Log("[connect] target %s:%u - writing SB_CONNECT_TARGET, queuing JOIN on the game thread.", host, port);
-    std::string hs(host);
-    EnqueueGameThreadTask([hs, port, ji] {
-        if (!SB_WriteConnectTarget(hs.c_str(), port)) { Log("[connect] couldn't write target struct."); return; }
-        Log("[connect] -> JOIN-init (connecting to %s:%u)...", hs.c_str(), port);
-        SB_CallJoinInit(ji);
-        Log("[connect] JOIN-init returned.");
-    });
-    char st[96]; sprintf_s(st, "connecting to %s:%u ...", host, port);
-    SetStatus(st, 8000);
+    Log("[connect] target %s:%u parsed OK - NOT dispatched. Connect goes via the engine "
+        "command bus [RVA 0x%zx] cmd 0x%x (needs live menu state + the r8 input layout, "
+        "RE pending); 0xE53DE0 is connect OUTPUT, not a settable target. Preview only.",
+        host, port, (size_t)mxb::RVA_CMD_BUS_PTR, mxb::CMD_JOIN);
+    char st[112]; sprintf_s(st, "direct connect: %s:%u parsed (dispatch pending RE - see log)", host, port);
+    SetStatus(st, 6000);
 }
 
 // Enter pressed in the box: parse; on error keep the box open (so it can be fixed),
@@ -844,6 +812,195 @@ void OpenDirectConnect() {
         (unsigned)mxb::MXB_DEFAULT_PORT);
 }
 void CloseDirectConnect() { g_dcOpen.store(false); }
+
+// ---------------------------------------------------------------------------
+// BIKE MODEL SWAP (F8 menu > 3) - swap a bike's model (its whole file set) for another.
+// In MX Bikes a bike lives at <mods>\bikes\<Bike>\ as loose files. A "model" is the ENTIRE
+// set of top-level files: model.edf (the mesh) PLUS its .hrc/.cfg lineup/alignment - those
+// are tuned to that specific mesh, so the whole set travels together. Only the paints\
+// subfolder (universal liveries) stays put across a swap. We keep a per-bike library of
+// alternative models at <Bike>\FrostMod Models\<Variant>\ (each variant is a FOLDER holding
+// a full file set) plus an "_active.txt" marker naming the live one. Swapping MOVES the
+// current file set into the library (auto-backup => reversible) and MOVES the chosen
+// variant's set into the bike root, then reloads. Invariant: the ACTIVE variant's files are
+// the loose files in the bike root; every OTHER variant is a folder in the library.
+// Two-level list (pick bike, then variant). State is touched only on the render thread
+// (Tick + draw), like the other panels above - no lock needed.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_msOpen{false};       // model-swap panel open?
+static int   g_msLevel = 0;                      // 0 = bike picker, 1 = variant picker
+static std::vector<std::string> g_msBikes;       // bike folder names that contain a model.edf
+static int   g_msBikeCursor = 0, g_msBikeTop = 0;
+static std::string g_msBike;                     // chosen bike folder name (at level 1)
+static std::vector<std::string> g_msVars;        // variant names for g_msBike (row 0 = active)
+static int   g_msVarCursor = 0, g_msVarTop = 0;
+static const char* kMsLibDir   = "FrostMod Models";  // per-bike model library folder
+static const char* kMsMarker   = "_active.txt";      // names the active variant
+static const char* kMsOriginal = "Original";         // name given to the model captured on first swap
+
+static std::string MsBikesRoot()                         { return std::string(g_modsPath) + "\\bikes"; }
+static std::string MsBikeDir(const std::string& b)       { return MsBikesRoot() + "\\" + b; }
+static std::string MsLibDir(const std::string& b)        { return MsBikeDir(b) + "\\" + kMsLibDir; }
+static std::string MsActiveEdf(const std::string& b)     { return MsBikeDir(b) + "\\model.edf"; }
+static std::string MsVariantDir(const std::string& b, const std::string& n) {
+    return MsLibDir(b) + "\\" + n;
+}
+static bool MsFileExists(const std::string& p) {
+    DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+static bool MsDirExists(const std::string& p) {
+    DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+// Top-level FILE names (not subfolders) directly inside `dir`. These are a bike's model
+// files (model.edf + .hrc/.cfg); the paints\ / FrostMod Models\ subfolders are skipped.
+static void MsListFiles(const std::string& dir, std::vector<std::string>& out) {
+    out.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        out.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+// Move each named file from srcDir to dstDir (created if needed). All-or-nothing: on the
+// first failure the ones already moved are moved back and it returns false.
+static bool MsMoveSet(const std::string& srcDir, const std::string& dstDir,
+                      const std::vector<std::string>& files, const char* what) {
+    EnsureDirTree((dstDir + "\\x").c_str());                  // ensure dstDir exists
+    std::vector<std::string> done;
+    for (const auto& f : files) {
+        std::string s = srcDir + "\\" + f, d = dstDir + "\\" + f;
+        if (MoveFileExA(s.c_str(), d.c_str(), MOVEFILE_COPY_ALLOWED)) { done.push_back(f); continue; }
+        Log("[model] %s MOVE failed (err %lu): %s -> %s (model in use? exit the bike first).",
+            what, GetLastError(), s.c_str(), d.c_str());
+        for (const auto& g : done) {                          // undo the ones we already moved
+            std::string bs = dstDir + "\\" + g, bd = srcDir + "\\" + g;
+            MoveFileExA(bs.c_str(), bd.c_str(), MOVEFILE_COPY_ALLOWED);
+        }
+        return false;
+    }
+    return true;
+}
+// Read the active-variant marker; "" when the bike has never been swapped (its loose files
+// are still the un-captured original set).
+static std::string MsReadActive(const std::string& bike) {
+    std::string mk = MsLibDir(bike) + "\\" + kMsMarker;
+    FILE* f = nullptr; fopen_s(&f, mk.c_str(), "rb");
+    if (!f) return "";
+    char buf[128] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f);
+    buf[n] = 0;
+    size_t L = strlen(buf);
+    while (L && (buf[L-1]=='\n' || buf[L-1]=='\r' || buf[L-1]==' ' || buf[L-1]=='\t')) buf[--L] = 0;
+    return std::string(buf);
+}
+static void MsWriteActive(const std::string& bike, const std::string& name) {
+    EnsureDirTree((MsLibDir(bike) + "\\x").c_str());     // ensure the library folder exists
+    std::string mk = MsLibDir(bike) + "\\" + kMsMarker;
+    FILE* f = nullptr; fopen_s(&f, mk.c_str(), "wb");
+    if (!f) { Log("[model] could not write marker %s", mk.c_str()); return; }
+    fwrite(name.c_str(), 1, name.size(), f); fclose(f);
+}
+
+// Scan <mods>\bikes for subfolders that have a model.edf (i.e. real bikes), sorted.
+static void MsScanBikes() {
+    g_msBikes.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((MsBikesRoot() + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::string bike = fd.cFileName;
+        if (MsFileExists(MsActiveEdf(bike))) g_msBikes.push_back(bike);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    std::sort(g_msBikes.begin(), g_msBikes.end(),
+              [](const std::string& a, const std::string& b){ return _stricmp(a.c_str(), b.c_str()) < 0; });
+}
+
+// Build the variant list for `bike`: row 0 is the ACTIVE variant (marker name, or
+// "Original" if never swapped); the rest are the library's subfolders (the inactive ones).
+static void MsScanVariants(const std::string& bike) {
+    g_msVars.clear();
+    std::string active = MsReadActive(bike);
+    std::string activeLabel = active.empty() ? kMsOriginal : active;
+    g_msVars.push_back(activeLabel);                          // row 0 = active
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((MsLibDir(bike) + "\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == '.') continue;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;     // variant = subfolder
+            std::string name = fd.cFileName;
+            if (_stricmp(name.c_str(), activeLabel.c_str()) == 0) continue;      // active is already row 0
+            g_msVars.push_back(name);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (g_msVars.size() > 2)                                  // sort the inactive tail; keep active first
+        std::sort(g_msVars.begin() + 1, g_msVars.end(),
+                  [](const std::string& a, const std::string& b){ return _stricmp(a.c_str(), b.c_str()) < 0; });
+    g_msVarCursor = 0; g_msVarTop = 0;
+}
+
+// Swap `bike`'s model (whole file set) to variant `target`. Auto-backs-up the current set
+// into the library (reversible) and moves the target's set in; on any move failure rolls
+// back and aborts without a broken bike. Reloads on success. Runs on the render thread.
+static void MsApply(const std::string& bike, const std::string& target) {
+    std::string active = MsReadActive(bike);
+    std::string activeLabel = active.empty() ? kMsOriginal : active;
+    if (_stricmp(target.c_str(), activeLabel.c_str()) == 0) {
+        SetStatus("model swap: already active", 3000);
+        return;
+    }
+    std::string rootDir   = MsBikeDir(bike);                    // <Bike>\ (holds the live set)
+    std::string backupDir = MsVariantDir(bike, activeLabel);    // where the current set is parked
+    std::string targetDir = MsVariantDir(bike, target);         // the variant to bring in
+    if (!MsDirExists(targetDir) || !MsFileExists(targetDir + "\\model.edf")) {
+        Log("[model] variant '%s' invalid (need %s\\model.edf).", target.c_str(), targetDir.c_str());
+        SetStatus("model swap: variant missing model.edf (see log)", 5000);
+        return;
+    }
+    std::vector<std::string> rootFiles, targetFiles;
+    MsListFiles(rootDir,   rootFiles);                          // current model files to back up
+    MsListFiles(targetDir, targetFiles);                       // variant files to bring in
+    // 1) back up the current set into the library (all-or-nothing; MsMoveSet rolls itself back).
+    if (!rootFiles.empty() && !MsMoveSet(rootDir, backupDir, rootFiles, "backup")) {
+        SetStatus("model swap: files in use - exit the bike first", 6000);
+        return;
+    }
+    // 2) move the variant's set into the bike root.
+    if (!MsMoveSet(targetDir, rootDir, targetFiles, "activate")) {
+        MsMoveSet(backupDir, rootDir, rootFiles, "rollback");  // restore the backed-up set
+        SetStatus("model swap failed - rolled back (see log)", 6000);
+        return;
+    }
+    MsWriteActive(bike, target);
+    Log("[model] %s: model set '%s' -> '%s' (%zu files) - reloading.",
+        bike.c_str(), activeLabel.c_str(), target.c_str(), targetFiles.size());
+    SetStatus("model swapped - reloading", 4000);
+    g_msOpen.store(false);
+    RequestReload();
+}
+
+void OpenModelSwap() {
+    if (!g_modsPath[0]) {
+        Log("[model] cannot open - mods path unknown (run frostmod.exe so it writes frostmod_mods.txt).");
+        SetStatus("model swap: mods path unknown", 4000);
+        return;
+    }
+    MsScanBikes();
+    g_msLevel = 0; g_msBikeCursor = 0; g_msBikeTop = 0;
+    g_msBike.clear(); g_msVars.clear();
+    g_msOpen.store(true);
+    Log("[model] model swap opened - %zu bike(s) under %s.", g_msBikes.size(), MsBikesRoot().c_str());
+}
+void CloseModelSwap() { g_msOpen.store(false); }
 
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
@@ -1133,11 +1290,10 @@ char                   g_statusText[128] = {0};
 struct MenuItem { char key; const char* label; };
 static const MenuItem kMenu[] = {
     { '1', "Reload mods" },
-    { '2', "Track manager" },
-    { '3', "Switch track (localhost)" },
-    { '4', "Track list  (log)" },
-    { '5', "Toggle this overlay" },
-    { '6', "Direct connect (IP)" },
+    { '2', "Toggle this overlay" },
+    { '3', "Bike model swap" },
+    // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
+    // Track list, Direct connect. Re-add a row here to expose one again.
 };
 static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
 
@@ -1306,11 +1462,73 @@ static void DrawDirectConnect(int w, int h, int lh) {
     GlText(x0 + 8, y, "  digits . :   Enter connect   Esc cancel");
 }
 
+// The model-swap panel: two-level scrolled list. Level 0 lists bikes; level 1 lists the
+// chosen bike's variants with row 0 = the active one (green "(active)"). Switcher styling.
+static void DrawModelSwap(int w, int h, int lh) {
+    const bool lvl1 = (g_msLevel == 1);
+    std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
+    int& cursor = lvl1 ? g_msVarCursor : g_msBikeCursor;
+    int& top    = lvl1 ? g_msVarTop    : g_msBikeTop;
+    const int n = (int)items.size();
+    if (cursor < top)                top = cursor;
+    if (cursor >= top + kTrkVisible) top = cursor - kTrkVisible + 1;
+    if (top < 0) top = 0;
+
+    const int shown     = n < kTrkVisible ? n : kTrkVisible;
+    const bool needHint = lvl1 && n <= 1;            // only the active variant => show "add .edf" hint
+    const int listLines = n == 0 ? 1 : shown;
+    const int rows = listLines + (needHint ? 4 : 3); // title + list [+ hint] + spacer + footer
+    const int bw = 560, bh = rows * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    char title[160];
+    if (lvl1) sprintf_s(title, "FrostMod - Model Swap   %s   (%d)", g_msBike.c_str(), n);
+    else      sprintf_s(title, "FrostMod - Model Swap   (%d bikes)", n);
+    GlText(x0 + 8, y, title); y -= lh;
+
+    if (n == 0) {
+        glColor4f(0.80f, 0.62f, 0.62f, 1.0f);
+        GlText(x0 + 8, y, "  (no bikes found under mods\\bikes)"); y -= lh;
+    }
+    for (int i = top; i < top + shown && i < n; ++i) {
+        bool cur = (i == cursor);
+        if (cur) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4); }
+        char row[220];
+        if (lvl1) {
+            bool active = (i == 0);                  // row 0 is the active variant
+            sprintf_s(row, "%s %s%s", cur ? ">" : " ", items[i].c_str(), active ? "   (active)" : "");
+            if (active) glColor4f(0.55f, 0.95f, 0.75f, 1.0f);
+            else        glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        } else {
+            sprintf_s(row, "%s %s", cur ? ">" : " ", items[i].c_str());
+            glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        }
+        GlText(x0 + 8, y, row); y -= lh;
+    }
+    if (needHint) {
+        glColor4f(0.70f, 0.74f, 0.82f, 1.0f);
+        GlText(x0 + 8, y, "  add a variant folder (model.edf + its .hrc/.cfg) under 'FrostMod Models'"); y -= lh;
+    }
+
+    y -= 2;
+    glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+    char foot[160];
+    if (lvl1) sprintf_s(foot, "  Up/Down  Enter swap+reload  Esc back    [%d-%d/%d]",
+                        n ? top + 1 : 0, top + shown, n);
+    else      sprintf_s(foot, "  Up/Down  Enter choose bike  Esc close    [%d-%d/%d]",
+                        n ? top + 1 : 0, top + shown, n);
+    GlText(x0 + 8, y, foot);
+}
+
 void DrawOverlay(HDC hdc) {
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
-        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load()) return;
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -1324,6 +1542,7 @@ void DrawOverlay(HDC hdc) {
     const bool trk       = g_trkOpen.load() && !reloading;
     const bool sw        = g_swOpen.load()  && !reloading;
     const bool dc        = g_dcOpen.load()  && !reloading;
+    const bool ms        = g_msOpen.load()  && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -1348,7 +1567,9 @@ void DrawOverlay(HDC hdc) {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     const int lh = 18;                           // line height
-    if (trk) {
+    if (ms) {
+        DrawModelSwap(w, h, lh);
+    } else if (trk) {
         DrawTrackManager(w, h, lh);
     } else if (sw) {
         DrawSwitcher(w, h, lh);
@@ -1456,13 +1677,14 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
 static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
-        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load()) return;
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()) return;
 
     const bool reloading = g_reloadActive.load();
     const bool menu = g_menuOpen.load() && !reloading;
     const bool trk  = g_trkOpen.load()  && !reloading;
     const bool sw   = g_swOpen.load()   && !reloading;
     const bool dc   = g_dcOpen.load()   && !reloading;
+    const bool ms   = g_msOpen.load()   && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -1477,7 +1699,57 @@ static void BuildOverlayDrawLists() {
     const unsigned long cAmber = ToABGR(1.0f,  0.85f, 0.45f, 1.0f);
     const unsigned long cHi    = ToABGR(0.47f, 0.78f, 1.0f, 0.18f);
 
-    if (trk) {
+    if (ms) {
+        const bool lvl1 = (g_msLevel == 1);
+        std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
+        int& cursor = lvl1 ? g_msVarCursor : g_msBikeCursor;
+        int& top    = lvl1 ? g_msVarTop    : g_msBikeTop;
+        const int n = (int)items.size();
+        if (cursor < top)                top = cursor;
+        if (cursor >= top + kTrkVisible) top = cursor - kTrkVisible + 1;
+        if (top < 0) top = 0;
+        const int  shown     = n < kTrkVisible ? n : kTrkVisible;
+        const bool needHint  = lvl1 && n <= 1;
+        const int  listLines = n == 0 ? 1 : shown;
+        const int  rows      = listLines + (needHint ? 4 : 3);
+        const float w = 0.44f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        char title[160];
+        if (lvl1) sprintf_s(title, "FrostMod - Model Swap   %s   (%d)", g_msBike.c_str(), n);
+        else      sprintf_s(title, "FrostMod - Model Swap   (%d bikes)", n);
+        DText(MX + PADX, y, title, cBlue, FS); y += LH;
+        if (n == 0) {
+            DText(MX + PADX, y, "  (no bikes found under mods\\bikes)", ToABGR(0.80f, 0.62f, 0.62f, 1.0f), FS);
+            y += LH;
+        }
+        for (int i = top; i < top + shown && i < n; ++i) {
+            bool cur = (i == cursor);
+            if (cur) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            char row[220];
+            if (lvl1) {
+                bool active = (i == 0);
+                sprintf_s(row, "%s %s%s", cur ? ">" : " ", items[i].c_str(), active ? "   (active)" : "");
+                DText(MX + PADX, y, row, active ? ToABGR(0.55f, 0.95f, 0.75f, 1.0f) : cWhite, FS);
+            } else {
+                sprintf_s(row, "%s %s", cur ? ">" : " ", items[i].c_str());
+                DText(MX + PADX, y, row, cWhite, FS);
+            }
+            y += LH;
+        }
+        if (needHint) {
+            DText(MX + PADX, y, "  add a variant folder (model.edf + .hrc/.cfg) under 'FrostMod Models'",
+                  ToABGR(0.70f, 0.74f, 0.82f, 1.0f), FS);
+            y += LH;
+        }
+        y += 0.004f;
+        char foot[160];
+        if (lvl1) sprintf_s(foot, "  Up/Down  Enter swap+reload  Esc back   [%d-%d/%d]",
+                            n ? top + 1 : 0, top + shown, n);
+        else      sprintf_s(foot, "  Up/Down  Enter choose bike  Esc close   [%d-%d/%d]",
+                            n ? top + 1 : 0, top + shown, n);
+        DText(MX + PADX, y, foot, cGray, FS);
+    } else if (trk) {
         const int total_t = (int)g_trk.size();
         const int vn      = (int)g_trkView.size();
         if (g_trkCursor < g_trkTop)                g_trkTop = g_trkCursor;
@@ -1704,14 +1976,14 @@ void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
 void MenuAction(int d) {
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
-    case 2: g_menuOpen.store(false); OpenTrackManager(); break;   // manage track files (list UI)
-    case 3: g_menuOpen.store(false); OpenSwitcher();     break;   // switch the localhost map
-    case 4: DumpTrackList();    g_menuOpen.store(false); break;   // [tracks] to the log (verify fields)
-    case 5: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
+    case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
-    case 6: g_menuOpen.store(false); OpenDirectConnect(); break;   // join a server by IP
+    case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
     default: break;
     }
+    // Hidden actions kept for reference / easy re-enable (their functions still exist):
+    //   OpenTrackManager()               - track manager      OpenSwitcher() - switch track
+    //   DumpTrackList()                  - track list -> log   OpenDirectConnect() - direct connect
 }
 
 void Tick() {
@@ -1725,7 +1997,9 @@ void Tick() {
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
-        if (g_trkOpen.load()) {                              // F8 also closes an open list
+        if (g_msOpen.load()) {                               // F8 also closes an open list
+            CloseModelSwap(); Log("[model] model swap closed (F8).");
+        } else if (g_trkOpen.load()) {
             CloseTrackManager(); Log("[trklib] track manager closed (F8).");
         } else if (g_swOpen.load()) {
             CloseSwitcher(); Log("[switch] switcher closed (F8).");
@@ -1864,6 +2138,48 @@ void Tick() {
         if (changed) g_dcError.clear();                      // editing clears the last error
         if (enter)     AttemptDirectConnect();               // parse + connect (keeps box open on error)
         else if (esc) { CloseDirectConnect(); Log("[connect] direct connect closed (Esc)."); }
+    }
+
+    // Bike model swap (F8 > 3): two-level list. Up/Down move (held-key repeat); Enter picks
+    // a bike (level 0 -> level 1) or swaps the highlighted variant (level 1); Esc backs out
+    // one level, or closes from the bike list. State touched only here + the draw paths.
+    if (g_msOpen.load()) {
+        static bool mUp = false, mDown = false, mEnter = false, mEsc = false;
+        static ULONGLONG mUpNext = 0, mDownNext = 0;
+        const ULONGLONG now = GetTickCount64();
+        const bool lvl1 = (g_msLevel == 1);
+        const int  n = (int)(lvl1 ? g_msVars.size() : g_msBikes.size());
+        int& cursor = lvl1 ? g_msVarCursor : g_msBikeCursor;
+        bool up    = (GetAsyncKeyState(VK_UP)     & 0x8000) != 0;
+        bool down  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) != 0;
+        bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        bool esc   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        auto step = [&](bool held, bool prev, ULONGLONG& nextAt) -> bool {
+            if (held && !prev)         { nextAt = now + 350; return true; }
+            if (held && now >= nextAt) { nextAt = now + 90;  return true; }
+            return false;
+        };
+        if (n) {
+            if (step(up,   mUp,   mUpNext))   cursor = (cursor - 1 + n) % n;
+            if (step(down, mDown, mDownNext)) cursor = (cursor + 1)     % n;
+        }
+        if (enter && !mEnter) {
+            if (!lvl1) {                                     // level 0: enter the chosen bike
+                if (n) {
+                    g_msBike = g_msBikes[g_msBikeCursor];
+                    MsScanVariants(g_msBike);
+                    g_msLevel = 1;
+                    Log("[model] bike '%s' - %zu variant(s) (active='%s').",
+                        g_msBike.c_str(), g_msVars.size(), g_msVars.empty() ? "" : g_msVars[0].c_str());
+                }
+            } else if (n) {                                  // level 1: swap the highlighted variant
+                MsApply(g_msBike, g_msVars[g_msVarCursor]);   // owns its own reload + status
+            }
+        } else if (esc && !mEsc) {
+            if (lvl1) g_msLevel = 0;                          // back to the bike list
+            else { CloseModelSwap(); Log("[model] model swap closed (Esc)."); }
+        }
+        mUp = up; mDown = down; mEnter = enter; mEsc = esc;
     }
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so

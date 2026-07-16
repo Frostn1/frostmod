@@ -273,6 +273,85 @@ int64_t __fastcall hkReset(void* a0, void* a1) {
     return g_origReset(a0, a1);
 }
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC: capture bike-model (.edf) file opens + their CALL STACK.
+// Opt-in via a frostmod_edfcap.flag file next to frostmod.log (see Init()).
+//
+// WHY: the garage bike PREVIEW only re-reads a swapped model.edf after the user
+// switches bike class away and back - the surgical reload rebuilds the content
+// CATALOGS but not the live preview instance, and static tracing couldn't pin the
+// scene-level mesh loader or its identity/cache behaviour. Loose bike files are
+// real disk opens, so hooking kernel32!CreateFileW/A and logging every '.edf' open
+// WITH a stack walk answers both open questions from the log alone:
+//   (A) swap a model then RE-SELECT the SAME bike (no class change): if NO new
+//       [edf] line appears, the mesh is cached by identity -> the fix must
+//       replicate away-and-back; if a line appears, a single re-select suffices.
+//   (B) switch class away+back: the [edf] line's stack names the mesh loader (the
+//       top mxbikes.exe RVA) and the "selected-bike-changed" caller above it.
+// Read-only: we call the original CreateFile unchanged and only log.
+using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR,  DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+CreateFileW_t    g_origCreateFileW = nullptr;
+CreateFileA_t    g_origCreateFileA = nullptr;
+std::atomic<int> g_edfShots{0};
+
+// True if the path contains ".edf" (case-insensitive) - no allocation.
+static bool PathHasEdf(const char* p) {
+    for (const char* s = p; s[0]; ++s)
+        if (s[0] == '.' && (s[1]|0x20) == 'e' && (s[2]|0x20) == 'd' && (s[3]|0x20) == 'f') return true;
+    return false;
+}
+
+// Stack walk formatted as game-module RVAs (frames outside mxbikes.exe -> "[ext]").
+// The first RVA is the game's own file-open wrapper; walk up to the mesh loader.
+static std::string EdfStackChain() {
+    static RtlCaptureStackBackTrace_t cap = []() -> RtlCaptureStackBackTrace_t {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        return nt ? (RtlCaptureStackBackTrace_t)GetProcAddress(nt, "RtlCaptureStackBackTrace") : nullptr;
+    }();
+    if (!cap) return "<no stackwalk>";
+    void* frames[32] = {0};
+    USHORT n = cap(2 /*skip EdfStackChain + the detour*/, 32, frames, nullptr);
+    std::string chain; char b[48];
+    for (USHORT i = 0; i < n; ++i) {
+        uintptr_t a = (uintptr_t)frames[i], rva = a - g_base;
+        bool inGame = (a >= g_base && rva < 0x1000000);          // mxbikes.exe is ~14MB
+        _snprintf_s(b, sizeof(b), _TRUNCATE, "%s%s", i ? " <- " : "", inGame ? "" : "[ext]");
+        chain += b;
+        if (inGame) { _snprintf_s(b, sizeof(b), _TRUNCATE, "0x%zx", (size_t)rva); chain += b; }
+    }
+    return chain;
+}
+
+static void EdfLog(const char* path) {
+    if (!path || !PathHasEdf(path)) return;
+    static thread_local bool inHook = false;   // our Log()->fopen must not recurse in
+    if (inHook) return;
+    int n = g_edfShots.fetch_add(1);
+    if (n >= 400) return;                       // cap the log; the capture is short-lived
+    inHook = true;
+    Log("[edf] #%d open '%s' <- %s", n + 1, path, EdfStackChain().c_str());
+    inHook = false;
+}
+
+HANDLE WINAPI hkCreateFileW(LPCWSTR name, DWORD acc, DWORD shr, LPSECURITY_ATTRIBUTES sa,
+                            DWORD disp, DWORD fl, HANDLE tmpl) {
+    HANDLE h = g_origCreateFileW(name, acc, shr, sa, disp, fl, tmpl);
+    if (name) {
+        char narrow[MAX_PATH * 2] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+        EdfLog(narrow);
+    }
+    return h;
+}
+
+HANDLE WINAPI hkCreateFileA(LPCSTR name, DWORD acc, DWORD shr, LPSECURITY_ATTRIBUTES sa,
+                            DWORD disp, DWORD fl, HANDLE tmpl) {
+    HANDLE h = g_origCreateFileA(name, acc, shr, sa, disp, fl, tmpl);
+    EdfLog(name);
+    return h;
+}
+
 // PROBE (opt-in via frostmod.exe --probe-mount): capture how the real pkz-mount
 // function (0x15a9e0) is called, to learn which arg is the .pkz path. Observe-only
 // pass-through; we log each arg as a string so a readable path reveals itself.
@@ -2520,6 +2599,33 @@ DWORD WINAPI Init(LPVOID) {
                     (unsigned)kMasterPort);
             } else {
                 Log("[cap] --capture-master: could not load ws2_32.dll; capture not installed.");
+            }
+        }
+    }
+
+    // OPT-IN (create an empty frostmod_edfcap.flag next to frostmod.log): log every
+    // bike-model (.edf) file the game opens, WITH its call stack, to RE the garage
+    // bike-preview reload path - which loader re-reads model.edf from disk, and
+    // whether re-selecting the SAME bike re-opens it (the mesh-cache test). See the
+    // hkCreateFileW/A capture hooks above. Read-only; off by default.
+    {
+        char flag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(flag, g_logPath);
+            if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_edfcap.flag"); }
+        }
+        if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            if (HMODULE k32 = GetModuleHandleA("kernel32.dll")) {
+                if (auto p = GetProcAddress(k32, "CreateFileW"))
+                    InstallHook((void*)p, &hkCreateFileW, (void**)&g_origCreateFileW, "kernel32!CreateFileW");
+                if (auto p = GetProcAddress(k32, "CreateFileA"))
+                    InstallHook((void*)p, &hkCreateFileA, (void**)&g_origCreateFileA, "kernel32!CreateFileA");
+                Log("[edf] --edfcap ARMED. In the GARAGE: (A) swap a bike's model then RE-SELECT the SAME "
+                    "bike (no class change) - if NO new [edf] line appears, the mesh is cached by identity. "
+                    "(B) switch bike CLASS away then back - the new [edf] line's stack names the loader (top "
+                    "mxbikes.exe RVA) and the selection caller above it. Then send frostmod.log back.");
+            } else {
+                Log("[edf] --edfcap: could not get kernel32; capture not installed.");
             }
         }
     }

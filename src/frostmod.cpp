@@ -28,6 +28,7 @@
 #include <cstring>
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
+#include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
 #include <GL/gl.h>    // immediate-mode GL overlay
 
 #include "MinHook.h"
@@ -1357,6 +1358,311 @@ void RequestReload() {
     SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
 }
 
+// ===========================================================================
+// RADAR + RIDER OUTLINES (ESP)  -  sanctioned PiBoSo telemetry
+//
+// Data comes entirely from the plugin API callbacks (implemented at the bottom
+// of this file, next to Draw()): RunTelemetry (our world pos), RaceTrackPosition
+// (EVERY rider's live world pos + yaw), RaceAddEntry/RaceClassification (race
+// number -> name + laps-done, for the lap-status coloring). No memory reads.
+//
+// The one thing the plugin API does NOT give us is the camera view-projection
+// matrix, which the on-screen outline needs to project a rider's world XYZ to a
+// screen box. MX Bikes is OpenGL, so we capture it from the fixed-function GL
+// pipeline (hkGlLoadMatrixf below). If capture ever fails validation, the ESP
+// degrades to a screen-edge directional arrow that needs no matrix.
+//
+// CALIBRATION: a few world-axis / yaw-sign conventions can only be confirmed by
+// running the game (the Windows tester box). They are isolated in the CAL block
+// below so calibration is a one-line change; see docs/PLUGIN.md verification.
+// ===========================================================================
+
+// ---- SDK structs (verbatim prefix from mxb_example.c; we read only early, fixed
+// fields, and every ingest guards on the reported _iDataSize) ----------------
+struct SPluginsBikeData_t {          // RunTelemetry payload (local bike)
+    int   m_iRPM;
+    float m_fEngineTemperature, m_fWaterTemperature;
+    int   m_iGear;
+    float m_fFuel, m_fSpeedometer;
+    float m_fPosX, m_fPosY, m_fPosZ; // world position  (all we read)
+    // ... velocity / accel / rotation / controls follow; unused here.
+};
+struct SPluginsRaceTrackPosition_t { // RaceTrackPosition array element
+    int   m_iRaceNum;
+    float m_fPosX, m_fPosY, m_fPosZ;
+    float m_fYaw;
+    float m_fTrackPos;
+    int   m_iCrashed;
+};
+struct SPluginsRaceAddEntry_t {      // RaceAddEntry payload
+    int  m_iRaceNum;
+    char m_szName[100], m_szBikeName[100], m_szBikeShortName[100], m_szCategory[100];
+    int  m_iUnactive, m_iNumberOfGears, m_iMaxRPM;
+};
+struct SPluginsRaceClassification_t {      // RaceClassification header
+    int m_iSession, m_iSessionState, m_iSessionTime, m_iNumEntries;
+};
+struct SPluginsRaceClassificationEntry_t { // RaceClassification array element
+    int m_iRaceNum, m_iState, m_iBestLap, m_iBestLapNum, m_iNumLaps;
+    int m_iGap, m_iGapLaps, m_iPenalty, m_iPit;
+};
+
+// ---- CALIBRATION knobs (VERIFY on the Windows tester) -----------------------
+// Which two world axes form the horizontal (ground) plane, and which is "up".
+// GL engines are commonly Y-up (ground = X,Z). If the radar looks squashed or a
+// rider directly ahead lands sideways, this is the first thing to flip.
+static inline void GroundUV(float x, float y, float z, float& u, float& v) {
+    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y  [verify]
+}
+static constexpr float RAD_YAW_SIGN   = 1.0f;   // flip if the radar spins the wrong way
+static constexpr float RAD_YAW_OFFSET = 0.0f;   // add if "straight ahead" isn't at the top
+
+// ---- shared rider snapshot (producer = game data threads; consumer = render) -
+static std::atomic<bool> g_radarOn{false};   // radar HUD panel
+static std::atomic<bool> g_espOn{false};     // on-screen rider outlines
+static float             g_radarRange = 80.0f; // metres shown edge-to-center
+
+static std::mutex g_radMutex;                // guards everything below
+struct RadRider { int raceNum; float x, y, z, yaw; int crashed; };
+static bool     g_radHaveMe = false;
+static float    g_radMeX = 0, g_radMeY = 0, g_radMeZ = 0;   // from RunTelemetry
+static int      g_radN = 0;
+static RadRider g_radRiders[64];             // from RaceTrackPosition
+struct RadEntry { int raceNum; int numLaps; char name[24]; };
+static int      g_radNEntries = 0;
+static RadEntry g_radEntries[64];            // from RaceAddEntry / RaceClassification
+
+static int RadFindEntry(int raceNum) {       // caller holds g_radMutex
+    for (int i = 0; i < g_radNEntries; ++i)
+        if (g_radEntries[i].raceNum == raceNum) return i;
+    return -1;
+}
+
+// ---- ingest (called from the plugin callbacks; take the lock) ---------------
+static void RadStoreTelemetry(const void* d, int size) {
+    if (!d || size < (int)sizeof(SPluginsBikeData_t)) return;
+    const auto* b = (const SPluginsBikeData_t*)d;
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    g_radMeX = b->m_fPosX; g_radMeY = b->m_fPosY; g_radMeZ = b->m_fPosZ;
+    g_radHaveMe = true;
+}
+static void RadStoreTrackPositions(int n, const void* arr, int elem) {
+    if (!arr || elem <= 0) { std::lock_guard<std::mutex> lk(g_radMutex); g_radN = 0; return; }
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    if (n < 0) n = 0; if (n > 64) n = 64;
+    g_radN = 0;
+    for (int i = 0; i < n; ++i) {
+        const auto* e = (const SPluginsRaceTrackPosition_t*)((const char*)arr + (size_t)i * elem);
+        RadRider& r = g_radRiders[g_radN++];
+        r.raceNum = e->m_iRaceNum; r.x = e->m_fPosX; r.y = e->m_fPosY; r.z = e->m_fPosZ;
+        r.yaw = e->m_fYaw; r.crashed = e->m_iCrashed;
+    }
+}
+static void RadAddEntry(const void* d, int size) {
+    if (!d || size < (int)sizeof(SPluginsRaceAddEntry_t)) return;
+    const auto* a = (const SPluginsRaceAddEntry_t*)d;
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    int i = RadFindEntry(a->m_iRaceNum);
+    if (i < 0 && g_radNEntries < 64) { i = g_radNEntries++; g_radEntries[i].numLaps = 0; }
+    if (i >= 0) { g_radEntries[i].raceNum = a->m_iRaceNum;
+                  strncpy_s(g_radEntries[i].name, a->m_szName, _TRUNCATE); }
+}
+static void RadRemoveEntry(const void* d, int size) {
+    if (!d || size < (int)sizeof(int)) return;
+    int raceNum = *(const int*)d;            // payload starts with m_iRaceNum
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    int i = RadFindEntry(raceNum);
+    if (i >= 0) g_radEntries[i] = g_radEntries[--g_radNEntries];
+}
+static void RadStoreClassification(const void* arr, int n, int elem) {
+    if (!arr || elem <= 0) return;
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    if (n < 0) n = 0; if (n > 64) n = 64;
+    for (int k = 0; k < n; ++k) {
+        const auto* c = (const SPluginsRaceClassificationEntry_t*)((const char*)arr + (size_t)k * elem);
+        int i = RadFindEntry(c->m_iRaceNum);
+        if (i < 0 && g_radNEntries < 64) { i = g_radNEntries++; g_radEntries[i].name[0] = 0; }
+        if (i >= 0) { g_radEntries[i].raceNum = c->m_iRaceNum; g_radEntries[i].numLaps = c->m_iNumLaps; }
+    }
+}
+static void RadResetRace() {
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    g_radN = 0; g_radNEntries = 0; g_radHaveMe = false;
+}
+
+// ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
+static void RadarSettingsPath(char* out, size_t n) {
+    strncpy_s(out, n, g_logPath, _TRUNCATE);
+    char* slash = strrchr(out, '\\');
+    if (slash) slash[1] = 0; else out[0] = 0;
+    strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
+}
+static void SaveRadarSettings() {
+    char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
+    FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
+    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\n",
+            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange);
+    fclose(f);
+}
+static void LoadRadarSettings() {
+    char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
+    FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
+    char line[64]; int v;
+    while (fgets(line, sizeof(line), f)) {
+        if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
+        else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
+        else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
+    }
+    fclose(f);
+    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm",
+        g_radarOn.load(), g_espOn.load(), (int)g_radarRange);
+}
+
+// ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
+// lap: +1 = they are lapping YOU (a lap ahead -> red), -1 = you are lapping them
+// (a lap behind -> blue), 0 = same lap (white). rx/ry are heading-up radar-disc
+// coords in [-1,1] (ry up = ahead). bearing is the world heading to them
+// relative to my facing, for the ESP arrow fallback. wx/wy/wz = world pos.
+struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yaw; int lap; int raceNum; };
+// Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
+// (no telemetry / no track positions). outMe* receive my world pos + heading.
+static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
+                         float* outMeYaw, float* outMeX, float* outMeY, float* outMeZ) {
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    if (!g_radHaveMe || g_radN == 0) return -1;
+    // "me" = the RaceTrackPosition entry closest to my telemetry world pos.
+    int me = -1; float best = 1e30f;
+    for (int i = 0; i < g_radN; ++i) {
+        float dx = g_radRiders[i].x - g_radMeX, dy = g_radRiders[i].y - g_radMeY,
+              dz = g_radRiders[i].z - g_radMeZ;
+        float d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < best) { best = d2; me = i; }
+    }
+    if (me < 0) return -1;
+    const float myYaw = g_radRiders[me].yaw;
+    if (outMeYaw) *outMeYaw = myYaw;
+    if (outMeX) *outMeX = g_radRiders[me].x;
+    if (outMeY) *outMeY = g_radRiders[me].y;
+    if (outMeZ) *outMeZ = g_radRiders[me].z;
+    int myLaps = 0; { int ei = RadFindEntry(g_radRiders[me].raceNum);
+                      if (ei >= 0) myLaps = g_radEntries[ei].numLaps; }
+    float meu, mev; GroundUV(g_radRiders[me].x, g_radRiders[me].y, g_radRiders[me].z, meu, mev);
+    const float a  = RAD_YAW_SIGN * myYaw + RAD_YAW_OFFSET;
+    const float ca = cosf(a), sa = sinf(a);
+
+    int count = 0;
+    for (int i = 0; i < g_radN && count < maxOut; ++i) {
+        if (i == me) continue;
+        const RadRider& r = g_radRiders[i];
+        float ru, rv; GroundUV(r.x, r.y, r.z, ru, rv);
+        float du = ru - meu, dv = rv - mev;
+        // rotate world delta into heading-up radar space (forward -> +ry/up)
+        float rx =  du * ca - dv * sa;
+        float ry =  du * sa + dv * ca;
+        float dist = sqrtf(du*du + dv*dv);
+        int lap = 0; { int ei = RadFindEntry(r.raceNum);
+                       if (ei >= 0) { int l = g_radEntries[ei].numLaps;
+                                      lap = (l > myLaps) ? +1 : (l < myLaps ? -1 : 0); } }
+        RadBlip& b = out[count++];
+        b.rx = rangeM > 0 ? rx / rangeM : 0; b.ry = rangeM > 0 ? ry / rangeM : 0;
+        // clamp to the disc; riders past range sit on the rim
+        float m = sqrtf(b.rx*b.rx + b.ry*b.ry);
+        if (m > 1.0f) { b.rx /= m; b.ry /= m; }
+        b.dist = dist; b.bearing = atan2f(rx, ry);   // 0 = ahead, +right
+        b.wx = r.x; b.wy = r.y; b.wz = r.z; b.yaw = r.yaw; b.lap = lap; b.raceNum = r.raceNum;
+    }
+    return count;
+}
+
+// ---- lap-status colors (shared by both render paths) ------------------------
+// same lap = white, they're lapping you = red, you're lapping them = blue.
+static void LapColorRGB(int lap, float& r, float& g, float& b) {
+    if (lap > 0)      { r = 1.00f; g = 0.32f; b = 0.32f; }   // red
+    else if (lap < 0) { r = 0.40f; g = 0.70f; b = 1.00f; }   // blue
+    else              { r = 0.94f; g = 0.96f; b = 1.00f; }   // white
+}
+
+// ---- camera view-projection capture (fixed-function OpenGL) -----------------
+// The engine sets a perspective PROJECTION then loads the camera view as the
+// first MODELVIEW before any per-object matrix. We snoop glMatrixMode +
+// glLoadMatrixf to grab both, compose VP = Proj * View (column-major), and
+// validate it each frame by projecting known riders. g_inOverlay suppresses
+// capture while OUR overlay is drawing its own ortho matrices.
+using glMatrixMode_t  = void (WINAPI*)(GLenum);
+using glLoadMatrixf_t = void (WINAPI*)(const GLfloat*);
+static glMatrixMode_t  g_origGlMatrixMode  = nullptr;
+static glLoadMatrixf_t g_origGlLoadMatrixf = nullptr;
+
+static std::atomic<bool> g_inOverlay{false};
+static std::atomic<bool> g_vpValid{false};
+static std::atomic<int>  g_glDiag{0};          // >0 => log the next N matrix loads once
+static GLenum g_glMode = 0;
+static bool   g_projPrimed = false;
+static float  g_capProj[16], g_capView[16], g_vp[16];
+
+static bool IsPerspectiveProj(const GLfloat* m) {   // GL column-major perspective
+    return m[15] == 0.0f && m[11] < -0.5f && m[11] > -1.5f;
+}
+static void MatMul16(const float* a, const float* b, float* o) {   // o = a*b, column-major
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) {
+            float s = 0; for (int k = 0; k < 4; ++k) s += a[k*4 + r] * b[c*4 + k];
+            o[c*4 + r] = s;
+        }
+}
+void WINAPI hkGlMatrixMode(GLenum mode) { g_glMode = mode; g_origGlMatrixMode(mode); }
+void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
+    // glLoadMatrixf is hot; only do capture work when the outline feature (or the
+    // one-shot diagnostic) actually needs it. Otherwise this is a cheap passthrough.
+    if (m && !g_inOverlay.load(std::memory_order_relaxed)
+        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed))) {
+        if (int d = g_glDiag.load(std::memory_order_relaxed)) {
+            Log("[esp/diag] loadMatrix mode=0x%X persp=%d m11=%.3f m15=%.3f",
+                g_glMode, (int)IsPerspectiveProj(m), m[11], m[15]);
+            g_glDiag.store(d - 1, std::memory_order_relaxed);
+        }
+        if (g_glMode == GL_PROJECTION && IsPerspectiveProj(m)) {
+            memcpy(g_capProj, m, sizeof(g_capProj)); g_projPrimed = true;
+        } else if (g_glMode == GL_MODELVIEW && g_projPrimed) {
+            memcpy(g_capView, m, sizeof(g_capView)); g_projPrimed = false;
+            MatMul16(g_capProj, g_capView, g_vp);    // VP ready; validated per frame
+        }
+    }
+    g_origGlLoadMatrixf(m);
+}
+
+// Raw projection through the captured VP (no validity gate). *sx,*sy = normalized
+// screen (0..1, top-left origin); *w = clip w (view depth). Returns false if the
+// point is at/behind the camera plane.
+static bool VPProject01(float x, float y, float z, float* sx, float* sy, float* w) {
+    const float* m = g_vp;
+    float cx = m[0]*x + m[4]*y + m[8]*z  + m[12];
+    float cy = m[1]*x + m[5]*y + m[9]*z  + m[13];
+    float cw = m[3]*x + m[7]*y + m[11]*z + m[15];
+    if (cw <= 0.0001f) return false;                 // behind camera
+    *sx = (cx / cw) * 0.5f + 0.5f; *sy = 0.5f - (cy / cw) * 0.5f; *w = cw;
+    return true;
+}
+// Public projector: only succeeds when the VP passed this frame's validation AND
+// the point lands on-screen.
+static bool WorldToScreen01(float x, float y, float z, float* sx, float* sy, float* w) {
+    if (!g_vpValid.load(std::memory_order_relaxed)) return false;
+    if (!VPProject01(x, y, z, sx, sy, w)) return false;
+    return (*sx >= 0 && *sx <= 1 && *sy >= 0 && *sy <= 1);
+}
+
+// Validate the captured VP each frame: project my own world pos + require it to
+// land on-screen with positive depth. Cheap gate; on failure ESP uses arrows.
+static void RadValidateVP() {
+    if (g_vp[15] == 0 && g_vp[0] == 0) { g_vpValid.store(false); return; }   // never captured
+    float meYaw, mx, my, mz; RadBlip tmp[1];
+    if (RadBuildBlips(tmp, 1, g_radarRange, &meYaw, &mx, &my, &mz) < 0) { g_vpValid.store(false); return; }
+    float sx, sy, w;
+    bool ok = VPProject01(mx, my + 1.0f, mz, &sx, &sy, &w) && w > 0
+              && sx > -0.5f && sx < 1.5f && sy > -0.5f && sy < 1.5f;   // generous: I'm ~on screen
+    g_vpValid.store(ok, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // in-game overlay - a corner hint drawn with immediate-mode GL inside the
 // wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
@@ -1376,6 +1682,8 @@ static const MenuItem kMenu[] = {
     { '1', "Reload mods" },
     { '2', "Toggle this overlay" },
     { '3', "Bike model swap" },
+    { '4', "Radar (riders around you)" },
+    { '5', "Rider outlines" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -1608,11 +1916,79 @@ static void DrawModelSwap(int w, int h, int lh) {
     GlText(x0 + 8, y, foot);
 }
 
+// ---- radar + ESP, GL immediate-mode (used in injected/menu contexts) --------
+static void GlCircle(int cx, int cy, int r, bool fill) {
+    glBegin(fill ? GL_TRIANGLE_FAN : GL_LINE_LOOP);
+    if (fill) glVertex2i(cx, cy);
+    for (int i = 0; i <= 48; ++i) {
+        float a = (float)i / 48.0f * 6.2831853f;
+        glVertex2i(cx + (int)(cosf(a) * r), cy + (int)(sinf(a) * r));
+    }
+    glEnd();
+}
+static void GlTri(int x0,int y0,int x1,int y1,int x2,int y2) {
+    glBegin(GL_TRIANGLES); glVertex2i(x0,y0); glVertex2i(x1,y1); glVertex2i(x2,y2); glEnd();
+}
+static void GlRectOutline(int x0,int y0,int x1,int y1,int t) {
+    FillRect(x0,y0,x1,y0+t); FillRect(x0,y1-t,x1,y1);
+    FillRect(x0,y0,x0+t,y1); FillRect(x1-t,y0,x1,y1);
+}
+static float ClampF(float v,float lo,float hi){ return v<lo?lo:(v>hi?hi:v); }
+
+// The heading-up radar disc, top-right corner. Blips colored by lap status.
+static void DrawRadarGL(int w, int h) {
+    const int R = 92, M = 18, cx = w - M - R, cy = h - M - R;   // GL y-up: top-right
+    glColor4f(0.03f,0.05f,0.09f,0.72f); GlCircle(cx,cy,R,true);
+    glColor4f(0.45f,0.55f,0.72f,0.55f); GlCircle(cx,cy,R,false); GlCircle(cx,cy,R/2,false);
+    glColor4f(0.30f,0.38f,0.52f,0.5f);
+    FillRect(cx-R,cy-1,cx+R,cy+1); FillRect(cx-1,cy-R,cx+1,cy+R);
+    glColor4f(0.55f,0.85f,1.0f,1.0f);                          // "you" arrow, points up
+    GlTri(cx,cy+9, cx-6,cy-6, cx+6,cy-6);
+    RadBlip blips[64]; float meYaw,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    for (int i = 0; i < n; ++i) {
+        float r,g,b; LapColorRGB(blips[i].lap,r,g,b); glColor4f(r,g,b,1.0f);
+        int bx = cx + (int)(blips[i].rx * R), by = cy + (int)(blips[i].ry * R);
+        FillRect(bx-3,by-3,bx+3,by+3);
+    }
+    glColor4f(0.6f,0.66f,0.76f,1.0f);
+    char lbl[32]; sprintf_s(lbl,"RADAR %dm", (int)g_radarRange);
+    GlText(cx-R, cy+R+14, lbl);
+}
+
+// On-screen rider outlines. Box when the VP projects them on-screen; otherwise a
+// screen-edge directional arrow (needs no matrix). Colored by lap status.
+static void DrawEspGL(int w, int h) {
+    RadBlip blips[64]; float meYaw,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    if (n < 0) return;
+    const bool vp = g_vpValid.load(std::memory_order_relaxed);
+    const int scx = w/2, scy = h/2;
+    for (int i = 0; i < n; ++i) {
+        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
+        float sx,sy,wd;
+        if (vp && WorldToScreen01(blips[i].wx, blips[i].wy, blips[i].wz, &sx,&sy,&wd)) {
+            int px = (int)(sx*w), py = (int)((1.0f-sy)*h);      // 0..1 top-left -> GL y-up
+            int hw = (int)ClampF(1400.0f/wd, 8.0f, 140.0f), hh = hw*2;
+            glColor4f(r,g,b,0.95f); GlRectOutline(px-hw, py, px+hw, py+hh, 2);
+        } else {
+            // edge arrow: bearing 0 = ahead(up), +right. GL y-up so ahead = +y.
+            float dx = sinf(blips[i].bearing), dy = cosf(blips[i].bearing);
+            float rad = (float)(h < w ? h : w) * 0.34f;
+            int ax = scx + (int)(dx*rad), ay = scy + (int)(dy*rad);
+            int tx = (int)(dx*10), ty = (int)(dy*10), nx = (int)(-dy*6), ny = (int)(dx*6);
+            glColor4f(r,g,b,0.9f);
+            GlTri(ax+tx, ay+ty, ax-tx+nx, ay-ty+ny, ax-tx-nx, ay-ty-ny);
+        }
+    }
+}
+
 void DrawOverlay(HDC hdc) {
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
-        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()) return;
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
+        && !g_radarOn.load() && !g_espOn.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -1642,6 +2018,7 @@ void DrawOverlay(HDC hdc) {
         strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
     }
 
+    g_inOverlay.store(true, std::memory_order_relaxed);   // don't let our ortho corrupt VP capture
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
     glOrtho(0, w, 0, h, -1, 1);                  // origin bottom-left
@@ -1676,7 +2053,7 @@ void DrawOverlay(HDC hdc) {
         }
         glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
         GlText(x0 + 8, y, "  F8 / Esc   close");
-    } else {
+    } else if (g_overlayOn.load() || reloading || GetTickCount64() < g_statusUntil.load()) {
         // compact pill: hint / status, or the reload progress bar
         const int bw = 250, bh = reloading ? 38 : 24;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
@@ -1692,9 +2069,13 @@ void DrawOverlay(HDC hdc) {
         }
     }
 
+    if (g_espOn.load())   DrawEspGL(w, h);       // HUD overlays draw on top of any panel
+    if (g_radarOn.load()) DrawRadarGL(w, h);
+
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
     glPopAttrib();
+    g_inOverlay.store(false, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,8 +2106,10 @@ struct SPluginString_t {
     unsigned long m_ulColor;        // ABGR
 };
 
-static SPluginQuad_t   g_drawQuads[64];
-static SPluginString_t g_drawStrs[64];
+// Sized with headroom for the radar disc + blips and per-rider outline boxes on
+// top of a panel; DQuad/DText bounds-check against these so overflow just drops.
+static SPluginQuad_t   g_drawQuads[128];
+static SPluginString_t g_drawStrs[128];
 static int             g_nDrawQuads = 0, g_nDrawStrs = 0;
 
 // our glColor4f palette -> ABGR (so both renderers share exactly one set of colors)
@@ -1754,6 +2137,55 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
     t.m_iFont = 1; t.m_fSize = size; t.m_iJustify = 0; t.m_ulColor = abgr;
 }
 
+// PiBoSo mirror of the radar/ESP HUD. Normalized 0..1, top-left origin; the disc
+// is drawn in an aspect-corrected square (assume 16:9 - Draw() gives no resolution).
+// Quad budget is shared (cap 64), so blips/boxes are capped to stay within it.
+static constexpr float PB_ASPECT = 9.0f / 16.0f;   // narrow x so the disc isn't stretched
+static void EmitRadarPiBoSo() {
+    const float cx = 0.905f, cy = 0.135f, Ry = 0.105f, Rx = Ry * PB_ASPECT;
+    DQuad(cx - Rx*1.12f, cy - Ry*1.12f, cx + Rx*1.12f, cy + Ry*1.12f, ToABGR(0.03f,0.05f,0.09f,0.72f));
+    DQuad(cx - 0.004f*PB_ASPECT, cy - Ry, cx + 0.004f*PB_ASPECT, cy + Ry, ToABGR(0.30f,0.38f,0.52f,0.5f)); // v axis
+    DQuad(cx - Rx, cy - 0.004f, cx + Rx, cy + 0.004f, ToABGR(0.30f,0.38f,0.52f,0.5f));                     // h axis
+    DQuad(cx - 0.010f*PB_ASPECT, cy - 0.012f, cx + 0.010f*PB_ASPECT, cy + 0.006f, ToABGR(0.55f,0.85f,1.0f,1.0f)); // "you"
+    RadBlip blips[64]; float meYaw,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    int drawn = 0;
+    for (int i = 0; i < n && drawn < 22; ++i) {
+        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
+        float bx = cx + blips[i].rx * Rx;
+        float by = cy - blips[i].ry * Ry;         // top-left origin: ahead(+ry) -> up(-y)
+        float s = 0.006f;
+        DQuad(bx - s*PB_ASPECT, by - s, bx + s*PB_ASPECT, by + s, ToABGR(r,g,b,1.0f));
+        ++drawn;
+    }
+    DText(cx - Rx, cy + Ry*1.12f + 0.006f, "RADAR", ToABGR(0.6f,0.66f,0.76f,1.0f), 0.017f);
+}
+static void EmitEspPiBoSo() {
+    RadBlip blips[64]; float meYaw,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    if (n < 0) return;
+    const bool vp = g_vpValid.load(std::memory_order_relaxed);
+    int boxes = 0;
+    for (int i = 0; i < n && boxes < 10; ++i) {
+        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
+        unsigned long col = ToABGR(r,g,b,0.95f);
+        float sx,sy,wd;
+        if (vp && WorldToScreen01(blips[i].wx, blips[i].wy, blips[i].wz, &sx,&sy,&wd)) {
+            float hh = ClampF(1.6f/wd, 0.012f, 0.16f), hw = hh * 0.5f * PB_ASPECT; // taller than wide
+            float x0 = sx - hw, x1 = sx + hw, y0 = sy - hh, y1 = sy + hh, t = 0.0025f;
+            DQuad(x0, y0, x1, y0+t, col); DQuad(x0, y1-t, x1, y1, col);      // hollow box (4 quads)
+            DQuad(x0, y0, x0+t*PB_ASPECT, y1, col); DQuad(x1-t*PB_ASPECT, y0, x1, y1, col);
+            ++boxes;
+        } else {
+            // fallback marker: a dot on a centered ring in the rider's direction
+            float dx = sinf(blips[i].bearing), dy = -cosf(blips[i].bearing);  // ahead -> up
+            float ax = 0.5f + dx*0.34f*PB_ASPECT, ay = 0.5f + dy*0.34f, s = 0.006f;
+            DQuad(ax - s*PB_ASPECT, ay - s, ax + s*PB_ASPECT, ay + s, col);
+            ++boxes;
+        }
+    }
+}
+
 // Fill g_drawQuads/g_drawStrs from the same overlay state DrawOverlay() reads.
 // Normalized-coord mirror of DrawOverlay: quads are backgrounds/highlights/bars
 // (no font needed), strings are labels (font index 1). Panel widths are fractions
@@ -1761,7 +2193,13 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
 static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
-        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()) return;
+        && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
+        && !g_radarOn.load() && !g_espOn.load()) return;
+
+    // HUD overlays draw first (independent of the modal panel chain below), so the
+    // panels' quads sit on top of them and both share the 64-quad budget.
+    if (g_espOn.load())   EmitEspPiBoSo();
+    if (g_radarOn.load()) EmitRadarPiBoSo();
 
     const bool reloading = g_reloadActive.load();
     const bool menu = g_menuOpen.load() && !reloading;
@@ -1926,7 +2364,7 @@ static void BuildOverlayDrawLists() {
             DText(MX + PADX, y, row, cWhite, FS); y += LH;
         }
         DText(MX + PADX, y, "  F8 / Esc   close", cGray, FS);
-    } else {
+    } else if (g_overlayOn.load() || reloading || GetTickCount64() < g_statusUntil.load()) {
         char line[128];
         if (reloading) {
             static const char spin[4] = {'|', '/', '-', '\\'};
@@ -2063,6 +2501,12 @@ void MenuAction(int d) {
     case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
+    case 4: { bool on = !g_radarOn.load(); g_radarOn.store(on); SaveRadarSettings();
+              SetStatus(on ? "radar: on" : "radar: off", 1500);
+              Log("[radar] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveRadarSettings();
+              SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
+              Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -2292,12 +2736,39 @@ void Tick() {
         Log("[srvlist] manual dump (D)"); DumpServerListBlob(true);
     }
 
+    // Radar range adjust (PageUp/PageDown) while the radar is shown; validate the
+    // captured camera matrix each frame so the ESP can fall back to arrows if it drifts.
+    if (g_radarOn.load() || g_espOn.load()) {
+        static bool prevPgUp = false, prevPgDn = false;
+        bool pu = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;   // PageUp
+        bool pd = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;   // PageDown
+        if (pu && !prevPgUp) { g_radarRange = ClampF(g_radarRange + 20.0f, 20.0f, 400.0f); SaveRadarSettings(); }
+        if (pd && !prevPgDn) { g_radarRange = ClampF(g_radarRange - 20.0f, 20.0f, 400.0f); SaveRadarSettings(); }
+        prevPgUp = pu; prevPgDn = pd;
+        RadValidateVP();
+    }
+
     DrainGameThreadTasks();
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 
+// One-shot: log the GL pipeline identity + arm a short matrix-flow dump. Tells us
+// (from the tester's log) whether fixed-function VP capture is viable or we must
+// pivot to a shader/uniform capture for the ESP. Read-only.
+static void LogGlInfoOnce() {
+    static bool done = false; if (done) return; done = true;
+    const char* ver = (const char*)glGetString(GL_VERSION);
+    const char* sl  = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
+    const char* rnd = (const char*)glGetString(GL_RENDERER);
+    GLint vp[4] = {0,0,0,0}; glGetIntegerv(GL_VIEWPORT, vp);
+    Log("[esp/diag] GL_VERSION='%s' GLSL='%s' RENDERER='%s' viewport=%dx%d",
+        ver ? ver : "?", sl ? sl : "?", rnd ? rnd : "?", vp[2], vp[3]);
+    g_glDiag.store(240, std::memory_order_relaxed);   // dump the next ~240 matrix loads
+}
+
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
 BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
+    LogGlInfoOnce();
     Tick();
     // Draw the GL overlay only when the sanctioned Draw() path is NOT feeding the
     // engine this frame. On track the game calls Draw() every frame (g_drawCalls
@@ -2541,6 +3012,13 @@ DWORD WINAPI Init(LPVOID) {
         if (auto p = GetProcAddress(gl, "wglSwapBuffers"))
             InstallHook((void*)p, &hkWglSwapBuffers,
                         (void**)&g_origWglSwapBuffers, "opengl32!wglSwapBuffers");
+        // camera view-projection capture for the rider outlines (ESP). Snoop the
+        // fixed-function matrix calls; if the engine is core-profile these never
+        // fire and g_vp stays uncaptured (ESP falls back to directional arrows).
+        if (auto p = GetProcAddress(gl, "glMatrixMode"))
+            InstallHook((void*)p, &hkGlMatrixMode,  (void**)&g_origGlMatrixMode,  "opengl32!glMatrixMode");
+        if (auto p = GetProcAddress(gl, "glLoadMatrixf"))
+            InstallHook((void*)p, &hkGlLoadMatrixf, (void**)&g_origGlLoadMatrixf, "opengl32!glLoadMatrixf");
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
     }
@@ -2670,6 +3148,7 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
+        LoadRadarSettings();   // restore radar / rider-outline toggles + range
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
@@ -2782,5 +3261,31 @@ __declspec(dllexport) void Draw(int /*_iState*/, int* _piNumQuads, void** _ppQua
     if (_piNumString) *_piNumString = g_nDrawStrs;
     if (_ppString)    *_ppString    = g_drawStrs;
 }
+
+// ---- radar / rider-outline data feed (all read-only; see the RADAR section) --
+// RunTelemetry: our own bike pose. Startup() returned rate 3, so the game calls
+// this and we keep the latest world position (used to identify "me" among the
+// track-position entries).
+__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+    RadStoreTelemetry(_pData, _iDataSize);
+}
+// Every vehicle's live world position + yaw, once per update. The radar + outlines.
+__declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
+}
+__declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    RadAddEntry(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    RadRemoveEntry(_pData, _iDataSize);
+}
+// Classification carries laps-done per race number -> the lap-status coloring.
+__declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
+    int n = (_pData && _iDataSize >= (int)sizeof(SPluginsRaceClassification_t))
+            ? ((SPluginsRaceClassification_t*)_pData)->m_iNumEntries : 0;
+    RadStoreClassification(_pArray, n, _iElemSize);
+}
+__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); }
+__declspec(dllexport) void RaceDeinit()             { RadResetRace(); }
 
 } // extern "C"

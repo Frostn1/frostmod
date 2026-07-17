@@ -36,10 +36,34 @@ We also implement the optional **`Draw()`** callback (`void Draw(int state, int*
 void** quads, int* nStrings, void** strings)`) — the sanctioned overlay path. On
 track/spectate/replay the game calls it and we hand back arrays of quads + strings
 (normalized `0..1` coords, ABGR color) for the engine to render; see *Feature 3* below.
-The remaining callbacks stay omitted (`RunTelemetry()`,
-`RaceEvent/RaceSession/RaceClassification`, `SpectateVehicles/Cameras`). None of them
-expose the server list or the mods directory, which is why filtering and refreshing are
-done with function hooks (below), not through the API.
+We also consume the **rider-data callbacks** for the radar + outline HUD (see below):
+`RunTelemetry()` (our own world position, so we can identify "me"), `RaceTrackPosition()`
+(every rider's live world position + yaw each update), and `RaceAddEntry()` /
+`RaceClassification()` (race number → name + laps-done, for the lap-status coloring). We
+reset the rider table on `RaceSession()` / `RaceDeinit()`. All are read-only. The rest
+(`SpectateVehicles/Cameras`) stay omitted; none of these expose the server list or the
+mods directory, which is why filtering and refreshing are done with function hooks
+(below), not through the API.
+
+### Feature — Radar + lap-aware rider outlines (F8 → `4` / `5`)
+A racing-spotter HUD built only on the callbacks above (no memory reads of other players).
+
+- **Radar** (`4`): a heading-up disc, top-right. World deltas to each rider are rotated by
+  our heading so a blip at the top is directly ahead; `PageUp`/`PageDown` change range.
+- **Outlines** (`5`): a screen box around each on-screen rider. The plugin API does not
+  expose the camera view-projection matrix, so we capture it from the fixed-function GL
+  pipeline (hook `glMatrixMode`/`glLoadMatrixf`, compose `VP = P·MV`, validate per frame by
+  projecting our own position). If no valid VP is available, the outline degrades to a
+  screen-edge directional arrow from the radar bearing — always something on screen.
+- **Lap colors** (both): white = same lap, red = a rider lapping you (a lap ahead),
+  blue = a rider you are lapping (backmarker), from `m_iNumLaps`.
+- Toggles + range persist in `frostmod_radar.cfg` (next to `frostmod.log`).
+
+**Calibration / RE status (verify on the Windows tester).** A few world-axis and yaw-sign
+conventions are isolated as constants in `src/frostmod.cpp` (`GroundUV`, `RAD_YAW_SIGN`,
+`RAD_YAW_OFFSET`) and set after the first live run. The one-shot `[esp/diag]` log lines
+(`GL_VERSION`/`GLSL`/`RENDERER` + a short matrix-flow dump) confirm whether the
+fixed-function VP capture is viable or a shader/uniform capture is needed for the outline.
 
 ### Where the plugin goes
 The plugin file is **`frostmod.dlo`** (a byte-for-byte copy of `frostmod.dll` — the game

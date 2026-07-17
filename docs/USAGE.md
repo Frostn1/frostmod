@@ -70,6 +70,12 @@ F-key per feature.
 | `1` | Reload mods (rescans content from disk, with a progress bar) |
 | `2` | Toggle the corner hint overlay |
 | `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
+| `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
+| `5` | Rider outlines — on-screen box around each rider |
+
+Radar blips and outlines are colored by lap status: **white** = same lap as you,
+**red** = a rider lapping you (a lap ahead), **blue** = a rider you are lapping
+(backmarker). Both toggles and the range persist across restarts.
 
 ### Bike model swap (menu `3`)
 

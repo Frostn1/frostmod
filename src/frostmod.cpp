@@ -31,6 +31,14 @@
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
 #include <GL/gl.h>    // immediate-mode GL overlay
 
+// The Windows SDK ships an OpenGL 1.1 gl.h, so GL 2.0+ tokens aren't declared and
+// glext.h isn't available. We only need this one as a glGetString() key (the
+// [esp/diag] line that tells us fixed-function vs core-profile), so define the
+// value rather than take on a new header dependency.
+#ifndef GL_SHADING_LANGUAGE_VERSION
+#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
+#endif
+
 #include "MinHook.h"
 #include "offsets.h"
 #include "serverfilter.h"

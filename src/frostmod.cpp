@@ -2909,6 +2909,94 @@ uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
+// Stage A (opt-in --bikecap): OBSERVE the bike APPLY loader to RE the in-garage
+// bike switcher. Hooks fcn.1400E4550 (RVA_BIKE_APPLY) and, per apply, logs:
+//   * the caller return address (to tell the garage caller from the on-track one),
+//   * a hex/ASCII dump of the descriptor (rdx) + a pointer-probe of it, so we can
+//     see WHERE the picked bike's name sits (inline or by pointer),
+//   * once: the whole bike ARRAY (index -> entry+0x00 / entry+0x4C0 names) and a
+//     full byte dump of entry[0] (to find the [data] cat/class offset - it's ASCII).
+// Read-only; performs NO swap. Off unless frostmod_bikecap.flag is present. Once the
+// log pins the descriptor name field + class offset + the garage caller, Stage B
+// builds the switcher (capture-and-replay with the target bike substituted).
+// ---------------------------------------------------------------------------
+using BikeApply_t = int64_t(__fastcall*)(void*, void*);
+BikeApply_t g_origBikeApply = nullptr;
+std::atomic<int>  g_bikeCapShots{0};
+std::atomic<bool> g_bikeArrayLogged{false};
+
+// Hex+ASCII dump of a (possibly bogus) region to frostmod.log, SEH-guarded via
+// SafeReadBytes. `len` capped to the local buffer.
+static void LogHexDump(const char* tag, const void* base, size_t len) {
+    char raw[0x540];
+    if (len > sizeof(raw)) len = sizeof(raw);
+    size_t got = SafeReadBytes(reinterpret_cast<const char*>(base), raw, len);
+    for (size_t off = 0; off < got; off += 16) {
+        std::string hex, asc;
+        char b[8];
+        for (size_t i = 0; i < 16; ++i) {
+            if (off + i < got) {
+                unsigned char c = (unsigned char)raw[off + i];
+                _snprintf_s(b, sizeof(b), _TRUNCATE, "%02x ", c);
+                hex += b;
+                asc += (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+            } else {
+                hex += "   ";
+            }
+        }
+        Log("[bikecap] %s +%03zx  %s %s", tag, off, hex.c_str(), asc.c_str());
+    }
+}
+
+// Some descriptor fields may hold the bike name by POINTER rather than inline;
+// resolve each aligned qword and log any that point at a plausible name string.
+static void LogDescStrings(void* desc) {
+    char raw[0x140];
+    size_t got = SafeReadBytes(reinterpret_cast<const char*>(desc), raw, sizeof(raw));
+    for (size_t off = 0; off + 8 <= got; off += 8) {
+        uintptr_t q;
+        memcpy(&q, raw + off, sizeof(q));
+        if (q < 0x10000) continue;                 // not a plausible pointer
+        std::string s = SafeStr((void*)q);
+        bool printable = s.size() >= 2 && s.size() <= 48;
+        for (char c : s)
+            if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7f) printable = false;
+        if (printable) Log("[bikecap] desc+0x%03zx -> ptr '%s'", off, s.c_str());
+    }
+}
+
+// Enumerate the in-game bike array: index -> entry+0x00 / entry+0x4C0 names.
+static void LogBikeArray() {
+    int count = SafeReadInt(reinterpret_cast<const int*>(g_base + mxb::RVA_BIKE_COUNT + g_sigDelta));
+    uintptr_t arr = 0;
+    SafeReadBytes(reinterpret_cast<const char*>(g_base + mxb::RVA_BIKE_LIST + g_sigDelta),
+                  reinterpret_cast<char*>(&arr), sizeof(arr));
+    Log("[bikecap] bike array: count=%d ptr=%p stride=0x%x", count, (void*)arr, mxb::BIKE_STRIDE);
+    if (!arr || count <= 0 || count > 100000) return;
+    int lim = count < 128 ? count : 128;
+    for (int i = 0; i < lim; ++i) {
+        uintptr_t e = arr + (uintptr_t)i * mxb::BIKE_STRIDE;
+        Log("[bikecap]   [%d] +0x00='%s'  +0x4C0='%s'", i,
+            SafeStr((void*)(e + mxb::BIKE_FOLDER)).c_str(),
+            SafeStr((void*)(e + mxb::BIKE_CFGNAME)).c_str());
+    }
+    // entry[0] full bytes once: the [data] cat/class field is ASCII in this dump.
+    LogHexDump("entry0", (void*)arr, 0x520);
+}
+
+int64_t __fastcall hkBikeApply(void* rcx, void* rdx) {
+    int shot = g_bikeCapShots.fetch_add(1);
+    if (shot < 24) {
+        uintptr_t crva = (uintptr_t)_ReturnAddress() - g_base;
+        Log("[bikecap] --- APPLY 0xE4550 #%d  rcx=%p rdx=%p  caller=0x%zx%s",
+            shot, rcx, rdx, (size_t)crva, (crva < 0x1000000) ? "" : "(ext)");
+        if (rdx) { LogHexDump("desc", rdx, 0x140); LogDescStrings(rdx); }
+        if (!g_bikeArrayLogged.exchange(true)) LogBikeArray();
+    }
+    return g_origBikeApply(rcx, rdx);
+}
+
+// ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
 bool InstallHook(void* target, void* detour, void** original, const char* name) {
@@ -3113,6 +3201,29 @@ DWORD WINAPI Init(LPVOID) {
             } else {
                 Log("[edf] --edfcap: could not get kernel32; capture not installed.");
             }
+        }
+    }
+
+    // OPT-IN (create an empty frostmod_bikecap.flag next to frostmod.log): Stage A of
+    // the in-garage bike switcher. Hooks the bike APPLY loader (fcn.1400E4550) and logs
+    // the descriptor + bike array so we can pin the descriptor's bike-name field, the
+    // [data] cat/class offset, and the garage caller. Read-only; NO swap. Off by default.
+    {
+        char flag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(flag, g_logPath);
+            if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_bikecap.flag"); }
+        }
+        if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            uintptr_t applyAddr = g_base + mxb::RVA_BIKE_APPLY + g_sigDelta;
+            InstallHook((void*)applyAddr, &hkBikeApply, (void**)&g_origBikeApply, "bikeApply(0xE4550)");
+            Log("[bikecap] ARMED. In the GARAGE, pick a few bikes (across classes). frostmod.log will "
+                "show the apply caller, the descriptor dump (find the picked bike's name offset), the "
+                "bike array, and entry[0] bytes (find the [data] cat/class offset). Then send the log "
+                "back. NO swap is performed.");
+        } else {
+            Log("[bikecap] off. Arm with an empty frostmod_bikecap.flag next to frostmod.log to RE the "
+                "bike switcher (Stage A: observe the bike apply loader).");
         }
     }
 

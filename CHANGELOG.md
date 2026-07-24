@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-23
+
+### Added
+- **In-garage bike switcher — Stage A (opt-in `--bikecap` diagnostic).** Groundwork for
+  switching the whole bike (model + physics) live from the garage, offline, restricted to
+  the race's class — paired with the MXB App UI. This first slice is **observation-only, no
+  swap**: dropping an empty `frostmod_bikecap.flag` next to `frostmod.log` arms a read-only
+  hook on the bike **apply** loader `fcn.1400E4550`. Per apply it logs the caller (to tell
+  the garage caller from the on-track one), a hex/ASCII dump of the session descriptor
+  (`rdx`) + a pointer-probe (to locate the picked bike's name field), and once the whole
+  in-game bike array (index → `+0x00`/`+0x4C0` names) plus `entry[0]` bytes (to find the
+  `[data] cat`/class offset). Settles the four static-RE unknowns so Stage B can build the
+  switcher (capture-and-replay `0xE4550` with the target bike substituted). New bike offsets
+  in `offsets.h` (list ptr `0xF4EDE8`, count `0xF48218`, stride `0x4334`, apply `0xE4550`,
+  + AOB). Off by default; no game state touched. (`src/frostmod.cpp`, `src/offsets.h`.)
+
 ## 2026-07-16
 ### Added
 - **In-game Radar + lap-aware Rider Outlines (F8 menu > `4` radar, `5` outlines).** A racing-spotter HUD built entirely on the sanctioned PiBoSo plugin callbacks — no memory reads of other players. New exports `RunTelemetry` (our world pos), `RaceTrackPosition` (every rider's live world pos + yaw each update), and `RaceAddEntry`/`RaceClassification` (race number → name + laps-done) feed a shared, mutex-guarded rider snapshot; "me" is identified as the track-position entry closest to our telemetry pos, so no extra RE is needed. **Radar** is a heading-up disc in the top-right (your bike points to the top; a blip at the top is directly ahead), rendered in both the PiBoSo `Draw()` path (on track) and the GL overlay (menus/injected), with `PageUp`/`PageDown` to change range (default 80 m). **Outlines** draw a box around each on-screen rider. **Three lap-status colors** on both blips and outlines, from `m_iNumLaps`: white = same lap, red = a rider lapping you (a lap ahead — let them by), blue = a rider you are lapping (a backmarker). Toggles + range persist in `frostmod_radar.cfg` next to `frostmod.log`. (`src/frostmod.cpp`.)

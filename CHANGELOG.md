@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-08-07
+
+### Added
+- **Instant model refresh — a swapped model shows without the class-switch away-and-back.**
+  Until now, changing a bike's model left the garage preview showing the old mesh: the
+  surgical content reload rebuilds the content *catalogs*, not the live preview instance,
+  so the only way to see the new model was to switch bike class away and back. The bike
+  **apply** loader `fcn.1400E4550` — RE'd for the in-garage switcher — is the fix: it
+  re-derives the selected bike by name and reloads the machine from
+  `bikes\<Bike>\<Bike>.cfg`, so **replaying it with the same descriptor** makes the game
+  re-read the bike from disk, which is exactly what away-and-back achieves without
+  disturbing the player's selection. The hook is now **always installed** (its verbose
+  Stage-A diagnostics stay opt-in behind `frostmod_bikecap.flag`) and records the last
+  apply's args. A refresh replays that call, but only when the swapped bike is the one
+  currently selected — decided by matching the bike name against the strings captured
+  in/behind the descriptor, so we never needed to pin which field holds it. Wired into
+  both swap paths: the F8 model swap (`MsApply`) and MXB App over the command channel.
+  (`src/frostmod.cpp`.)
+- **Command channel from MXB App (`Local\FrostModCommand` + `%TEMP%\frostmod_cmd.json`).**
+  MXB App has been writing this command file and pulsing this event since its garage-switch
+  groundwork, but **nothing in FrostMod ever listened** — only `Local\FrostModReload` was
+  created, so `garage_swap_bike` was a dead contract that could never do anything. FrostMod
+  now creates the event, polls it in `Tick` alongside the reload event, and dispatches the
+  payload on the render thread. Verbs: `refresh_bike_model` (above) and `swap_bike`, which
+  logs "not implemented yet" rather than silently ignoring the app. The reader is a small
+  field scanner, not a general JSON parser — the file is machine-written with a known flat
+  shape. Contract mirrored in mxb-app's `src-tauri/src/frostmod.rs`. (`src/frostmod.cpp`.)
+
+### Changed
+- **Replay safety.** The apply descriptor may be a caller stack temporary, so a stored
+  pointer can go stale. Rather than probe stack bounds, the replay re-scans the descriptor
+  and requires the captured bike name to still be there — a reused frame won't match, and
+  we skip with a "re-select the bike" status instead of handing the loader garbage. The
+  call itself is SEH-guarded in a POD-only helper (same rule as `SafeCopyStr`), and a
+  re-entry flag stops our own replay overwriting the capture it is replaying.
+
+## 2026-07-23
+
+### Added
+- **In-garage bike switcher — Stage A (opt-in `--bikecap` diagnostic).** Groundwork for
+  switching the whole bike (model + physics) live from the garage, offline, restricted to
+  the race's class — paired with the MXB App UI. This first slice is **observation-only, no
+  swap**: dropping an empty `frostmod_bikecap.flag` next to `frostmod.log` arms a read-only
+  hook on the bike **apply** loader `fcn.1400E4550`. Per apply it logs the caller (to tell
+  the garage caller from the on-track one), a hex/ASCII dump of the session descriptor
+  (`rdx`) + a pointer-probe (to locate the picked bike's name field), and once the whole
+  in-game bike array (index → `+0x00`/`+0x4C0` names) plus `entry[0]` bytes (to find the
+  `[data] cat`/class offset). Settles the four static-RE unknowns so Stage B can build the
+  switcher (capture-and-replay `0xE4550` with the target bike substituted). New bike offsets
+  in `offsets.h` (list ptr `0xF4EDE8`, count `0xF48218`, stride `0x4334`, apply `0xE4550`,
+  + AOB). Off by default; no game state touched. (`src/frostmod.cpp`, `src/offsets.h`.)
 ## 2026-07-29
 ### Added
 - **Diagnostic: plugin `Draw()`-dispatch watch across an F8 reload.** Investigating a report that a co-existing HUD plugin (MXBMRP3) goes dark after an F8 → `1 Reload mods`, while FrostMod's own HUD stays up. Hypothesis: the surgical content reload (which deliberately skips the game's reinit/UI-transition tail — see `RequestReload`/`kReloadSteps`) leaves the game no longer calling the plugin `Draw()` callback; FrostMod masks this on itself via its GL swap-hook fallback, but plugins without one simply stop rendering. `RequestReload()` now arms a 20 s window during which `Tick()` logs, once a second, presented `frames/s` vs plugin `Draw()/s` (`[drawdiag]` lines). If `frames/s` stays high while `Draw()/s` falls to 0 right after the reload, the mechanism is confirmed. Pure logging, self-silencing, no game state touched. To be removed once the cause is fixed. (`src/frostmod.cpp`.)

@@ -71,6 +71,30 @@ constexpr uintptr_t RVA_TRK_DATA_LOADER = 0x5A20;  // fcn.140005A20(ecx=index): 
 constexpr uintptr_t RVA_TRK_SEL_INDEX   = 0x4CA3D4;// int32 selected index (re-derived from name cfg)
 constexpr uintptr_t RVA_TRK_SESSION_CFG = 0xE4B540;// name cfg: +0x00 folder, +0x20 2nd name
 
+// ---- in-garage BIKE switcher (RE'd; analog of the track switcher) --------------
+// In-game bike list: a QWORD *pointer* to a heap array of bike entries (deref before
+// indexing). count is int32. Entry +0x00 = folder/ID (the field the loader
+// _stricmp-matches); +0x4C0 = the string used to build  bikes\<name>\<name>.cfg .
+// The class ([data] cat, e.g. "Classic MX1 OEM") lives in the entry's data block;
+// its exact offset is TBD — Stage A (--bikecap) dumps an entry to find it.
+constexpr uintptr_t RVA_BIKE_LIST   = 0xF4EDE8;  // qword: pointer to bike array
+constexpr uintptr_t RVA_BIKE_COUNT  = 0xF48218;  // int32 bike count
+constexpr int       BIKE_STRIDE     = 0x4334;    // 17204 bytes per bike entry
+constexpr int       BIKE_FOLDER     = 0x000;     // folder/ID (matched by _stricmp)
+constexpr int       BIKE_CFGNAME    = 0x4C0;     // string in bikes\<name>\<name>.cfg
+
+// fcn.1400E4550 : the bike/session APPLY loader.  __fastcall(void* rcx, void* rdx).
+//   Re-derives the selected index by name-matching entry+0x00 against a name held in
+//   the descriptor (rdx), builds "%sbikes\%s\%s.cfg", loads the machine. Mirrors the
+//   track loader's re-derive-by-name shape, but selection travels through the passed
+//   descriptor (no fixed session-cfg global like tracks' 0xE4B540). Callers 0xE5632/0xE57A0.
+constexpr uintptr_t RVA_BIKE_APPLY  = 0xE4550;
+// AOB for the apply prologue (offset-drift resilience; the E8 rel32 is wildcarded):
+//   40 53 56 57 41 57 B8 C8 20 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B 05
+constexpr char SIG_BIKE_APPLY[] =
+    "\x40\x53\x56\x57\x41\x57\xB8\xC8\x20\x00\x00\xE8\x00\x00\x00\x00\x48\x2B\xE0\x48\x8B\x05";
+constexpr char SIG_BIKE_APPLY_MASK[] = "xxxxxxxxxxxx????xxxxxx";
+
 // AOB signature for the scanner prologue (fallback if RVA drifts across updates).
 // 40 53 56 57 41 54 41 55 41 56 48 81 EC F8 07 00 00 48 8B 05 ?? ?? ?? ??
 constexpr char SIG_SCAN_FOLDER[] =

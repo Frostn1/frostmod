@@ -2974,7 +2974,7 @@ uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
 //     full byte dump of entry[0] (to find the [data] cat/class offset - it's ASCII).
 // Read-only; performs NO swap. Off unless frostmod_bikecap.flag is present.
 //
-// WHY THERE IS NO REPLAY HERE ANY MORE (v0.9.10; it shipped in v0.9.9 and was
+// WHY THERE IS NO REPLAY HERE ANY MORE (v0.9.11; it shipped in v0.9.9 and was
 // removed):
 //
 // v0.9.9 kept the last apply's (rcx, rdx) and replayed that call to make the garage
@@ -3094,7 +3094,7 @@ void NoteModelNeedsReselect(const char* bikeId, const char* why) {
     std::string bike = bikeId ? bikeId : "";
     if (bike.empty()) return;
     Log("[bikefresh] '%s' swapped (%s) - re-select the bike in the garage to load the new "
-        "model. (Live re-apply was removed in v0.9.10: it crashed the game.)",
+        "model. (Live re-apply was removed in v0.9.11: it crashed the game.)",
         bike.c_str(), why ? why : "");
     SetStatus("model swapped - re-select the bike to see it", 6000);
 }
@@ -3166,7 +3166,7 @@ void HandleFrostModCommand() {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike
         // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
-        // below v0.9.10, so reaching here means an older app - answer it truthfully.
+        // below v0.9.11, so reaching here means an older app - answer it truthfully.
         NoteModelNeedsReselect(bikeId.c_str(), "MXB App model swap");
     } else if (verb == "swap_bike") {
         // Stage B (whole-bike in-garage switch) isn't built yet. Say so instead of

@@ -32,9 +32,16 @@
   descriptor, which treats every aligned qword as a possible string pointer — in the path
   of every bike selection in every player's game, purely to feed a refresh that no longer
   exists. Its Stage-A diagnostics are unchanged and remain the only reason to arm it.
-- **Release v0.9.10.** Bumped `FROSTMOD_VERSION` 0.9.9 → 0.9.10 (`src/version.h` +
-  `CMakeLists.txt`). MXB App v0.7.1 and up withhold `refresh_bike_model` from anything
-  below this release, so updating is what stops the app asking for the unsafe path.
+- **Release v0.9.11 — the fix ships as 0.9.11, not 0.9.10.** `v0.9.10-rc1` was already
+  published from a branch that isn't on `main` and **still contains the replay**, and its
+  `version.h` reads `0.9.10` too. Two builds claiming one version would be bad enough, but
+  MXB App gates on the recorded tag numerically: a `v0.9.10` floor reads `v0.9.10-rc1` as
+  new enough and hands it the very verb that crashes it. Taking the next number costs
+  nothing and excludes that pre-release cleanly, without touching a tag that isn't ours.
+  `FROSTMOD_VERSION` 0.9.9 → **0.9.11** (`src/version.h` + `CMakeLists.txt`), which is also
+  what the release workflow's tag check compares against. MXB App v0.7.1 and up withhold
+  `refresh_bike_model` from anything below this release, so updating is what stops the app
+  asking for the unsafe path.
 - **Doing this properly is still open.** It needs what Stage A was always meant to settle —
   which descriptor field holds the picked bike's name, and which call site is the garage
   one — after which the apply can be driven from a descriptor **we build**, rather than one

@@ -1328,6 +1328,13 @@ static const int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadS
 // progress state - touched on the render thread; the overlay reads the two atomics.
 std::atomic<bool> g_reloadActive{false};
 std::atomic<int>  g_reloadDone{0};    // steps completed (drives the progress bar)
+
+// TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): tick-count until which Tick()
+// logs the render-frame vs plugin-Draw() rate. Armed by RequestReload() so we can see,
+// in a reporter's log, whether the game stops calling the plugin Draw() callback after a
+// surgical reload (which would explain co-existing HUD plugins like MXBMRP3 going dark
+// while FrostMod survives via its GL swap-hook fallback). 0 => off. Remove once confirmed.
+std::atomic<uint64_t> g_drawDiagUntil{0};
 static int  g_reloadCur = 0;          // next step to run
 static bool g_reloadPrimed = false;   // have we presented one frame before starting work?
 
@@ -1369,6 +1376,9 @@ void RequestReload() {
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
     Log("[reload] surgical content reload (stepped over %d frames)...", kReloadStepCount);
     SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
+    // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
+    g_drawDiagUntil.store(GetTickCount64() + 20000);
+    Log("[drawdiag] armed 20s - watching plugin Draw() dispatch across this reload");
 }
 
 // ===========================================================================
@@ -2536,6 +2546,34 @@ void Tick() {
     // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
+
+    // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
+    // log once a second how many frames we presented vs how many times the game called the
+    // plugin Draw() callback (g_drawCalls). On track both track the framerate. If frames/s
+    // stays high but Draw()/s drops to 0 right after a reload, the game stopped dispatching
+    // Draw() -> plugins with no fallback (MXBMRP3) go dark; FrostMod's GL swap-hook path
+    // hides it for us. Self-silences when the window closes. Remove once the cause is fixed.
+    if (uint64_t until = g_drawDiagUntil.load(std::memory_order_relaxed)) {
+        static uint64_t winFrames = 0, winBaseDraw = 0, nextLog = 0;
+        const uint64_t nowMs = GetTickCount64();
+        if (nextLog == 0) {                       // first frame of a fresh window
+            winFrames = 0; winBaseDraw = g_drawCalls.load(std::memory_order_relaxed);
+            nextLog = nowMs + 1000;
+        }
+        ++winFrames;
+        if (nowMs >= nextLog) {
+            const uint64_t d = g_drawCalls.load(std::memory_order_relaxed);
+            const uint64_t draws = d - winBaseDraw;
+            Log("[drawdiag] frames/s=%llu Draw()/s=%llu  (plugin Draw dispatch %s)",
+                (unsigned long long)winFrames, (unsigned long long)draws,
+                draws ? "ALIVE" : "DEAD - co-existing HUD plugins go dark");
+            winFrames = 0; winBaseDraw = d; nextLog = nowMs + 1000;
+        }
+        if (nowMs >= until) {
+            g_drawDiagUntil.store(0, std::memory_order_relaxed); nextLog = 0;
+            Log("[drawdiag] window closed");
+        }
+    }
 
     // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.

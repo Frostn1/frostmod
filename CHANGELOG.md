@@ -51,6 +51,11 @@
   switcher (capture-and-replay `0xE4550` with the target bike substituted). New bike offsets
   in `offsets.h` (list ptr `0xF4EDE8`, count `0xF48218`, stride `0x4334`, apply `0xE4550`,
   + AOB). Off by default; no game state touched. (`src/frostmod.cpp`, `src/offsets.h`.)
+## 2026-07-29
+### Added
+- **Diagnostic: plugin `Draw()`-dispatch watch across an F8 reload.** Investigating a report that a co-existing HUD plugin (MXBMRP3) goes dark after an F8 → `1 Reload mods`, while FrostMod's own HUD stays up. Hypothesis: the surgical content reload (which deliberately skips the game's reinit/UI-transition tail — see `RequestReload`/`kReloadSteps`) leaves the game no longer calling the plugin `Draw()` callback; FrostMod masks this on itself via its GL swap-hook fallback, but plugins without one simply stop rendering. `RequestReload()` now arms a 20 s window during which `Tick()` logs, once a second, presented `frames/s` vs plugin `Draw()/s` (`[drawdiag]` lines). If `frames/s` stays high while `Draw()/s` falls to 0 right after the reload, the mechanism is confirmed. Pure logging, self-silencing, no game state touched. To be removed once the cause is fixed. (`src/frostmod.cpp`.)
+### Changed
+- **Release v0.9.8.** Bumped `FROSTMOD_VERSION` 0.9.7 → 0.9.8 (`src/version.h` + `CMakeLists.txt`). Diagnostic patch: ships the `[drawdiag]` reload/`Draw()`-dispatch watch (above) to confirm why a co-existing HUD plugin stops rendering after an F8 reload; no behaviour change for normal users (log-only, self-silencing).
 
 ## 2026-07-16
 ### Added

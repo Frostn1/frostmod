@@ -15,6 +15,7 @@
 #include <winsock2.h>   // must precede <windows.h> so it doesn't pull in winsock1
 #include <ws2tcpip.h>   // addrinfo (master-capture: --capture-master)
 #include <windows.h>
+#include <shellapi.h>   // ShellExecuteA - mxbapp:// handoff to the MXB App
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <set>
 #include <cstring>
+#include <cctype>
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
@@ -42,6 +44,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "serverfilter.h"
+#include "fsclient.h"   // ask a server's FrostServer for its map + download link
 #include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
@@ -1100,8 +1103,93 @@ void OpenModelSwap() {
 }
 void CloseModelSwap() { g_msOpen.store(false); }
 
+// ---------------------------------------------------------------------------
+// SERVER ADDRESSES - harvested from the rows the browser is already building.
+//
+// A browser row IS a master-list record (see offsets.h "server ADDRESS per browser
+// row"), and a record starts with two 19-byte address blobs. So every server we
+// see in the list hands us its IP:port for free - which is what lets FrostMod ask
+// a server's FrostServer companion "what map are you running, and where do I get
+// it?" (F8 > 6). No extra hook: we read it in the filter hook that is already
+// installed and proven.
+// ---------------------------------------------------------------------------
+struct ServerRow {
+    std::string name;
+    std::string ip;                 // "a.b.c.d" (public blob); "" if unreadable
+    uint16_t    port    = 0;        // game port
+    int         players = -1, maxPlayers = -1;
+    bool        unjoinable = false;
+};
+// Appended to per row and cleared at the top of each pass; a reader that catches a
+// pass in flight just sees a short list, which the next open re-reads.
+std::mutex              g_srvMutex;
+std::vector<ServerRow>  g_srvRows;
+
+// Decode a 19-byte address blob -> dotted IPv4 + port. Returns false for IPv6 and
+// for the all-zero blob (a record whose address the master never filled in): we
+// only ever speak IPv4 to FrostServer, and a bogus host is worse than none.
+static bool DecodeAddrBlob(const unsigned char* b, char* ip, size_t ipCap, uint16_t* port) {
+    if (b[0] != mxb::ADDR_FAM_IPV4) return false;          // IPv6 (or junk) - not handled
+    const unsigned p = ((unsigned)b[5] << 8) | b[6];       // big-endian in the blob
+    if (!p) return false;
+    if (!b[1] && !b[2] && !b[3] && !b[4]) return false;    // 0.0.0.0 - unusable
+    _snprintf_s(ip, ipCap, _TRUNCATE, "%u.%u.%u.%u", b[1], b[2], b[3], b[4]);
+    *port = (uint16_t)p;
+    return true;
+}
+
+// Snapshot of the last populate pass, for the Server Maps UI.
+static std::vector<ServerRow> GetServerRows() {
+    std::lock_guard<std::mutex> lk(g_srvMutex);
+    return g_srvRows;
+}
+
+// Fallback source: read the game's master-list array directly (base ptr
+// RVA_SRV_ARRAY_PTR, count RVA_SRV_ARRAY_COUNT, stride SBE_STRIDE). Used when the
+// browser hook hasn't run a pass yet - e.g. the player opens F8 > 6 before ever
+// opening the server browser. These are .data RVAs, which the .text AOB delta does
+// NOT cover, so everything is validated before it's believed: a sane count, and a
+// first record with a printable name. On any doubt we return nothing and the UI
+// tells the player to open the server browser once.
+static std::vector<ServerRow> ReadServerArrayDirect() {
+    std::vector<ServerRow> out;
+    if (!g_base) return out;
+
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_SRV_ARRAY_COUNT));
+    if (count <= 0 || count > 4096) return out;
+    uintptr_t arr = 0;
+    if (SafeReadBytes((const char*)(g_base + mxb::RVA_SRV_ARRAY_PTR), (char*)&arr, sizeof(arr))
+            != sizeof(arr) || !arr)
+        return out;
+
+    for (int i = 0; i < count; ++i) {
+        const char* rec = (const char*)(arr + (size_t)i * mxb::SBE_STRIDE);
+        char name[128] = "";
+        if (!SafeCopyStr(rec + mxb::SREC_NAME, name, sizeof(name))) return {};   // bad pointer
+        if (i == 0 && !name[0]) return {};        // first record has no name -> wrong address
+        unsigned char blob[mxb::ADDR_BLOB_LEN] = {0};
+        char ip[16] = ""; uint16_t port = 0;
+        const bool haveAddr =
+            SafeReadBytes(rec + mxb::SREC_ADDR_PUB, (char*)blob, sizeof(blob)) == sizeof(blob)
+            && DecodeAddrBlob(blob, ip, sizeof(ip), &port);
+
+        ServerRow r;
+        r.name       = name[0] ? name : "(unnamed)";
+        r.ip         = haveAddr ? ip : "";
+        r.port       = port;
+        r.players    = SafeReadInt((const int*)(rec + mxb::SREC_PLAYERS));
+        r.maxPlayers = SafeReadInt((const int*)(rec + mxb::SREC_MAXPLAYERS));
+        r.unjoinable = (uint32_t)SafeReadInt((const int*)(rec + mxb::SREC_PING))
+                       == mxb::SBE_PING_UNJOINABLE;
+        out.push_back(std::move(r));
+    }
+    Log("[srv] read %zu server(s) straight from the game's list array.", out.size());
+    return out;
+}
+
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
+static int  g_sbProbeLeft = 1;     // one-shot: dump the unidentified +0x80 field (see below)
 // When true, matching rows are actually skipped (hidden) via the game's own row-skip
 // label; when false the hook is a read-only PREVIEW (logs [srv] but hides nothing).
 bool g_sbHideEnabled = true;
@@ -1121,6 +1209,7 @@ extern "C" bool SB_SuppressRow(uint64_t index, void* gameRsp) {
     if (index == 0) {                                // new populate pass (r14 restarts at 0)
         g_sbRow = 0;
         g_sbHexLeft = 1;                             // one hex window to re-confirm the record
+        { std::lock_guard<std::mutex> lk(g_srvMutex); g_srvRows.clear(); }
         Log("[srv] ===== server-list pass (%s) =====",
             g_sbHideEnabled ? "hiding cheat/ad spam" : "PREVIEW - nothing hidden");
     }
@@ -1143,12 +1232,40 @@ extern "C" bool SB_SuppressRow(uint64_t index, void* gameRsp) {
     std::string why = frostmod::serverfilter::ShouldHide(si);
     bool hide = !why.empty() && g_sbHideEnabled;
 
+    // The row's own address (record +0x00 = stack +0x60). Kept for every row we
+    // KEEP - hidden rows are spam we'd never query anyway.
+    unsigned char blob[mxb::ADDR_BLOB_LEN] = {0};
+    char ip[16] = ""; uint16_t gamePort = 0;
+    const bool haveAddr =
+        SafeReadBytes(base + mxb::SBE_ADDR_PUB, (char*)blob, sizeof(blob)) == sizeof(blob)
+        && DecodeAddrBlob(blob, ip, sizeof(ip), &gamePort);
+    if (!hide) {
+        ServerRow r;
+        r.name = si.name; r.ip = haveAddr ? ip : ""; r.port = gamePort;
+        r.players = nums.players; r.maxPlayers = nums.maxPlayers;
+        r.unjoinable = pingUnresolved;
+        std::lock_guard<std::mutex> lk(g_srvMutex);
+        if (g_srvRows.size() < 2048) g_srvRows.push_back(std::move(r));
+    }
+
     char pingStr[16];
     if (pingUnresolved) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
     const char* tag = hide ? "HIDE" : (why.empty() ? "keep" : "WOULD-HIDE(preview)");
-    Log("[srv] #%02llu '%s' cur=%d cap=%d ping=%s | %s%s%s",
-        (unsigned long long)index, si.name.c_str(), nums.players, nums.maxPlayers, pingStr,
+    Log("[srv] #%02llu '%s' %s:%u cur=%d cap=%d ping=%s | %s%s%s",
+        (unsigned long long)index, si.name.c_str(), haveAddr ? ip : "?", gamePort,
+        nums.players, nums.maxPlayers, pingStr,
         tag, why.empty() ? "" : ": ", why.c_str());
+
+    // One-shot probe: record +0x80 is a 32-byte string the parser fills but the
+    // browser never displays, so static RE couldn't name it. If it turns out to be
+    // the track name, "you don't have this track" needs no FrostServer round-trip.
+    // Logs one row, once per process. Read-only; delete once the log answers it.
+    if (g_sbProbeLeft > 0) {
+        char u80[33] = {0};
+        SafeCopyStr(base + mxb::SBE_UNK80, u80, sizeof(u80));
+        Log("[srv.probe] record+0x80 (32B str) = '%s'   <- is this the track name?", u80);
+        --g_sbProbeLeft;
+    }
 
     if (g_sbHexLeft > 0) { LogHexWindow(raw, n); --g_sbHexLeft; }
     ++g_sbRow;
@@ -1263,6 +1380,154 @@ bool InstallServerFilterHook() {
         g_sbHideEnabled ? "HIDE" : "PREVIEW",
         (size_t)(skipTarget - g_base));
     return true;
+}
+
+// ===========================================================================
+// SERVER MAPS (F8 > 6) - "that server is running a track I don't have; get it"
+//
+// Pulls the server list we already harvest (name + IP:port per row), asks each
+// server's FrostServer companion what map it's running and where to download it,
+// and marks the ones you're missing. Enter hands the download link to the MXB
+// App over the mxbapp:// scheme; the App downloads + extracts it and pokes the
+// existing Local\FrostModReload event, which live-reloads content - so a missing
+// track becomes a joinable one without leaving the game.
+//
+// Nothing here touches game memory beyond the read-only list read above.
+// ===========================================================================
+std::atomic<bool>      g_smOpen{false};
+std::vector<ServerRow> g_smRows;
+int                    g_smCursor = 0, g_smTop = 0;
+std::vector<std::string> g_smTracks;        // installed track names, normalized
+bool                   g_smPrimed = false;  // swallow the '6' that opened the panel
+
+// Track names travel through three systems (the game's list, the server's
+// RaceEvent string, the admin's YAML key), so compare them loosely: case-folded
+// with every non-alphanumeric dropped. "Red Bud '24!" == "redbud24".
+static std::string NormalizeTrackName(const std::string& s) {
+    std::string o;
+    for (unsigned char c : s)
+        if (isalnum(c)) o += (char)tolower(c);
+    return o;
+}
+
+// Snapshot the game's installed tracks (same array the switcher reads).
+static void SmLoadInstalledTracks() {
+    g_smTracks.clear();
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_TRACK_COUNT));
+    if (count <= 0 || count > 100000) return;
+    uintptr_t arr = 0;
+    if (SafeReadBytes((const char*)(g_base + mxb::RVA_TRACK_LIST), (char*)&arr, sizeof(arr))
+            != sizeof(arr) || !arr)
+        return;
+    for (int i = 0; i < count; ++i) {
+        char nm[80] = "";
+        SafeCopyStr((const char*)(arr + (size_t)i * mxb::TRACK_STRIDE) + mxb::TRK_NAME,
+                    nm, sizeof(nm));
+        if (nm[0]) g_smTracks.push_back(NormalizeTrackName(nm));
+    }
+}
+
+static bool SmHaveTrack(const std::string& mapName) {
+    if (mapName.empty()) return false;
+    const std::string want = NormalizeTrackName(mapName);
+    if (want.empty()) return false;
+    for (const auto& t : g_smTracks) if (t == want) return true;
+    return false;
+}
+
+// Hand a mxb-mods.com page to the MXB App, which downloads + extracts it and then
+// signals our reload event. If the app isn't installed the scheme isn't
+// registered, so ShellExecute fails - fall back to just opening the page in the
+// browser, which is still better than nothing (the player downloads it manually
+// and F8 > 1 reloads).
+static void SmHandOffToMxbApp(const std::string& link, const std::string& mapName) {
+    if (link.empty()) return;
+    const std::string deep = "mxbapp://download?url=" + link;
+    HINSTANCE rc = ShellExecuteA(nullptr, "open", deep.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)rc > 32) {
+        Log("[fs] handed '%s' to the MXB App: %s", mapName.c_str(), deep.c_str());
+        char st[128];
+        sprintf_s(st, "downloading %s via MXB App...", mapName.c_str());
+        SetStatus(st, 8000);
+        return;
+    }
+    Log("[fs] mxbapp:// not registered (ShellExecute rc=%d) - opening the page in the "
+        "browser instead. Install the MXB App for the one-click flow.", (int)(INT_PTR)rc);
+    ShellExecuteA(nullptr, "open", link.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    SetStatus("MXB App not installed - opened the download page", 7000);
+}
+
+// Rebuild the list and open the panel. Reads the game's list array first: it needs
+// no hook, covers every server (not just the rows that survived the spam filter),
+// and works whether or not the browser has been opened. The rows the filter hook
+// captured are the fallback - that hook is opt-in (frostmod_filter.flag), so for
+// most players it never runs, but when it has run its rows are beyond doubt
+// because the game itself built them.
+void OpenServerMaps() {
+    const char* src = "game list array";
+    g_smRows = ReadServerArrayDirect();
+    if (g_smRows.empty()) { g_smRows = GetServerRows(); src = "server browser rows"; }
+
+    SmLoadInstalledTracks();
+    g_smCursor = 0; g_smTop = 0;
+    g_smPrimed = false;
+    g_smOpen.store(true);
+    Log("[fs] server maps opened - %zu server(s) from the %s, %zu track(s) installed.",
+        g_smRows.size(), src, g_smTracks.size());
+    if (g_smRows.empty())
+        Log("[fs] no servers known yet - open the in-game server browser once, then retry.");
+}
+void CloseServerMaps() { g_smOpen.store(false); }
+
+// Kick off queries for the rows currently on screen. Called once a frame while the
+// panel is open; fsclient itself de-dupes, caps concurrency and caches, so this
+// stays cheap and never blocks the caller.
+static void SmPumpQueries(int firstRow, int lastRow) {
+    for (int i = firstRow; i <= lastRow && i < (int)g_smRows.size(); ++i)
+        if (i >= 0 && !g_smRows[i].ip.empty())
+            frostmod::fsclient::Query(g_smRows[i].ip, frostmod::fsclient::kDefaultPort);
+}
+
+// Enter on a row: download the map if we're missing it and the admin configured a
+// link; otherwise say precisely why nothing happened.
+static void SmActivateRow() {
+    if (g_smCursor < 0 || g_smCursor >= (int)g_smRows.size()) return;
+    const ServerRow& row = g_smRows[g_smCursor];
+    if (row.ip.empty()) { SetStatus("no address for that server", 4000); return; }
+
+    using namespace frostmod::fsclient;
+    const Result r = Get(row.ip, kDefaultPort);
+    switch (r.state) {
+        case State::Idle:
+        case State::Querying:
+            SetStatus("asking that server...", 2500);
+            Query(row.ip, kDefaultPort);
+            return;
+        case State::NoServer:
+            Log("[fs] '%s' (%s) runs no FrostServer (%s) - nothing to ask.",
+                row.name.c_str(), row.ip.c_str(), r.error.c_str());
+            SetStatus("that server doesn't run FrostServer", 5000);
+            return;
+        case State::Ok:
+            break;
+    }
+    if (r.gamePort && row.port && r.gamePort != row.port) {
+        Log("[fs] %s answers for game port %d, but that row is port %u - a different "
+            "server on the same machine. Not acting on its map.",
+            row.ip.c_str(), r.gamePort, row.port);
+        SetStatus("that FrostServer belongs to another server on the same IP", 6000);
+        return;
+    }
+    if (r.currentMap.empty())      { SetStatus("that server isn't running a track", 4000); return; }
+    if (SmHaveTrack(r.currentMap)) { SetStatus("you already have that track", 4000); return; }
+    if (!r.haveLink)               {
+        Log("[fs] '%s' runs '%s' but its admin configured no download link for it.",
+            row.name.c_str(), r.currentMap.c_str());
+        SetStatus("no download link configured for that map", 5000);
+        return;
+    }
+    SmHandOffToMxbApp(r.link, r.currentMap);
+    CloseServerMaps();
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1972,7 @@ static const MenuItem kMenu[] = {
     { '3', "Bike model swap" },
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
+    { '6', "Server maps (download a server's track)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -1939,6 +2205,99 @@ static void DrawModelSwap(int w, int h, int lh) {
     GlText(x0 + 8, y, foot);
 }
 
+// ---- Server Maps rows, shared by both renderers -----------------------------
+// One row of the Server Maps panel, formatted once so the GL and PiBoSo paths can
+// never drift apart. 'tint' picks the colour both renderers then apply:
+//   0 normal   1 good/have it   2 actionable (missing + downloadable)   3 muted
+static void SmFormatRow(const ServerRow& row, char* out, size_t cap, int* tint) {
+    using namespace frostmod::fsclient;
+    char players[24] = "";
+    if (row.players >= 0 && row.maxPlayers >= 0)
+        sprintf_s(players, "%d/%d", row.players, row.maxPlayers);
+
+    const char* status = "";
+    *tint = 0;
+    std::string map;
+    if (row.ip.empty()) {
+        status = "(no address)"; *tint = 3;
+    } else {
+        const Result r = Get(row.ip, kDefaultPort);
+        switch (r.state) {
+            case State::Idle:     status = "-";              *tint = 3; break;
+            case State::Querying: status = "asking...";      *tint = 3; break;
+            case State::NoServer: status = "no FrostServer"; *tint = 3; break;
+            case State::Ok:
+                // One box can host several servers, but only one can own the
+                // FrostServer port - so an answer whose gamePort isn't this row's
+                // is about a *different* server and must not be shown as this one's.
+                if (r.gamePort && row.port && r.gamePort != row.port) {
+                    status = "other server on that IP"; *tint = 3;
+                }
+                else if (r.currentMap.empty())      { status = "idle";        *tint = 3; }
+                else if (SmHaveTrack(r.currentMap)) { map = r.currentMap; status = "have it"; *tint = 1; }
+                else if (r.haveLink)                { map = r.currentMap; status = "GET IT";  *tint = 2; }
+                else                                { map = r.currentMap; status = "no link"; *tint = 3; }
+                break;
+        }
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "%-26.26s %-6s %-22.22s %s",
+                row.name.c_str(), players, map.c_str(), status);
+}
+
+// The Server Maps panel: one row per known server with the map its FrostServer
+// reports and whether you already have it. Switcher styling.
+static void DrawServerMaps(int w, int h, int lh) {
+    const int n = (int)g_smRows.size();
+    if (g_smCursor < g_smTop)                g_smTop = g_smCursor;
+    if (g_smCursor >= g_smTop + kTrkVisible) g_smTop = g_smCursor - kTrkVisible + 1;
+    if (g_smTop < 0) g_smTop = 0;
+
+    const int shown     = n < kTrkVisible ? n : kTrkVisible;
+    const int listLines = n == 0 ? 2 : shown;
+    const int rows      = listLines + 4;      // title + header + list + spacer + footer
+    const int bw = 660, bh = rows * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    char title[128];
+    sprintf_s(title, "FrostMod - Server Maps   (%d servers, %d tracks installed)",
+              n, (int)g_smTracks.size());
+    GlText(x0 + 8, y, title); y -= lh;
+
+    glColor4f(0.60f, 0.66f, 0.76f, 1.0f);
+    GlText(x0 + 8, y, "   SERVER                     PLAYERS  MAP                    STATUS"); y -= lh;
+
+    if (n == 0) {
+        glColor4f(0.80f, 0.62f, 0.62f, 1.0f);
+        GlText(x0 + 8, y, "  (no servers known yet)"); y -= lh;
+        GlText(x0 + 8, y, "  open the in-game server browser once, then reopen this panel"); y -= lh;
+    }
+    for (int i = g_smTop; i < g_smTop + shown && i < n; ++i) {
+        const bool cur = (i == g_smCursor);
+        if (cur) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4); }
+        char body[220]; int tint = 0;
+        SmFormatRow(g_smRows[i], body, sizeof(body), &tint);
+        char row[240]; sprintf_s(row, "%s %s", cur ? ">" : " ", body);
+        switch (tint) {
+            case 1:  glColor4f(0.55f, 0.95f, 0.75f, 1.0f); break;   // already installed
+            case 2:  glColor4f(1.00f, 0.85f, 0.45f, 1.0f); break;   // missing + downloadable
+            case 3:  glColor4f(0.62f, 0.66f, 0.74f, 1.0f); break;   // nothing to do
+            default: glColor4f(0.90f, 0.94f, 1.0f, 1.0f); break;
+        }
+        GlText(x0 + 8, y, row); y -= lh;
+    }
+
+    y -= 2;
+    glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
+    char foot[176];
+    sprintf_s(foot, "  Up/Down  Enter download via MXB App  R refresh  Esc close   [%d-%d/%d]",
+              n ? g_smTop + 1 : 0, g_smTop + shown, n);
+    GlText(x0 + 8, y, foot);
+}
+
 // ---- radar + ESP, GL immediate-mode (used in injected/menu contexts) --------
 static void GlCircle(int cx, int cy, int r, bool fill) {
     glBegin(fill ? GL_TRIANGLE_FAN : GL_LINE_LOOP);
@@ -2011,7 +2370,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_smOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -2026,6 +2385,7 @@ void DrawOverlay(HDC hdc) {
     const bool sw        = g_swOpen.load()  && !reloading;
     const bool dc        = g_dcOpen.load()  && !reloading;
     const bool ms        = g_msOpen.load()  && !reloading;
+    const bool sm        = g_smOpen.load()  && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -2051,7 +2411,9 @@ void DrawOverlay(HDC hdc) {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     const int lh = 18;                           // line height
-    if (ms) {
+    if (sm) {
+        DrawServerMaps(w, h, lh);
+    } else if (ms) {
         DrawModelSwap(w, h, lh);
     } else if (trk) {
         DrawTrackManager(w, h, lh);
@@ -2217,7 +2579,7 @@ static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_smOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -2230,6 +2592,7 @@ static void BuildOverlayDrawLists() {
     const bool sw   = g_swOpen.load()   && !reloading;
     const bool dc   = g_dcOpen.load()   && !reloading;
     const bool ms   = g_msOpen.load()   && !reloading;
+    const bool sm   = g_smOpen.load()   && !reloading;
     const int  done = g_reloadDone.load(), total = kReloadStepCount;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -2244,7 +2607,48 @@ static void BuildOverlayDrawLists() {
     const unsigned long cAmber = ToABGR(1.0f,  0.85f, 0.45f, 1.0f);
     const unsigned long cHi    = ToABGR(0.47f, 0.78f, 1.0f, 0.18f);
 
-    if (ms) {
+    if (sm) {
+        const int n = (int)g_smRows.size();
+        if (g_smCursor < g_smTop)                g_smTop = g_smCursor;
+        if (g_smCursor >= g_smTop + kTrkVisible) g_smTop = g_smCursor - kTrkVisible + 1;
+        if (g_smTop < 0) g_smTop = 0;
+        const int shown     = n < kTrkVisible ? n : kTrkVisible;
+        const int listLines = n == 0 ? 2 : shown;
+        const int rows      = listLines + 4;
+        const float w = 0.60f, h = rows * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        char title[128];
+        sprintf_s(title, "FrostMod - Server Maps   (%d servers, %d tracks installed)",
+                  n, (int)g_smTracks.size());
+        DText(MX + PADX, y, title, cBlue, FS); y += LH;
+        DText(MX + PADX, y, "   SERVER                     PLAYERS  MAP                    STATUS",
+              cGray, FS); y += LH;
+        if (n == 0) {
+            DText(MX + PADX, y, "  (no servers known yet)", ToABGR(0.80f, 0.62f, 0.62f, 1.0f), FS);
+            y += LH;
+            DText(MX + PADX, y, "  open the in-game server browser once, then reopen this panel",
+                  ToABGR(0.70f, 0.74f, 0.82f, 1.0f), FS);
+            y += LH;
+        }
+        for (int i = g_smTop; i < g_smTop + shown && i < n; ++i) {
+            const bool cur = (i == g_smCursor);
+            if (cur) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            char body[220]; int tint = 0;
+            SmFormatRow(g_smRows[i], body, sizeof(body), &tint);
+            char row[240]; sprintf_s(row, "%s %s", cur ? ">" : " ", body);
+            unsigned long c = cWhite;
+            if      (tint == 1) c = ToABGR(0.55f, 0.95f, 0.75f, 1.0f);
+            else if (tint == 2) c = cAmber;
+            else if (tint == 3) c = ToABGR(0.62f, 0.66f, 0.74f, 1.0f);
+            DText(MX + PADX, y, row, c, FS); y += LH;
+        }
+        y += 0.004f;
+        char foot[176];
+        sprintf_s(foot, "  Up/Down  Enter download via MXB App  R refresh  Esc close   [%d-%d/%d]",
+                  n ? g_smTop + 1 : 0, g_smTop + shown, n);
+        DText(MX + PADX, y, foot, cGray, FS);
+    } else if (ms) {
         const bool lvl1 = (g_msLevel == 1);
         std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
         int& cursor = lvl1 ? g_msVarCursor : g_msBikeCursor;
@@ -2534,6 +2938,7 @@ void MenuAction(int d) {
     case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveRadarSettings();
               SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
               Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 6: g_menuOpen.store(false); OpenServerMaps();   break;   // server maps (FrostServer)
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -2580,7 +2985,9 @@ void Tick() {
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
-        if (g_msOpen.load()) {                               // F8 also closes an open list
+        if (g_smOpen.load()) {                               // F8 also closes an open list
+            CloseServerMaps(); Log("[fs] server maps closed (F8).");
+        } else if (g_msOpen.load()) {
             CloseModelSwap(); Log("[model] model swap closed (F8).");
         } else if (g_trkOpen.load()) {
             CloseTrackManager(); Log("[trklib] track manager closed (F8).");
@@ -2763,6 +3170,51 @@ void Tick() {
             else { CloseModelSwap(); Log("[model] model swap closed (Esc)."); }
         }
         mUp = up; mDown = down; mEnter = enter; mEsc = esc;
+    }
+
+    // Server maps (F8 > 6): Up/Down move (held-key repeat), Enter downloads the
+    // highlighted server's map via the MXB App, R re-reads the server list, Esc
+    // closes. While it's open we keep asking the on-screen servers what they're
+    // running - fsclient caches and caps that, so it costs a map lookup per frame.
+    // On the first frame we latch held keys so the '6' that opened the panel (the
+    // menu digit block above) isn't also read as a keypress here.
+    if (g_smOpen.load()) {
+        static bool smPrev[256] = {false};
+        static ULONGLONG smUpNext = 0, smDownNext = 0;
+        const ULONGLONG now = GetTickCount64();
+        auto keyDown = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+        if (!g_smPrimed) {
+            for (int vk = 0; vk < 256; ++vk) smPrev[vk] = keyDown(vk);
+            g_smPrimed = true;
+        }
+        auto edge = [&](int vk) { bool k = keyDown(vk); bool e = k && !smPrev[vk]; smPrev[vk] = k; return e; };
+        auto repeat = [&](int vk, ULONGLONG& nextAt) {
+            bool k = keyDown(vk), fire = false;
+            if (k && !smPrev[vk])        { nextAt = now + 350; fire = true; }
+            else if (k && now >= nextAt) { nextAt = now + 90;  fire = true; }
+            smPrev[vk] = k; return fire;
+        };
+
+        const int n = (int)g_smRows.size();
+        if (n) {
+            if (repeat(VK_UP,   smUpNext))   g_smCursor = (g_smCursor - 1 + n) % n;
+            if (repeat(VK_DOWN, smDownNext)) g_smCursor = (g_smCursor + 1)     % n;
+        }
+        const bool enter = edge(VK_RETURN), esc = edge(VK_ESCAPE), refresh = edge('R');
+        if (refresh) {                                   // re-read the list + re-ask everyone
+            frostmod::fsclient::Invalidate();
+            OpenServerMaps();
+            g_smPrimed = true;                           // OpenServerMaps cleared it; R is held
+            SetStatus("server maps: refreshed", 2000);
+        } else if (enter) {
+            SmActivateRow();
+        } else if (esc) {
+            CloseServerMaps(); Log("[fs] server maps closed (Esc).");
+        }
+
+        // Ask only for what's on screen (plus a little either side, so scrolling
+        // finds answers already waiting) - not all few-hundred servers.
+        if (g_smOpen.load()) SmPumpQueries(g_smTop - 2, g_smTop + kTrkVisible + 2);
     }
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
@@ -3595,6 +4047,7 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
+        frostmod::fsclient::Init(&SfLog);   // F8 > 6 server-map queries log here too
         LoadRadarSettings();   // restore radar / rider-outline toggles + range
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs

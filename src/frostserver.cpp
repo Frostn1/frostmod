@@ -37,6 +37,7 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 
 #include "version.h"
 
@@ -51,6 +52,10 @@ std::mutex g_logMutex;
 char       g_logPath[MAX_PATH]    = {0};
 char       g_configPath[MAX_PATH] = {0};
 HMODULE    g_selfModule           = nullptr;   // set in DllMain (DLL build)
+
+// Declared up here because the config reload reports against it (see LoadConfig);
+// the server loop that owns it lives further down.
+std::atomic<bool> g_httpRunning{false};
 
 // Fill 'out' with the folder (trailing '\') that this binary lives in.
 void ModuleDir(char* out, size_t n) {
@@ -150,23 +155,38 @@ std::string jsonEscape(const std::string& s) {
 // config: port, server name, and the map-name -> mxb-mods link table
 // ---------------------------------------------------------------------------
 struct Config {
-    int         port = 54210;
+    int         port     = 54210;
+    int         gamePort = 54200;                           // the MX Bikes port this server runs on
     std::string name;                                       // friendly server name (optional)
     std::vector<std::pair<std::string, std::string>> maps;  // {track name, link} in file order
 };
 std::mutex g_cfgMutex;
 Config     g_cfg;
 
-constexpr const char* kConfigVersion = "# frostserver v1";
+constexpr const char* kConfigVersion = "# frostserver v2";
+
+// Bumped when the JSON contract changes in a way a client must notice. Reported as
+// "protocol" in /frostserver/info so an older client can bail out cleanly instead
+// of misreading a newer reply.
+constexpr int kProtocolVersion = 1;
 
 const char* kDefaultConfig =
-    "# frostserver v1\n"
+    "# frostserver v2\n"
     "# FrostServer - expose this dedicated server's current map + its mxb-mods.com\n"
     "# download link so FrostMod clients can one-click download it (then live-reload,\n"
     "# no game restart). Read-only HTTP API; see docs/FROSTSERVER.md.\n"
+    "#\n"
+    "# Edits are picked up within a few seconds - no restart needed.\n"
     "\n"
     "port: 54210          # TCP port for the HTTP API; clients reach <server-ip>:<port>\n"
     "name: ''             # optional friendly server name reported in /frostserver/info\n"
+    "\n"
+    "# The MX Bikes port THIS dedicated server runs on. Clients use it to tell which\n"
+    "# server they reached when one machine hosts several: they find FrostServer at\n"
+    "# <ip>:<port> above, and check this matches the server row they picked. If you\n"
+    "# run more than one server on a box, give each a different 'port' above and set\n"
+    "# 'gamePort' to that server's game port.\n"
+    "gamePort: 54200\n"
     "\n"
     "# For each track this server runs, the mxb-mods.com page to download it.\n"
     "# The KEY must be the track name EXACTLY as FrostServer logs it - watch\n"
@@ -258,21 +278,73 @@ void LoadConfig() {
         inMaps = false;
         if      (key == "maps") inMaps = true;
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
+        else if (key == "gameport") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.gamePort = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
         else Log("[config] ignoring unknown key: %s", key.c_str());
     }
     fclose(f);
 
-    Log("[config] loaded: port=%d name='%s' maps=%zu", c.port, c.name.c_str(), c.maps.size());
-    std::lock_guard<std::mutex> lk(g_cfgMutex);
-    g_cfg = std::move(c);
+    Log("[config] loaded: port=%d gamePort=%d name='%s' maps=%zu",
+        c.port, c.gamePort, c.name.c_str(), c.maps.size());
+    int oldPort, newPort;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        oldPort = g_cfg.port;
+        newPort = c.port;
+        g_cfg = std::move(c);
+    }
+    // The listener is bound at startup; a port change needs a restart to take effect.
+    // Say so rather than letting the file and reality disagree in silence.
+    if (g_httpRunning.load() && oldPort != newPort)
+        Log("[config] NOTE: 'port' is now %d but the API is already listening on %d - "
+            "restart the server to move it.", newPort, oldPort);
 }
 
-// Look up the mxb-mods link for a track name (case-insensitive). "" if none.
+// Last write time of the config, so edits can be picked up without a restart. A
+// dedicated server runs for days; an admin who adds a link for tonight's track
+// shouldn't have to bounce it (and kick everyone) for the link to go live.
+uint64_t ConfigWriteTime() {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!g_configPath[0] || !GetFileAttributesExA(g_configPath, GetFileExInfoStandard, &fad))
+        return 0;
+    return ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+}
+
+std::atomic<uint64_t> g_cfgStamp{0};
+
+// Re-read the config if it changed on disk. Called just before each request is
+// answered, so a reply always reflects the file as it is now, at the cost of one
+// file-attribute query per request - no polling thread, nothing on a timer.
+void ReloadConfigIfChanged() {
+    const uint64_t now = ConfigWriteTime();
+    if (!now || now == g_cfgStamp.load()) return;
+    g_cfgStamp.store(now);
+    Log("[config] frostserver.yaml changed on disk - reloading.");
+    LoadConfig();
+}
+
+// Fold a track name to its comparable form: lowercase, letters and digits only.
+// The admin types these keys by hand from a log line, so "Red Bud 2024",
+// "red bud 2024" and "RedBud2024" must all resolve to the same entry - an exact
+// match would silently return "no link" over a stray space or apostrophe, which
+// looks to a player exactly like the admin never configured one.
+std::string foldName(const std::string& s) {
+    std::string o;
+    for (unsigned char c : s)
+        if (std::isalnum(c)) o += (char)std::tolower(c);
+    return o;
+}
+
+// Look up the mxb-mods link for a track name. Exact (case-insensitive) match wins;
+// otherwise fall back to the folded comparison above. "" if none.
 std::string LinkForTrack(const std::string& track) {
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     for (const auto& m : g_cfg.maps)
         if (ieq(m.first, track)) return m.second;
+    const std::string want = foldName(track);
+    if (want.empty()) return "";
+    for (const auto& m : g_cfg.maps)
+        if (foldName(m.first) == want) return m.second;
     return "";
 }
 
@@ -302,7 +374,6 @@ bool GetCurrentTrack(std::string& out) {
 // ---------------------------------------------------------------------------
 // tiny HTTP/1.1 server (read-only GET; one connection at a time)
 // ---------------------------------------------------------------------------
-std::atomic<bool> g_httpRunning{false};
 // Shared between the server thread and Stop* only at shutdown; on Win64 an
 // aligned pointer-sized read/write is atomic, which is all this needs.
 SOCKET            g_listenSock = INVALID_SOCKET;
@@ -311,9 +382,15 @@ std::string BuildInfoJson() {
     std::string track;
     bool active = GetCurrentTrack(track);
     std::string serverName; std::string version = FROSTMOD_VERSION;
-    { std::lock_guard<std::mutex> lk(g_cfgMutex); serverName = g_cfg.name; }
+    int gamePort;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); serverName = g_cfg.name; gamePort = g_cfg.gamePort; }
+
+    char nums[64];
+    _snprintf_s(nums, sizeof(nums), _TRUNCATE, "\"protocol\":%d,\"gamePort\":%d,",
+                kProtocolVersion, gamePort);
 
     std::string j = "{\"frostserver\":\"" + jsonEscape(version) + "\",";
+    j += nums;
     j += "\"name\":\"" + jsonEscape(serverName) + "\",";
     if (!active) {
         j += "\"currentMap\":null}";
@@ -424,6 +501,7 @@ void HttpServerLoop(int port) {
             if (!g_httpRunning.load()) break;    // closed by StopHttpServer
             continue;
         }
+        ReloadConfigIfChanged();     // answer from the file as it is right now
         // Never let a bad request take down the listener.
         __try { HandleConnection(c); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[http] request handler faulted - caught."); }
@@ -453,10 +531,29 @@ void StopHttpServer() {
 }
 
 // Diagnostic: log every run of >=3 printable ASCII chars in a buffer, with its
-// offset. Lets the first dedicated-server run reveal exactly where a callback's
+// offset. Lets a dedicated-server run reveal exactly where a callback's
 // track/name strings sit - verifying the struct layout on THIS game build
 // instead of trusting it (RaceEvent's track is expected at +0x68).
+//
+// OPT-IN: this fires on every race event, which on a server that runs for days is
+// a lot of log for something only needed while confirming the layout once. Drop an
+// empty 'frostserver_probe.flag' next to frostserver.log to turn it on.
+std::atomic<bool> g_probeOn{false};
+
+void InitProbeFlag() {
+    char flag[MAX_PATH] = {0};
+    ModuleDir(flag, sizeof(flag));
+    if (!flag[0]) return;
+    strcat_s(flag, "frostserver_probe.flag");
+    const bool on = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+    g_probeOn.store(on);
+    Log(on ? "[probe] frostserver_probe.flag present - dumping raw callback fields."
+           : "[probe] off (drop frostserver_probe.flag next to the log to dump raw "
+             "callback fields when verifying a new game build).");
+}
+
 void LogAsciiRuns(const char* tag, const void* data, int size) {
+    if (!g_probeOn.load()) return;
     if (!data || size <= 0) return;
     const unsigned char* p = (const unsigned char*)data;
     int cap = size < 512 ? size : 512;      // guard against a bogus size
@@ -477,12 +574,24 @@ void LogAsciiRuns(const char* tag, const void* data, int size) {
     }
 }
 
-// Shared init used by both the plugin Startup() and the standalone main().
-void FrostServerInit() {
+// Shared init used by both the plugin Startup() and the standalone main(). The
+// overrides exist for the .exe's --port/--name and must be applied after the config
+// is read but before the socket is bound, which is why they live in here.
+void FrostServerInit(const char* how, int portOverride = 0, const char* nameOverride = nullptr) {
     InitPaths();
-    Log("=============== FrostServer %s starting ===============", FROSTMOD_VERSION);
+    Log("=============== FrostServer %s starting (%s) ===============", FROSTMOD_VERSION, how);
+    InitProbeFlag();
     ensureConfig();
     LoadConfig();
+    g_cfgStamp.store(ConfigWriteTime());   // baseline, so we only reload on real edits
+    if (portOverride || (nameOverride && *nameOverride)) {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        if (portOverride) { g_cfg.port = portOverride; Log("[cfg] port overridden: %d", portOverride); }
+        if (nameOverride && *nameOverride) {
+            g_cfg.name = nameOverride;
+            Log("[cfg] name overridden: '%s'", nameOverride);
+        }
+    }
     StartHttpServer();
 }
 
@@ -510,7 +619,7 @@ __declspec(dllexport) int   GetModDataVersion()   { return 8; }
 __declspec(dllexport) int   GetInterfaceVersion() { return 9; }
 
 __declspec(dllexport) int Startup(char* /*_szSavePath*/) {
-    FrostServerInit();
+    FrostServerInit("plugin");
     return 3;   // telemetry rate (unused, must be valid to stay loaded)
 }
 
@@ -581,20 +690,72 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
 // ===========================================================================
 // Standalone frostserver.exe - serve the API with no game attached, for
 // testing the client / MXB App flow. Optionally seed a "current" track.
-//   frostserver.exe --track "Red Bud 2024"
+//   frostserver.exe --track "Red Bud 2024" [--port 54210] [--name "My Server"]
 // ===========================================================================
-int main(int argc, char** argv) {
-    std::string seedTrack;
-    for (int i = 1; i < argc; ++i) {
-        if ((_stricmp(argv[i], "--track") == 0 || _stricmp(argv[i], "-t") == 0) && i + 1 < argc)
-            seedTrack = argv[++i];
+namespace {
+std::atomic<bool> g_exeStop{false};
+
+// Ctrl+C / console close: stop the listener and let main() fall through, so the
+// socket is closed and the last log line is flushed instead of the process being
+// shot mid-write.
+BOOL WINAPI ConsoleCtrl(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT: case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT: case CTRL_LOGOFF_EVENT: case CTRL_SHUTDOWN_EVENT:
+            Log("[exe] stop requested - shutting down.");
+            StopHttpServer();
+            g_exeStop.store(true);
+            return TRUE;
+        default:
+            return FALSE;
     }
-    FrostServerInit();
+}
+
+void Usage() {
+    printf("FrostServer %s - map/link API for MX Bikes\n\n"
+           "  frostserver.exe [--track \"Name\"] [--port N] [--name \"Server\"]\n\n"
+           "  --track, -t   seed the 'current' track (the real plugin learns this\n"
+           "                from the game; this is for testing a client)\n"
+           "  --port,  -p   override the API port from frostserver.yaml\n"
+           "  --name,  -n   override the server name from frostserver.yaml\n"
+           "  --help,  -h   this text\n\n"
+           "Config + full HTTP contract: docs/FROSTSERVER.md\n", FROSTMOD_VERSION);
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    std::string seedTrack, nameOverride;
+    int portOverride = 0;
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        const bool hasNext = (i + 1 < argc);
+        if ((_stricmp(a, "--track") == 0 || _stricmp(a, "-t") == 0) && hasNext)
+            seedTrack = argv[++i];
+        else if ((_stricmp(a, "--port") == 0 || _stricmp(a, "-p") == 0) && hasNext)
+            portOverride = atoi(argv[++i]);
+        else if ((_stricmp(a, "--name") == 0 || _stricmp(a, "-n") == 0) && hasNext)
+            nameOverride = argv[++i];
+        else if (_stricmp(a, "--help") == 0 || _stricmp(a, "-h") == 0 || _stricmp(a, "/?") == 0) {
+            Usage(); return 0;
+        } else {
+            printf("unknown argument: %s\n\n", a); Usage(); return 2;
+        }
+    }
+    if (portOverride && (portOverride < 1 || portOverride > 65535)) {
+        printf("--port must be 1..65535\n"); return 2;
+    }
+
+    FrostServerInit("standalone", portOverride, nameOverride.c_str());
+
+    SetConsoleCtrlHandler(ConsoleCtrl, TRUE);
     if (!seedTrack.empty()) {
         SetCurrentTrack(seedTrack);
         Log("[exe] seeded current track: '%s'", seedTrack.c_str());
     }
     Log("[exe] running. Press Ctrl+C to stop.");
-    for (;;) Sleep(1000);   // serve until killed
+    while (!g_exeStop.load()) Sleep(200);
+    Sleep(200);            // let the accept loop notice the closed socket and log its exit
+    Log("[exe] stopped.");
+    return 0;
 }
 #endif

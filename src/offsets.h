@@ -222,6 +222,54 @@ constexpr int SBE_STRIDE = 0x1D8, SBE_NAME = 0x86, SBE_MAXPLAYERS = 0xC8,
               SBE_PLAYERS = 0xCC, SBE_PING = 0xDC, SBE_TYPE = 0x100;
 constexpr uint32_t SBE_PING_UNJOINABLE = 0xFFFFFFFFu; // ping value shown as "---"
 
+// ---- server ADDRESS per browser row (RE'd 2026-08-07, static; capstone) -------
+// The browser's stack entries are a verbatim memcpy of the game's master-list
+// records, and a record STARTS with two 19-byte address blobs - so every row in
+// the server browser carries the server's IP:port, and our existing populate-loop
+// hook can read it with no new hook. This is what lets a client ask a server's
+// FrostServer "what map are you running?" (see docs/FROSTSERVER.md).
+//
+// Provenance (unpacked mxbikes.exe, image base 0x140000000):
+//   * The master list parser at 0x2A6B40-0x2A6D96 writes each record into a heap
+//     array: base ptr [0x5985D8], count [0x5985E0], stride 0x1D8. It stores the
+//     name at +0x26, then read_bytes(0x13) twice into +0x00 and +0x13, then the
+//     u32 fields (+0x6C players, +0x68 max, +0x78, +0x80 str[0x20], +0xA0 type).
+//   * 0x2A67F0 memcpy's `count` whole records (0x1D8 each) into a caller buffer -
+//     that is what the browser's bus cmd 0x385 / 0x37E call at 0x0AB927/0x0AB903
+//     fills its stack array with. Hence RECORD offset + SBE_REC_BASE == SBE_*:
+//     0x60+0x26 = 0x86 (name), +0x68 = 0xC8, +0x6C = 0xCC, +0x7C = 0xDC,
+//     +0xA0 = 0x100 - the existing offsets, independently derived. Self-consistent.
+//   * The browser JOIN path 0x0AA348-0x0AA3B8 copies exactly 8+8+2+1 = 19 bytes
+//     from the selected record's +0x00 into 0xE53DE0 and from +0x13 into 0xE54020,
+//     confirming both the blob size and that 0xE53DE0 holds this same blob shape.
+constexpr uintptr_t RVA_SRV_ARRAY_PTR   = 0x5985D8; // qword: ptr to the record array
+constexpr uintptr_t RVA_SRV_ARRAY_COUNT = 0x5985E0; // int:   number of records
+
+// Where a record begins inside the browser's stack copy. Add SBE_REC_* to a row
+// base (gameRsp + index*SBE_STRIDE) to reach a record field.
+constexpr int SBE_REC_BASE = 0x60;
+constexpr int SBE_ADDR_PUB = SBE_REC_BASE + 0x00;  // 0x60: public address blob
+constexpr int SBE_ADDR_LAN = SBE_REC_BASE + 0x13;  // 0x73: LAN address blob
+constexpr int SBE_UNK80    = SBE_REC_BASE + 0x80;  // 0xE0: str[0x20], contents unknown
+                                                   // (candidate: track name - probed
+                                                   //  once at runtime, see [srv.probe])
+
+// Record-relative offsets, for reading the global array directly.
+constexpr int SREC_ADDR_PUB = 0x00, SREC_ADDR_LAN = 0x13, SREC_NAME = 0x26,
+              SREC_MAXPLAYERS = 0x68, SREC_PLAYERS = 0x6C, SREC_PING = 0x7C,
+              SREC_UNK80 = 0x80, SREC_TYPE = 0xA0;
+
+// The 19-byte address blob, decoded from the blob->sockaddr converter 0x2856E0:
+//   [0]        family tag: 0 = IPv4, 1 = IPv6 (mapped to AF_INET / AF_INET6)
+//   IPv4: [1..4]   the four address bytes in order (copied straight to sin_addr)
+//         [5],[6]  port, big-endian:  port = (b[5] << 8) | b[6]
+//   IPv6: [1..16]  the 16 address bytes
+//         [17],[18] port, big-endian
+// (0x2856E0 assembles the port host-order from those two bytes and htons()es it.)
+constexpr int ADDR_BLOB_LEN  = 0x13;   // 19
+constexpr int ADDR_FAM_IPV4  = 0;
+constexpr int ADDR_FAM_IPV6  = 1;
+
 // exact bytes at RVA_SB_HIDE_EMPTY_BR: cmp [rsp+rdi+0xCC], r12d (8 bytes). The
 // filter hook verifies these before splicing, and jz's target is the skip label.
 constexpr unsigned char SB_HIDE_EMPTY_BYTES[] =

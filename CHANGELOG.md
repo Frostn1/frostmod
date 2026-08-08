@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-08-08
+
+### Fixed
+- **The game no longer crashes to desktop after a model swap.** v0.9.9's instant model
+  refresh replayed the game's bike-**apply** call (`fcn.1400E4550`) using the arguments of
+  an earlier call, to make a swapped model appear without the class-switch away-and-back.
+  It crashed the game — not at the swap, but at the **next bike the player selected by
+  hand**, which is what made it read as "picking a bike crashes MX Bikes" rather than as
+  anything to do with swapping a model. The replay is removed. It could not be made safe
+  by checking harder:
+  - the descriptor is a caller temporary we don't own, and the liveness test — is the
+    captured bike name still somewhere in its `0x140` bytes — passes for a frame that has
+    returned but not yet been overwritten, which is precisely the case it existed to catch;
+  - `rcx`, the object the loader writes into, was never checked at all;
+  - the surgical content reload rebuilds the very arrays the loader indexes, so after a
+    swap the capture describes a world that no longer exists — and the replay waited for
+    that reload to finish and then went ahead regardless;
+  - the `__try`/`__except` around the call made it worse: an access violation inside a
+    half-finished machine swap was swallowed and the game carried on with the wreckage,
+    converting an immediate crash into a delayed, unattributable one.
+
+  Both swap paths (F8 and the MXB App command channel) now say "model swapped — re-select
+  the bike to see it" and leave the running game alone. The `refresh_bike_model` verb is
+  still accepted and answered with that same notice, so an older MXB App gets the truth
+  rather than silence. (`src/frostmod.cpp`.)
+
+### Changed
+- **The bike-apply hook is opt-in again (`frostmod_bikecap.flag`), as it was before
+  v0.9.9.** Shipping it to everyone put our detour — and its speculative scan of the
+  descriptor, which treats every aligned qword as a possible string pointer — in the path
+  of every bike selection in every player's game, purely to feed a refresh that no longer
+  exists. Its Stage-A diagnostics are unchanged and remain the only reason to arm it.
+- **Release v0.9.10.** Bumped `FROSTMOD_VERSION` 0.9.9 → 0.9.10 (`src/version.h` +
+  `CMakeLists.txt`). MXB App v0.7.1 and up withhold `refresh_bike_model` from anything
+  below this release, so updating is what stops the app asking for the unsafe path.
+- **Doing this properly is still open.** It needs what Stage A was always meant to settle —
+  which descriptor field holds the picked bike's name, and which call site is the garage
+  one — after which the apply can be driven from a descriptor **we build**, rather than one
+  we borrowed. Until that run happens on Windows, the re-select is the feature.
+
 ## 2026-08-07
 
 ### Added

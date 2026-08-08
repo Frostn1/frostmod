@@ -36,7 +36,7 @@ treated as an explicit path to the DLL.
 | `--filter-servers` | — | *(already on)* | Force the filter on. Redundant now that it's the default; kept for clarity. |
 | `--game <id>` | `mxb` \| `gpb` | `mxb` | Which title to attach to. `gpb` is GP Bikes — reload works there; the server-browser filter does not (its offsets are MX Bikes' and aren't ported). |
 | `--process <name>` | exe name | `mxbikes.exe` | Inject into a process by image name. `--game` is the friendlier form of the same thing. |
-| `--mods "<path>"` | folder | `Documents\PiBoSo\MX Bikes\mods` | Watch a different mods folder (only affects the console's mod list). |
+| `--mods "<path>"` | folder | `Documents\PiBoSo\<title>\mods` | Watch a different mods folder. The default follows `--game`/`--process`, so GP Bikes reads GP Bikes' folder. |
 | `<path>` | `.dll` path | `frostmod.dll` next to the exe | Positional: load a specific DLL build. |
 
 ### Advanced / diagnostic

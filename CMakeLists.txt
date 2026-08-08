@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.10.0")
+set(FROSTMOD_VERSION "0.11.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -85,6 +85,15 @@ add_executable(frostserver_app src/frostserver.cpp ${FROSTSERVER_EXE_RC})
 target_compile_definitions(frostserver_app PRIVATE FROSTSERVER_EXE)
 target_link_libraries(frostserver_app PRIVATE ws2_32)
 set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
+
+# --- offsets invariants test --------------------------------------------------
+# Asserts that each title's offset tables belong to that title (see
+# tests/offsets_test.cpp for why). Pure constants - no Win32, no game - so unlike
+# every other target here it builds and runs anywhere, which makes it the only
+# part of FrostMod that CI can actually execute rather than just compile.
+enable_testing()
+add_executable(offsets_test tests/offsets_test.cpp)
+add_test(NAME offsets COMMAND offsets_test)
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

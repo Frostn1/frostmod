@@ -11,8 +11,9 @@
 //       watching that folder - new / removed .pkz files are printed live.
 //    3. Streams frostmod.log (what the injected DLL writes) to this console in
 //       real time, so you can see the capture / reload activity.
-//    4. Press  R  to reload mods,  Q  (or Ctrl+C) to quit. Reload also works
-//       from inside the game (F8, or the in-game overlay hint).
+//    4. Press  R  to reload mods,  Q  (or Ctrl+C) to quit. The game itself has no
+//       FrostMod UI - it only shows a small "attached" badge - so R here (or the
+//       MXB App) is how a reload is triggered.
 //
 //  The log lives NEXT TO the binaries (frostmod.exe + frostmod.dll are in the
 //  same folder), so the exe and the injected dll always agree on the file even
@@ -700,8 +701,10 @@ int main(int argc, char** argv) {
     std::string switchFlag = ExeDir() + "frostmod_trackswitch.flag";
     if (switchLive) {
         if (FILE* f = nullptr; fopen_s(&f, switchFlag.c_str(), "w") == 0 && f) fclose(f);
-        printf("[*] --switch-live ON: track switcher (F8>3) will REALLY load the picked track.\n"
-               "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n");
+        printf("[*] --switch-live ON: the track switcher will REALLY load the picked track.\n"
+               "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n"
+               "    NOTE: the in-game switcher UI is compiled out of this build (FROSTMOD_UI 0),\n"
+               "    so this flag only matters in a build with the UI turned back on.\n");
     } else {
         DeleteFileA(switchFlag.c_str());
     }
@@ -840,10 +843,11 @@ int main(int argc, char** argv) {
                 printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
             else
                 for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
-            printf("\nRELOAD: press R here, or F8 in-game (opens the FrostMod menu) -> 1.\n"
+            printf("\nRELOAD: press R here.\n"
                    "  FrostMod re-runs the game's content-load so new tracks/skins register,\n"
-                   "  with an on-screen progress bar (no freeze).\n");
-            printf("\nIN-GAME: F8 = FrostMod menu (top-left). Press a number for an action.\n");
+                   "  with no freeze. Progress is reported in the live log below.\n");
+            printf("\nIN-GAME: FrostMod draws one badge, top-left, so you can see it is attached.\n"
+                   "  It has no menu and captures no keys - drive as normal.\n");
             printf("\n--- live log ---   [R] reload   [Q]/Ctrl+C quit\n");
             printf("    (with --dump-serverlist, opening the online browser auto-dumps the list)\n");
         }

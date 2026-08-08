@@ -45,7 +45,7 @@ reset the rider table on `RaceSession()` / `RaceDeinit()`. All are read-only. Th
 mods directory, which is why filtering and refreshing are done with function hooks
 (below), not through the API.
 
-### Feature — Radar + lap-aware rider outlines (F8 → `4` / `5`)
+### Feature — Radar + lap-aware rider outlines (`FROSTMOD_UI 1` builds only)
 A racing-spotter HUD built only on the callbacks above (no memory reads of other players).
 
 - **Radar** (`4`): a heading-up disc, top-right. World deltas to each rider are rotated by
@@ -110,9 +110,9 @@ game, or pass the folder: `--install-plugin "…\MX Bikes"`).
 
   All calls go through SEH-guarded wrappers (`SafeCallScan`/`SafeCallReset`), so a
   wrong-argument attempt logs `FAULTED - caught` instead of crashing the game.
-- Trigger a reload: `R` in `frostmod.exe`, `F8` in-game, the floating-window
-  button, or by signalling `Local\FrostModReload`. Cycle strategy: `S` / `F7` /
-  `Local\FrostModCycle`.
+- Trigger a reload: `R` in `frostmod.exe`, the floating-window button, or by
+  signalling `Local\FrostModReload` from any process (this is the MXB App's path).
+  Cycle strategy: `S` / `F7` / `Local\FrostModCycle`.
 - **Note on captured args:** the scanner's `dir`/`ext` (rdx/r8) point into the
   module and stay valid, but the game's `status`/`out` buffers (rcx/r9) were on its
   stack. Strategies A* reuse the captured pointers (empirically fine); strategy B
@@ -147,8 +147,11 @@ game, or pass the folder: `--install-plugin "…\MX Bikes"`).
 
 ## Feature 3 — in-game overlay (hybrid render path)
 
-The overlay (status pill, reload progress bar, F8 menu, track manager/switcher) has
-**two renderers over one shared state**, chosen automatically:
+The overlay has **two renderers over one shared state**, chosen automatically. In the
+shipped build (`FROSTMOD_UI 0`) that state is a single "attached" badge; with
+`FROSTMOD_UI 1` it is also the status pill, reload progress bar, F8 menu and the
+track-manager / switcher / model-swap / server-maps panels. Both renderers are gated
+by the same switch, so they can never disagree:
 
 - **Sanctioned `Draw()`** — used on track/spectate/replay in plugin mode.
   `BuildOverlayDrawLists()` fills static quad/string arrays in normalized `0..1` space
@@ -192,8 +195,8 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 - `DoReloadOnGameThread`, `DoDirectCall`, `ReplayReset`, `SafeCallScan` /
   `SafeCallReset`, `CycleStrategy` / `StrategyName` — the reload strategies, queued
   to the render thread via `EnqueueGameThreadTask` / `DrainGameThreadTasks`.
-- `Tick`, `hkSwapBuffers` / `hkWglSwapBuffers` — per-frame hook (F8, reload-event,
-  task drain, heartbeat).
+- `Tick`, `hkSwapBuffers` / `hkWglSwapBuffers` — per-frame hook (reload-event, task
+  drain, heartbeat; plus the UI's key handling in a `FROSTMOD_UI 1` build).
 - `UiThread` / `WndProc` — the floating window.
 - `serverfilter::Init` / `Reload` / `ShouldHide` — the filter engine.
 - `DllMain`, `GetModID` / `GetModDataVersion` / `GetInterfaceVersion` / `Startup` /

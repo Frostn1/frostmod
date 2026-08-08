@@ -142,8 +142,10 @@ not just the current one (e.g. to pre-download the rotation).
 
 ## The download flow (client side)
 
-In game, **F8 → `6` Server maps** lists the servers the game knows about, with the
-map each one is running and whether you already have it:
+The client half is built and compiled in, but its in-game browser is only reachable
+in a `FROSTMOD_UI 1` build (see [`src/frostmod.cpp`](../src/frostmod.cpp)); the
+shipped build is UI-free. In such a build, **Server maps** lists the servers the
+game knows about, with the map each one is running and whether you already have it:
 
 ```
   SERVER                     PLAYERS  MAP                    STATUS
@@ -168,7 +170,7 @@ without a restart. End to end:
 
 If the MXB App isn't installed the `mxbapp://` scheme isn't registered, so
 FrostMod falls back to opening the mxb-mods page in your browser and says so —
-you download it by hand and press **F8 → `1` Reload mods**.
+you download it by hand and press **`R`** in the `frostmod.exe` console.
 
 Queries run on a worker thread with short timeouts and are cached, so a server
 with no FrostServer costs one fast failure, not a stutter. Only servers currently

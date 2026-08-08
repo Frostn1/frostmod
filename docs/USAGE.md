@@ -13,9 +13,9 @@ That's the whole thing — **no flags needed**. With no arguments it:
 
 - waits for `mxbikes.exe`, then injects `frostmod.dll` (and re-injects on every
   relaunch, so a rebuilt DLL always takes effect),
-- enables **live mod reload** (press **`R`** / **`F8`** after dropping in a `.pkz`),
+- enables **live mod reload** (press **`R`** after dropping in a `.pkz`),
 - enables the **server-browser spam filter** (hides cheat/ad "ghost" servers), and
-- shows the **in-game overlay**.
+- shows the **in-game badge** so you can see FrostMod is attached.
 
 Run it as the **same user** as the game, and **elevated** if the game runs
 elevated (otherwise injection fails with an access error).
@@ -61,24 +61,27 @@ treated as an explicit path to the DLL.
 
 ### In-game (works in fullscreen)
 
-Press **`F8`** to open the FrostMod **menu** (top-left). While it's open, press an
-item's number; `Esc` or `F8` closes it. Everything lives here instead of a separate
-F-key per feature.
+FrostMod draws **one** thing: a small pill in the top-left corner reading
 
-| In the menu | Action |
-|-------------|--------|
-| `1` | Reload mods (rescans content from disk, with a progress bar) |
-| `2` | Toggle the corner hint overlay |
-| `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
-| `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
-| `5` | Rider outlines — on-screen box around each rider |
-| `6` | Server maps — what map each server is running, and download the ones you're missing (see below) |
+```
+FrostMod v0.9.10   -   attached
+```
 
-Radar blips and outlines are colored by lap status: **white** = same lap as you,
-**red** = a rider lapping you (a lap ahead), **blue** = a rider you are lapping
-(backmarker). Both toggles and the range persist across restarts.
+That is the entire in-game UI. There is **no menu and no key binding of any kind** —
+FrostMod reads no keyboard input while the game is running, so it cannot interfere
+with your controls or with another HUD plugin.
 
-### Server maps (menu `6`)
+Everything is driven from outside the game: `R` in the `frostmod.exe` console, or
+the [MXB App](https://github.com/Frostn1/mxb-app).
+
+> **Bringing the UI back.** The F8 menu, the feature panels and the radar/rider-outline
+> HUD are all still in the source, behind one switch: set `FROSTMOD_UI` to `1` at the
+> top of [`src/frostmod.cpp`](../src/frostmod.cpp) and rebuild. The sections below
+> describe those features; they document what the code does and how the on-disk side
+> of each works, and the in-game panels they mention only exist in a `FROSTMOD_UI 1`
+> build.
+
+### Server maps (UI build only)
 
 Lists the servers the game knows about with the track each one is running, so you
 can grab a map you don't have without leaving the game:
@@ -93,7 +96,8 @@ can grab a map you don't have without leaving the game:
 `Up`/`Down` move, `R` refreshes, `Esc` closes. **Enter** on a `GET IT` row hands the
 download to the [MXB App](https://github.com/Frostn1/mxb-app), which installs the
 track and live-reloads it — no restart. If the MXB App isn't installed, FrostMod
-opens the download page in your browser instead; install it by hand, then `F8` → `1`.
+opens the download page in your browser instead; install it by hand, then press `R`
+in the `frostmod.exe` console.
 
 The map and link come from **FrostServer**, the server-side companion, so only
 servers whose admin runs it can answer — the rest show `no FrostServer`. If the
@@ -101,7 +105,7 @@ list is empty, open the in-game server browser once so the game fetches it. Stat
 values: `GET IT` (missing, downloadable), `have it`, `no link` (admin configured
 none for that track), `idle` (no race running), `no FrostServer`.
 
-### Bike model swap (menu `3`)
+### Bike model swap (UI build only)
 
 In MX Bikes a bike lives at `mods\bikes\<Bike>\` as loose files. A "model" is the whole
 top-level file set — `model.edf` (the mesh) **and** its `.hrc`/`.cfg` lineup/alignment files,
@@ -110,8 +114,11 @@ which are tuned to that mesh and swap together. Only `paints\` (universal liveri
 1. Add each alternative model as a **folder** in the bike's library:
    `mods\bikes\<Bike>\FrostMod Models\<Name>\`, containing that model's full file set
    (`model.edf` + its `.hrc`/`.cfg`). Create the `FrostMod Models` folder if it isn't there.
-2. F8 → `3`, pick the **bike**, then pick a **variant**. Enter swaps its files in and reloads
-   — the new model appears without a restart.
+2. Pick the **bike**, then a **variant**, in the model-swap panel. It swaps that variant's
+   files in and reloads — the new model appears without a restart. In a UI-free build the
+   [MXB App](https://github.com/Frostn1/mxb-app) does the on-disk swap itself and then
+   signals `Local\FrostModCommand` (`refresh_bike_model`), which is what re-reads the
+   garage preview.
 3. The model you were using is auto-saved back into the library (as `Original` on the first
    swap), so you can always pick it again to revert. `paints\` is never touched.
 
@@ -160,8 +167,9 @@ defaults change it's rewritten and your old copy is kept as `.bak`.
 
 Drop `frostmod.dll` into MX Bikes' `plugins` folder and the game loads it at
 startup — no launcher needed. You lose the console (mods list / log stream / `R`),
-but reload (`F8`), the overlay, and the filter all still work. Details:
-[PLUGIN.md](PLUGIN.md).
+but the badge and the filter still work, and a reload can still be triggered by any
+process that signals the `Local\FrostModReload` event — which is what the MXB App
+does after it installs something. Details: [PLUGIN.md](PLUGIN.md).
 
 ## Notes
 

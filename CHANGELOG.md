@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-08-07 (2)
+
+### Changed
+- **The in-game UI is compiled out — FrostMod now only shows that it is attached.**
+  The overlay is a single top-left pill reading `FrostMod v0.9.10 - attached`, drawn
+  by both render paths (the GL `wglSwapBuffers` fallback and the sanctioned PiBoSo
+  `Draw()` callback). Nothing else renders, and `Tick()` no longer polls the keyboard
+  at all, so FrostMod cannot shadow a game binding or fight another HUD plugin.
+  Gated on one switch, `FROSTMOD_UI`, at the top of `src/frostmod.cpp`: set it to `1`
+  and the previous build returns verbatim.
+
+### Removed
+- **F8 menu** and every panel it opened — track manager, track switcher, bike model
+  swap, direct connect, server maps — plus the radar disc and rider outlines, the
+  reload progress bar and the transient status line. All of the *feature* code behind
+  them is untouched and still compiled in; only the menu, the panel renderers and
+  their key handling sit behind `FROSTMOD_UI`.
+- The in-game reload trigger. A reload now comes from **`R`** in the `frostmod.exe`
+  console or from any process signalling `Local\FrostModReload` (the MXB App's path),
+  and reports to `frostmod.log` rather than an on-screen bar. The MXB App command
+  channel (`Local\FrostModCommand` → `refresh_bike_model`) is unaffected.
+
+### Docs
+- `README.md`, `docs/USAGE.md`, `docs/PLUGIN.md`, `docs/FROSTSERVER.md` and the
+  `frostmod.exe` console text no longer advertise F8; each notes which behaviour needs
+  a `FROSTMOD_UI 1` build.
+
 ## 2026-08-07
 
 ### Added

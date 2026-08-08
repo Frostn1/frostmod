@@ -3,8 +3,8 @@
 //
 //  MX Bikes scans its content folders once at startup; .pkz files added later
 //  are ignored until a restart. FrostMod re-triggers the game's own content
-//  scan (in-game F8 menu, or 'R' in frostmod.exe) so new tracks/skins/bikes
-//  register live, with no loading screen.
+//  scan ('R' in frostmod.exe, or the Local\FrostModReload event) so new
+//  tracks/skins/bikes register live, with no loading screen.
 //
 //  The reload replays the content-load section of the game's boot routine one
 //  step per frame on the render thread (see kReloadSteps / AdvanceReload), so
@@ -46,6 +46,24 @@
 #include "serverfilter.h"
 #include "fsclient.h"   // ask a server's FrostServer for its map + download link
 #include "version.h"    // FROSTMOD_VERSION
+
+// ---------------------------------------------------------------------------
+// SHOWCASE BUILD SWITCH.
+//
+// 0 (default) - FrostMod draws ONE thing in-game: a small "attached" badge in the
+//   top-left corner, proving the dll is loaded and the render hook is live. No F8
+//   menu, no panels, no radar/ESP HUD, and FrostMod captures no keys at all.
+// 1 - the full in-game UI: the F8 menu, the track-manager / switcher / model-swap /
+//   direct-connect / server-maps panels, and the radar + rider-outline HUD.
+//
+// Everything the UI needs is still compiled into the dll either way - only the menu,
+// the panel renderers and their keyboard handling sit behind this switch, so flipping
+// it back to 1 restores the old build verbatim. The FEATURES themselves (reload,
+// track manager, model swap, server maps + fsclient, radar ingest) are never gated:
+// the reload still runs from frostmod.exe (R) and from the MXB App command channel,
+// and the plugin data callbacks keep feeding the radar snapshot.
+// ---------------------------------------------------------------------------
+#define FROSTMOD_UI 0
 
 // ---------------------------------------------------------------------------
 // logging -> <dll folder>\frostmod.log (+ OutputDebugString). Next to the dll,
@@ -1952,10 +1970,12 @@ static void RadValidateVP() {
 }
 
 // ---------------------------------------------------------------------------
-// in-game overlay - a corner hint drawn with immediate-mode GL inside the
-// wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
-// On a core GL profile the fixed-function calls are no-ops (overlay stays hidden);
-// everything is push/pop-wrapped so the game's GL state is never disturbed.
+// in-game overlay - drawn with immediate-mode GL inside the wglSwapBuffers hook.
+// In a showcase build (FROSTMOD_UI 0) this is a single corner badge saying FrostMod
+// is attached; with FROSTMOD_UI 1 it is also the F8 menu, the feature panels and the
+// radar/ESP HUD. On a core GL profile the fixed-function calls are no-ops (the
+// overlay stays hidden); everything is push/pop-wrapped so the game's GL state is
+// never disturbed.
 // ---------------------------------------------------------------------------
 std::atomic<bool>      g_overlayOn{true};
 std::atomic<bool>      g_menuOpen{false};       // F8 opens the FrostMod action menu
@@ -1963,6 +1983,7 @@ std::atomic<ULONGLONG> g_statusUntil{0};        // show g_statusText until this 
 std::mutex             g_statusMutex;
 char                   g_statusText[128] = {0};
 
+#if FROSTMOD_UI
 // The FrostMod menu (F8). One entry per action - press its key. New features add a
 // row here instead of another global F-key. Keep labels short (they set the width).
 struct MenuItem { char key; const char* label; };
@@ -1977,7 +1998,11 @@ static const MenuItem kMenu[] = {
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
 static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
+#endif  // FROSTMOD_UI
 
+// Still called from all over the feature code. With the UI compiled out nothing
+// renders g_statusText, so it survives only as the last-message buffer - the text
+// itself always reaches frostmod.log through the caller's own Log() line.
 void SetStatus(const char* s, unsigned ms) {
     std::lock_guard<std::mutex> lk(g_statusMutex);
     strncpy_s(g_statusText, s, _TRUNCATE);
@@ -2018,6 +2043,7 @@ static void FillRect(int x0, int y0, int x1, int y1) {
     glEnd();
 }
 
+#if FROSTMOD_UI
 // The track-manager panel (top-left, like the menu but taller + scrolled). Cursor row
 // is prefixed '>' and highlighted; [x]/[ ] is the STAGED active/inactive state; a
 // trailing '*' (amber) marks a row whose staged state differs from disk (pending move).
@@ -2364,13 +2390,19 @@ static void DrawEspGL(int w, int h) {
         }
     }
 }
+#endif  // FROSTMOD_UI
 
 void DrawOverlay(HDC hdc) {
+#if FROSTMOD_UI
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_smOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
+#else
+    // Showcase build: the badge is the only thing this path ever draws.
+    if (!g_overlayOn.load()) return;
+#endif
     EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
@@ -2378,6 +2410,7 @@ void DrawOverlay(HDC hdc) {
     const int w = vp[2], h = vp[3];
     if (w <= 0 || h <= 0) return;
 
+#if FROSTMOD_UI
     static unsigned frame = 0; ++frame;              // advances every presented frame
     const bool reloading = g_reloadActive.load();
     const bool menu      = g_menuOpen.load() && !reloading;
@@ -2400,6 +2433,7 @@ void DrawOverlay(HDC hdc) {
     } else {
         strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
     }
+#endif  // FROSTMOD_UI
 
     g_inOverlay.store(true, std::memory_order_relaxed);   // don't let our ortho corrupt VP capture
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -2410,6 +2444,18 @@ void DrawOverlay(HDC hdc) {
     glDisable(GL_LIGHTING);   glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
+#if !FROSTMOD_UI
+    // Showcase: one compact pill, always on, top-left. It says nothing but "the dll
+    // is loaded and this render hook is firing" - which is the whole point of it.
+    {
+        const int bw = 250, bh = 24;
+        const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+        glColor4f(0.04f, 0.05f, 0.08f, 0.72f);
+        FillRect(x0, y0, x1, y1);
+        glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
+        GlText(x0 + 8, y1 - 17, "FrostMod v" FROSTMOD_VERSION "   -   attached");
+    }
+#else
     const int lh = 18;                           // line height
     if (sm) {
         DrawServerMaps(w, h, lh);
@@ -2456,6 +2502,7 @@ void DrawOverlay(HDC hdc) {
 
     if (g_espOn.load())   DrawEspGL(w, h);       // HUD overlays draw on top of any panel
     if (g_radarOn.load()) DrawRadarGL(w, h);
+#endif  // FROSTMOD_UI
 
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
@@ -2522,6 +2569,7 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
     t.m_iFont = 1; t.m_fSize = size; t.m_iJustify = 0; t.m_ulColor = abgr;
 }
 
+#if FROSTMOD_UI
 // PiBoSo mirror of the radar/ESP HUD. Normalized 0..1, top-left origin; the disc
 // is drawn in an aspect-corrected square (assume 16:9 - Draw() gives no resolution).
 // Quad budget is shared (cap 64), so blips/boxes are capped to stay within it.
@@ -2570,6 +2618,7 @@ static void EmitEspPiBoSo() {
         }
     }
 }
+#endif  // FROSTMOD_UI
 
 // Fill g_drawQuads/g_drawStrs from the same overlay state DrawOverlay() reads.
 // Normalized-coord mirror of DrawOverlay: quads are backgrounds/highlights/bars
@@ -2577,6 +2626,15 @@ static void EmitEspPiBoSo() {
 // tuned to match the GL layout's proportions - adjust here if text overflows.
 static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0;
+#if !FROSTMOD_UI
+    // Showcase: the same "attached" pill as the GL path, in the engine's normalized
+    // space - one quad, one string, nothing else. The literals are the full-UI path's
+    // constants folded in: MX 0.010, MY 0.014, w 0.20, h 0.034, PADX 0.006, FS 0.021.
+    if (!g_overlayOn.load()) return;
+    DQuad(0.010f, 0.014f, 0.210f, 0.048f, ToABGR(0.04f, 0.05f, 0.08f, 0.72f));
+    DText(0.016f, 0.020f, "FrostMod v" FROSTMOD_VERSION "   -   attached",
+          ToABGR(0.47f, 0.78f, 1.0f, 1.0f), 0.021f);
+#else
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_smOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
@@ -2812,6 +2870,7 @@ static void BuildOverlayDrawLists() {
             DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(0.47f, 0.78f, 1.0f, 0.95f));
         }
     }
+#endif  // FROSTMOD_UI
 }
 
 // ---------------------------------------------------------------------------
@@ -2924,6 +2983,7 @@ void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
 void HandleFrostModCommand();          // fwd (defined with the bike-apply code below)
 // g_origMpMsg (defined above) is non-null once --dump-serverlist hooked the handler
 
+#if FROSTMOD_UI
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
 void MenuAction(int d) {
@@ -2945,10 +3005,12 @@ void MenuAction(int d) {
     //   OpenTrackManager()               - track manager      OpenSwitcher() - switch track
     //   DumpTrackList()                  - track list -> log   OpenDirectConnect() - direct connect
 }
+#endif  // FROSTMOD_UI
 
 void Tick() {
     // Heartbeat: proves the render hook fires. No [tick] line in the log => the game
-    // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
+    // isn't calling the SwapBuffers we hooked, so the badge can't show and a reload
+    // signalled from frostmod.exe can't run.
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
@@ -2980,6 +3042,7 @@ void Tick() {
         }
     }
 
+#if FROSTMOD_UI
     // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
@@ -3216,6 +3279,7 @@ void Tick() {
         // finds answers already waiting) - not all few-hundred servers.
         if (g_smOpen.load()) SmPumpQueries(g_smTop - 2, g_smTop + kTrkVisible + 2);
     }
+#endif  // FROSTMOD_UI
 
     // If --dump-serverlist is active, auto-dump the blob whenever it changes - so
     // just opening the online browser captures it, no key press / console focus.
@@ -3247,6 +3311,7 @@ void Tick() {
         HandleFrostModCommand();
     }
 
+#if FROSTMOD_UI
     // Radar range adjust (PageUp/PageDown) while the radar is shown; validate the
     // captured camera matrix each frame so the ESP can fall back to arrows if it drifts.
     if (g_radarOn.load() || g_espOn.load()) {
@@ -3258,6 +3323,7 @@ void Tick() {
         prevPgUp = pu; prevPgDn = pd;
         RadValidateVP();
     }
+#endif  // FROSTMOD_UI
 
     DrainGameThreadTasks();
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
@@ -3800,7 +3866,8 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
-    Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
+    Log("[init] reload = re-run content load (fcn.1400ef210); trigger with R in "
+        "frostmod.exe, or by signalling Local\\FrostModReload.");
 
     // CONTENT hooks first and ASAP - they're timing-critical: we must be hooked
     // before the game's one-time startup mods scan. Wait for the code to be
@@ -3822,7 +3889,7 @@ DWORD WINAPI Init(LPVOID) {
             uint8_t *cb, *ce;
             if (GetExecRange(g_base, &cb, &ce) && (uint8_t*)ci >= cb && (uint8_t*)ci < ce) {
                 g_contentInit = (ContentInit_t)ci;
-                Log("[init] content-load routine @ RVA 0x%zx - reload ready (R / F8).",
+                Log("[init] content-load routine @ RVA 0x%zx - reload ready (R / event).",
                     (size_t)(ci - g_base));
             } else {
                 Log("[init] WARNING: content-load RVA 0x%zx outside .text; reload disabled.",
@@ -3865,7 +3932,7 @@ DWORD WINAPI Init(LPVOID) {
             "until offsets.h is updated. (mods listing + logs still work.)");
     }
 
-    // RENDER hooks (drive Tick: F8, the reload-event check, and running reloads on
+    // RENDER hooks (drive Tick: the badge, the reload-event check, and running reloads on
     // the game thread). Not timing-critical for capture, so we can wait for
     // opengl32 to load - when injecting early it isn't mapped yet. gdi32 is always
     // present. Reload only runs much later (when you press R), by which point
@@ -4031,7 +4098,7 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(g_inactivePath, '\\')) *s = 0;   // strip trailing "\mods"
             strcat_s(g_inactivePath, "\\FrostMod Inactive Tracks");
             Log("[trklib] mods=%s", g_modsPath);
-            Log("[trklib] inactive store=%s (F8 menu > 2 opens the track manager)", g_inactivePath);
+            Log("[trklib] inactive store=%s (track manager needs a FROSTMOD_UI build)", g_inactivePath);
         } else {
             Log("[trklib] mods path unknown yet (run frostmod.exe so it writes frostmod_mods.txt).");
         }
@@ -4047,7 +4114,7 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
-        frostmod::fsclient::Init(&SfLog);   // F8 > 6 server-map queries log here too
+        frostmod::fsclient::Init(&SfLog);   // server-map queries log here too
         LoadRadarSettings();   // restore radar / rider-outline toggles + range
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs

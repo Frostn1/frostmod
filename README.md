@@ -14,8 +14,10 @@ FrostMod is a client-side toolkit for MX Bikes.
   instantly without restarting the game.
 - **Server-browser spam filter** - hide ad / cheat-shop / "ghost" servers from
   your list. Purely client-side, nobody else is affected.
-- **In-game overlay** - a small status hint that shows FrostMod is live and
-  reports each reload.
+- **In-game badge** - a small top-left pill that shows FrostMod is loaded and
+  attached. That is the whole of the in-game UI: no menu, no panels, and FrostMod
+  captures no keys, so it can never interfere with riding. Everything else is
+  driven from the `frostmod.exe` console or the MXB App.
 - **FrostServer (dedicated servers)** - a server-side companion plugin that
   publishes the track a server is running plus its mxb-mods.com download link, so
   a client can fetch and install that track without leaving the game. The server
@@ -43,7 +45,7 @@ Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`, and
 stays open as a console - listing the mods it finds and streaming its log.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
-  console, or **`F8`** in-game to open the FrostMod menu and pick **Reload**.
+  console. The game needs no input; watch the console log for progress.
 - **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.
@@ -55,7 +57,7 @@ Full command-line reference — every flag, key, and file — is in
 You can also run it as a **PiBoSo plugin**: drop `frostmod.dlo` into MX Bikes'
 `plugins` folder (next to `mxbikes.exe`) and the game loads it at startup — no
 injector needed. Run `frostmod.exe --install-plugin` to copy it there for you.
-In plugin mode the in-game overlay renders through the game's sanctioned `Draw()`
+In plugin mode the in-game badge renders through the game's sanctioned `Draw()`
 callback. See [docs/PLUGIN.md](docs/PLUGIN.md).
 
 
@@ -74,12 +76,12 @@ A standalone `frostserver.exe` serves the same API with no game attached, for
 testing (`frostserver.exe --track "Some Track Name"`). Full HTTP contract, config
 format, and setup are in [docs/FROSTSERVER.md](docs/FROSTSERVER.md).
 
-**On the player's side** this is **F8 → `6` Server maps**: a list of the servers
-the game knows about, the map each one is running, and whether you already have
-it. Enter on a map you're missing downloads it through the
-[MXB App](https://github.com/Frostn1/mxb-app) and live-reloads it into the game —
-no restart, no hunting the track down. Servers without FrostServer simply show as
-such.
+**On the player's side** the client half — reading the servers the game knows
+about, asking each one what map it is running, checking it against what you have
+installed, and handing a missing one to the [MXB App](https://github.com/Frostn1/mxb-app)
+to download and live-reload — is all built and compiled in. Its in-game browser is
+currently **not exposed**: this build ships UI-free (see `FROSTMOD_UI` in
+[src/frostmod.cpp](src/frostmod.cpp)), so the flow is driven from outside the game.
 
 
 ## Troubleshooting
@@ -132,11 +134,11 @@ user** as the game, and **elevated (Run as administrator)** if the game runs
 elevated — otherwise injection fails with an access error. Or sidestep injection
 entirely with **plugin mode** (above).
 
-### Nothing happens / no log output / the overlay never appears
+### Nothing happens / no log output / the badge never appears
 
 - Check **`frostmod.log`** (next to the binaries, or `%TEMP%\frostmod.log` if that
   folder is read-only) — it records what the DLL is doing.
-- The overlay only shows once the game starts calling its present/draw hook; give
+- The badge only shows once the game starts calling its present/draw hook; give
   it until you reach a menu or the track.
 - Make sure the folder holding the binaries is **writable** — the DLL writes its log
   and flag files there.

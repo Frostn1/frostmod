@@ -569,7 +569,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 }
 
 void RequestReload();                          // fwd (defined with the reload code below)
-void RefreshSelectedBikeModel(const char* bikeId, const char* why);  // fwd (bike-apply code below)
+void NoteModelNeedsReselect(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 
 // One track in the manager list. `active` = current on-disk state (true => the .pkz
@@ -1080,10 +1080,10 @@ static void MsApply(const std::string& bike, const std::string& target) {
     SetStatus("model swapped - reloading", 4000);
     g_msOpen.store(false);
     RequestReload();
-    // If this is the bike the player currently has selected, re-apply it so the new
-    // model shows immediately instead of after a class switch away and back. No-op
-    // for any other bike. Same path MXB App drives over the command channel.
-    RefreshSelectedBikeModel(bike.c_str(), "F8 model swap");
+    // The files and the catalogs are updated; the live machine is not. Tell the player
+    // to re-select the bike. (v0.9.9 re-applied it for them and crashed the game doing
+    // so - see the bike-apply block.)
+    NoteModelNeedsReselect(bike.c_str(), "F8 model swap");
 }
 
 void OpenModelSwap() {
@@ -2960,118 +2960,51 @@ uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
-// BIKE APPLY capture + same-bike REPLAY ("instant model refresh").
+// Stage A (opt-in --bikecap): OBSERVE the bike APPLY loader to RE the in-garage
+// bike switcher.
 //
 // fcn.1400E4550 (RVA_BIKE_APPLY) is the bike/session APPLY loader: it re-derives
 // the selected index by name-matching entry+0x00 against a name held in the
 // descriptor (rdx), builds "%sbikes\<name>\<name>.cfg" and loads the machine.
+// Hooking it and, per apply, logging:
+//   * the caller return address (to tell the garage caller from the on-track one),
+//   * a hex/ASCII dump of the descriptor (rdx) + a pointer-probe of it, so we can
+//     see WHERE the picked bike's name sits (inline or by pointer),
+//   * once: the whole bike ARRAY (index -> entry+0x00 / entry+0x4C0 names) and a
+//     full byte dump of entry[0] (to find the [data] cat/class offset - it's ASCII).
+// Read-only; performs NO swap. Off unless frostmod_bikecap.flag is present.
 //
-// WHY WE HOOK IT: a model swap rewrites the loose files at bikes\<Bike>\, but the
-// garage PREVIEW keeps showing the old mesh until the player switches bike class
-// away and back - the surgical content reload rebuilds the CATALOGS, not the live
-// preview instance (see the --edfcap note above). Replaying this apply with the
-// SAME descriptor makes the game re-read the selected bike from disk, which is
-// exactly what away-and-back achieves, without touching the player's selection.
+// WHY THERE IS NO REPLAY HERE ANY MORE (v0.9.10; it shipped in v0.9.9 and was
+// removed):
 //
-// The hook is ALWAYS installed (we need the captured call), but its verbose Stage-A
-// diagnostics stay behind frostmod_bikecap.flag so the log doesn't flood.
+// v0.9.9 kept the last apply's (rcx, rdx) and replayed that call to make the garage
+// re-read a just-swapped model from disk, instead of the class-switch away-and-back.
+// It crashed the game - not at the swap, but at the NEXT bike the player picked by
+// hand, which is what made it hard to attribute. The approach cannot be rescued by
+// checking harder:
 //
-// STILL PROVISIONAL (settled by one --bikecap run on Windows): whether re-applying
-// the SAME bike re-reads model.edf, or whether the mesh is cached by identity and
-// we must apply another bike first and come back. Both are driven by this same
-// captured call - see ReplayBikeApply().
+//   * The descriptor is a caller temporary we do not own. The liveness test asked
+//     whether the captured bike name was still somewhere in its 0x140 bytes - and a
+//     frame that has returned but not yet been overwritten still holds that name.
+//     The check passed in exactly the case it existed to catch.
+//   * `rcx`, the object the loader writes its result into, was never checked at all.
+//   * The surgical content reload rebuilds the very arrays the loader indexes, so
+//     after a swap the capture describes a world that no longer exists. The replay
+//     WAITED for that reload to finish and then went ahead anyway.
+//   * Wrapping the call in __try/__except made it worse, not safer: an access
+//     violation inside a half-finished machine swap was swallowed and the game kept
+//     running on the wreckage, turning an immediate, attributable crash into a
+//     delayed one.
+//
+// Doing this properly means building a descriptor WE own, which needs what Stage A
+// was always meant to settle: which field holds the picked bike's name, and which
+// call site is the garage one. Until a --bikecap run on Windows answers both, a
+// swapped model needs a manual re-select in the garage, and both swap paths say so.
 // ---------------------------------------------------------------------------
 using BikeApply_t = int64_t(__fastcall*)(void*, void*);
 BikeApply_t g_origBikeApply = nullptr;
-
-// Last apply the game made, kept so we can replay it. `names` are every plausible
-// string found in/behind the descriptor at capture time - one of them is the picked
-// bike's folder, and we never needed to know WHICH field it lived in: matching the
-// set is enough to answer "is the bike being swapped the one currently selected?".
-//
-// The descriptor may well be a caller stack temporary, so a stored pointer can go
-// stale. We don't need stack-bounds probing to catch that: at replay we re-scan the
-// descriptor and require the captured name to STILL be there. A reused frame won't
-// match, and we skip rather than hand the loader garbage.
-struct BikeApplyCall {
-    std::mutex mu;
-    bool valid = false;
-    void* rcx = nullptr;
-    void* rdx = nullptr;
-    std::vector<std::string> names;   // candidate bike names seen in the descriptor
-};
-BikeApplyCall g_bikeApply;
-
-// Every plausible NUL-terminated ASCII name in a descriptor: inline runs, plus the
-// targets of aligned qwords that look like pointers. SEH-guarded throughout.
-static std::vector<std::string> DescriptorNames(void* desc) {
-    std::vector<std::string> out;
-    if (!desc) return out;
-    char raw[0x140];
-    size_t got = SafeReadBytes(reinterpret_cast<const char*>(desc), raw, sizeof(raw));
-
-    auto plausible = [](const std::string& s) {
-        if (s.size() < 2 || s.size() > 64) return false;
-        for (char c : s)
-            if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7f) return false;
-        return true;
-    };
-    auto add = [&](const std::string& s) {
-        if (!plausible(s)) return;
-        for (const auto& e : out)
-            if (_stricmp(e.c_str(), s.c_str()) == 0) return;
-        out.push_back(s);
-    };
-
-    // (a) inline ASCII runs.
-    for (size_t i = 0; i < got; ) {
-        size_t j = i;
-        while (j < got && (unsigned char)raw[j] >= 0x20 && (unsigned char)raw[j] < 0x7f) ++j;
-        if (j > i) add(std::string(raw + i, j - i));
-        i = (j > i) ? j : i + 1;
-    }
-    // (b) strings behind aligned qword pointers.
-    for (size_t off = 0; off + 8 <= got; off += 8) {
-        uintptr_t q;
-        memcpy(&q, raw + off, sizeof(q));
-        if (q < 0x10000) continue;
-        add(SafeStr((void*)q));
-    }
-    return out;
-}
-
-// Does any captured string name this bike? An exact hit, or the bike appearing as a
-// whole PATH COMPONENT - the descriptor may hold "...\bikes\<Bike>\<Bike>.cfg" rather
-// than the bare folder name, and a bare substring test would also match a bike whose
-// name merely prefixes another ("CR250" inside "CR250F").
-static bool NamesContain(const std::vector<std::string>& v, const char* want) {
-    size_t n = strlen(want);
-    if (!n) return false;
-    for (const auto& s : v) {
-        if (_stricmp(s.c_str(), want) == 0) return true;
-        for (size_t i = 0; i + n <= s.size(); ++i) {
-            if (_strnicmp(s.c_str() + i, want, n) != 0) continue;
-            char before = (i == 0)          ? '\\' : s[i - 1];
-            char after  = (i + n == s.size()) ? '\\' : s[i + n];
-            bool bOk = (before == '\\' || before == '/');
-            bool aOk = (after == '\\' || after == '/' || after == '.');
-            if (bOk && aOk) return true;
-        }
-    }
-    return false;
-}
 std::atomic<int>  g_bikeCapShots{0};
 std::atomic<bool> g_bikeArrayLogged{false};
-// Stage-A verbose diagnostics on? (frostmod_bikecap.flag). The apply hook itself is
-// always installed - only its logging is opt-in.
-std::atomic<bool> g_bikeCapArmed{false};
-
-// SEH-guarded call into the apply loader. POD-only body (no C++ objects), which is
-// what lets us use __try here - same rule as SafeCopyStr/SafeReadBytes above.
-static bool SafeCallBikeApply(BikeApply_t fn, void* rcx, void* rdx) {
-    __try { fn(rcx, rdx); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
 
 // Hex+ASCII dump of a (possibly bogus) region to frostmod.log, SEH-guarded via
 // SafeReadBytes. `len` capped to the local buffer.
@@ -3132,109 +3065,38 @@ static void LogBikeArray() {
     LogHexDump("entry0", (void*)arr, 0x520);
 }
 
-// True while ReplayBikeApply is calling the loader, so our own replay doesn't
-// overwrite the capture it is replaying (and can't recurse).
-std::atomic<bool> g_bikeApplyReplaying{false};
-
+// Observation only. Nothing is recorded for later use: v0.9.9 kept every apply's
+// (rcx, rdx) so it could replay one, and replaying a call we don't own is what
+// crashed the game (see the block comment above). The hook is installed ONLY under
+// frostmod_bikecap.flag now, so a normal player's bike selection runs through
+// nothing of ours at all.
 int64_t __fastcall hkBikeApply(void* rcx, void* rdx) {
-    if (!g_bikeApplyReplaying.load()) {
-        // ALWAYS capture: this is the call the instant model refresh replays.
-        auto names = DescriptorNames(rdx);
-        {
-            std::lock_guard<std::mutex> lk(g_bikeApply.mu);
-            g_bikeApply.rcx = rcx;
-            g_bikeApply.rdx = rdx;
-            g_bikeApply.names = std::move(names);
-            g_bikeApply.valid = true;
-        }
-        // Stage-A diagnostics (opt-in), unchanged.
-        if (g_bikeCapArmed.load()) {
-            int shot = g_bikeCapShots.fetch_add(1);
-            if (shot < 24) {
-                uintptr_t crva = (uintptr_t)_ReturnAddress() - g_base;
-                Log("[bikecap] --- APPLY 0xE4550 #%d  rcx=%p rdx=%p  caller=0x%zx%s",
-                    shot, rcx, rdx, (size_t)crva, (crva < 0x1000000) ? "" : "(ext)");
-                if (rdx) { LogHexDump("desc", rdx, 0x140); LogDescStrings(rdx); }
-                if (!g_bikeArrayLogged.exchange(true)) LogBikeArray();
-            }
-        }
+    int shot = g_bikeCapShots.fetch_add(1);
+    if (shot < 24) {
+        uintptr_t crva = (uintptr_t)_ReturnAddress() - g_base;
+        Log("[bikecap] --- APPLY 0xE4550 #%d  rcx=%p rdx=%p  caller=0x%zx%s",
+            shot, rcx, rdx, (size_t)crva, (crva < 0x1000000) ? "" : "(ext)");
+        if (rdx) { LogHexDump("desc", rdx, 0x140); LogDescStrings(rdx); }
+        if (!g_bikeArrayLogged.exchange(true)) LogBikeArray();
     }
     return g_origBikeApply(rcx, rdx);
 }
 
-// Re-run the captured apply so the game re-reads the selected bike from disk.
-// MUST run on the render thread (enqueued by RefreshSelectedBikeModel).
+// Tell the player their swapped model needs a manual re-select, and say so in the
+// log for whoever reads it afterwards. This is all a model swap does to the running
+// game now: the files on disk have changed and the content catalogs have been
+// rebuilt, but the live machine is left strictly alone. Safe from any thread.
 //
-// `bikeId` is the bike whose model was just swapped; we replay only if it is the
-// one currently selected, so a swap on some other bike never disturbs the player.
-static void ReplayBikeApply(const std::string& bikeId, const std::string& why) {
-    void* rcx; void* rdx;
-    {
-        std::lock_guard<std::mutex> lk(g_bikeApply.mu);
-        if (!g_bikeApply.valid) {
-            Log("[bikefresh] no bike apply captured yet - pick a bike in the garage once "
-                "so we have a call to replay. (%s)", why.c_str());
-            return;
-        }
-        if (!NamesContain(g_bikeApply.names, bikeId.c_str())) {
-            Log("[bikefresh] '%s' is not the selected bike - nothing to refresh. (%s)",
-                bikeId.c_str(), why.c_str());
-            return;
-        }
-        rcx = g_bikeApply.rcx;
-        rdx = g_bikeApply.rdx;
-    }
-    // Liveness check: the descriptor may have been a caller stack temporary. If the
-    // bike name we captured is no longer in it, the memory was reused - skip rather
-    // than hand the loader garbage.
-    if (!NamesContain(DescriptorNames(rdx), bikeId.c_str())) {
-        Log("[bikefresh] captured descriptor for '%s' went stale - skipping replay; "
-            "re-select the bike in the garage to load the new model. (%s)",
-            bikeId.c_str(), why.c_str());
-        SetStatus("model swapped - re-select the bike to see it", 6000);
-        return;
-    }
-    if (!g_origBikeApply) {
-        Log("[bikefresh] apply loader not hooked (offsets mismatch?) - cannot refresh.");
-        return;
-    }
-    Log("[bikefresh] replaying apply 0xE4550 for '%s' (%s)", bikeId.c_str(), why.c_str());
-    g_bikeApplyReplaying.store(true);
-    bool ok = SafeCallBikeApply(g_origBikeApply, rcx, rdx);
-    g_bikeApplyReplaying.store(false);
-    if (ok) {
-        Log("[bikefresh] '%s' re-applied - the swapped model should be live.", bikeId.c_str());
-        SetStatus("model refreshed", 3000);
-    } else {
-        Log("[bikefresh] EXCEPTION replaying the apply for '%s' - re-select the bike in the "
-            "garage instead.", bikeId.c_str());
-        SetStatus("model refresh failed - re-select the bike", 6000);
-    }
-}
-
-// A model swap kicks off a surgical content reload too (MsApply), and that rebuilds
-// the very lists this apply reads. Defer the replay until the reload finishes - each
-// deferral costs one frame, so this is a couple of frames in practice.
-constexpr int kBikeRefreshMaxDefers = 240;   // ~4s at 60fps, then go anyway
-
-static void QueueBikeRefresh(const std::string& bike, const std::string& why, int tries) {
-    EnqueueGameThreadTask([bike, why, tries]() {
-        if (g_reloadActive.load()) {
-            if (tries < kBikeRefreshMaxDefers) { QueueBikeRefresh(bike, why, tries + 1); return; }
-            Log("[bikefresh] content reload still running after %d frames - refreshing anyway.",
-                tries);
-        }
-        ReplayBikeApply(bike, why);
-    });
-}
-
-// Queue an instant model refresh for `bikeId` on the render thread. Safe to call
-// from any thread; a no-op unless that bike is the one currently selected.
-void RefreshSelectedBikeModel(const char* bikeId, const char* why) {
+// v0.9.9 tried to spare the player this step by replaying the game's own bike-apply
+// call; that is what crashed the game at the next hand-picked bike. Until the apply
+// can be driven from a descriptor we build ourselves, the re-select IS the feature.
+void NoteModelNeedsReselect(const char* bikeId, const char* why) {
     std::string bike = bikeId ? bikeId : "";
-    std::string reason = why ? why : "";
     if (bike.empty()) return;
-    QueueBikeRefresh(bike, reason, 0);
+    Log("[bikefresh] '%s' swapped (%s) - re-select the bike in the garage to load the new "
+        "model. (Live re-apply was removed in v0.9.10: it crashed the game.)",
+        bike.c_str(), why ? why : "");
+    SetStatus("model swapped - re-select the bike to see it", 6000);
 }
 
 // ---------------------------------------------------------------------------
@@ -3301,9 +3163,11 @@ void HandleFrostModCommand() {
     Log("[cmd] verb='%s' bikeId='%s'", verb.c_str(), bikeId.c_str());
 
     if (verb == "refresh_bike_model") {
-        // Already on the render thread, but go through the queue so the refresh runs
-        // at the same point in the frame as every other game-thread task.
-        RefreshSelectedBikeModel(bikeId.c_str(), "MXB App model swap");
+        // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
+        // captured bike-apply call, which crashed the game at the next hand-picked bike
+        // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
+        // below v0.9.10, so reaching here means an older app - answer it truthfully.
+        NoteModelNeedsReselect(bikeId.c_str(), "MXB App model swap");
     } else if (verb == "swap_bike") {
         // Stage B (whole-bike in-garage switch) isn't built yet. Say so instead of
         // silently doing nothing - MXB App's garage_swap_bike sends this today.
@@ -3525,13 +3389,13 @@ DWORD WINAPI Init(LPVOID) {
         }
     }
 
-    // Bike APPLY loader (fcn.1400E4550). ALWAYS hooked: the captured call is what the
-    // instant model refresh replays so a swapped model shows without the class-switch
-    // away-and-back (see the bike-apply block). The hook itself only records args.
-    //
-    // Its Stage-A diagnostics (descriptor dump + bike array, to pin the descriptor's
-    // name field, the [data] cat/class offset and the garage caller for the future
-    // in-garage SWITCHER) stay opt-in behind frostmod_bikecap.flag - they're verbose.
+    // Bike APPLY loader (fcn.1400E4550). OPT-IN again (frostmod_bikecap.flag), as it was
+    // before v0.9.9: nothing in a normal session needs it now that the instant model
+    // refresh is gone, and hooking it for everyone put our detour - and its speculative
+    // scan of the descriptor - in the path of every bike a player selects. Its Stage-A
+    // diagnostics (descriptor dump + bike array, to pin the descriptor's name field, the
+    // [data] cat/class offset and the garage caller for the future in-garage SWITCHER)
+    // are the only reason to install it, and they're verbose.
     {
         char flag[MAX_PATH] = {0};
         if (g_logPath[0]) {
@@ -3539,15 +3403,10 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_bikecap.flag"); }
         }
         bool armed = flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
-        g_bikeCapArmed.store(armed);
-
-        uintptr_t applyAddr = g_base + mxb::RVA_BIKE_APPLY + g_sigDelta;
-        if (!InstallHook((void*)applyAddr, &hkBikeApply, (void**)&g_origBikeApply,
-                         "bikeApply(0xE4550)")) {
-            Log("[bikefresh] apply loader NOT hooked - instant model refresh is unavailable; "
-                "a swapped model needs a manual bike re-select in the garage.");
-        }
         if (armed) {
+            uintptr_t applyAddr = g_base + mxb::RVA_BIKE_APPLY + g_sigDelta;
+            InstallHook((void*)applyAddr, &hkBikeApply, (void**)&g_origBikeApply,
+                        "bikeApply(0xE4550)");
             Log("[bikecap] Stage-A diagnostics ARMED. In the GARAGE, pick a few bikes (across "
                 "classes). frostmod.log will show the apply caller, the descriptor dump (find the "
                 "picked bike's name offset), the bike array, and entry[0] bytes (find the [data] "

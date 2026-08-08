@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-08-07
+
+### Added
+- **Instant model refresh — a swapped model shows without the class-switch away-and-back.**
+  Until now, changing a bike's model left the garage preview showing the old mesh: the
+  surgical content reload rebuilds the content *catalogs*, not the live preview instance,
+  so the only way to see the new model was to switch bike class away and back. The bike
+  **apply** loader `fcn.1400E4550` — RE'd for the in-garage switcher — is the fix: it
+  re-derives the selected bike by name and reloads the machine from
+  `bikes\<Bike>\<Bike>.cfg`, so **replaying it with the same descriptor** makes the game
+  re-read the bike from disk, which is exactly what away-and-back achieves without
+  disturbing the player's selection. The hook is now **always installed** (its verbose
+  Stage-A diagnostics stay opt-in behind `frostmod_bikecap.flag`) and records the last
+  apply's args. A refresh replays that call, but only when the swapped bike is the one
+  currently selected — decided by matching the bike name against the strings captured
+  in/behind the descriptor, so we never needed to pin which field holds it. Wired into
+  both swap paths: the F8 model swap (`MsApply`) and MXB App over the command channel.
+  (`src/frostmod.cpp`.)
+- **Command channel from MXB App (`Local\FrostModCommand` + `%TEMP%\frostmod_cmd.json`).**
+  MXB App has been writing this command file and pulsing this event since its garage-switch
+  groundwork, but **nothing in FrostMod ever listened** — only `Local\FrostModReload` was
+  created, so `garage_swap_bike` was a dead contract that could never do anything. FrostMod
+  now creates the event, polls it in `Tick` alongside the reload event, and dispatches the
+  payload on the render thread. Verbs: `refresh_bike_model` (above) and `swap_bike`, which
+  logs "not implemented yet" rather than silently ignoring the app. The reader is a small
+  field scanner, not a general JSON parser — the file is machine-written with a known flat
+  shape. Contract mirrored in mxb-app's `src-tauri/src/frostmod.rs`. (`src/frostmod.cpp`.)
+
+### Changed
+- **Replay safety.** The apply descriptor may be a caller stack temporary, so a stored
+  pointer can go stale. Rather than probe stack bounds, the replay re-scans the descriptor
+  and requires the captured bike name to still be there — a reused frame won't match, and
+  we skip with a "re-select the bike" status instead of handing the loader garbage. The
+  call itself is SEH-guarded in a POD-only helper (same rule as `SafeCopyStr`), and a
+  re-entry flag stops our own replay overwriting the capture it is replaying.
+
 ## 2026-07-23
 
 ### Added

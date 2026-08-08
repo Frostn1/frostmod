@@ -241,3 +241,70 @@ constexpr char SIG_MP_MSG_HANDLER[] =
 constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 
 } // namespace mxb
+
+// ============ GP Bikes ========================================================
+// Same engine, same source, different build — so the analogous routines exist but every
+// RVA differs. Recovered statically from an unpacked `gpbikes.exe` (SteamStub removed with
+// Steamless; ImageBase 0x140000000, `.text` entropy 6.035).
+//
+// Only the two constants live mod reload needs are here. The server browser / master
+// protocol group is NOT ported — see `offsets_complete` on GameOffsets below, which keeps
+// those features off rather than letting them fire at MX Bikes addresses.
+//
+// UNVERIFIED AT RUNTIME: both were derived by static analysis and have not been confirmed
+// under a debugger. See tasks/gp-bikes-port.md for the full derivation.
+namespace gpb {
+
+// Boot content-load + app-init; GP twin of mxb::RVA_CONTENT_INIT.
+//   Identified by fingerprinting MX's routine by the strings it references (%sglobal.ini,
+//   mods, cache, %stextures\, lastprofile, %sprofiles\%s\profile.ini, texture_quality,
+//   core, ...) with `mxbikes.ini` swapped for `gpbikes.ini`: this function shares 19 of
+//   those 23, is one of only three referencing "gpbikes.ini", is called from exactly one
+//   site (0x402e0 — "called once from WinMain"), and takes `int mode` in ecx like MX's.
+//   .pdata range 0xfb650-0xfcfb7.
+// Carries MX's warning too: it re-inits Steam/input/sound and transitions to the UI, so
+// calling it mid-game is a soft restart to the menu.
+constexpr uintptr_t RVA_CONTENT_INIT = 0xfb650;
+
+// Generic VFS directory walker (out_status, dir, ext, out_buf); GP twin of
+// mxb::RVA_SCAN_FOLDER. Pinned two independent ways that agree exactly:
+//   1. mxb::SIG_SCAN_FOLDER matches here byte-for-byte — including the same 0x7f8 frame —
+//      and is the ONLY match at a .pdata function start in the whole binary.
+//   2. In MX it sits 4 .pdata entries before the "%s*.pkz" wrapper; GP's wrapper is
+//      0x18f53b, minus 4 entries lands here.
+// It also has 3 call sites (0x16020b, 0x237421, 0x2bee1d), matching MX's 3.
+constexpr uintptr_t RVA_SCAN_FOLDER = 0x18f150;
+
+} // namespace gpb
+
+// ============ which title we're attached to ===================================
+// The scanner signature is deliberately NOT part of this: GP's scanner prologue is
+// byte-identical to MX's, so mxb::SIG_SCAN_FOLDER resolves both games unchanged and the
+// existing signature-with-delta fallback keeps working for either.
+struct GameOffsets {
+    /// Short, stable id — what `frostmod.exe --game <id>` takes. Matches the ids MXB App
+    /// uses in its own config, so the two agree on what a title is called.
+    const char* id;
+    /// Process image name, matched case-insensitively.
+    const char* exe;
+    /// Product name for logs. Never translated.
+    const char* display;
+    uintptr_t content_init;
+    uintptr_t scan_folder;
+    /// Whether every offset in this file has been derived for this title. False means the
+    /// features that need the un-ported groups (server browser filter, master protocol,
+    /// direct connect) must stay OFF — their MX addresses are meaningless here, and
+    /// hooking them would splice code at a wild location.
+    bool offsets_complete;
+};
+
+inline constexpr GameOffsets GAME_MXB = {
+    "mxb", "mxbikes.exe", "MX Bikes", mxb::RVA_CONTENT_INIT, mxb::RVA_SCAN_FOLDER, true,
+};
+
+inline constexpr GameOffsets GAME_GPB = {
+    "gpb", "gpbikes.exe", "GP Bikes", gpb::RVA_CONTENT_INIT, gpb::RVA_SCAN_FOLDER, false,
+};
+
+inline constexpr const GameOffsets* ALL_GAMES[] = { &GAME_MXB, &GAME_GPB };
+

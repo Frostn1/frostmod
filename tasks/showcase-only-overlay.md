@@ -66,11 +66,21 @@ Implemented and committed locally as `6ebd73f` on `chore/showcase-only-overlay`.
 - `FillRect` / `GlText` / `EnsureFont` deliberately stay outside the guards — the
   badge needs them.
 
+**Compiled — Windows CI green**
+- Run [31243797962](https://github.com/Frostn1/frostmod/actions/runs/31243797962) on
+  `chore/showcase-only-overlay`: configure + Release build + output check, all pass in
+  51s on `windows-latest` / MSVC x64.
+- **Zero new warnings.** The build emits exactly one, `C4010` (a `//` comment ending in
+  `\` at `src/frostmod.cpp:930`), which is pre-existing — the prior run on
+  `feature/frostserver-client` (31242604381) emits the same single warning. Confirms the
+  prediction above: unreferenced statics left behind the guards cost nothing at MSVC's
+  default warning level.
+- CI does not fire on a branch push (only `main`, PRs, `workflow_dispatch`); this run was
+  dispatched manually.
+
 **NOT verified**
-- **It has not been compiled.** No Windows toolchain on this machine, and the push
-  to `origin` was refused (403 — the git credential here is `seand-glocod`, which
-  has no write access to `Frostn1/frostmod`), so Windows CI never ran.
-- Nothing has been run in the game.
+- Nothing has been run in the game. The badge's appearance on both render paths, and a
+  console reload with the UI gone, still need the Windows box.
 
 **Expected leftovers (harmless)**
 Several statics are now referenced only from guarded code — `RadValidateVP`,

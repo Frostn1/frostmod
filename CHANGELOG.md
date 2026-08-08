@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-08-08 — v0.11.0
+
+### Fixed
+- **Reloading mods no longer crashes GP Bikes.** v0.10.0 attached to `gpbikes.exe`
+  correctly and then ran *MX Bikes'* reload table inside it. The reload was never the
+  `RVA_CONTENT_INIT` constant that shipped with the GP port — that is only a gate — but a
+  21-entry table of `mxbikes.exe` RVAs, half of them calls and half raw writes zeroing MX
+  list globals. Fired into GP Bikes that called arbitrary functions and zeroed arbitrary
+  memory; the per-step `__try/__except` meant it corrupted silently and died a moment
+  later with nothing in the log. GP Bikes now has its own table, derived from the
+  content-load section of its boot init (`0xfb95a`), covering tracks, tyres, rider, bikes,
+  paints, helmets, riders, animations, stands and dashes.
+- **FrostMod uses the mods folder of the game it is attached to.** The default was
+  hardcoded to `Documents\PiBoSo\MX Bikes\mods` regardless of `--game`, so a GP Bikes
+  session pointed the track manager, the inactive-tracks store and the model swap at MX
+  Bikes' folders. `--process gpbikes.exe` now picks the right folder too.
+- **The `registryReset` capture hook no longer installs on GP Bikes.** That RVA is MX
+  Bikes' and has no twin derived, so v0.10.0 was splicing a detour into whatever code
+  happened to live at `0x159340` in `gpbikes.exe`. Same for the `--bikecap` and
+  `--dump-serverlist` diagnostics, which read MX's bike array and server-list blob.
+
+### Changed
+- **A title with no reload offsets now refuses the reload instead of attempting it.** The
+  step table moved onto `GameOffsets`, so it is reached through the attached title and
+  cannot fall back to another game's. If a table proves wrong, setting `reload_steps` to
+  null degrades that title to an honest "reload not supported" rather than a crash.
+- `frostmod.exe` prints which title it is driving, so a mismatch is visible at a glance.
+
+### Added
+- `tests/offsets_test.cpp` — asserts each title's offsets belong to that title, that MX's
+  table is unchanged, and that a table with DIR steps supplies the operands they need. It
+  is pure constants, so CI runs it (`ctest`) rather than only compiling it. Pointing GP at
+  MX's table, the exact v0.10.0 defect, fails five of its checks.
+
+### Notes
+- GP Bikes' reload table was derived by static analysis against an unpacked `gpbikes.exe`
+  and corroborated against a reporter's crash log, but has **not** been confirmed under a
+  debugger. Verify on Windows before release: drop a `.pkz` into
+  `Documents\PiBoSo\GP Bikes\mods\tracks`, press `R`, and confirm the track appears with
+  no crash — then re-run the same flow on MX Bikes to prove the refactor didn't regress it.
+
 ## 2026-08-08 — v0.10.0
 
 ### Added

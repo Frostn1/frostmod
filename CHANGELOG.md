@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-08-08 — v0.10.0
+
+### Added
+- **FrostMod attaches to GP Bikes and reloads its mods.** MXB App drives GP Bikes now, but
+  FrostMod was gated off there because every RVA in `offsets.h` came from `mxbikes.exe`.
+  The two constants live reload actually needs have been recovered from an unpacked
+  `gpbikes.exe` — the boot content-load routine (`0xfb650`) and the VFS directory walker
+  (`0x18f150`) — so dropping a `.pkz` into `Documents\PiBoSo\GP Bikes\mods` and pressing
+  `R` works the same way it does for MX Bikes. Run `frostmod.exe --game gpb`, or
+  `--process gpbikes.exe` as before; injected into the game, the DLL works out which title
+  it is in from the host process itself.
+
+  The scanner *signature* turned out to be shared: GP's prologue is byte-for-byte identical
+  to MX Bikes', same `0x7f8` frame, so the existing signature-with-delta fallback that
+  survives a game update keeps working for either title unchanged.
+
+### Changed
+- **Features whose offsets are MX-Bikes-only now stay off elsewhere** rather than firing at
+  addresses that mean nothing in another build. The server-browser filter is the one that
+  matters: it writes a jump at `RVA_SB_POPULATE_LOOP`, which on GP Bikes is unrelated code.
+  A per-title `offsets_complete` flag gates it, and the log says why.
+- `--update` refuses to run while *either* game is open, not just MX Bikes — the DLL is
+  locked by whichever one loaded it.
+
+### Notes
+- The GP Bikes offsets were derived by static analysis and have **not** been confirmed under
+  a debugger; see `tasks/gp-bikes-port.md` for how they were found and what remains. The
+  server-browser filter, master protocol and direct connect are still MX Bikes only.
+
 ## 2026-08-08
 
 ### Fixed

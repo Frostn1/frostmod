@@ -53,6 +53,7 @@
 #include <string>
 #include <set>
 #include "version.h"    // FROSTMOD_VERSION
+#include "offsets.h"    // GameOffsets / ALL_GAMES (which titles --game accepts)
 
 // Where updates come from (public GitHub Releases).
 #define FROSTMOD_UPDATE_HOST L"api.github.com"
@@ -442,10 +443,15 @@ static int DoUpdate() {
     }
     printf("[*] updating v%s -> %s\n", FROSTMOD_VERSION, tag.c_str());
 
-    // the DLL is loaded (and locked) while MX Bikes runs, so it must be closed.
-    if (FindProcess("mxbikes.exe")) {
-        printf("[!] MX Bikes is running - close it, then run  frostmod.exe --update  again.\n");
-        return 1;
+    // The DLL is loaded (and locked) while the game runs, so it must be closed. Check
+    // every title we can attach to, not just MX Bikes — otherwise updating while GP Bikes
+    // is open fails on a locked file with no explanation.
+    for (const GameOffsets* g : ALL_GAMES) {
+        if (FindProcess(g->exe)) {
+            printf("[!] %s is running - close it, then run  frostmod.exe --update  again.\n",
+                   g->display);
+            return 1;
+        }
     }
 
     std::string exeUrl = FindAssetUrl(body, "frostmod.exe");
@@ -574,7 +580,10 @@ int main(int argc, char** argv) {
     SetConsoleTitleA("FrostMod");
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-    const char* processName = "mxbikes.exe";
+    // Which title to attach to. `--process` has always taken a raw image name; `--game`
+    // is the friendly form, since the two supported titles are a closed set (see
+    // GameOffsets in offsets.h). Defaults to MX Bikes.
+    const char* processName = GAME_MXB.exe;
     std::string dllPath;
     std::string modsPath;
     long warmupMs = 400;     // delay after seeing the process before injecting;
@@ -595,6 +604,18 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--process" && i + 1 < argc)    processName = argv[++i];
+        else if (a == "--game" && i + 1 < argc) {
+            std::string want = argv[++i];
+            const GameOffsets* picked = nullptr;
+            for (const GameOffsets* g : ALL_GAMES)
+                if (_stricmp(want.c_str(), g->id) == 0 || _stricmp(want.c_str(), g->exe) == 0)
+                    picked = g;
+            if (!picked) {
+                printf("[!] unknown --game '%s' (expected mxb or gpb).\n", want.c_str());
+                return 1;
+            }
+            processName = picked->exe;
+        }
         else if (a == "--install-plugin") {
             doInstallPlugin = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') gameDirArg = argv[++i];

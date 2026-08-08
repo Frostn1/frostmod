@@ -74,8 +74,12 @@ A standalone `frostserver.exe` serves the same API with no game attached, for
 testing (`frostserver.exe --track "Some Track Name"`). Full HTTP contract, config
 format, and setup are in [docs/FROSTSERVER.md](docs/FROSTSERVER.md).
 
-> The server side (this) ships now. The one-click **Download this map** button in
-> the client's server browser is the next step.
+**On the player's side** this is **F8 → `6` Server maps**: a list of the servers
+the game knows about, the map each one is running, and whether you already have
+it. Enter on a map you're missing downloads it through the
+[MXB App](https://github.com/Frostn1/mxb-app) and live-reloads it into the game —
+no restart, no hunting the track down. Servers without FrostServer simply show as
+such.
 
 
 ## Troubleshooting

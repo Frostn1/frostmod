@@ -72,10 +72,34 @@ F-key per feature.
 | `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
 | `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
 | `5` | Rider outlines — on-screen box around each rider |
+| `6` | Server maps — what map each server is running, and download the ones you're missing (see below) |
 
 Radar blips and outlines are colored by lap status: **white** = same lap as you,
 **red** = a rider lapping you (a lap ahead), **blue** = a rider you are lapping
 (backmarker). Both toggles and the range persist across restarts.
+
+### Server maps (menu `6`)
+
+Lists the servers the game knows about with the track each one is running, so you
+can grab a map you don't have without leaving the game:
+
+```
+  SERVER                     PLAYERS  MAP                    STATUS
+> Frosty's Practice Server   4/24     Red Bud 2024           GET IT
+  Some Other Server          0/32     Whiplash               have it
+  A Third Server             8/40                            no FrostServer
+```
+
+`Up`/`Down` move, `R` refreshes, `Esc` closes. **Enter** on a `GET IT` row hands the
+download to the [MXB App](https://github.com/Frostn1/mxb-app), which installs the
+track and live-reloads it — no restart. If the MXB App isn't installed, FrostMod
+opens the download page in your browser instead; install it by hand, then `F8` → `1`.
+
+The map and link come from **FrostServer**, the server-side companion, so only
+servers whose admin runs it can answer — the rest show `no FrostServer`. If the
+list is empty, open the in-game server browser once so the game fetches it. Status
+values: `GET IT` (missing, downloadable), `have it`, `no link` (admin configured
+none for that track), `idle` (no race running), `no FrostServer`.
 
 ### Bike model swap (menu `3`)
 

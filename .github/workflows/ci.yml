@@ -29,6 +29,11 @@ jobs:
       - name: Build (Release)
         run: cmake --build build --config Release
 
+      # The offsets table is the one thing here that can be checked without a game
+      # attached, and getting it wrong crashes the title it is wrong for.
+      - name: Test (offsets invariants)
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Verify outputs exist
         shell: pwsh
         run: |

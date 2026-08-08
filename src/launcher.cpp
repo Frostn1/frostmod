@@ -174,12 +174,15 @@ static std::string LogPath() {
     return dir + "frostmod.log";
 }
 
-static std::string DefaultModsPath() {
-    // MX Bikes (PiBoSo) keeps user content under Documents\PiBoSo\MX Bikes\mods.
+// PiBoSo titles keep user content under Documents\PiBoSo\<title>\mods. Which title is
+// whichever `--game` picked: hardcoding MX Bikes here meant a GP Bikes session wrote the
+// MX Bikes path into frostmod_mods.txt, so the track manager, the inactive store and the
+// model swap all operated on the wrong game's folders while GP Bikes was running.
+static std::string DefaultModsPath(const GameOffsets* game) {
     char docs[MAX_PATH];
     if (SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, docs) != S_OK)
         return "";
-    return std::string(docs) + "\\PiBoSo\\MX Bikes\\mods";
+    return std::string(docs) + "\\PiBoSo\\" + game->user_dir + "\\mods";
 }
 
 static void EnumPkz(const std::string& dir, std::set<std::string>& out) {
@@ -583,6 +586,7 @@ int main(int argc, char** argv) {
     // Which title to attach to. `--process` has always taken a raw image name; `--game`
     // is the friendly form, since the two supported titles are a closed set (see
     // GameOffsets in offsets.h). Defaults to MX Bikes.
+    const GameOffsets* game = &GAME_MXB;
     const char* processName = GAME_MXB.exe;
     std::string dllPath;
     std::string modsPath;
@@ -614,6 +618,7 @@ int main(int argc, char** argv) {
                 printf("[!] unknown --game '%s' (expected mxb or gpb).\n", want.c_str());
                 return 1;
             }
+            game = picked;
             processName = picked->exe;
         }
         else if (a == "--install-plugin") {
@@ -674,13 +679,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (modsPath.empty()) modsPath = DefaultModsPath();
+    // `--process <exe>` predates `--game` and is still the documented way to point at a
+    // different title, so honour it for the mods path too - otherwise `--process
+    // gpbikes.exe` would attach to GP Bikes while defaulting to MX Bikes' mods folder.
+    for (const GameOffsets* g : ALL_GAMES)
+        if (_stricmp(processName, g->exe) == 0) game = g;
+
+    if (modsPath.empty()) modsPath = DefaultModsPath(game);
     bool modsExist = !modsPath.empty() &&
                      GetFileAttributesA(modsPath.c_str()) != INVALID_FILE_ATTRIBUTES;
     const std::string logPath = LogPath();
 
     printf("============== FrostMod v" FROSTMOD_VERSION " ==============\n");
     printf("[*] build : " __DATE__ " " __TIME__ "  (this exe)\n");
+    printf("[*] game  : %s (%s)\n", game->display, processName);
     printf("[*] DLL   : %s\n", dllPath.c_str());
     printf("[*] mods  : %s%s\n", modsPath.empty() ? "<unknown>" : modsPath.c_str(),
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");

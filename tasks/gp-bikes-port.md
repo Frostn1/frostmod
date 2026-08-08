@@ -143,8 +143,23 @@ data only — no paint data — so don't plan on it for anything content-related
 Only tier 1 is needed to flip `caps.frostmod` on.
 
 **Tier 1 — live mod reload** (the feature the app actually gates on)
-- **DONE** — see "Tier-1 offsets" above. `RVA_CONTENT_INIT = 0xfb650`,
-  `RVA_SCAN_FOLDER = 0x18f150`. Confirm under x64dbg, then wire them in.
+- **DONE (v0.11.0)** — but note the trap this section originally walked into.
+  `RVA_CONTENT_INIT = 0xfb650` and `RVA_SCAN_FOLDER = 0x18f150` are *not* what the
+  reload runs. `content_init` is only a gate ("did offsets resolve"); the reload is
+  `kReloadSteps`, a transcription of the content-load section of boot init. v0.10.0
+  wired in the two constants above, declared tier 1 done, and left GP Bikes running
+  MX Bikes' step table — which crashed the game on the first reload.
+  GP's own table is now in `gpb::kReloadSteps`, transcribed from `0xfb95a`.
+- Deriving it is mechanical, and worth reusing for any future title: disassemble the
+  contiguous run of loader calls inside boot init, then identify each by the path
+  strings it and its callees reference (`%stracks`, `%styres`, `%srider`, `%sbikes`,
+  …). The same pass run against MX's `0xef68e` reproduces the shipped 21-step table
+  exactly, including the DIR steps' zeroed globals — that is how to check the method
+  before trusting it on a new binary. Note the zero-stores are `mov [rip+X], <reg>`
+  with a register xor'd to zero, not `mov [rip+X], 0`.
+- GP's shape differs from MX's: MX inlines the per-directory dance into boot init for
+  some categories (the DIR steps), GP wraps it inside each loader, so every GP step is
+  self-contained and needs no z-globals or operands.
 
 **Tier 2 — badge**: should come free via §2. Confirm, don't re-derive.
 

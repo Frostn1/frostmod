@@ -1323,27 +1323,10 @@ void SetStatus(const char* s, unsigned ms);   // in-game overlay status (defined
 // them ONE PER FRAME from the swap hook. Between steps every list is complete (old or
 // new), so the game stays consistent, and the overlay can draw an advancing progress
 // bar + spinner so you can see it's working.
-struct RLStep { uint8_t dir; uintptr_t z1, z2, z3, rva; };  // dir=0 -> SC(rva); dir=1 -> DIR(...)
-static const RLStep kReloadSteps[] = {
-    {0,0,0,0,0x2460}, {0,0,0,0,0x1CE00},                 // tracks
-    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790},
-    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x171D0}, // bikes
-    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320},
-    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950},
-    {0,0,0,0,0x17F80},
-    {1,0xF48620,0xF3DB64,0x109E090,0x18360},
-    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0},
-    {1,0xF4EE00,0x109DE90,0xF48610,0x19060},
-    {0,0,0,0,0x1BDD0},
-    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330},
-    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10},
-    {0,0,0,0,0x1B420}, {0,0,0,0,0x19DA0},
-    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110},
-    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770},
-    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140},
-    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450},
-};
-static const int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
+// The step table itself lives in offsets.h, per title, and is reached through
+// g_game->reload_steps. It has to be per-title: the RVAs address one specific binary,
+// so running MX's table inside GP Bikes calls arbitrary functions and zeroes arbitrary
+// globals. A title with no table derived yet gets the reload refused (see RequestReload).
 
 // progress state - touched on the render thread; the overlay reads the two atomics.
 std::atomic<bool> g_reloadActive{false};
@@ -1360,9 +1343,9 @@ static bool g_reloadPrimed = false;   // have we presented one frame before star
 
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
-    const void* S = (const void*)(b + 0x3333EB);   // "String" = "" (game dir = cwd)
-    const void* M = (const void*)(b + 0xE54B44);   // byte_140E54B44 = mods folder path
-    const RLStep& s = kReloadSteps[i];
+    const void* S = (const void*)(b + g_game->reload_str);   // "" (game dir = cwd)
+    const void* M = (const void*)(b + g_game->reload_mods);  // mods folder path global
+    const RLStep& s = g_game->reload_steps[i];
     if (!s.dir) RL_SC(b + s.rva);
     else { RL_Z32(b + s.z1); RL_Z32(b + s.z2); RL_Z64(b + s.z3); RL_Dir(b + s.rva, S, M); }
 }
@@ -1372,18 +1355,27 @@ static void RunReloadStep(int i) {
 void AdvanceReload() {
     if (!g_reloadActive.load()) return;
     if (!g_reloadPrimed) { g_reloadPrimed = true; return; }   // show the 0% frame first
-    if (g_reloadCur < kReloadStepCount) {
+    if (g_reloadCur < g_game->reload_count) {
         RunReloadStep(g_reloadCur);
         g_reloadDone.store(++g_reloadCur);
     } else {
         g_reloadActive.store(false);
-        Log("[reload] done - all %d content lists rebuilt from disk.", kReloadStepCount);
+        Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
         SetStatus("reloaded - new mods listed", 4000);
     }
 }
 
 void RequestReload() {
     Log("[ui] reload requested");
+    // No table for this title => refuse. The alternative is replaying another game's RVAs,
+    // which calls arbitrary code and zeroes arbitrary memory in this process: FrostMod
+    // v0.10.0 did exactly that on GP Bikes and took the game down on the first reload.
+    if (!g_game->reload_steps || g_game->reload_count <= 0) {
+        Log("[reload] ABORT: no content-load offsets derived for %s - reload is not "
+            "supported on this title yet.", g_game->display);
+        SetStatus("reload not supported on this game yet", 5000);
+        return;
+    }
     if (!g_contentInit) {   // g_contentInit resolved <=> offsets match this build
         Log("[reload] ABORT: offsets didn't match this build (see the [sig] lines).");
         SetStatus("reload unavailable (offsets mismatch)", 5000);
@@ -1394,7 +1386,7 @@ void RequestReload() {
     frostmod::serverfilter::Reload();
     g_reloadCur = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
-    Log("[reload] surgical content reload (stepped over %d frames)...", kReloadStepCount);
+    Log("[reload] surgical content reload (stepped over %d frames)...", g_game->reload_count);
     SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
     // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
     g_drawDiagUntil.store(GetTickCount64() + 20000);
@@ -2046,7 +2038,7 @@ void DrawOverlay(HDC hdc) {
     const bool sw        = g_swOpen.load()  && !reloading;
     const bool dc        = g_dcOpen.load()  && !reloading;
     const bool ms        = g_msOpen.load()  && !reloading;
-    const int  done = g_reloadDone.load(), total = kReloadStepCount;
+    const int  done = g_reloadDone.load(), total = g_game->reload_count;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
     char line[128];
@@ -2250,7 +2242,7 @@ static void BuildOverlayDrawLists() {
     const bool sw   = g_swOpen.load()   && !reloading;
     const bool dc   = g_dcOpen.load()   && !reloading;
     const bool ms   = g_msOpen.load()   && !reloading;
-    const int  done = g_reloadDone.load(), total = kReloadStepCount;
+    const int  done = g_reloadDone.load(), total = g_game->reload_count;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
     const float MX = 0.010f, MY = 0.014f;   // top-left anchor
@@ -3270,12 +3262,22 @@ DWORD WINAPI Init(LPVOID) {
         // The registry-reset function has no signature in offsets.h, so we can't
         // verify it independently - we apply the same delta the scanner moved by
         // (correct if the update shifted .text uniformly; best-effort otherwise).
-        uintptr_t resetAddr = g_base + mxb::RVA_REGISTRY_RESET + delta;
-        if (delta)
-            Log("[sig] NOTE: applying scanner delta %+lld to registryReset @ RVA 0x%zx "
-                "(unverified - it has no signature).",
-                (long long)delta, (size_t)(resetAddr - g_base));
-        InstallHook((void*)resetAddr, &hkReset, (void**)&g_origReset, "registryReset");
+        //
+        // MX Bikes only: RVA_REGISTRY_RESET has no twin derived for other titles, and it
+        // is a capture-only diagnostic. Splicing a detour at that address in another
+        // binary writes a jmp into whatever happens to live there, so it stays off until
+        // the address is derived for that title.
+        if (g_game->offsets_complete) {
+            uintptr_t resetAddr = g_base + mxb::RVA_REGISTRY_RESET + delta;
+            if (delta)
+                Log("[sig] NOTE: applying scanner delta %+lld to registryReset @ RVA 0x%zx "
+                    "(unverified - it has no signature).",
+                    (long long)delta, (size_t)(resetAddr - g_base));
+            InstallHook((void*)resetAddr, &hkReset, (void**)&g_origReset, "registryReset");
+        } else {
+            Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
+                "no twin here.", g_game->display);
+        }
 
         // OPT-IN PROBE: if frostmod.exe --probe-mount left the flag next to us, hook
         // the real .pkz-mount function (0x15a9e0, apply the same delta) to log how it's
@@ -3338,7 +3340,16 @@ DWORD WINAPI Init(LPVOID) {
             strcpy_s(flag, g_logPath);
             if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_dumplist.flag"); }
         }
-        if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+        bool armed = flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+        // MX Bikes only. The handler itself is signature-validated, but the blob it dumps
+        // (RVA_MP_LIST_BLOB) and the state counters beside it are fixed MX RVAs, so on
+        // another title this would report whatever memory happens to sit there.
+        if (armed && !g_game->offsets_complete) {
+            Log("[srvlist] flag present but ignored: the master-protocol offsets are "
+                "MX Bikes' and have not been derived for %s.", g_game->display);
+            armed = false;
+        }
+        if (armed) {
             uint8_t *b3, *e3;
             bool ok = GetExecRange(g_base, &b3, &e3);
             uint8_t* mp = (uint8_t*)(g_base + mxb::RVA_MP_MSG_HANDLER);
@@ -3428,6 +3439,14 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(flag, '\\')) { *(s + 1) = 0; strcat_s(flag, "frostmod_bikecap.flag"); }
         }
         bool armed = flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+        // MX Bikes only: RVA_BIKE_APPLY and the bike array (RVA_BIKE_LIST / RVA_BIKE_COUNT
+        // that LogBikeArray reads) are MX's, so arming this elsewhere would splice a detour
+        // at a wild address and dump whatever memory happens to sit at those RVAs.
+        if (armed && !g_game->offsets_complete) {
+            Log("[bikecap] flag present but ignored: the bike-apply and bike-array offsets "
+                "are MX Bikes' and have not been derived for %s.", g_game->display);
+            armed = false;
+        }
         if (armed) {
             uintptr_t applyAddr = g_base + mxb::RVA_BIKE_APPLY + g_sigDelta;
             InstallHook((void*)applyAddr, &hkBikeApply, (void**)&g_origBikeApply,

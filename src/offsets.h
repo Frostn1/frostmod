@@ -9,6 +9,19 @@
 #pragma once
 #include <cstdint>
 
+/// One step of the surgical content reload: replay of a single content-list rebuild
+/// lifted out of the game's boot init. Two shapes, mirroring what the game itself does:
+///
+///   dir=0  SC  self-contained. The loader clears its own list globals and scans both
+///              the game dir and the mods dir. Called as `fn(0, 0)` — it ignores args.
+///   dir=1  DIR the *caller* zeroes three list globals inline, then calls the loader
+///              once per directory: `fn(&"")` for the game dir, then `fn(&mods)`.
+///
+/// Which shape a given loader uses is a property of the build, not of the category —
+/// MX Bikes inlines the per-dir dance into boot init for some categories, GP Bikes wraps
+/// it inside the loader for all of them (so GP's table is entirely SC).
+struct RLStep { uint8_t dir; uintptr_t z1, z2, z3, rva; };
+
 namespace mxb {
 
 // ---- content loading (RE'd from IDA - see CHANGELOG 2026-07-05) ---------------
@@ -240,6 +253,42 @@ constexpr char SIG_MP_MSG_HANDLER[] =
     "\x40\x53\x56\x57\x48\x81\xEC\x20\x07\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x84\x24\x10\x07\x00";
 constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 
+// ---- surgical reload: the content-load section of fcn.1400ef210 ---------------
+// Transcribed verbatim from boot init, RVA 0xef68e..0xef8xx. Every content list is
+// cleared and rescanned from disk (tracks, bikes, tyres, helmets, boots, riders, ...),
+// but the input/sound/Steam re-init and the UI transition that follow it are skipped —
+// so new mods of any type appear with no loading screen and no bounce to the menu.
+//
+// Boot init also carries `cmp/jge` bail-outs between some loaders (e.g. "no bikes found
+// -> abort startup"). Those are deliberately NOT transcribed: they jump out of the
+// routine, which is meaningless when replaying just this section.
+constexpr RLStep kReloadSteps[] = {
+    {0,0,0,0,0x2460}, {0,0,0,0,0x1CE00},                 // tracks
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790},
+    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x171D0}, // bikes
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950},
+    {0,0,0,0,0x17F80},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18360},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x19060},
+    {0,0,0,0,0x1BDD0},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10},
+    {0,0,0,0,0x1B420}, {0,0,0,0,0x19DA0},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450},
+};
+constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
+
+// The two operands the DIR steps pass. `RELOAD_STR` is the empty string the game hands
+// its loaders for "the game dir" (cwd); `RELOAD_MODS` is the mods-folder path global,
+// scanned only when non-empty — exactly the `cmp byte ptr [mods], 0 / je` the game does.
+constexpr uintptr_t RVA_RELOAD_STR  = 0x3333EB;
+constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
+
 } // namespace mxb
 
 // ============ GP Bikes ========================================================
@@ -247,12 +296,14 @@ constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 // RVA differs. Recovered statically from an unpacked `gpbikes.exe` (SteamStub removed with
 // Steamless; ImageBase 0x140000000, `.text` entropy 6.035).
 //
-// Only the two constants live mod reload needs are here. The server browser / master
-// protocol group is NOT ported — see `offsets_complete` on GameOffsets below, which keeps
-// those features off rather than letting them fire at MX Bikes addresses.
+// Only what live mod reload needs is here. The server browser / master protocol group and
+// the in-game bike array are NOT ported — see `offsets_complete` on GameOffsets below,
+// which keeps those features off rather than letting them fire at MX Bikes addresses.
 //
-// UNVERIFIED AT RUNTIME: both were derived by static analysis and have not been confirmed
-// under a debugger. See tasks/gp-bikes-port.md for the full derivation.
+// UNVERIFIED AT RUNTIME: every constant below was derived by static analysis and has not
+// been confirmed under a debugger. See tasks/gp-bikes-port.md for the full derivation.
+// If the reload table proves wrong, set `reload_steps` to null in GAME_GPB: that degrades
+// GP Bikes to an honest "reload not supported" instead of a crash.
 namespace gpb {
 
 // Boot content-load + app-init; GP twin of mxb::RVA_CONTENT_INIT.
@@ -275,6 +326,43 @@ constexpr uintptr_t RVA_CONTENT_INIT = 0xfb650;
 // It also has 3 call sites (0x16020b, 0x237421, 0x2bee1d), matching MX's 3.
 constexpr uintptr_t RVA_SCAN_FOLDER = 0x18f150;
 
+// ---- surgical reload: the content-load section of GP's boot init --------------
+// The contiguous run of loader calls at 0xfb95a..0xfb9b3 inside RVA_CONTENT_INIT.
+//
+// GP differs from MX in shape, not in substance: where MX inlines the per-directory
+// dance into boot init for some categories (the DIR steps), GP wraps it inside each
+// loader — every one zeroes its own list globals and scans both the game dir and the
+// mods dir itself. So every GP step is SC and the table needs no z-globals, no
+// RELOAD_STR and no RELOAD_MODS.
+//
+// How each was identified: by the path-format strings it and its callees reference,
+// the same signal that names MX's (0x2460 -> "%stracks", 0x1ce00 -> "%styres", ...).
+// Corroborated against a reporter's crash log, whose stack traces for the boot track
+// scan carry frames 0x13a18 and 0x13a36 — two call sites inside 0x139a0, one per
+// directory — with return address 0xfb95f, i.e. the `call 0x139a0` at 0xfb95a.
+//
+// Boot init's `cmp/jge` bail-out after the bikes loader is not transcribed, matching
+// how MX's table treats the same construct.
+//
+// Deliberately stops before 0x315f0 ("music"/"ogg"): MX's table draws the line at
+// content too, and restarting the music is not what a mods reload is for.
+constexpr RLStep kReloadSteps[] = {
+    {0,0,0,0,0x139A0},   // tracks
+    {0,0,0,0,0x34AE0},   // tyres
+    {0,0,0,0,0x34080},   // rider
+    {0,0,0,0,0x14D90},   // bikes
+    {0,0,0,0,0x31880},   // paints\data.ini
+    {0,0,0,0,0x32090},   // bike paints
+    {0,0,0,0,0x32490},   // rider\helmets
+    {0,0,0,0,0x32F30},   // helmet paints
+    {0,0,0,0,0x344C0},   // rider\riders
+    {0,0,0,0,0x336A0},   // rider paints
+    {0,0,0,0,0x33A90},   // rider\animations
+    {0,0,0,0,0x34FD0},   // misc\stands
+    {0,0,0,0,0x25C50},   // misc\dashes
+};
+constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
+
 } // namespace gpb
 
 // ============ which title we're attached to ===================================
@@ -289,21 +377,42 @@ struct GameOffsets {
     const char* exe;
     /// Product name for logs. Never translated.
     const char* display;
+    /// Folder under `Documents\PiBoSo` this title keeps its user content in. Matches the
+    /// `user_dir` MXB App uses in `src-tauri/src/game.rs`, so both agree where mods live.
+    const char* user_dir;
     uintptr_t content_init;
     uintptr_t scan_folder;
+    /// The surgical reload's step table for this title, or null when it has not been
+    /// derived. Null means reload is REFUSED, not attempted with another title's
+    /// addresses — see RequestReload. Never fall back to `mxb::kReloadSteps` here: those
+    /// RVAs address a different binary, so replaying them calls arbitrary code and zeroes
+    /// arbitrary memory in this one.
+    const RLStep* reload_steps;
+    int reload_count;
+    /// Operands for the DIR steps. Both unused (0) for a table that is entirely SC.
+    uintptr_t reload_str;
+    uintptr_t reload_mods;
     /// Whether every offset in this file has been derived for this title. False means the
     /// features that need the un-ported groups (server browser filter, master protocol,
-    /// direct connect) must stay OFF — their MX addresses are meaningless here, and
-    /// hooking them would splice code at a wild location.
+    /// direct connect, the in-game bike array) must stay OFF — their MX addresses are
+    /// meaningless here, and hooking or reading them would land at a wild location.
     bool offsets_complete;
 };
 
 inline constexpr GameOffsets GAME_MXB = {
-    "mxb", "mxbikes.exe", "MX Bikes", mxb::RVA_CONTENT_INIT, mxb::RVA_SCAN_FOLDER, true,
+    "mxb", "mxbikes.exe", "MX Bikes", "MX Bikes",
+    mxb::RVA_CONTENT_INIT, mxb::RVA_SCAN_FOLDER,
+    mxb::kReloadSteps, mxb::kReloadStepCount,
+    mxb::RVA_RELOAD_STR, mxb::RVA_RELOAD_MODS,
+    true,
 };
 
 inline constexpr GameOffsets GAME_GPB = {
-    "gpb", "gpbikes.exe", "GP Bikes", gpb::RVA_CONTENT_INIT, gpb::RVA_SCAN_FOLDER, false,
+    "gpb", "gpbikes.exe", "GP Bikes", "GP Bikes",
+    gpb::RVA_CONTENT_INIT, gpb::RVA_SCAN_FOLDER,
+    // Entirely SC, so no DIR operands: see gpb::kReloadSteps.
+    gpb::kReloadSteps, gpb::kReloadStepCount, 0, 0,
+    false,
 };
 
 inline constexpr const GameOffsets* ALL_GAMES[] = { &GAME_MXB, &GAME_GPB };

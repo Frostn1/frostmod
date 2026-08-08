@@ -95,13 +95,16 @@ jobs:
           $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
                  else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
           $readme = @(
-            "FrostMod $tag - in-game overlay / mod loader for MX Bikes"
+            "FrostMod $tag - live mod loader for MX Bikes"
             "https://github.com/Frostn1/frostmod"
             ""
             "QUICK START"
             "  1. Keep frostmod.exe and frostmod.dll together in this folder."
-            "  2. Run frostmod.exe. It waits for MX Bikes and loads the overlay;"
-            "     press F8 in-game to open the FrostMod menu."
+            "  2. Run frostmod.exe. It waits for MX Bikes and attaches. In game you"
+            "     get one small badge, top-left, showing FrostMod is loaded - there"
+            "     is no menu and no key binding, so it cannot affect your controls."
+            "  3. Drop a .pkz into your mods folder, then press R in this console to"
+            "     load it live. No restart, no loading screen."
             ""
             "PLUGIN MODE (no injection)"
             "  frostmod.exe --install-plugin"

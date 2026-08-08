@@ -133,6 +133,26 @@ void DrainGameThreadTasks() {
 // resolved game addresses + captured call arguments
 // ---------------------------------------------------------------------------
 uintptr_t g_base = 0;
+
+// Which PiBoSo title this DLL is living inside.
+//
+// The same binary serves both games — the engine is identical and its scanner prologue is
+// byte-for-byte the same, so only a couple of RVAs differ (see offsets.h). Detected from
+// the host process's image name rather than passed in, because the DLL is injected and has
+// no argv of its own. Defaults to MX Bikes, which is what every existing install is.
+const GameOffsets* g_game = &GAME_MXB;
+
+// Pick `g_game` from the process we were loaded into.
+static void DetectGame() {
+    char path[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(nullptr, path, sizeof(path))) return;
+    const char* exe = strrchr(path, '\\');
+    exe = exe ? exe + 1 : path;
+    for (const GameOffsets* g : ALL_GAMES) {
+        if (_stricmp(exe, g->exe) == 0) { g_game = g; return; }
+    }
+    Log("[init] unrecognised host process '%s' - assuming %s offsets.", exe, g_game->display);
+}
 // Build drift: (address where the scanner signature was actually found) minus its
 // expected RVA. 0 when offsets.h matches this build exactly; nonzero when the game
 // binary shifted (a game update, or SteamStub unpacking to a different layout).
@@ -2889,7 +2909,7 @@ uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* 
 // sets *outDelta to how far it moved from the offsets.h RVA (0 == offsets fit).
 uintptr_t ResolveScanner(intptr_t* outDelta) {
     *outDelta = 0;
-    uint8_t* expected = (uint8_t*)(g_base + mxb::RVA_SCAN_FOLDER);
+    uint8_t* expected = (uint8_t*)(g_base + g_game->scan_folder);
     size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
 
     uint8_t *b, *e;
@@ -2899,24 +2919,24 @@ uintptr_t ResolveScanner(intptr_t* outDelta) {
     bool rvaInRange = haveRange && expected >= b && expected + sigLen <= e;
     if (rvaInRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
         Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
-            (size_t)mxb::RVA_SCAN_FOLDER);
+            (size_t)g_game->scan_folder);
         return (uintptr_t)expected;
     }
     if (!haveRange) {
         Log("[sig] WARNING: can't read module sections to validate; using the raw RVA "
-            "0x%zx anyway (may be wrong).", (size_t)mxb::RVA_SCAN_FOLDER);
+            "0x%zx anyway (may be wrong).", (size_t)g_game->scan_folder);
         return (uintptr_t)expected;
     }
     Log("[sig] WARNING: bytes at scanner RVA 0x%zx do NOT match the signature - "
         "offsets.h looks stale for this mxbikes build. Scanning .text...",
-        (size_t)mxb::RVA_SCAN_FOLDER);
+        (size_t)g_game->scan_folder);
     uint8_t* found = PatternScan(b, e, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK);
     if (!found) {
         Log("[sig] ERROR: scanner signature not found in .text. The reload can't work on "
             "this build until offsets.h/SIG_SCAN_FOLDER are updated. Skipping content hooks.");
         return 0;
     }
-    *outDelta = (intptr_t)((uintptr_t)found - (g_base + mxb::RVA_SCAN_FOLDER));
+    *outDelta = (intptr_t)((uintptr_t)found - (g_base + g_game->scan_folder));
     Log("[sig] scanner RELOCATED: found at RVA 0x%zx (delta %+lld from offsets.h).",
         (size_t)((uintptr_t)found - g_base), (long long)*outDelta);
     return (uintptr_t)found;
@@ -2929,7 +2949,7 @@ uintptr_t ResolveScanner(intptr_t* outDelta) {
 // after unpack but (hopefully) before the game itself calls the scanner.
 uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
     *outDelta = 0;
-    uint8_t* expected = (uint8_t*)(g_base + mxb::RVA_SCAN_FOLDER);
+    uint8_t* expected = (uint8_t*)(g_base + g_game->scan_folder);
     size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
     DWORD    start    = GetTickCount();
     bool     announced = false;
@@ -2944,7 +2964,7 @@ uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
                     (unsigned long)(GetTickCount() - start));
             else
                 Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
-                    (size_t)mxb::RVA_SCAN_FOLDER);
+                    (size_t)g_game->scan_folder);
             return (uintptr_t)expected;
         }
         if (GetTickCount() - start > timeoutMs) break;
@@ -3199,8 +3219,13 @@ DWORD WINAPI Init(LPVOID) {
     // usually because the game had it locked). Close the game before rebuilding.
     Log("=============== FrostMod v" FROSTMOD_VERSION " loading (dll built " __DATE__ " " __TIME__ ") ===============");
 
-    g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // mxbikes.exe
-    Log("[init] module base = %p", (void*)g_base);
+    DetectGame();
+    g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // the game exe
+    Log("[init] %s - module base = %p", g_game->display, (void*)g_base);
+    if (!g_game->offsets_complete)
+        Log("[init] NOTE: only the content-load offsets are ported for %s. The server "
+            "browser filter and anything else needing the un-ported groups stays off.",
+            g_game->display);
 
     if (MH_Initialize() != MH_OK) { Log("[init] MinHook init failed"); return 1; }
 
@@ -3230,7 +3255,7 @@ DWORD WINAPI Init(LPVOID) {
         // no signature, so apply the same delta the scanner moved by (best-effort) and
         // only accept it if it lands inside .text.
         {
-            uintptr_t ci = g_base + mxb::RVA_CONTENT_INIT + delta;
+            uintptr_t ci = g_base + g_game->content_init + delta;
             uint8_t *cb, *ce;
             if (GetExecRange(g_base, &cb, &ce) && (uint8_t*)ci >= cb && (uint8_t*)ci < ce) {
                 g_contentInit = (ContentInit_t)ci;
@@ -3238,7 +3263,7 @@ DWORD WINAPI Init(LPVOID) {
                     (size_t)(ci - g_base));
             } else {
                 Log("[init] WARNING: content-load RVA 0x%zx outside .text; reload disabled.",
-                    (size_t)mxb::RVA_CONTENT_INIT);
+                    (size_t)g_game->content_init);
             }
         }
 
@@ -3465,7 +3490,12 @@ DWORD WINAPI Init(LPVOID) {
             strcpy_s(fflag, g_logPath);
             if (char* s = strrchr(fflag, '\\')) { *(s + 1) = 0; strcat_s(fflag, "frostmod_filter.flag"); }
         }
-        if (fflag[0] && GetFileAttributesA(fflag) != INVALID_FILE_ATTRIBUTES)
+        if (!g_game->offsets_complete)
+            // Every RVA_SB_*/RVA_MP_* constant is MX Bikes'; on another title they point
+            // at unrelated code, and the hook writes a jump at one of them.
+            Log("[filter] not available on %s - the server browser offsets are MX Bikes' "
+                "and have not been ported.", g_game->display);
+        else if (fflag[0] && GetFileAttributesA(fflag) != INVALID_FILE_ATTRIBUTES)
             InstallServerFilterHook();
         else
             Log("[filter] rules loaded (inert). Run frostmod.exe --filter-servers to "

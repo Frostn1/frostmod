@@ -23,9 +23,9 @@
   channel (`Local\FrostModCommand` → `refresh_bike_model`) is unaffected.
 
 ### Docs
-- `README.md`, `docs/USAGE.md`, `docs/PLUGIN.md`, `docs/FROSTSERVER.md` and the
-  `frostmod.exe` console text no longer advertise F8; each notes which behaviour needs
-  a `FROSTMOD_UI 1` build.
+- `README.md`, `docs/USAGE.md`, `docs/PLUGIN.md`, `docs/FROSTSERVER.md`, the
+  `frostmod.exe` console text and the `README.txt` bundled into `Release.zip` no longer
+  advertise F8; each notes which behaviour needs a `FROSTMOD_UI 1` build.
 
 ## 2026-08-07
 

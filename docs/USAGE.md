@@ -13,9 +13,9 @@ That's the whole thing — **no flags needed**. With no arguments it:
 
 - waits for `mxbikes.exe`, then injects `frostmod.dll` (and re-injects on every
   relaunch, so a rebuilt DLL always takes effect),
-- enables **live mod reload** (press **`R`** / **`F8`** after dropping in a `.pkz`),
+- enables **live mod reload** (press **`R`** after dropping in a `.pkz`),
 - enables the **server-browser spam filter** (hides cheat/ad "ghost" servers), and
-- shows the **in-game overlay**.
+- shows the **in-game version pill**.
 
 Run it as the **same user** as the game, and **elevated** if the game runs
 elevated (otherwise injection fails with an access error).
@@ -62,40 +62,34 @@ treated as an explicit path to the DLL.
 
 ### In-game (works in fullscreen)
 
-Press **`F8`** to open the FrostMod **menu** (top-left). While it's open, press an
-item's number; `Esc` or `F8` closes it. Everything lives here instead of a separate
-F-key per feature.
+FrostMod draws **one thing**: a small pill in the top-left corner.
 
-| In the menu | Action |
-|-------------|--------|
-| `1` | Reload mods (rescans content from disk, with a progress bar) |
-| `2` | Toggle the corner hint overlay |
-| `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
-| `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
-| `5` | Rider outlines — on-screen box around each rider |
+| The pill shows | When |
+|----------------|------|
+| `FrostMod vX.Y.Z - attached` | idle — the DLL is loaded and the render hook is firing |
+| `/ Reloading mods... 60%` + a progress bar | while a reload runs |
+| a status line | briefly, after something worth reporting (e.g. the MXB App asking you to re-select a bike) |
 
-Radar blips and outlines are colored by lap status: **white** = same lap as you,
-**red** = a rider lapping you (a lap ahead), **blue** = a rider you are lapping
-(backmarker). Both toggles and the range persist across restarts.
+| Key | Action |
+|-----|--------|
+| `F8` | Hide / show the pill |
 
-### Bike model swap (menu `3`)
+`F8` is the **only** key FrostMod reads — no menu, no digits, no arrows — so it can't
+shadow a game binding or fight another HUD plugin for a keystroke. Hidden means hidden:
+a reload in progress won't force the pill back. Press `F8` again to bring it back.
 
-In MX Bikes a bike lives at `mods\bikes\<Bike>\` as loose files. A "model" is the whole
-top-level file set — `model.edf` (the mesh) **and** its `.hrc`/`.cfg` lineup/alignment files,
-which are tuned to that mesh and swap together. Only `paints\` (universal liveries) stays put.
+There is no in-game menu. Model swaps, the track manager, the track switcher, direct
+connect, the radar and the rider outlines are all still **compiled in** but no longer
+reachable from the game — they need a `FROSTMOD_UI 1` build (the switch is at the top of
+`src/frostmod.cpp`). Bike model swaps are the MXB App's job now.
 
-1. Add each alternative model as a **folder** in the bike's library:
-   `mods\bikes\<Bike>\FrostMod Models\<Name>\`, containing that model's full file set
-   (`model.edf` + its `.hrc`/`.cfg`). Create the `FrostMod Models` folder if it isn't there.
-2. F8 → `3`, pick the **bike**, then pick a **variant**. Enter swaps its files in and reloads
-   — the new model appears without a restart.
-3. The model you were using is auto-saved back into the library (as `Original` on the first
-   swap), so you can always pick it again to revert. `paints\` is never touched.
+The model-swap library layout is unchanged, since the engine behind it still ships: a
+bike's alternative models live as folders under `mods\bikes\<Bike>\FrostMod Models\<Name>\`,
+each holding a full file set (`model.edf` plus its `.hrc`/`.cfg` lineup/alignment files,
+which are tuned to that mesh and swap together). `paints\` is never touched, and the model
+you were using is auto-saved back into the library as `Original` on the first swap.
 
-If the model files are locked (you're currently riding that bike), the swap rolls back with
-the bike left intact and asks you to exit the bike first.
-
-Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
+Reloading (`R` in the console, or the MXB App) makes new tracks, bikes, and skins appear
 immediately — no restart, no loading screen.
 
 ## Files
@@ -136,8 +130,8 @@ defaults change it's rewritten and your old copy is kept as `.bak`.
 ## Run as a plugin instead
 
 Drop `frostmod.dll` into MX Bikes' `plugins` folder and the game loads it at
-startup — no launcher needed. You lose the console (mods list / log stream / `R`),
-but reload (`F8`), the overlay, and the filter all still work. Details:
+startup — no launcher needed. You lose the console (mods list / log stream / `R`), so
+reload comes from the MXB App, but the pill and the filter still work. Details:
 [PLUGIN.md](PLUGIN.md).
 
 ## Notes

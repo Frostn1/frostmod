@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-08-09
+
+### Changed
+- **The in-game overlay is now just a version pill.** FrostMod draws one thing: a small
+  top-left pill reading `FrostMod vX.Y.Z - attached`, which becomes the spinner + percent
+  + progress bar while a reload runs, and shows a status line when something sets one.
+- **`F8` hides and shows that pill**, and is the *only* key FrostMod reads anywhere. No
+  digits, arrows, `Enter`/`Esc` or `PageUp`/`PageDown` are polled, so FrostMod can no
+  longer shadow a game binding or race another HUD plugin for a keystroke. Hidden means
+  hidden — a reload in progress does not force the pill back on screen.
+
+### Removed
+- Gone from the screen: the **F8 action menu**, and the **bike model swap**, **track
+  manager**, **track switcher** and **direct connect** panels, plus the **radar disc** and
+  **rider outlines**. Bike model swaps are the MXB App's job; the in-game panel was a
+  second way to do the same thing.
+
+### Added
+- A single compile-time switch, `FROSTMOD_UI` (`0` = the shipped pill-only build, `1` =
+  the full UI), at the top of `src/frostmod.cpp`. Every menu, panel, HUD renderer and
+  keyboard block sits behind it — both render paths (the GL `wglSwapBuffers` fallback and
+  the sanctioned PiBoSo `Draw()` callback) are gated together, so they cannot disagree
+  about what is on screen. Flipping it to `1` restores the previous build verbatim.
+
+### Notes
+- **The features behind those panels are untouched and still compiled in.** Reload still
+  runs from `R` in `frostmod.exe` and from `Local\FrostModReload` (the MXB App's path);
+  the `Local\FrostModCommand` channel (`refresh_bike_model`) is unaffected, so the app's
+  instant model refresh still works; the model-swap engine and its `FrostMod Models`
+  library layout are unchanged; and the plugin data callbacks keep feeding the radar
+  snapshot.
+- Stale `F8` advice scrubbed from the launcher console, the `[init]` / `[trklib]` log
+  lines, `README.md`, `docs/USAGE.md` and `docs/PLUGIN.md`; each now notes which behaviour
+  needs a `FROSTMOD_UI 1` build.
+
+No DB/schema surface in this repo.
+
 ## 2026-08-08 — v0.11.0
 
 ### Fixed

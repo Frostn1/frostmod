@@ -14,8 +14,10 @@ FrostMod is a client-side toolkit for MX Bikes.
   instantly without restarting the game.
 - **Server-browser spam filter** - hide ad / cheat-shop / "ghost" servers from
   your list. Purely client-side, nobody else is affected.
-- **In-game overlay** - a small status hint that shows FrostMod is live and
-  reports each reload.
+- **In-game overlay** - one small pill in the top-left corner naming the FrostMod
+  version, so you can see it is attached. It shows reload progress while a reload
+  runs, and **`F8`** hides or shows it. That is the whole in-game UI, and `F8` is
+  the only key FrostMod reads.
 - **FrostServer (dedicated servers)** - a server-side companion plugin that
   publishes the track a server is running plus its mxb-mods.com download link, so
   a client can fetch and install that track without leaving the game. The server
@@ -43,7 +45,8 @@ Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`, and
 stays open as a console - listing the mods it finds and streaming its log.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
-  console, or **`F8`** in-game to open the FrostMod menu and pick **Reload**.
+  console. The MXB App triggers the same reload without the console.
+- **Hide the overlay** - **`F8`** in-game toggles the version pill.
 - **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.
@@ -134,6 +137,7 @@ entirely with **plugin mode** (above).
   folder is read-only) — it records what the DLL is doing.
 - The overlay only shows once the game starts calling its present/draw hook; give
   it until you reach a menu or the track.
+- The pill can simply be hidden — press **`F8`** to bring it back.
 - Make sure the folder holding the binaries is **writable** — the DLL writes its log
   and flag files there.
 

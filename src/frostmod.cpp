@@ -280,9 +280,11 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
                 isNew = true; count = g_scans.size();
             }
         }
+        // tid: the boot scans run on the thread that owns the content lists, so this is
+        // the value the [reload] line's tid has to match for a replay to be safe.
         if (isNew && count <= 5)
-            Log("[capture] scan dir='%s' ext='%s' (rcx=%p rdx=%p r8=%p r9=%p)",
-                dir.c_str(), ext.c_str(), a0, a1, a2, a3);
+            Log("[capture] scan dir='%s' ext='%s' tid=%lu (rcx=%p rdx=%p r8=%p r9=%p)",
+                dir.c_str(), ext.c_str(), GetCurrentThreadId(), a0, a1, a2, a3);
         else if (isNew && count == 6)
             Log("[capture] ...(further startup scans still recorded, logging suppressed)");
 
@@ -1340,12 +1342,24 @@ std::atomic<int>  g_reloadDone{0};    // steps completed (drives the progress ba
 std::atomic<uint64_t> g_drawDiagUntil{0};
 static int  g_reloadCur = 0;          // next step to run
 static bool g_reloadPrimed = false;   // have we presented one frame before starting work?
+// Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
+// table this title has not confirmed. Only the person collecting a diagnostic log should
+// ever turn it on - see the refusal in RequestReload.
+static bool g_unsafeReload = false;
 
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
     const void* S = (const void*)(b + g_game->reload_str);   // "" (game dir = cwd)
     const void* M = (const void*)(b + g_game->reload_mods);  // mods folder path global
     const RLStep& s = g_game->reload_steps[i];
+    // BEFORE the call, not after: every helper below is SEH-guarded, so the faults that
+    // survive to kill the process (heap corruption fail-fast, a fault raised on another
+    // thread by what we just rebuilt) never come back here to be logged. Log() writes
+    // through to disk per line, so whichever step is last in the log IS the one that did
+    // it. This is what a crash report has to carry to be actionable - GP Bikes' reload
+    // has taken the game down twice with nothing between "reload" and the next process.
+    Log("[reload] step %d/%d rva=0x%zx%s%s", i + 1, g_game->reload_count, (size_t)s.rva,
+        s.what ? " - " : "", s.what ? s.what : "");
     if (!s.dir) RL_SC(b + s.rva);
     else { RL_Z32(b + s.z1); RL_Z32(b + s.z2); RL_Z64(b + s.z3); RL_Dir(b + s.rva, S, M); }
 }
@@ -1376,6 +1390,20 @@ void RequestReload() {
         SetStatus("reload not supported on this game yet", 5000);
         return;
     }
+    // A table that exists but has never been proven on the title is the more dangerous
+    // case, not the safer one: it looks like a working feature right up to the moment it
+    // takes the game down, and it does so with no fault we can catch (see RunReloadStep).
+    // GP Bikes' table did exactly that in a v0.11.0 reporter log - one session died on
+    // its first reload, another on its fourth. Refuse by default; --unsafe-reload arms it
+    // for whoever is collecting the step-level log that will pin the offending loader.
+    if (!g_game->reload_verified && !g_unsafeReload) {
+        Log("[reload] ABORT: %s's content-load offsets are derived but NOT confirmed on "
+            "the title - and they crashed it in a reporter's log. Refusing rather than "
+            "risking the session. Arm with `frostmod.exe --unsafe-reload` to help pin the "
+            "step that faults (the [reload] step lines name it).", g_game->display);
+        SetStatus("reload not supported on this game yet", 5000);
+        return;
+    }
     if (!g_contentInit) {   // g_contentInit resolved <=> offsets match this build
         Log("[reload] ABORT: offsets didn't match this build (see the [sig] lines).");
         SetStatus("reload unavailable (offsets mismatch)", 5000);
@@ -1386,7 +1414,14 @@ void RequestReload() {
     frostmod::serverfilter::Reload();
     g_reloadCur = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
-    Log("[reload] surgical content reload (stepped over %d frames)...", g_game->reload_count);
+    // The thread id is here to be compared with the one on the boot [capture] scan lines.
+    // Those run on the thread that called WinMain, i.e. the thread that owns the content
+    // lists; we replay the same loaders from whichever thread presents frames. If the two
+    // ids differ, this reload races the game's own use of the lists - which is the leading
+    // explanation for GP Bikes dying on some reloads and not others.
+    Log("[reload] surgical content reload (stepped over %d frames, tid=%lu)%s...",
+        g_game->reload_count, GetCurrentThreadId(),
+        g_game->reload_verified ? "" : " [UNSAFE: unconfirmed table, armed by --unsafe-reload]");
     SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
     // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
     g_drawDiagUntil.store(GetTickCount64() + 20000);
@@ -3533,6 +3568,29 @@ DWORD WINAPI Init(LPVOID) {
         g_swLiveLoad = sflag[0] && GetFileAttributesA(sflag) != INVALID_FILE_ATTRIBUTES;
         Log("[switch] live load %s.", g_swLiveLoad ? "ARMED (--switch-live) - try from the testing menu"
                                                    : "off (safe preview) - arm with --switch-live");
+    }
+
+    // Unconfirmed reload tables: opt-in via frostmod_unsafe_reload.flag (--unsafe-reload).
+    // Says its piece at load, not at the first F8, so a log shows which mode the session
+    // ran in even if the reload was never pressed.
+    {
+        char uflag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(uflag, g_logPath);
+            if (char* s = strrchr(uflag, '\\')) { *(s + 1) = 0; strcat_s(uflag, "frostmod_unsafe_reload.flag"); }
+        }
+        g_unsafeReload = uflag[0] && GetFileAttributesA(uflag) != INVALID_FILE_ATTRIBUTES;
+        if (g_game->reload_verified)
+            Log("[reload] %s's step table is confirmed - reload is ON (R / F8).", g_game->display);
+        else if (g_unsafeReload)
+            Log("[reload] ARMED UNSAFELY (--unsafe-reload): %s's step table has NOT been "
+                "confirmed on this title and has crashed it. Each step is logged before it "
+                "runs - the last [reload] step line in this file names the one that faults.",
+                g_game->display);
+        else
+            Log("[reload] OFF for %s - its step table is derived but unconfirmed, and "
+                "crashed the game in a reporter's log. Arm with --unsafe-reload only to "
+                "collect a step-level log.", g_game->display);
     }
 
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "

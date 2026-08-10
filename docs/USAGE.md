@@ -34,7 +34,7 @@ treated as an explicit path to the DLL.
 | `--uninstall-startup` | — | — | Stop running at login (removes the entry above). |
 | `--no-filter-servers` | — | filter **on** | Turn the server filter off (reload only; leaves the browser untouched). |
 | `--filter-servers` | — | *(already on)* | Force the filter on. Redundant now that it's the default; kept for clarity. |
-| `--game <id>` | `mxb` \| `gpb` | `mxb` | Which title to attach to. `gpb` is GP Bikes — reload works there; the server-browser filter does not (its offsets are MX Bikes' and aren't ported). |
+| `--game <id>` | `mxb` \| `gpb` | `mxb` | Which title to attach to. On `gpb` (GP Bikes) reload is currently **off** — its offsets are derived but unconfirmed and crashed the game (see `--unsafe-reload`); the server-browser filter is off there too (its offsets are MX Bikes' and aren't ported). |
 | `--process <name>` | exe name | `mxbikes.exe` | Inject into a process by image name. `--game` is the friendlier form of the same thing. |
 | `--mods "<path>"` | folder | `Documents\PiBoSo\<title>\mods` | Watch a different mods folder. The default follows `--game`/`--process`, so GP Bikes reads GP Bikes' folder. |
 | `<path>` | `.dll` path | `frostmod.dll` next to the exe | Positional: load a specific DLL build. |
@@ -49,6 +49,7 @@ treated as an explicit path to the DLL.
 | `--dump-serverlist` | — | off | Log the raw master server-list blob to `[srvlist] …` lines (for tuning filter rules). |
 | `--capture-master` | — | off | RE diagnostic for the **mimic master server** — hooks the `ws2_32` exports and logs only master (UDP 54200 / resolved `mx-bikes.com` IP) traffic to `[cap]` / `[cap.hex]` / `[cap.str]` lines. Read-only. Open the online browser and/or run a local `mxbikes.exe --dedicated`, then share `frostmod.log`. |
 | `--probe-mount` | — | off | RE diagnostic only — logs the content-loader's arguments (`[mount] …`). Not needed for normal use. |
+| `--unsafe-reload` | — | off | Run the reload on a title whose step table hasn't been confirmed — today that means **GP Bikes, where it has crashed the game**. Only worth arming to collect a log: every step is written to `frostmod.log` *before* it runs, so the last `[reload] step …` line names the loader that faults. Send that log in. |
 
 ## Controls
 
@@ -107,7 +108,7 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 |------|---------|
 | `frostmod.log` | The live log, streamed into the console. Falls back to `%TEMP%\frostmod.log` if that folder is read-only. |
 | `frostmod_serverfilter.yaml` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
-| `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
+| `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag`, `frostmod_unsafe_reload.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
 
 ### Server-filter rules (`frostmod_serverfilter.yaml`)
 

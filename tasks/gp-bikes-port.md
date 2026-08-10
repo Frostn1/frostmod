@@ -179,6 +179,37 @@ layout is unresolved). Don't port an unfinished feature; leave it MX-only.
 Bikes updates on its own cadence, and nobody wants to re-RE on every patch —
 derive the signature at the same time as the RVA, not later.
 
+## Field result — the v0.11.0 table crashes too (2026-08-09)
+
+A reporter running v0.11.0 on GP Bikes (`frostmod-2.log`, Windows, RTX 4060 Ti):
+`[reload] surgical content reload (stepped over 13 frames)...` with **no**
+`[reload] done` after it and the process gone. Once on the session's first
+reload, once on the fourth after three that completed in ~2s each. Same log's
+v0.10.0 sessions show the older every-time crash, so this is a different, milder
+failure — not the one v0.11.0 fixed.
+
+So GP Bikes' reload is **off by default** as of v0.12.0 (`reload_verified =
+false` in `GAME_GPB`), armed only with `--unsafe-reload`. What is still needed:
+
+1. **Which step.** v0.12.0 logs every step before running it, so an
+   `--unsafe-reload` run on GP Bikes ends with the offending loader named. Get
+   one log; that turns 13 candidates into 1. Note the crash is *not* a plain
+   access violation — `RL_SC` is SEH-guarded and would swallow one and finish —
+   so expect heap corruption or a fault on another thread.
+2. **Which thread.** GP's boot content load runs on the WinMain thread (its scan
+   stacks bottom out at `0x402e5`); we replay from whichever thread calls
+   `SwapBuffers`. v0.12.0 logs both ids. If they differ, that is the bug, and
+   the fix is to run the steps on the game's thread rather than the presenting
+   one — it would also explain crashing on some reloads and not others.
+3. **The 8 unconfirmed RVAs.** The log corroborates only tracks `0x139A0`,
+   tyres `0x34AE0`, rider `0x34080`, bikes `0x14D90` and bike paints `0x32090`
+   (each shows the game-dir and mods-dir scans sharing one boot-init return with
+   two call sites inside the loader — the SC shape this table assumes).
+   `LogScanCallers` stops after 16 stack shots, which is why the rest never
+   appear. Raising that cap on a diagnostic build would corroborate the other 8
+   from a plain startup log, with no reload and no crash — do that first, it is
+   free.
+
 ## Verification
 
 There is no unit test for this; it is verified by running it.

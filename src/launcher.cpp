@@ -32,6 +32,9 @@
 //     frostmod.exe --no-update-check       (don't check GitHub for a newer version)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
 //     frostmod.exe --process gpbikes.exe   (different game)
+//     frostmod.exe --unsafe-reload         (run a reload table the title hasn't confirmed
+//                                           - GP Bikes: it has crashed the game. Only for
+//                                           collecting the step-level log that pins it)
 //     frostmod.exe --mods "D:\path\mods"   (override the mods folder)
 //     frostmod.exe C:\path\frostmod.dll    (explicit DLL path)
 //
@@ -596,6 +599,7 @@ int main(int argc, char** argv) {
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
     bool captureMaster = false; // --capture-master: sniff master protocol (RE for the mimic master)
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
+    bool unsafeReload = false;// --unsafe-reload: replay a step table the title hasn't confirmed
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
@@ -631,6 +635,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-serverlist")       dumpList = true;
         else if (a == "--capture-master")        captureMaster = true;
         else if (a == "--switch-live")           switchLive = true;
+        else if (a == "--unsafe-reload")         unsafeReload = true;
         else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
         else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
         else if (a == "--install-startup")       installStartup = true;
@@ -696,6 +701,14 @@ int main(int argc, char** argv) {
     printf("[*] DLL   : %s\n", dllPath.c_str());
     printf("[*] mods  : %s%s\n", modsPath.empty() ? "<unknown>" : modsPath.c_str(),
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
+    // Whether reload works is per-title now, so say it here rather than let someone press
+    // R in game and wonder. A title with an unconfirmed table is refused unless armed.
+    printf("[*] reload: %s\n",
+           game->reload_verified   ? "on (press R here, or R / F8 in game)"
+           : unsafeReload          ? "ARMED UNSAFELY for this title - it has crashed the game; "
+                                     "you are collecting a log"
+                                   : "OFF for this title - offsets derived but not confirmed "
+                                     "(arm with --unsafe-reload)");
     printf("[*] log   : %s\n", logPath.c_str());
     printf("=============================================\n");
 
@@ -737,6 +750,16 @@ int main(int argc, char** argv) {
                "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n");
     } else {
         DeleteFileA(switchFlag.c_str());
+    }
+    std::string unsafeFlag = ExeDir() + "frostmod_unsafe_reload.flag";
+    if (unsafeReload) {
+        if (FILE* f = nullptr; fopen_s(&f, unsafeFlag.c_str(), "w") == 0 && f) fclose(f);
+        printf("[*] --unsafe-reload ON: reload will run even where the step table is NOT\n"
+               "    confirmed for the title. It has crashed GP Bikes. Use it only to collect\n"
+               "    a log: every step is written to frostmod.log before it runs, so the last\n"
+               "    [reload] step line names the loader that faults. Then send the log.\n");
+    } else {
+        DeleteFileA(unsafeFlag.c_str());
     }
     std::string filterFlag = ExeDir() + "frostmod_filter.flag";
     if (filterSrv) {

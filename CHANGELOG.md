@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-09 — v0.12.0
+
+### Fixed
+- **Reload no longer takes GP Bikes down.** v0.11.0 replaced MX Bikes' table with one
+  derived for GP Bikes, and that one crashes the game too: a reporter's log shows
+  `[reload] surgical content reload` with no `[reload] done` after it and the process
+  gone — one session died on its first reload, another on its fourth after three clean
+  ones. The offsets are still unconfirmed, so GP Bikes now **refuses** the reload with an
+  honest message instead of attempting it. MX Bikes is untouched.
+
+### Added
+- **Every reload step is logged before it runs** (`[reload] step 4/13 rva=0x14D90 - bikes`),
+  on both titles. This is the only way a crash inside a replayed loader can be
+  attributed: each step is SEH-guarded, so an ordinary access violation is swallowed and
+  the reload finishes — what actually kills the process (heap corruption's fail-fast, a
+  fault raised on another thread) leaves nothing behind. `Log()` writes through per line,
+  so the last step in the log is the one that did it.
+- **`--unsafe-reload`** arms an unconfirmed table anyway, for whoever is collecting that
+  log. Off by default; the launcher and the DLL both say which mode the session is in.
+- **Thread ids on the boot scan and reload lines.** GP's boot content load runs on the
+  WinMain thread; we replay those loaders from whichever thread presents frames. If the
+  two ids differ, the reload races the game's own use of the lists — which fits an
+  intermittent kill. One report now settles it.
+- `reload_verified` on `GameOffsets`, with tests. A table that exists but has never run on
+  its title is the dangerous case, not the safe one — it looks like a working feature
+  until it isn't. Both GP crashes shipped as tables that compiled fine.
+
+### Notes
+- What the reporter's log *does* confirm: GP's loaders really are self-contained (for
+  tracks, tyres, rider and bikes the game-dir and mods-dir scans share one boot-init
+  return with two call sites inside the loader), and `0x139A0`/`0x34AE0`/`0x34080`/
+  `0x14D90`/`0x32090` are where the table says. The other 8 RVAs are still
+  string-derived: `LogScanCallers` stops after 16 stack shots, so the log never reaches
+  them.
+- Unrelated, same log, still open: `wglUseFontBitmaps` failed on all 7 attempts on that
+  machine (RTX 4060 Ti / 596.49), so every overlay panel draws its background quad with
+  no text in it. `EnsureFont` latches after one try and never retries.
+
 ## 2026-08-08 — v0.11.0
 
 ### Fixed

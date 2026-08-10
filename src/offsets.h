@@ -20,7 +20,15 @@
 /// Which shape a given loader uses is a property of the build, not of the category —
 /// MX Bikes inlines the per-dir dance into boot init for some categories, GP Bikes wraps
 /// it inside the loader for all of them (so GP's table is entirely SC).
-struct RLStep { uint8_t dir; uintptr_t z1, z2, z3, rva; };
+///
+/// `what` names the content category the step rebuilds. It is logged immediately BEFORE
+/// the step runs, and `Log()` reopens and closes the file per line, so when a step takes
+/// the game down its name is the last thing in the log. That is the only way a crash
+/// inside a replayed loader can be attributed: every step is SEH-guarded, so an ordinary
+/// access violation is swallowed and the reload finishes — the failures that actually
+/// kill the process (heap corruption's fail-fast, a fault on another thread) leave
+/// nothing behind but the last line written. Optional: null means "unlabelled".
+struct RLStep { uint8_t dir; uintptr_t z1, z2, z3, rva; const char* what; };
 
 namespace mxb {
 
@@ -302,8 +310,26 @@ constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 //
 // UNVERIFIED AT RUNTIME: every constant below was derived by static analysis and has not
 // been confirmed under a debugger. See tasks/gp-bikes-port.md for the full derivation.
-// If the reload table proves wrong, set `reload_steps` to null in GAME_GPB: that degrades
-// GP Bikes to an honest "reload not supported" instead of a crash.
+//
+// THE TABLE TOOK THE GAME DOWN IN THE FIELD (2026-08-09). A reporter's v0.11.0 log shows
+// the reload killing GP Bikes: `[reload] surgical content reload` with no `[reload] done`
+// after it, and the process gone — once on the first reload of a session, and once on the
+// fourth after three clean ones. So `reload_verified` below is false and the reload is
+// REFUSED on GP Bikes unless explicitly armed (`--unsafe-reload`). It is a table to
+// finish deriving, not a feature that works.
+//
+// What that log DOES settle (it is not all bad news — see the per-step notes):
+//   * The SC assumption is right for the categories it reaches. Boot scans stack as
+//     `<scanner> <- <inside loader> <- <boot-init return> <- 0x402e5(WinMain)`, and for
+//     tracks/tyres/rider/bikes the game-dir and mods-dir scans share ONE boot-init return
+//     with two call sites inside the loader — the loader does both directories itself.
+//   * Boot content load runs on the WinMain thread. Our replay runs on whichever thread
+//     calls SwapBuffers; if those differ, replaying these loaders races the game's own
+//     use of the lists, which fits an intermittent kill exactly. Both threads now log
+//     their id ([capture] scan tid=, [reload] ... tid=) so the next log settles it.
+//   * The log reaches only 5 of the 13 categories — `LogScanCallers` stops after 16
+//     stack shots — so the other 8 RVAs remain string-derived guesses. Any one of them
+//     landing on the wrong function would corrupt the heap much like this.
 namespace gpb {
 
 // Boot content-load + app-init; GP twin of mxb::RVA_CONTENT_INIT.
@@ -346,20 +372,24 @@ constexpr uintptr_t RVA_SCAN_FOLDER = 0x18f150;
 //
 // Deliberately stops before 0x315f0 ("music"/"ogg"): MX's table draws the line at
 // content too, and restarting the music is not what a mods reload is for.
+// The four marked "boot-corroborated" are the ones a reporter's log pins directly: each
+// shows TWO scanner call sites inside the loader (game dir, then the mods dir) under a
+// SINGLE boot-init return address, which is exactly the SC shape this table assumes.
+// See the "what the reporter log settles" note above. The rest are string-derived only.
 constexpr RLStep kReloadSteps[] = {
-    {0,0,0,0,0x139A0},   // tracks
-    {0,0,0,0,0x34AE0},   // tyres
-    {0,0,0,0,0x34080},   // rider
-    {0,0,0,0,0x14D90},   // bikes
-    {0,0,0,0,0x31880},   // paints\data.ini
-    {0,0,0,0,0x32090},   // bike paints
-    {0,0,0,0,0x32490},   // rider\helmets
-    {0,0,0,0,0x32F30},   // helmet paints
-    {0,0,0,0,0x344C0},   // rider\riders
-    {0,0,0,0,0x336A0},   // rider paints
-    {0,0,0,0,0x33A90},   // rider\animations
-    {0,0,0,0,0x34FD0},   // misc\stands
-    {0,0,0,0,0x25C50},   // misc\dashes
+    {0,0,0,0,0x139A0, "tracks"},              // boot-corroborated (ret 0xfb95f, calls 0x13a18/0x13a36)
+    {0,0,0,0,0x34AE0, "tyres"},               // boot-corroborated (ret 0xfb964, calls 0x34b0f/0x34b28)
+    {0,0,0,0,0x34080, "rider"},               // boot-corroborated (ret 0xfb969, calls 0x340af/0x340c8)
+    {0,0,0,0,0x14D90, "bikes"},               // boot-corroborated (ret 0xfb96e, calls 0x14e12/0x14e29)
+    {0,0,0,0,0x31880, "paints\\data.ini"},
+    {0,0,0,0,0x32090, "bike paints"},         // boot-corroborated (ret 0xfb98b, call 0x320bf)
+    {0,0,0,0,0x32490, "rider\\helmets"},
+    {0,0,0,0,0x32F30, "helmet paints"},
+    {0,0,0,0,0x344C0, "rider\\riders"},
+    {0,0,0,0,0x336A0, "rider paints"},
+    {0,0,0,0,0x33A90, "rider\\animations"},
+    {0,0,0,0,0x34FD0, "misc\\stands"},
+    {0,0,0,0,0x25C50, "misc\\dashes"},
 };
 constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
 
@@ -392,6 +422,14 @@ struct GameOffsets {
     /// Operands for the DIR steps. Both unused (0) for a table that is entirely SC.
     uintptr_t reload_str;
     uintptr_t reload_mods;
+    /// Whether this title's step table has been confirmed to run without taking the game
+    /// down. False = derived but not proven, so the reload is REFUSED unless the user
+    /// explicitly arms it (`frostmod.exe --unsafe-reload`, for collecting a step-level
+    /// log). This is a third state on purpose: a null table means "nothing derived", and
+    /// a wrong-but-present table is the more dangerous case — v0.10.0 crashed GP Bikes
+    /// with one, and v0.11.0 shipped a GP-specific replacement that crashes it too. A
+    /// table only earns `true` by being exercised on the title itself.
+    bool reload_verified;
     /// Whether every offset in this file has been derived for this title. False means the
     /// features that need the un-ported groups (server browser filter, master protocol,
     /// direct connect, the in-game bike array) must stay OFF — their MX addresses are
@@ -404,6 +442,7 @@ inline constexpr GameOffsets GAME_MXB = {
     mxb::RVA_CONTENT_INIT, mxb::RVA_SCAN_FOLDER,
     mxb::kReloadSteps, mxb::kReloadStepCount,
     mxb::RVA_RELOAD_STR, mxb::RVA_RELOAD_MODS,
+    true,   // reload_verified: this is the table that has been in players' hands since v0.9
     true,
 };
 
@@ -412,6 +451,7 @@ inline constexpr GameOffsets GAME_GPB = {
     gpb::RVA_CONTENT_INIT, gpb::RVA_SCAN_FOLDER,
     // Entirely SC, so no DIR operands: see gpb::kReloadSteps.
     gpb::kReloadSteps, gpb::kReloadStepCount, 0, 0,
+    false,  // reload_verified: it crashed a reporter's game — armed only by --unsafe-reload
     false,
 };
 

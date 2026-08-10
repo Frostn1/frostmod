@@ -81,6 +81,33 @@ static void gp_table_is_all_self_contained() {
     CHECK(gpb::kReloadSteps[0].rva == 0x139A0, "GP's first loader should be tracks (0x139A0)");
 }
 
+// A step that kills the process is only fixable if the log says which one it was, and the
+// log line is built from `what`. This is not cosmetic: every step is SEH-guarded, so the
+// crash itself leaves nothing behind - the label written before the call is the evidence.
+// Required on unconfirmed tables, where a crash is expected rather than hypothetical.
+static void unconfirmed_tables_label_every_step() {
+    for (const GameOffsets* g : ALL_GAMES) {
+        if (!g->reload_steps || g->reload_verified) continue;
+        for (int i = 0; i < g->reload_count; ++i)
+            CHECK(g->reload_steps[i].what && *g->reload_steps[i].what,
+                  "%s step %d has no label; a crash in it would be unattributable", g->id, i);
+    }
+}
+
+// The state this file exists to protect. `reload_verified` is what stands between a player
+// and a table that has never run on their title: v0.10.0 shipped GP Bikes MX's table and
+// crashed it, v0.11.0 shipped GP its own and crashed it too. Flipping this to true is a
+// claim that someone watched the reload complete on that game - not that it compiles.
+static void only_confirmed_tables_run_unprompted() {
+    CHECK(GAME_MXB.reload_verified, "MX Bikes' table is the shipping one - it must stay confirmed");
+    CHECK(!GAME_GPB.reload_verified,
+          "GP Bikes' table is marked confirmed, but it took a reporter's game down on "
+          "v0.11.0. Only flip this after watching a reload finish on GP Bikes itself.");
+    for (const GameOffsets* g : ALL_GAMES)
+        if (!g->reload_steps)
+            CHECK(!g->reload_verified, "%s has no table but claims a confirmed one", g->id);
+}
+
 // The actual v0.10.0 defect: one title running another title's addresses. No two titles may
 // share a step table, and no table may be reachable from the wrong GameOffsets.
 static void no_title_borrows_another_titles_offsets() {
@@ -135,6 +162,8 @@ static void ids_match_what_mxb_app_sends() {
 int main() {
     mx_table_is_unchanged();
     gp_table_is_all_self_contained();
+    unconfirmed_tables_label_every_step();
+    only_confirmed_tables_run_unprompted();
     no_title_borrows_another_titles_offsets();
     every_title_is_internally_consistent();
     ids_match_what_mxb_app_sends();

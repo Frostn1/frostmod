@@ -2,6 +2,21 @@
 
 ## 2026-08-10
 
+### Added
+- **Proximity voice, via Mumble.** FrostMod publishes your position through Mumble's Link
+  interface, so riders on the same server hear each other from where they actually are.
+  Mumble does the voice; we only say where we are. On by default, toggled with **`6`** in
+  the F8 menu, persisted in `frostmod_radar.cfg`. See [docs/MUMBLE.md](docs/MUMBLE.md) for
+  the setup and the coordinate derivation.
+- The facing vector is derived from the radar rather than guessed, and the two are checked
+  against each other at every 30° of heading — if the radar points at someone, Mumble hears
+  them in the same direction by construction. `LinkedMem`'s layout is a cross-process
+  contract, so its size is pinned by a `static_assert`; getting it wrong would write
+  Mumble's fields at the wrong offsets with no error anywhere.
+- `RaceEvent` is now consumed on the client, for the Mumble context (`server|track`).
+  Nothing is published until it arrives: an empty context is still a context, and every
+  rider carrying one would be grouped together regardless of the server they're on.
+
 ### Fixed
 - **The radar pointed riders in arbitrary directions.** `m_fYaw` is *degrees from north*
   and was being handed straight to `cosf`/`sinf`, which take radians — scaling every

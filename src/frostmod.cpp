@@ -42,6 +42,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "serverfilter.h"
+#include "mumblelink.h"
 #include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1466,12 @@ struct SPluginsRaceTrackPosition_t { // RaceTrackPosition array element
     float m_fTrackPos;                // 0..1 along the centreline
     int   m_iCrashed;
 };
+struct SPluginsRaceEvent_t {         // RaceEvent payload
+    int  m_iType;                    // 1 = testing; 2 = race; 4 = straight rhythm; -1 = replay
+    char m_szName[100];              // the server/event name
+    char m_szTrackName[100];
+    float m_fTrackLength;            // metres
+};
 struct SPluginsRaceAddEntry_t {      // RaceAddEntry payload
     int  m_iRaceNum;
     char m_szName[100], m_szBikeName[100], m_szBikeShortName[100], m_szCategory[100];
@@ -1585,8 +1592,9 @@ static void RadarSettingsPath(char* out, size_t n) {
 static void SaveRadarSettings() {
     char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
-    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\n",
-            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange);
+    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nmumble=%d\n",
+            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
+            mumblelink::Enabled() ? 1 : 0);
     fclose(f);
 }
 static void LoadRadarSettings() {
@@ -1597,10 +1605,11 @@ static void LoadRadarSettings() {
         if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
+        else if (sscanf_s(line, "mumble=%d",   &v) == 1) mumblelink::SetEnabled(v != 0);
     }
     fclose(f);
-    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm",
-        g_radarOn.load(), g_espOn.load(), (int)g_radarRange);
+    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm mumble=%d",
+        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, mumblelink::Enabled());
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -1611,11 +1620,11 @@ static void LoadRadarSettings() {
 struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int raceNum; };
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
-static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
-                         float* outMeYawDeg, float* outMeX, float* outMeY, float* outMeZ) {
-    std::lock_guard<std::mutex> lk(g_radMutex);
+// "me" = the RaceTrackPosition entry closest to my telemetry world pos. Caller holds
+// g_radMutex. Shared by the radar and by the Mumble publisher so the two can never
+// disagree about which rider we are — they would be very hard to debug if they did.
+static int RadFindMe() {
     if (!g_radHaveMe || g_radN == 0) return -1;
-    // "me" = the RaceTrackPosition entry closest to my telemetry world pos.
     int me = -1; float best = 1e30f;
     for (int i = 0; i < g_radN; ++i) {
         float dx = g_radRiders[i].x - g_radMeX, dy = g_radRiders[i].y - g_radMeY,
@@ -1623,6 +1632,13 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
         float d2 = dx*dx + dy*dy + dz*dz;
         if (d2 < best) { best = d2; me = i; }
     }
+    return me;
+}
+
+static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
+                         float* outMeYawDeg, float* outMeX, float* outMeY, float* outMeZ) {
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    const int me = RadFindMe();
     if (me < 0) return -1;
     const float myYawDeg = g_radRiders[me].yawDeg;
     if (outMeYawDeg) *outMeYawDeg = myYawDeg;
@@ -1657,6 +1673,42 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
         b.wx = r.x; b.wy = r.y; b.wz = r.z; b.yawDeg = r.yawDeg; b.lap = lap; b.raceNum = r.raceNum;
     }
     return count;
+}
+
+// ---- Mumble positional audio ------------------------------------------------
+// We publish only OUR OWN pose; Mumble's server distributes it and does the panning and
+// attenuation. That is the whole reason this is cheap: proximity chat without ever having
+// to match a voice stream to a rider on track.
+//
+// Called every frame from Tick(). Off track — in menus, or before the first
+// RaceTrackPosition — there is no "me", and we clear rather than leave the last position
+// standing, so a rider sitting in a menu isn't heard from wherever they parked.
+static void MumblePublish() {
+    if (!mumblelink::Enabled()) return;
+    // Fail closed until RaceEvent has told us which server and track we are on. Without
+    // it every rider would share the empty context and be heard positionally from tracks
+    // they are not on — worse than being heard flat.
+    if (!mumblelink::HasContext()) return;
+    float x, y, z, yawDeg;
+    int meRaceNum = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_radMutex);
+        const int me = RadFindMe();
+        if (me < 0) { mumblelink::Clear(); return; }
+        x = g_radRiders[me].x; y = g_radRiders[me].y; z = g_radRiders[me].z;
+        yawDeg = g_radRiders[me].yawDeg;
+        meRaceNum = g_radRiders[me].raceNum;
+    }
+    // Identity only has to be unique within the context, and the race number is exactly
+    // that — unlike a rider name, which two people on one grid can share.
+    static int lastRaceNum = -2;
+    if (meRaceNum != lastRaceNum) {
+        lastRaceNum = meRaceNum;
+        char id[64];
+        _snprintf_s(id, sizeof(id), _TRUNCATE, "racenum:%d", meRaceNum);
+        mumblelink::SetIdentity(id);
+    }
+    mumblelink::Update(x, y, z, yawDeg);
 }
 
 // ---- lap-status colors (shared by both render paths) ------------------------
@@ -1769,6 +1821,7 @@ static const MenuItem kMenu[] = {
     { '3', "Bike model swap" },
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
+    { '6', "Proximity voice (Mumble)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2596,6 +2649,9 @@ void MenuAction(int d) {
     case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveRadarSettings();
               SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
               Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 6: { bool on = !mumblelink::Enabled(); mumblelink::SetEnabled(on); SaveRadarSettings();
+              SetStatus(on ? "proximity voice: on" : "proximity voice: off", 1500);
+              Log("[mumble] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -2608,6 +2664,11 @@ void Tick() {
     // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
+
+    // Mumble polls the shared block; publishing here keeps it at frame rate rather than
+    // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
+    // ride past someone.
+    MumblePublish();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
@@ -3548,7 +3609,14 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
-        LoadRadarSettings();   // restore radar / rider-outline toggles + range
+        // Before LoadRadarSettings, which may switch it off: the block is created either
+        // way so Mumble can be started after the game and still find it.
+        if (mumblelink::Init()) {
+            Log("[mumble] link block ready");
+        } else {
+            Log("[mumble] link block unavailable - positional audio will not work");
+        }
+        LoadRadarSettings();   // restore radar / rider-outline toggles + range + mumble
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
@@ -3713,7 +3781,19 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
             ? ((SPluginsRaceClassification_t*)_pData)->m_iNumEntries : 0;
     RadStoreClassification(_pArray, n, _iElemSize);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); }
-__declspec(dllexport) void RaceDeinit()             { RadResetRace(); }
+// The server/event name and track. Mumble strips positional data between users whose
+// context differs, so this is what scopes proximity to the server you are actually on.
+__declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
+    if (!_pData || _iDataSize < (int)sizeof(SPluginsRaceEvent_t)) return;
+    const auto* e = (const SPluginsRaceEvent_t*)_pData;
+    // The fields are fixed-size char arrays and are not guaranteed NUL-terminated.
+    char name[101] = {0}, track[101] = {0};
+    memcpy(name, e->m_szName, 100);
+    memcpy(track, e->m_szTrackName, 100);
+    mumblelink::SetContext(name, track);
+    Log("[mumble] context: server='%s' track='%s'", name, track);
+}
+__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); mumblelink::Clear(); }
+__declspec(dllexport) void RaceDeinit()             { RadResetRace(); mumblelink::Clear(); }
 
 } // extern "C"

@@ -1442,9 +1442,10 @@ void RequestReload() {
 // pipeline (hkGlLoadMatrixf below). If capture ever fails validation, the ESP
 // degrades to a screen-edge directional arrow that needs no matrix.
 //
-// CALIBRATION: a few world-axis / yaw-sign conventions can only be confirmed by
-// running the game (the Windows tester box). They are isolated in the CAL block
-// below so calibration is a one-line change; see docs/PLUGIN.md verification.
+// The world-axis / yaw conventions are settled from PiBoSo's SDK header and
+// MXBMRP3's working implementation -- see the block above GroundUV below. What
+// still wants a live run is the GL view-projection capture the outline needs;
+// the radar itself no longer depends on anything unconfirmed.
 // ===========================================================================
 
 // ---- SDK structs (verbatim prefix from mxb_example.c; we read only early, fixed
@@ -1459,9 +1460,9 @@ struct SPluginsBikeData_t {          // RunTelemetry payload (local bike)
 };
 struct SPluginsRaceTrackPosition_t { // RaceTrackPosition array element
     int   m_iRaceNum;
-    float m_fPosX, m_fPosY, m_fPosZ;
-    float m_fYaw;
-    float m_fTrackPos;
+    float m_fPosX, m_fPosY, m_fPosZ;  // metres
+    float m_fYaw;                     // angle from north, DEGREES (not radians)
+    float m_fTrackPos;                // 0..1 along the centreline
     int   m_iCrashed;
 };
 struct SPluginsRaceAddEntry_t {      // RaceAddEntry payload
@@ -1477,15 +1478,23 @@ struct SPluginsRaceClassificationEntry_t { // RaceClassification array element
     int m_iGap, m_iGapLaps, m_iPenalty, m_iPit;
 };
 
-// ---- CALIBRATION knobs (VERIFY on the Windows tester) -----------------------
-// Which two world axes form the horizontal (ground) plane, and which is "up".
-// GL engines are commonly Y-up (ground = X,Z). If the radar looks squashed or a
-// rider directly ahead lands sideways, this is the first thing to flip.
+// ---- World-axis / yaw conventions -------------------------------------------
+// Settled against PiBoSo's own SDK header and cross-checked against MXBMRP3
+// (https://github.com/thomas4f/mxbmrp3, MIT), which renders a working radar for
+// the same games from the same callback. All three agree with what was here:
+// ground = (X, Z) with Y up, rotate by +yaw, no offset.
 static inline void GroundUV(float x, float y, float z, float& u, float& v) {
-    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y  [verify]
+    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y
 }
-static constexpr float RAD_YAW_SIGN   = 1.0f;   // flip if the radar spins the wrong way
-static constexpr float RAD_YAW_OFFSET = 0.0f;   // add if "straight ahead" isn't at the top
+static constexpr float RAD_YAW_SIGN   = 1.0f;   // rotate by +yaw
+static constexpr float RAD_YAW_OFFSET = 0.0f;   // degrees; "ahead" is already at the top
+
+// m_fYaw is in DEGREES. cosf/sinf take radians, so it must be converted before
+// it reaches them -- the bug this block used to hide behind. Feeding degrees
+// straight in doesn't tilt the radar slightly, it scales the heading by 57.3 and
+// makes the rotation arbitrary, which reads as "the radar is broken" rather than
+// as "a constant needs flipping". No amount of flipping the two above fixes it.
+static constexpr float RAD_DEG_TO_RAD = 0.017453292519943295f;
 
 // ---- shared rider snapshot (producer = game data threads; consumer = render) -
 static std::atomic<bool> g_radarOn{false};   // radar HUD panel
@@ -1493,7 +1502,7 @@ static std::atomic<bool> g_espOn{false};     // on-screen rider outlines
 static float             g_radarRange = 80.0f; // metres shown edge-to-center
 
 static std::mutex g_radMutex;                // guards everything below
-struct RadRider { int raceNum; float x, y, z, yaw; int crashed; };
+struct RadRider { int raceNum; float x, y, z, yawDeg; int crashed; };
 static bool     g_radHaveMe = false;
 static float    g_radMeX = 0, g_radMeY = 0, g_radMeZ = 0;   // from RunTelemetry
 static int      g_radN = 0;
@@ -1516,8 +1525,14 @@ static void RadStoreTelemetry(const void* d, int size) {
     g_radMeX = b->m_fPosX; g_radMeY = b->m_fPosY; g_radMeZ = b->m_fPosZ;
     g_radHaveMe = true;
 }
+// `elem` is the game's stride, and we walk the array with it. A stride LARGER than our
+// struct is fine and expected -- a later game build appending fields still puts the ones
+// we read at the same offsets. A stride SMALLER than it is not: we'd read each element's
+// tail out of the next element, and the last one off the end of the array.
 static void RadStoreTrackPositions(int n, const void* arr, int elem) {
-    if (!arr || elem <= 0) { std::lock_guard<std::mutex> lk(g_radMutex); g_radN = 0; return; }
+    if (!arr || elem < (int)sizeof(SPluginsRaceTrackPosition_t)) {
+        std::lock_guard<std::mutex> lk(g_radMutex); g_radN = 0; return;
+    }
     std::lock_guard<std::mutex> lk(g_radMutex);
     if (n < 0) n = 0; if (n > 64) n = 64;
     g_radN = 0;
@@ -1525,7 +1540,7 @@ static void RadStoreTrackPositions(int n, const void* arr, int elem) {
         const auto* e = (const SPluginsRaceTrackPosition_t*)((const char*)arr + (size_t)i * elem);
         RadRider& r = g_radRiders[g_radN++];
         r.raceNum = e->m_iRaceNum; r.x = e->m_fPosX; r.y = e->m_fPosY; r.z = e->m_fPosZ;
-        r.yaw = e->m_fYaw; r.crashed = e->m_iCrashed;
+        r.yawDeg = e->m_fYaw; r.crashed = e->m_iCrashed;
     }
 }
 static void RadAddEntry(const void* d, int size) {
@@ -1545,7 +1560,7 @@ static void RadRemoveEntry(const void* d, int size) {
     if (i >= 0) g_radEntries[i] = g_radEntries[--g_radNEntries];
 }
 static void RadStoreClassification(const void* arr, int n, int elem) {
-    if (!arr || elem <= 0) return;
+    if (!arr || elem < (int)sizeof(SPluginsRaceClassificationEntry_t)) return;  // see above
     std::lock_guard<std::mutex> lk(g_radMutex);
     if (n < 0) n = 0; if (n > 64) n = 64;
     for (int k = 0; k < n; ++k) {
@@ -1593,11 +1608,11 @@ static void LoadRadarSettings() {
 // (a lap behind -> blue), 0 = same lap (white). rx/ry are heading-up radar-disc
 // coords in [-1,1] (ry up = ahead). bearing is the world heading to them
 // relative to my facing, for the ESP arrow fallback. wx/wy/wz = world pos.
-struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yaw; int lap; int raceNum; };
+struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int raceNum; };
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
 static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
-                         float* outMeYaw, float* outMeX, float* outMeY, float* outMeZ) {
+                         float* outMeYawDeg, float* outMeX, float* outMeY, float* outMeZ) {
     std::lock_guard<std::mutex> lk(g_radMutex);
     if (!g_radHaveMe || g_radN == 0) return -1;
     // "me" = the RaceTrackPosition entry closest to my telemetry world pos.
@@ -1609,15 +1624,15 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
         if (d2 < best) { best = d2; me = i; }
     }
     if (me < 0) return -1;
-    const float myYaw = g_radRiders[me].yaw;
-    if (outMeYaw) *outMeYaw = myYaw;
+    const float myYawDeg = g_radRiders[me].yawDeg;
+    if (outMeYawDeg) *outMeYawDeg = myYawDeg;
     if (outMeX) *outMeX = g_radRiders[me].x;
     if (outMeY) *outMeY = g_radRiders[me].y;
     if (outMeZ) *outMeZ = g_radRiders[me].z;
     int myLaps = 0; { int ei = RadFindEntry(g_radRiders[me].raceNum);
                       if (ei >= 0) myLaps = g_radEntries[ei].numLaps; }
     float meu, mev; GroundUV(g_radRiders[me].x, g_radRiders[me].y, g_radRiders[me].z, meu, mev);
-    const float a  = RAD_YAW_SIGN * myYaw + RAD_YAW_OFFSET;
+    const float a  = (RAD_YAW_SIGN * myYawDeg + RAD_YAW_OFFSET) * RAD_DEG_TO_RAD;
     const float ca = cosf(a), sa = sinf(a);
 
     int count = 0;
@@ -1639,7 +1654,7 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
         float m = sqrtf(b.rx*b.rx + b.ry*b.ry);
         if (m > 1.0f) { b.rx /= m; b.ry /= m; }
         b.dist = dist; b.bearing = atan2f(rx, ry);   // 0 = ahead, +right
-        b.wx = r.x; b.wy = r.y; b.wz = r.z; b.yaw = r.yaw; b.lap = lap; b.raceNum = r.raceNum;
+        b.wx = r.x; b.wy = r.y; b.wz = r.z; b.yawDeg = r.yawDeg; b.lap = lap; b.raceNum = r.raceNum;
     }
     return count;
 }
@@ -1725,8 +1740,8 @@ static bool WorldToScreen01(float x, float y, float z, float* sx, float* sy, flo
 // land on-screen with positive depth. Cheap gate; on failure ESP uses arrows.
 static void RadValidateVP() {
     if (g_vp[15] == 0 && g_vp[0] == 0) { g_vpValid.store(false); return; }   // never captured
-    float meYaw, mx, my, mz; RadBlip tmp[1];
-    if (RadBuildBlips(tmp, 1, g_radarRange, &meYaw, &mx, &my, &mz) < 0) { g_vpValid.store(false); return; }
+    float meYawDeg, mx, my, mz; RadBlip tmp[1];
+    if (RadBuildBlips(tmp, 1, g_radarRange, &meYawDeg, &mx, &my, &mz) < 0) { g_vpValid.store(false); return; }
     float sx, sy, w;
     bool ok = VPProject01(mx, my + 1.0f, mz, &sx, &sy, &w) && w > 0
               && sx > -0.5f && sx < 1.5f && sy > -0.5f && sy < 1.5f;   // generous: I'm ~on screen
@@ -2014,8 +2029,8 @@ static void DrawRadarGL(int w, int h) {
     FillRect(cx-R,cy-1,cx+R,cy+1); FillRect(cx-1,cy-R,cx+1,cy+R);
     glColor4f(0.55f,0.85f,1.0f,1.0f);                          // "you" arrow, points up
     GlTri(cx,cy+9, cx-6,cy-6, cx+6,cy-6);
-    RadBlip blips[64]; float meYaw,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    RadBlip blips[64]; float meYawDeg,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
     for (int i = 0; i < n; ++i) {
         float r,g,b; LapColorRGB(blips[i].lap,r,g,b); glColor4f(r,g,b,1.0f);
         int bx = cx + (int)(blips[i].rx * R), by = cy + (int)(blips[i].ry * R);
@@ -2029,8 +2044,8 @@ static void DrawRadarGL(int w, int h) {
 // On-screen rider outlines. Box when the VP projects them on-screen; otherwise a
 // screen-edge directional arrow (needs no matrix). Colored by lap status.
 static void DrawEspGL(int w, int h) {
-    RadBlip blips[64]; float meYaw,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    RadBlip blips[64]; float meYawDeg,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
     if (n < 0) return;
     const bool vp = g_vpValid.load(std::memory_order_relaxed);
     const int scx = w/2, scy = h/2;
@@ -2217,8 +2232,8 @@ static void EmitRadarPiBoSo() {
     DQuad(cx - 0.004f*PB_ASPECT, cy - Ry, cx + 0.004f*PB_ASPECT, cy + Ry, ToABGR(0.30f,0.38f,0.52f,0.5f)); // v axis
     DQuad(cx - Rx, cy - 0.004f, cx + Rx, cy + 0.004f, ToABGR(0.30f,0.38f,0.52f,0.5f));                     // h axis
     DQuad(cx - 0.010f*PB_ASPECT, cy - 0.012f, cx + 0.010f*PB_ASPECT, cy + 0.006f, ToABGR(0.55f,0.85f,1.0f,1.0f)); // "you"
-    RadBlip blips[64]; float meYaw,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    RadBlip blips[64]; float meYawDeg,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
     int drawn = 0;
     for (int i = 0; i < n && drawn < 22; ++i) {
         float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
@@ -2231,8 +2246,8 @@ static void EmitRadarPiBoSo() {
     DText(cx - Rx, cy + Ry*1.12f + 0.006f, "RADAR", ToABGR(0.6f,0.66f,0.76f,1.0f), 0.017f);
 }
 static void EmitEspPiBoSo() {
-    RadBlip blips[64]; float meYaw,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYaw,&mx,&my,&mz);
+    RadBlip blips[64]; float meYawDeg,mx,my,mz;
+    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
     if (n < 0) return;
     const bool vp = g_vpValid.load(std::memory_order_relaxed);
     int boxes = 0;

@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-10
+
+### Fixed
+- **The radar pointed riders in arbitrary directions.** `m_fYaw` is *degrees from north*
+  and was being handed straight to `cosf`/`sinf`, which take radians — scaling every
+  heading by 57.3. It isn't a small tilt: a rider held dead ahead swings from +86° to
+  −139° across four degrees of real heading change, so blips spin as you steer. The three
+  constants the code invited you to flip (`GroundUV`, `RAD_YAW_SIGN`, `RAD_YAW_OFFSET`)
+  were all correct, and flipping them could never have fixed it.
+- **A short element stride no longer reads off the end of the rider arrays.**
+  `RaceTrackPosition` and `RaceClassification` walk the game's array with the stride it
+  reports; a stride smaller than the struct we read meant each element's tail came out of
+  the next one, and the last out of bounds. A *larger* stride is still accepted — that's
+  just a later game build appending fields.
+
+### Changed
+- Yaw carriers renamed `yawDeg` (`RadRider`, `RadBlip`, `RadBuildBlips`) so the unit
+  travels with the value. The bug above was invisible at the call site precisely because
+  a bare `yaw` says nothing about what it's measured in.
+- The radar's conventions are documented as settled rather than pending a live run,
+  confirmed against PiBoSo's SDK header and cross-checked against
+  [MXBMRP3](https://github.com/thomas4f/mxbmrp3) (MIT), which draws a working radar for
+  the same games from the same callback. The outline's GL view-projection capture is
+  unaffected and still wants a Windows run.
+
 ## 2026-08-09 — v0.12.0
 
 ### Fixed

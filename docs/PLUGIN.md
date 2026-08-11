@@ -59,11 +59,22 @@ A racing-spotter HUD built only on the callbacks above (no memory reads of other
   blue = a rider you are lapping (backmarker), from `m_iNumLaps`.
 - Toggles + range persist in `frostmod_radar.cfg` (next to `frostmod.log`).
 
-**Calibration / RE status (verify on the Windows tester).** A few world-axis and yaw-sign
-conventions are isolated as constants in `src/frostmod.cpp` (`GroundUV`, `RAD_YAW_SIGN`,
-`RAD_YAW_OFFSET`) and set after the first live run. The one-shot `[esp/diag]` log lines
-(`GL_VERSION`/`GLSL`/`RENDERER` + a short matrix-flow dump) confirm whether the
-fixed-function VP capture is viable or a shader/uniform capture is needed for the outline.
+**Calibration — settled.** The world-axis and yaw conventions (`GroundUV`, `RAD_YAW_SIGN`,
+`RAD_YAW_OFFSET` in `src/frostmod.cpp`) were confirmed against PiBoSo's own SDK header and
+cross-checked against [MXBMRP3](https://github.com/thomas4f/mxbmrp3) (MIT), which renders a
+working radar for the same games from the same callback. Ground plane is `(X, Z)` with Y up;
+rotate by `+yaw`; no offset — all three as originally written.
+
+The bug was the **unit**. `SPluginsRaceTrackPosition_t::m_fYaw` is *degrees from north*, and
+it was being passed straight to `cosf`/`sinf`, which take radians. That doesn't tilt the
+radar slightly — it scales the heading by 57.3, so a rider held dead ahead swings from +86°
+to −139° across four degrees of real heading change. It read as "the radar is broken", and
+no combination of the two sign constants could have fixed it.
+
+**Still needs the Windows tester:** the outline's GL view-projection capture, not the radar.
+The one-shot `[esp/diag]` log lines (`GL_VERSION`/`GLSL`/`RENDERER` + a short matrix-flow
+dump) tell us whether the fixed-function VP capture is viable or a shader/uniform capture is
+needed.
 
 ### Where the plugin goes
 The plugin file is **`frostmod.dlo`** (a byte-for-byte copy of `frostmod.dll` — the game

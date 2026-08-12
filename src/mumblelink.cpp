@@ -55,6 +55,8 @@ std::atomic<bool> g_enabled{true};
 char g_context[256] = {0};
 UINT32 g_contextLen = 0;
 wchar_t g_identity[256] = {0};
+char g_server[100] = {0};
+char g_track[100] = {0};
 
 void WriteWide(wchar_t* dst, size_t cap, const wchar_t* src) {
     if (!dst || cap == 0) return;
@@ -99,14 +101,12 @@ bool Init() {
     return true;
 }
 
-void SetContext(const char* eventName, const char* trackName) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    // Server name plus track. The server alone would keep riders grouped across a track
-    // change, and the track alone would group strangers on unrelated servers running the
-    // same map — audible as voices from positions on a track they aren't sharing.
+// Caller holds g_mutex. Server name plus track: the server alone would keep riders
+// grouped across a track change, and the track alone would group strangers on unrelated
+// servers running the same map — heard from positions on a track they aren't sharing.
+static void RebuildContext() {
     char buf[256];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "mxbikes|%s|%s",
-                eventName ? eventName : "", trackName ? trackName : "");
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "mxbikes|%s|%s", g_server, g_track);
     memset(g_context, 0, sizeof(g_context));
     // Length, not strlen at use: the context is compared as bytes, and Mumble is given the
     // count explicitly.
@@ -115,9 +115,26 @@ void SetContext(const char* eventName, const char* trackName) {
     g_contextLen = (UINT32)len;
 }
 
+void SetServer(const char* serverName) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    strncpy_s(g_server, serverName ? serverName : "", _TRUNCATE);
+    RebuildContext();
+}
+
+void SetTrack(const char* trackName) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    strncpy_s(g_track, trackName ? trackName : "", _TRUNCATE);
+    RebuildContext();
+}
+
 void SetIdentity(const char* riderName) {
     std::lock_guard<std::mutex> lk(g_mutex);
     ToWide(g_identity, 256, riderName);
+}
+
+bool HasIdentity() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_identity[0] != 0;
 }
 
 bool HasContext() {
@@ -167,6 +184,13 @@ void Update(float x, float y, float z, float yawDeg) {
     g_mem->uiVersion = LINK_VERSION;
     // Last, and only now: everything above is the frame this tick advertises as fresh.
     g_mem->uiTick++;
+}
+
+void ClearContext() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_server[0] = 0; g_track[0] = 0;
+    memset(g_context, 0, sizeof(g_context));
+    g_contextLen = 0;
 }
 
 void Clear() {

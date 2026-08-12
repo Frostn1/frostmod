@@ -57,29 +57,46 @@ metres from where the rider is.
 ## The context, and why it fails closed
 
 Mumble strips positional data between two users whose `context` bytes differ — they still
-hear each other, just flat. We set it from `RaceEvent`:
+hear each other, just flat. We set it from **`EventInit`**, whose `SPluginsBikeEvent_t`
+carries the server name, the track ID *and* our own GUID:
 
 ```
-mxbikes|<server/event name>|<track name>
+mxbikes|<server name>|<track id>
 ```
 
 Both halves matter. The server alone would keep riders grouped through a track change; the
 track alone would group strangers on unrelated servers running the same map, and put their
 voices at positions on a track they aren't sharing.
 
-**We publish nothing until `RaceEvent` has given us a context.** An empty context is still
-a context, so every rider carrying one would be grouped together — the opposite of what
-this feature is for. No context, no positional data, and everyone is simply heard flat.
+**We publish nothing until a context exists.** An empty context is still a context, so
+every rider carrying one would be grouped together — the opposite of what this feature is
+for. No context, no positional data, and everyone is simply heard flat.
+
+`RaceEvent` is kept for the track half alone — a server on a rotation changes track without
+opening a new event — and the server name from `EventInit` survives it.
+
+### Why not `RaceEvent` for the whole thing
+
+It was the first attempt, and it **does not reach the client**: it is a *race*-session
+callback, confirmed firing on the dedicated server (see [FrostServer](FROSTSERVER.md)) and
+observed never firing in a client session. The fail-closed guard did its job — proximity
+simply never engaged — but the failure was silent, because the handler logged only *after*
+its size check, so "never called" and "called with an unexpected payload" looked identical.
+
+Every plugin callback we implement now logs once on first arrival with the size the game
+passed (`[cb] <name> fired (dataSize=N)`), so that class of failure costs one log line
+rather than a guess.
 
 ## What is unverified
 
-- **That `RaceEvent` fires on the client.** It is confirmed on the *dedicated server* (see
-  [FrostServer](FROSTSERVER.md) for the RE), and the callback is not documented as
-  server-only. If it turns out not to fire client-side, the fail-closed guard above means
-  proximity silently never engages — check `frostmod.log` for `[mumble] context:`.
 - **Everything downstream of the block.** The struct layout is guarded by a
   `static_assert`, and the vector maths is checked against the radar, but whether Mumble
   actually picks us up has to be seen once on Windows with Mumble running.
+- **`SPluginsBikeEvent_t`'s layout.** We read `m_szServerName`, `m_szTrackID` and
+  `m_szGUID`, which sit at the *end* of the struct, so every preceding field must match the
+  SDK exactly — a wrong size anywhere ahead of them yields plausible garbage rather than an
+  error. The size check rejects a payload smaller than expected, and the log line prints
+  what actually arrived.
 
 ## Files
 

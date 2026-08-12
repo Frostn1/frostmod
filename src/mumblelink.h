@@ -29,18 +29,28 @@ void Update(float x, float y, float z, float yawDeg);
 // riders sitting in menus don't stay pinned to wherever they last were on track.
 void Clear();
 
-// The grouping key. Mumble strips positional data between two users whose context
-// differs, so this is what scopes proximity to one server and track — riders elsewhere
-// are heard flat rather than from a position that means nothing to them.
-void SetContext(const char* eventName, const char* trackName);
+// The grouping key, in two halves. Mumble strips positional data between two users whose
+// context differs, so this is what scopes proximity to one server and track — riders
+// elsewhere are heard flat rather than from a position that means nothing to them.
+//
+// Split because the two arrive from different callbacks and change independently: the
+// server is known once, when the event opens; the track changes under us on a rotation.
+// Setting them together would mean a track change wiping the server name.
+void SetServer(const char* serverName);
+void SetTrack(const char* trackName);
 
-// Who we are, for Mumble's own bookkeeping.
+// Who we are, for Mumble's own bookkeeping. Our GUID when EventInit has given us one.
 void SetIdentity(const char* riderName);
+bool HasIdentity();
 
 // Whether a context has been established yet. Publishing before it is, is worse than
 // publishing nothing: an empty context is a context, and every rider carrying it would be
 // grouped together regardless of which server they are actually on.
 bool HasContext();
+
+// Forget the server and track. Called when the event closes, so a stale context can't
+// group us with whoever is in the next lobby.
+void ClearContext();
 
 // Runtime toggle, persisted alongside the radar's settings.
 void SetEnabled(bool on);

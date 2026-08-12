@@ -1466,6 +1466,31 @@ struct SPluginsRaceTrackPosition_t { // RaceTrackPosition array element
     float m_fTrackPos;                // 0..1 along the centreline
     int   m_iCrashed;
 };
+// EventInit payload. Unlike the structs above we read fields at the *end* of this one,
+// so every preceding field must match the SDK exactly — a wrong size anywhere ahead of
+// m_szServerName silently yields garbage rather than an error. Verbatim from mxb_api.h.
+struct SPluginsBikeEvent_t {
+    char  m_szRiderName[100];
+    char  m_szBikeID[100];
+    char  m_szBikeName[100];
+    int   m_iNumberOfGears;
+    int   m_iMaxRPM;
+    int   m_iLimiter;
+    int   m_iShiftRPM;
+    float m_fEngineOptTemperature;
+    float m_afEngineTemperatureAlarm[2];
+    float m_fMaxFuel;
+    float m_afSuspMaxTravel[2];
+    float m_fSteerLock;
+    char  m_szCategory[100];
+    char  m_szTrackID[100];
+    char  m_szTrackName[100];
+    float m_fTrackLength;
+    int   m_iType;                   // 1 = testing; 2 = race; 4 = straight rhythm
+    char  m_szServerName[64];        // the server we joined
+    int   m_iServerType;
+    char  m_szGUID[100];             // OUR OWN guid - the local player only
+};
 struct SPluginsRaceEvent_t {         // RaceEvent payload
     int  m_iType;                    // 1 = testing; 2 = race; 4 = straight rhythm; -1 = replay
     char m_szName[100];              // the server/event name
@@ -1675,6 +1700,18 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
     return count;
 }
 
+// One line the first time each plugin callback fires, with the size the game passed.
+// Without this a callback that arrives with an unexpected payload size is indistinguishable
+// from one that never arrives -- which is exactly how the first Mumble context attempt
+// failed, silently, against RaceEvent.
+static void LogCallbackOnce(const char* name, int size) {
+    static const char* seen[24] = {0};
+    static int n = 0;
+    for (int i = 0; i < n; ++i) if (seen[i] == name) return;
+    if (n < 24) seen[n++] = name;
+    Log("[cb] %s fired (dataSize=%d)", name, size);
+}
+
 // ---- Mumble positional audio ------------------------------------------------
 // We publish only OUR OWN pose; Mumble's server distributes it and does the panning and
 // attenuation. That is the whole reason this is cheap: proximity chat without ever having
@@ -1699,14 +1736,17 @@ static void MumblePublish() {
         yawDeg = g_radRiders[me].yawDeg;
         meRaceNum = g_radRiders[me].raceNum;
     }
-    // Identity only has to be unique within the context, and the race number is exactly
-    // that — unlike a rider name, which two people on one grid can share.
+    // Identity is set from our GUID in EventInit — stable per install, where a race
+    // number is only unique within one session. Kept here only as the fallback for a
+    // session that somehow started without one.
     static int lastRaceNum = -2;
     if (meRaceNum != lastRaceNum) {
         lastRaceNum = meRaceNum;
-        char id[64];
-        _snprintf_s(id, sizeof(id), _TRUNCATE, "racenum:%d", meRaceNum);
-        mumblelink::SetIdentity(id);
+        if (!mumblelink::HasIdentity()) {
+            char id[64];
+            _snprintf_s(id, sizeof(id), _TRUNCATE, "racenum:%d", meRaceNum);
+            mumblelink::SetIdentity(id);
+        }
     }
     mumblelink::Update(x, y, z, yawDeg);
 }
@@ -3763,13 +3803,16 @@ __declspec(dllexport) void Draw(int /*_iState*/, int* _piNumQuads, void** _ppQua
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+    LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
 }
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
@@ -3781,17 +3824,46 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
             ? ((SPluginsRaceClassification_t*)_pData)->m_iNumEntries : 0;
     RadStoreClassification(_pArray, n, _iElemSize);
 }
-// The server/event name and track. Mumble strips positional data between users whose
-// context differs, so this is what scopes proximity to the server you are actually on.
+// EventInit is where the client learns which server it joined. RaceEvent -- the obvious
+// candidate -- does not reach the client; it is a *race*-session callback, confirmed
+// firing on the dedicated server (see FROSTSERVER.md) and observed never firing here.
+// This one carries the server name, the track and our own GUID, which is more than we
+// need and all in one place.
+__declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
+    LogCallbackOnce("EventInit", _iDataSize);
+    if (!_pData || _iDataSize < (int)sizeof(SPluginsBikeEvent_t)) {
+        Log("[mumble] EventInit payload too small (%d < %d) - context not set",
+            _iDataSize, (int)sizeof(SPluginsBikeEvent_t));
+        return;
+    }
+    const auto* e = (const SPluginsBikeEvent_t*)_pData;
+    // Fixed-size char arrays, not guaranteed NUL-terminated.
+    char server[65] = {0}, track[101] = {0}, guid[101] = {0};
+    memcpy(server, e->m_szServerName, 64);
+    memcpy(track,  e->m_szTrackID,    100);
+    memcpy(guid,   e->m_szGUID,       100);
+
+    mumblelink::SetServer(server);
+    mumblelink::SetTrack(track);
+    if (guid[0]) mumblelink::SetIdentity(guid);
+    Log("[mumble] context: server='%s' track='%s' type=%d guid=%s",
+        server, track, e->m_iServerType, guid[0] ? "yes" : "no");
+}
+__declspec(dllexport) void EventDeinit() {
+    Log("[mumble] event closed - context cleared");
+    mumblelink::ClearContext();
+    mumblelink::Clear();
+}
+// Kept for the track half only: a server on a rotation changes track without a new event,
+// and this is confirmed to carry it. The server name set by EventInit survives.
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
+    LogCallbackOnce("RaceEvent", _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(SPluginsRaceEvent_t)) return;
     const auto* e = (const SPluginsRaceEvent_t*)_pData;
-    // The fields are fixed-size char arrays and are not guaranteed NUL-terminated.
-    char name[101] = {0}, track[101] = {0};
-    memcpy(name, e->m_szName, 100);
+    char track[101] = {0};
     memcpy(track, e->m_szTrackName, 100);
-    mumblelink::SetContext(name, track);
-    Log("[mumble] context: server='%s' track='%s'", name, track);
+    mumblelink::SetTrack(track);
+    Log("[mumble] track now '%s'", track);
 }
 __declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); mumblelink::Clear(); }
 __declspec(dllexport) void RaceDeinit()             { RadResetRace(); mumblelink::Clear(); }

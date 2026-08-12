@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-11
+
+### Fixed
+- **Proximity voice never engaged: `RaceEvent` doesn't reach the client.** It is a
+  *race*-session callback — confirmed firing on the dedicated server, never in a client
+  session — so the context was never set and the fail-closed guard correctly published
+  nothing. The context now comes from **`EventInit`**, whose `SPluginsBikeEvent_t` carries
+  the server name, the track ID *and* our own GUID. `RaceEvent` is kept for the track half
+  alone, so a rotation still updates it without losing the server name.
+- **Identity is now our GUID** rather than a race number — stable per install, where a race
+  number is only unique within one session.
+- `EventDeinit` clears the context on leaving, so a stale one can't group us with whoever
+  is in the next lobby.
+
+### Added
+- **Every plugin callback logs once on first arrival**, with the size the game passed
+  (`[cb] EventInit fired (dataSize=…)`). The bug above was invisible for exactly this
+  reason: the handler logged only *after* its size check, so "never called" and "called
+  with an unexpected payload" produced identical silence. One line now separates them.
+
 ## 2026-08-10
 
 ### Added

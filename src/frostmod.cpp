@@ -1342,11 +1342,21 @@ std::atomic<int>  g_reloadDone{0};    // steps completed (drives the progress ba
 // while FrostMod survives via its GL swap-hook fallback). 0 => off. Remove once confirmed.
 std::atomic<uint64_t> g_drawDiagUntil{0};
 static int  g_reloadCur = 0;          // next step to run
+static int  g_reloadStart = 0;        // index this run began at (nonzero only when skipping)
 static bool g_reloadPrimed = false;   // have we presented one frame before starting work?
 // Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
 // table this title has not confirmed. Only the person collecting a diagnostic log should
 // ever turn it on - see the refusal in RequestReload.
 static bool g_unsafeReload = false;
+// 1-based step to start the replay at, from that same flag file's contents
+// (--unsafe-reload-from=N). 1 = the whole table, which is what an empty file means.
+//
+// GP Bikes dies on step 1 (tracks, 0x139A0) every single time it is armed - three for three
+// in a v0.12.0 reporter log, with no step 2 ever reached. That leaves two explanations, and
+// skipping the step separates them: if 2..13 then complete, the tracks loader alone is
+// unsafe to re-run; if the new first step dies identically, replaying ANY loader from the
+// present-thread call site is what kills it.
+static int  g_unsafeReloadFrom = 1;
 
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
@@ -1375,7 +1385,12 @@ void AdvanceReload() {
         g_reloadDone.store(++g_reloadCur);
     } else {
         g_reloadActive.store(false);
-        Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
+        if (g_reloadStart > 0)
+            Log("[reload] done - steps %d..%d completed (1..%d were skipped). The skipped "
+                "step is the one that faults.",
+                g_reloadStart + 1, g_game->reload_count, g_reloadStart);
+        else
+            Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
         SetStatus("reloaded - new mods listed", 4000);
     }
 }
@@ -1413,15 +1428,16 @@ void RequestReload() {
     if (g_reloadActive.load()) { Log("[reload] already in progress - ignoring"); return; }
     // Re-read the server-filter blocklist too, so editing it takes effect live.
     frostmod::serverfilter::Reload();
-    g_reloadCur = 0; g_reloadDone.store(0); g_reloadPrimed = false;
+    // Normally 0. --unsafe-reload-from=N starts partway in, so the progress bar begins at
+    // the same offset rather than claiming work that was never done.
+    const int first = (g_unsafeReload && g_unsafeReloadFrom > 1) ? g_unsafeReloadFrom - 1 : 0;
+    g_reloadCur = first; g_reloadStart = first; g_reloadDone.store(first); g_reloadPrimed = false;
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
-    // The thread id is here to be compared with the one on the boot [capture] scan lines.
-    // Those run on the thread that called WinMain, i.e. the thread that owns the content
-    // lists; we replay the same loaders from whichever thread presents frames. If the two
-    // ids differ, this reload races the game's own use of the lists - which is the leading
-    // explanation for GP Bikes dying on some reloads and not others.
-    Log("[reload] surgical content reload (stepped over %d frames, tid=%lu)%s...",
-        g_game->reload_count, GetCurrentThreadId(),
+    // The thread id is still logged, but it is no longer the open question: a v0.12.0
+    // reporter log has it matching the boot [capture] scan tid in all three sessions, so
+    // we do replay on the thread that owns the content lists. The race theory is dead.
+    Log("[reload] surgical content reload (%d step(s) from #%d, stepped over frames, tid=%lu)%s...",
+        g_game->reload_count - first, first + 1, GetCurrentThreadId(),
         g_game->reload_verified ? "" : " [UNSAFE: unconfirmed table, armed by --unsafe-reload]");
     SetStatus("reloading mods...", 30000);   // long TTL; cleared when the bar completes
     // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
@@ -3703,8 +3719,26 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(uflag, '\\')) { *(s + 1) = 0; strcat_s(uflag, "frostmod_unsafe_reload.flag"); }
         }
         g_unsafeReload = uflag[0] && GetFileAttributesA(uflag) != INVALID_FILE_ATTRIBUTES;
+        if (g_unsafeReload) {
+            // Contents are optional: empty (every build before this one) means step 1.
+            if (FILE* f = nullptr; fopen_s(&f, uflag, "r") == 0 && f) {
+                int n = 0;
+                if (fscanf_s(f, "%d", &n) == 1 && n > 1) g_unsafeReloadFrom = n;
+                fclose(f);
+            }
+            // Clamp here rather than at the call site, so the [reload] line below and the
+            // step loop can never disagree about where this run actually starts.
+            if (g_unsafeReloadFrom > g_game->reload_count)
+                g_unsafeReloadFrom = g_game->reload_count;
+        }
         if (g_game->reload_verified)
             Log("[reload] %s's step table is confirmed - reload is ON (R / F8).", g_game->display);
+        else if (g_unsafeReload && g_unsafeReloadFrom > 1)
+            Log("[reload] ARMED UNSAFELY from step %d of %d (--unsafe-reload-from): steps "
+                "1..%d are SKIPPED on %s. If the rest complete, the skipped step is the "
+                "culprit; if step %d dies the same way, the call site is.",
+                g_unsafeReloadFrom, g_game->reload_count, g_unsafeReloadFrom - 1,
+                g_game->display, g_unsafeReloadFrom);
         else if (g_unsafeReload)
             Log("[reload] ARMED UNSAFELY (--unsafe-reload): %s's step table has NOT been "
                 "confirmed on this title and has crashed it. Each step is logged before it "

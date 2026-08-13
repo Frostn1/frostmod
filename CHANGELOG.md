@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-08-12 — v0.12.1-beta.1
+
+Diagnostic-only, and published as a **pre-release**: `releases/latest` skips it, so neither
+`frostmod.exe --update` nor the MXB App will offer it. Download it by hand if you are the
+one collecting the GP Bikes reload log.
+
+### Added
+- **`--unsafe-reload-from=<n>` skips to a given reload step**, for the one question a
+  step-level crash log can't answer on its own. GP Bikes dies on step 1 (`tracks`,
+  `0x139A0`) every time it is armed — three sessions out of three, with no step 2 ever
+  reached. Skipping it separates the two explanations: if 2–13 then complete, that single
+  loader is unsafe to re-run; if the new first step dies identically, replaying *any*
+  loader from the present-thread call site is what kills the game. Implies
+  `--unsafe-reload`, and rides in the same flag file — an empty one still reads as "start
+  at step 1", so a flag file left by an older build behaves exactly as it did.
+
+### Changed
+- The reload's thread-id line no longer frames the two ids as the open question. A v0.12.0
+  reporter log has the boot scan tid and the reload tid **identical** in all three sessions,
+  so we already replay on the thread that owns the content lists — the race theory that
+  motivated logging them is disproved. `tasks/gp-bikes-port.md` records what replaced it:
+  the tracks loader zeroes its list globals without freeing them, and is stack-cookie
+  guarded, so a failure there is `__fastfail` and SEH never sees it.
+
 ## 2026-08-12 — v0.12.0
 
 ### Fixed

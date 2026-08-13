@@ -1,26 +1,26 @@
 # Changelog
 
-## 2026-08-11
+## 2026-08-12 — v0.12.0
 
 ### Fixed
-- **Proximity voice never engaged: `RaceEvent` doesn't reach the client.** It is a
-  *race*-session callback — confirmed firing on the dedicated server, never in a client
-  session — so the context was never set and the fail-closed guard correctly published
-  nothing. The context now comes from **`EventInit`**, whose `SPluginsBikeEvent_t` carries
-  the server name, the track ID *and* our own GUID. `RaceEvent` is kept for the track half
-  alone, so a rotation still updates it without losing the server name.
-- **Identity is now our GUID** rather than a race number — stable per install, where a race
-  number is only unique within one session.
-- `EventDeinit` clears the context on leaving, so a stale one can't group us with whoever
-  is in the next lobby.
-
-### Added
-- **Every plugin callback logs once on first arrival**, with the size the game passed
-  (`[cb] EventInit fired (dataSize=…)`). The bug above was invisible for exactly this
-  reason: the handler logged only *after* its size check, so "never called" and "called
-  with an unexpected payload" produced identical silence. One line now separates them.
-
-## 2026-08-10
+- **Reload no longer takes GP Bikes down.** v0.11.0 replaced MX Bikes' table with one
+  derived for GP Bikes, and that one crashes the game too: a reporter's log shows
+  `[reload] surgical content reload` with no `[reload] done` after it and the process
+  gone — one session died on its first reload, another on its fourth after three clean
+  ones. The offsets are still unconfirmed, so GP Bikes now **refuses** the reload with an
+  honest message instead of attempting it. MX Bikes is untouched.
+- **The radar pointed riders in arbitrary directions.** `m_fYaw` is *degrees from north*
+  and was being handed straight to `cosf`/`sinf`, which take radians — scaling every
+  heading by 57.3. It isn't a small tilt: a rider held dead ahead swings from +86° to
+  −139° across four degrees of real heading change, so blips spin as you steer. The three
+  constants the code invited you to flip (`GroundUV`, `RAD_YAW_SIGN`, `RAD_YAW_OFFSET`)
+  were all correct, and flipping them could never have fixed it. Shipped this way since
+  v0.9.7.
+- **A short element stride no longer reads off the end of the rider arrays.**
+  `RaceTrackPosition` and `RaceClassification` walk the game's array with the stride it
+  reports; a stride smaller than the struct we read meant each element's tail came out of
+  the next one, and the last out of bounds. A *larger* stride is still accepted — that's
+  just a later game build appending fields.
 
 ### Added
 - **Proximity voice, via Mumble.** FrostMod publishes your position through Mumble's Link
@@ -33,44 +33,19 @@
   them in the same direction by construction. `LinkedMem`'s layout is a cross-process
   contract, so its size is pinned by a `static_assert`; getting it wrong would write
   Mumble's fields at the wrong offsets with no error anywhere.
-- `RaceEvent` is now consumed on the client, for the Mumble context (`server|track`).
-  Nothing is published until it arrives: an empty context is still a context, and every
-  rider carrying one would be grouped together regardless of the server they're on.
-
-### Fixed
-- **The radar pointed riders in arbitrary directions.** `m_fYaw` is *degrees from north*
-  and was being handed straight to `cosf`/`sinf`, which take radians — scaling every
-  heading by 57.3. It isn't a small tilt: a rider held dead ahead swings from +86° to
-  −139° across four degrees of real heading change, so blips spin as you steer. The three
-  constants the code invited you to flip (`GroundUV`, `RAD_YAW_SIGN`, `RAD_YAW_OFFSET`)
-  were all correct, and flipping them could never have fixed it.
-- **A short element stride no longer reads off the end of the rider arrays.**
-  `RaceTrackPosition` and `RaceClassification` walk the game's array with the stride it
-  reports; a stride smaller than the struct we read meant each element's tail came out of
-  the next one, and the last out of bounds. A *larger* stride is still accepted — that's
-  just a later game build appending fields.
-
-### Changed
-- Yaw carriers renamed `yawDeg` (`RadRider`, `RadBlip`, `RadBuildBlips`) so the unit
-  travels with the value. The bug above was invisible at the call site precisely because
-  a bare `yaw` says nothing about what it's measured in.
-- The radar's conventions are documented as settled rather than pending a live run,
-  confirmed against PiBoSo's SDK header and cross-checked against
-  [MXBMRP3](https://github.com/thomas4f/mxbmrp3) (MIT), which draws a working radar for
-  the same games from the same callback. The outline's GL view-projection capture is
-  unaffected and still wants a Windows run.
-
-## 2026-08-09 — v0.12.0
-
-### Fixed
-- **Reload no longer takes GP Bikes down.** v0.11.0 replaced MX Bikes' table with one
-  derived for GP Bikes, and that one crashes the game too: a reporter's log shows
-  `[reload] surgical content reload` with no `[reload] done` after it and the process
-  gone — one session died on its first reload, another on its fourth after three clean
-  ones. The offsets are still unconfirmed, so GP Bikes now **refuses** the reload with an
-  honest message instead of attempting it. MX Bikes is untouched.
-
-### Added
+- **Riders are grouped by the context `EventInit` carries** (`server|track`): its
+  `SPluginsBikeEvent_t` holds the server name, the track ID *and* our own GUID.
+  `RaceEvent` is a *race*-session callback — it fires on the dedicated server and never in
+  a client session — so it is kept for the track half alone, and a rotation still updates
+  it without losing the server name. Identity is our GUID, stable per install, where a
+  race number is only unique within one session. Nothing is published until a context
+  arrives: an empty context is still a context, and every rider carrying one would be
+  grouped together regardless of the server they're on. `EventDeinit` clears it on
+  leaving, so a stale one can't group you with whoever is in the next lobby.
+- **Every plugin callback logs once on first arrival**, with the size the game passed
+  (`[cb] EventInit fired (dataSize=…)`). The handler used to log only *after* its size
+  check, so "never called" and "called with an unexpected payload" produced identical
+  silence. One line now separates them.
 - **Every reload step is logged before it runs** (`[reload] step 4/13 rva=0x14D90 - bikes`),
   on both titles. This is the only way a crash inside a replayed loader can be
   attributed: each step is SEH-guarded, so an ordinary access violation is swallowed and
@@ -86,6 +61,16 @@
 - `reload_verified` on `GameOffsets`, with tests. A table that exists but has never run on
   its title is the dangerous case, not the safe one — it looks like a working feature
   until it isn't. Both GP crashes shipped as tables that compiled fine.
+
+### Changed
+- Yaw carriers renamed `yawDeg` (`RadRider`, `RadBlip`, `RadBuildBlips`) so the unit
+  travels with the value. The bug above was invisible at the call site precisely because
+  a bare `yaw` says nothing about what it's measured in.
+- The radar's conventions are documented as settled rather than pending a live run,
+  confirmed against PiBoSo's SDK header and cross-checked against
+  [MXBMRP3](https://github.com/thomas4f/mxbmrp3) (MIT), which draws a working radar for
+  the same games from the same callback. The outline's GL view-projection capture is
+  unaffected and still wants a Windows run.
 
 ### Notes
 - What the reporter's log *does* confirm: GP's loaders really are self-contained (for

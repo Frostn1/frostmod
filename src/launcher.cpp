@@ -35,6 +35,8 @@
 //     frostmod.exe --unsafe-reload         (run a reload table the title hasn't confirmed
 //                                           - GP Bikes: it has crashed the game. Only for
 //                                           collecting the step-level log that pins it)
+//     frostmod.exe --unsafe-reload-from=2  (same, but skip to step 2 - isolates whether a
+//                                           single loader is at fault or the call site is)
 //     frostmod.exe --mods "D:\path\mods"   (override the mods folder)
 //     frostmod.exe C:\path\frostmod.dll    (explicit DLL path)
 //
@@ -600,6 +602,7 @@ int main(int argc, char** argv) {
     bool captureMaster = false; // --capture-master: sniff master protocol (RE for the mimic master)
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool unsafeReload = false;// --unsafe-reload: replay a step table the title hasn't confirmed
+    int  reloadFrom   = 0;    // --unsafe-reload-from=N: start the replay at step N (0 = step 1)
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
@@ -636,6 +639,16 @@ int main(int argc, char** argv) {
         else if (a == "--capture-master")        captureMaster = true;
         else if (a == "--switch-live")           switchLive = true;
         else if (a == "--unsafe-reload")         unsafeReload = true;
+        // Skipping a step is only ever useful with the table already armed, so this
+        // implies --unsafe-reload rather than making you pass both.
+        else if (a.rfind("--unsafe-reload-from=", 0) == 0) {
+            reloadFrom = (int)atol(a.c_str() + strlen("--unsafe-reload-from="));
+            if (reloadFrom < 1) {
+                printf("[!] --unsafe-reload-from needs a step number of 1 or more.\n");
+                return 1;
+            }
+            unsafeReload = true;
+        }
         else if (a == "--filter-servers")        filterSrv = true;    // explicit (already default)
         else if (a == "--no-filter-servers")     filterSrv = false;   // opt out of the filter
         else if (a == "--install-startup")       installStartup = true;
@@ -703,12 +716,16 @@ int main(int argc, char** argv) {
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
     // Whether reload works is per-title now, so say it here rather than let someone press
     // R in game and wonder. A title with an unconfirmed table is refused unless armed.
-    printf("[*] reload: %s\n",
-           game->reload_verified   ? "on (press R here, or R / F8 in game)"
-           : unsafeReload          ? "ARMED UNSAFELY for this title - it has crashed the game; "
-                                     "you are collecting a log"
-                                   : "OFF for this title - offsets derived but not confirmed "
-                                     "(arm with --unsafe-reload)");
+    if (reloadFrom > 1)
+        printf("[*] reload: ARMED UNSAFELY from step %d (steps 1..%d skipped) - collecting a log\n",
+               reloadFrom, reloadFrom - 1);
+    else
+        printf("[*] reload: %s\n",
+               game->reload_verified   ? "on (press R here, or R / F8 in game)"
+               : unsafeReload          ? "ARMED UNSAFELY for this title - it has crashed the game; "
+                                         "you are collecting a log"
+                                       : "OFF for this title - offsets derived but not confirmed "
+                                         "(arm with --unsafe-reload)");
     printf("[*] log   : %s\n", logPath.c_str());
     printf("=============================================\n");
 
@@ -753,11 +770,24 @@ int main(int argc, char** argv) {
     }
     std::string unsafeFlag = ExeDir() + "frostmod_unsafe_reload.flag";
     if (unsafeReload) {
-        if (FILE* f = nullptr; fopen_s(&f, unsafeFlag.c_str(), "w") == 0 && f) fclose(f);
+        // The file's presence arms the table; its contents (when any) carry the 1-based
+        // step to start at. An empty file is what every previous build wrote, and the DLL
+        // still reads that as "start at 1" - so an old flag file left on disk behaves
+        // exactly as it did before.
+        if (FILE* f = nullptr; fopen_s(&f, unsafeFlag.c_str(), "w") == 0 && f) {
+            if (reloadFrom > 1) fprintf(f, "%d", reloadFrom);
+            fclose(f);
+        }
         printf("[*] --unsafe-reload ON: reload will run even where the step table is NOT\n"
                "    confirmed for the title. It has crashed GP Bikes. Use it only to collect\n"
                "    a log: every step is written to frostmod.log before it runs, so the last\n"
                "    [reload] step line names the loader that faults. Then send the log.\n");
+        if (reloadFrom > 1)
+            printf("[*] --unsafe-reload-from=%d: steps 1..%d are SKIPPED. This answers whether\n"
+                   "    one loader is unsafe or whether replaying any of them from here is:\n"
+                   "    if the rest now complete, the skipped step is the culprit; if the new\n"
+                   "    first step dies the same way, the call site is.\n",
+                   reloadFrom, reloadFrom - 1);
     } else {
         DeleteFileA(unsafeFlag.c_str());
     }

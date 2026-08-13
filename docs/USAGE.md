@@ -50,6 +50,7 @@ treated as an explicit path to the DLL.
 | `--capture-master` | — | off | RE diagnostic for the **mimic master server** — hooks the `ws2_32` exports and logs only master (UDP 54200 / resolved `mx-bikes.com` IP) traffic to `[cap]` / `[cap.hex]` / `[cap.str]` lines. Read-only. Open the online browser and/or run a local `mxbikes.exe --dedicated`, then share `frostmod.log`. |
 | `--probe-mount` | — | off | RE diagnostic only — logs the content-loader's arguments (`[mount] …`). Not needed for normal use. |
 | `--unsafe-reload` | — | off | Run the reload on a title whose step table hasn't been confirmed — today that means **GP Bikes, where it has crashed the game**. Only worth arming to collect a log: every step is written to `frostmod.log` *before* it runs, so the last `[reload] step …` line names the loader that faults. Send that log in. |
+| `--unsafe-reload-from=<n>` | step number | `1` | As `--unsafe-reload` (which it implies), but skips straight to step `n`. On GP Bikes the reload dies on **step 1 (`tracks`, `0x139A0`) every time**, so `--unsafe-reload-from=2` asks the one question that log can't answer: if steps 2–13 then complete, that single loader is unsafe to re-run; if step 2 dies the same way, replaying *any* loader from this call site is what kills the game. |
 
 ## Controls
 

@@ -191,16 +191,10 @@ failure — not the one v0.11.0 fixed.
 So GP Bikes' reload is **off by default** as of v0.12.0 (`reload_verified =
 false` in `GAME_GPB`), armed only with `--unsafe-reload`. What is still needed:
 
-1. **Which step.** v0.12.0 logs every step before running it, so an
-   `--unsafe-reload` run on GP Bikes ends with the offending loader named. Get
-   one log; that turns 13 candidates into 1. Note the crash is *not* a plain
-   access violation — `RL_SC` is SEH-guarded and would swallow one and finish —
-   so expect heap corruption or a fault on another thread.
-2. **Which thread.** GP's boot content load runs on the WinMain thread (its scan
-   stacks bottom out at `0x402e5`); we replay from whichever thread calls
-   `SwapBuffers`. v0.12.0 logs both ids. If they differ, that is the bug, and
-   the fix is to run the steps on the game's thread rather than the presenting
-   one — it would also explain crashing on some reloads and not others.
+1. ~~**Which step.**~~ **ANSWERED — step 1, `tracks`, `0x139A0`.** See the
+   v0.12.0 field result below.
+2. ~~**Which thread.**~~ **ANSWERED — same thread. The race theory is dead.**
+   See below.
 3. **The 8 unconfirmed RVAs.** The log corroborates only tracks `0x139A0`,
    tyres `0x34AE0`, rider `0x34080`, bikes `0x14D90` and bike paints `0x32090`
    (each shows the game-dir and mods-dir scans sharing one boot-init return with
@@ -209,6 +203,42 @@ false` in `GAME_GPB`), armed only with `--unsafe-reload`. What is still needed:
    appear. Raising that cap on a diagnostic build would corroborate the other 8
    from a plain startup log, with no reload and no crash — do that first, it is
    free.
+
+## Field result — it is step 1, and the thread theory is dead (2026-08-12)
+
+A reporter running **v0.12.0** on GP Bikes (`frostmod-3.txt`, Windows), armed
+with `--unsafe-reload`, across three sessions:
+
+- **All three die at `[reload] step 1/13 rva=0x139a0 - tracks`.** No step 2 in
+  the whole 108 KB log, no `[reload] done`, file ends mid-reload. Armed, it is
+  deterministic — not the intermittent failure v0.11.0 showed.
+- **The boot scan tid and the reload tid are identical** in every session
+  (33300, 27112, 34764). We already replay on the thread that owns the content
+  lists, so item 2 above is answered and wrong. Cross it off.
+- He was in the **menus**, not a session (no `[cb]` callbacks, no `EventInit`,
+  `persp=0`), so no track needs to be loaded for this to happen. `[sig] scanner
+  signature VERIFIED` rules out offset drift on his build.
+
+Disassembly of `0x1400139A0` in `gpbikes.exe.unpacked.exe` adds two things:
+
+- **The RVA is right.** Its two internal call sites are `0x13a18` (game dir) and
+  `0x13a36` (mods dir) — exactly the frames the boot stacks carry.
+- **It zeroes its list globals without freeing them** — `0x1405F21C8` (count),
+  `0x14094B428` (track array base), `0x1405E42D0` (index array). Safe exactly
+  once, at boot, when they are already null. A second call abandons live
+  allocations and rebuilds underneath anything still pointing at them.
+- **It is stack-cookie guarded**, ending in `call 0x1402DDC00`
+  (`__security_check_cookie`) after `xor rcx, rsp`. A cookie failure is
+  `__fastfail`, which **SEH cannot intercept** — which is why `RL_SC`'s guard
+  never sees it and the process vanishes with nothing logged. The recursive
+  directory walk at `0x13840` is 0x278/level under the loader's 0xFB8 frame and
+  `scanFolder`'s 0x7F8; at boot that runs six frames above thread start, at
+  reload it runs deep inside the present path — same thread, far deeper stack.
+
+**Next:** `--unsafe-reload-from=2` (added here) skips the tracks step. If 2..13
+then complete, that one loader is unsafe to re-run and the fix is targeted —
+restore its globals, or drop tracks from GP's table. If step 2 dies identically,
+the call site is the problem and the fix is *where* we replay from, not *what*.
 
 ## Verification
 

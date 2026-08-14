@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — v0.13.0
+
+### Fixed
+- **Every command MXB App has ever sent was ignored.** `HandleFrostModCommand` reads the
+  verb out of `frostmod_cmd.json` with `JsonStringField`, and that function could not
+  return `true`: the comment on its escape branch ended in a backslash, and a backslash at
+  the end of a line splices the following line into the comment — the following line being
+  the `if (ch == '"') return true;` that ends a value. So every read ran off the end of the
+  document and reported failure, and every command was refused with *no 'verb' in the
+  command file*. Nothing else is affected: reload from the console and `F8` are their own
+  event and never went near this. The parser now lives in `src/cmdchannel.h`, with the same
+  escape handling and a test that reads back a bike id holding both a quote and a
+  backslash, so it can't go quiet again unnoticed.
+
+### Added
+- **A command can arrive as a file alone, with no event to announce it.** The DLL re-reads
+  `frostmod_cmd.json` about five times a second and acts on it when it changes, as well as
+  when `Local\FrostModCommand` fires. This is what lets MXB App drive FrostMod on **Linux**:
+  there the game runs under Proton and so does FrostMod, but the app is a native Linux
+  process *outside* the Wine prefix — it can't open a Wine kernel object to pulse an event,
+  and it can't resolve what `%TEMP%` means in there. What it can do is write into the folder
+  it installed FrostMod into, one directory on disk seen from both sides, so that folder is
+  now read alongside `%TEMP%`. Windows is untouched: the event still arrives, and the file
+  it points at is still the one that gets read.
+- **`reload_mods`**, the verb behind MXB App's Reload button. It does what `R` and `F8` do;
+  it exists because a reload asked for from outside the prefix has no event to travel on.
+- **`src/cmdchannel.h` and `tests/command_channel_test.cpp`** — when a command counts as
+  new, kept clear of Win32 so CI can run it. The cases are the ways two mouths on one
+  channel go wrong: yesterday's command running at start-up, one command dispatched twice
+  because both paths saw it, the same command sent twice collapsing into one (MXB App
+  stamps each with `at`), and two command files taking turns looking new to each other and
+  reloading the game forever.
+
 ## 2026-08-12 — v0.12.1-beta.1
 
 Diagnostic-only, and published as a **pre-release**: `releases/latest` skips it, so neither

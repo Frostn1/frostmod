@@ -25,6 +25,7 @@
 #include <mutex>
 #include <atomic>
 #include <set>
+#include <map>        // command files -> what we last acted on (see the command channel)
 #include <cstring>
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
@@ -43,6 +44,7 @@
 #include "offsets.h"
 #include "serverfilter.h"
 #include "mumblelink.h"
+#include "cmdchannel.h" // MXB App command files: which one is new, and what it says
 #include "version.h"    // FROSTMOD_VERSION
 
 // ---------------------------------------------------------------------------
@@ -2689,6 +2691,8 @@ HANDLE g_cmdEvent    = nullptr;
 
 void DumpServerListBlob(bool force);   // fwd (defined near hkMpMsg)
 void HandleFrostModCommand();          // fwd (defined with the bike-apply code below)
+void PollCommandFiles();               // fwd (same block: the event-less arrival path)
+void SeedCommandFiles();               // fwd (same block: what to ignore at load)
 // g_origMpMsg (defined above) is non-null once --dump-serverlist hooked the handler
 
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
@@ -2973,6 +2977,9 @@ void Tick() {
     if (g_cmdEvent && WaitForSingleObject(g_cmdEvent, 0) == WAIT_OBJECT_0) {
         HandleFrostModCommand();
     }
+    // The same command channel for an app that can't pulse an event at us — MXB App on
+    // Linux, which is outside the Wine prefix we're running in. Rate-limited internally.
+    PollCommandFiles();
 
     // Radar range adjust (PageUp/PageDown) while the radar is shown; validate the
     // captured camera matrix each frame so the ESP can fall back to arrows if it drifts.
@@ -3287,28 +3294,17 @@ void NoteModelNeedsReselect(const char* bikeId, const char* why) {
 // the app doesn't get a result back, so every refusal is logged HERE.
 // The on-disk contract is mirrored in mxb-app's src-tauri/src/frostmod.rs; keep the
 // verb names in sync with swap_command_json / refresh_command_json there.
+//
+// The file is also read WITHOUT an event, on a poll, and that is what makes any of
+// this reachable from Linux. There the game runs under Proton and so do we, but MXB
+// App is a native Linux process outside the Wine prefix: Local\FrostModCommand is a
+// Wine kernel object it cannot open, and %TEMP% is a path it cannot resolve. What it
+// can do is write a file into the folder it installed us into - one directory on disk,
+// seen from both sides - and wait for us to notice. So on Windows the event still
+// arrives and nothing about that path changes; on Linux the write alone is the signal.
 // ---------------------------------------------------------------------------
 
-// Extract a JSON string field. The file is machine-written with a known flat shape
-// ({"bikeId":"..","verb":".."}), so a scan for "key" + the following quoted value is
-// sufficient - this is deliberately not a general JSON parser.
-static bool JsonStringField(const std::string& doc, const char* key, std::string& out) {
-    std::string needle = std::string("\"") + key + "\"";
-    size_t k = doc.find(needle);
-    if (k == std::string::npos) return false;
-    size_t c = doc.find(':', k + needle.size());
-    if (c == std::string::npos) return false;
-    size_t q = doc.find('"', c + 1);
-    if (q == std::string::npos) return false;
-    out.clear();
-    for (size_t i = q + 1; i < doc.size(); ++i) {
-        char ch = doc[i];
-        if (ch == '\\' && i + 1 < doc.size()) { out += doc[++i]; continue; }  // \" and \\
-        if (ch == '"') return true;
-        out += ch;
-    }
-    return false;   // unterminated
-}
+using frostmod::JsonStringField;   // the flat-JSON field reader, in cmdchannel.h
 
 static std::string CommandFilePath() {
     char tmp[MAX_PATH] = {0};
@@ -3317,31 +3313,83 @@ static std::string CommandFilePath() {
     return std::string(tmp) + "frostmod_cmd.json";
 }
 
-// Read + dispatch %TEMP%\frostmod_cmd.json. Called from the render thread when the
-// command event fires.
-void HandleFrostModCommand() {
-    std::string path = CommandFilePath();
-    if (path.empty()) { Log("[cmd] cannot resolve %%TEMP%% - ignoring command."); return; }
-    std::string doc;
-    if (FILE* f; fopen_s(&f, path.c_str(), "rb") == 0 && f) {
-        char buf[1024];
-        size_t got;
-        while ((got = fread(buf, 1, sizeof(buf), f)) > 0) doc.append(buf, got);
-        fclose(f);
-    } else {
-        Log("[cmd] command event fired but %s is unreadable.", path.c_str());
-        return;
-    }
+// The other place a command can land: our own folder, the one MXB App installed us into
+// and the one it can address from outside the prefix. Same folder frostmod_mods.txt and
+// the log already live in.
+static std::string CommandFilePathBesideUs() {
+    char p[MAX_PATH] = {0};
+    if (!g_selfModule || !GetModuleFileNameA(g_selfModule, p, sizeof(p))) return std::string();
+    char* slash = strrchr(p, '\\');
+    if (!slash) return std::string();
+    *(slash + 1) = 0;
+    return std::string(p) + "frostmod_cmd.json";
+}
 
+// Both, %TEMP% first: that is where every MXB App on Windows has always written, and an
+// event means "that file is the fresh one". A dll that can't resolve its own folder - or
+// one that lives in %TEMP% - must not contribute the same path twice.
+static std::vector<std::string> CommandFilePaths() {
+    std::vector<std::string> paths;
+    std::string temp = CommandFilePath();
+    if (!temp.empty()) paths.push_back(temp);
+    std::string beside = CommandFilePathBesideUs();
+    if (!beside.empty() && beside != temp) paths.push_back(beside);
+    return paths;
+}
+
+static bool ReadCommandFile(const std::string& path, std::string& out) {
+    FILE* f;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    out.clear();
+    char buf[1024];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, got);
+    fclose(f);
+    return true;
+}
+
+// What has already been acted on, so one command runs exactly once however it reached us
+// — the event path and the poll read the same files. The rules live in cmdchannel.h and
+// are tested there; this is only ever touched on the render thread.
+static frostmod::CommandInbox g_inbox;
+
+// Every command file that exists right now.
+static frostmod::CommandInbox::Snapshot ReadCommandFiles() {
+    frostmod::CommandInbox::Snapshot files;
+    for (const std::string& path : CommandFilePaths()) {
+        std::string doc;
+        if (ReadCommandFile(path, doc)) files.emplace_back(path, doc);
+    }
+    return files;
+}
+
+// Remember what is already lying around without acting on it. A command file survives the
+// session that wrote it, and re-running yesterday's reload the moment the game loads is
+// at best a surprise. Called from Init.
+void SeedCommandFiles() {
+    auto files = ReadCommandFiles();
+    for (const auto& file : files)
+        Log("[cmd] ignoring the command already in %s (left from an earlier run)",
+            file.first.c_str());
+    g_inbox.Seed(files);
+}
+
+// Act on one command document. `path` names where it came from, for the log.
+static void DispatchCommand(const std::string& doc, const std::string& path) {
     std::string verb, bikeId;
     if (!JsonStringField(doc, "verb", verb)) {
-        Log("[cmd] no 'verb' in the command file - ignoring.");
+        Log("[cmd] no 'verb' in %s - ignoring.", path.c_str());
         return;
     }
     JsonStringField(doc, "bikeId", bikeId);
     Log("[cmd] verb='%s' bikeId='%s'", verb.c_str(), bikeId.c_str());
 
-    if (verb == "refresh_bike_model") {
+    if (verb == "reload_mods") {
+        // MXB App's Reload button, arriving as a file rather than as the reload event it
+        // would rather pulse - see the header. Same work either way.
+        Log("[cmd] reload requested by MXB App");
+        RequestReload();
+    } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike
         // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
@@ -3354,6 +3402,35 @@ void HandleFrostModCommand() {
     } else {
         Log("[cmd] unknown verb '%s' - ignoring.", verb.c_str());
     }
+}
+
+// Read + dispatch the command file. Called from the render thread when the command event
+// fires.
+void HandleFrostModCommand() {
+    for (const std::string& path : CommandFilePaths()) {
+        std::string doc;
+        if (!ReadCommandFile(path, doc)) continue;
+        // The event says this file is fresh, so it is dispatched whatever it holds — but
+        // the poll has to be told, or it would run the same command again a moment later.
+        g_inbox.Note(path, doc);
+        DispatchCommand(doc, path);
+        return;
+    }
+    Log("[cmd] command event fired but no command file is readable.");
+}
+
+// Notice a command that arrived with no event to announce it. Cheap enough to sit in the
+// frame loop: two reads of a file well under a kilobyte, five times a second, on a thread
+// that is already drawing. A file that turns up after Init was written by a running app,
+// so it is acted on; one that was there at Init was seeded above and is not.
+void PollCommandFiles() {
+    static ULONGLONG lastPoll = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastPoll < 200) return;
+    lastPoll = now;
+
+    for (const auto& [path, doc] : g_inbox.Fresh(ReadCommandFiles()))
+        DispatchCommand(doc, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -3391,6 +3468,9 @@ DWORD WINAPI Init(LPVOID) {
     // MXB App -> FrostMod commands (payload file + this event); see HandleFrostModCommand.
     g_cmdEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModCommand");
     if (!g_cmdEvent) Log("[init] note: could not create command event (%lu)", GetLastError());
+    // Whatever command file is already on disk belongs to a previous session. Record it
+    // so the poll doesn't open this one by running it.
+    SeedCommandFiles();
 
     // triggers shared with frostmod.exe: R = reload, D = dump server list.
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");

@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.12.1")
+set(FROSTMOD_VERSION "0.13.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -94,6 +94,15 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 enable_testing()
 add_executable(offsets_test tests/offsets_test.cpp)
 add_test(NAME offsets COMMAND offsets_test)
+
+# --- command channel test ------------------------------------------------------
+# The MXB App command channel is read on an event *and* on a poll — the poll being all
+# a Linux MXB App, outside the Wine prefix, can reach us through. That makes "is this
+# document new?" a rule rather than an obvious fact, and a wrong answer is a reload
+# that fires twice or never. src/cmdchannel.h holds those rules apart from Win32 for
+# exactly this reason, so they run here too.
+add_executable(command_channel_test tests/command_channel_test.cpp)
+add_test(NAME command_channel COMMAND command_channel_test)
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

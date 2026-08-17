@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — v0.13.0
+## 2026-08-16 — v0.13.0
 
 ### Fixed
 - **Every command MXB App has ever sent was ignored.** `HandleFrostModCommand` reads the
@@ -17,13 +17,14 @@
 ### Added
 - **A command can arrive as a file alone, with no event to announce it.** The DLL re-reads
   `frostmod_cmd.json` about five times a second and acts on it when it changes, as well as
-  when `Local\FrostModCommand` fires. This is what lets MXB App drive FrostMod on **Linux**:
-  there the game runs under Proton and so does FrostMod, but the app is a native Linux
-  process *outside* the Wine prefix — it can't open a Wine kernel object to pulse an event,
-  and it can't resolve what `%TEMP%` means in there. What it can do is write into the folder
-  it installed FrostMod into, one directory on disk seen from both sides, so that folder is
-  now read alongside `%TEMP%`. Windows is untouched: the event still arrives, and the file
-  it points at is still the one that gets read.
+  when `Local\FrostModCommand` fires. This is what lets MXB App drive FrostMod on **Linux
+  and macOS**: there the game runs inside a Wine prefix — Proton's, or a CrossOver/Whisky
+  bottle — and so does FrostMod, but the app is a native process *outside* that prefix. It
+  can't open a Wine kernel object to pulse an event, and it can't resolve what `%TEMP%`
+  means in there. What it can do is write into the folder it installed FrostMod into, one
+  directory on disk seen from both sides, so that folder is now read alongside `%TEMP%`.
+  Windows is untouched: the event still arrives, and the file it points at is still the one
+  that gets read.
 - **`reload_mods`**, the verb behind MXB App's Reload button. It does what `R` and `F8` do;
   it exists because a reload asked for from outside the prefix has no event to travel on.
 - **`src/cmdchannel.h` and `tests/command_channel_test.cpp`** — when a command counts as

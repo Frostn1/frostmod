@@ -112,20 +112,26 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 | `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag`, `frostmod_unsafe_reload.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
 | `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods` or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
 
-### Running under Proton (Linux)
+### Running inside a Wine prefix (Linux and macOS)
 
-MXB App on Linux starts `frostmod.exe` inside the same Proton prefix as the game,
-which is the only place it can do its work — the game it injects into is a Windows
-process in that prefix, and so is FrostMod. Nothing here needs a flag for it, but
-two things follow from where the app is standing:
+MXB App starts `frostmod.exe` inside the same prefix as the game — Proton's on
+Linux, your CrossOver/Whisky/Wine bottle on macOS — which is the only place it can
+do its work: the game it injects into is a Windows process in that prefix, and so
+is FrostMod. Nothing here needs a flag for it, but two things follow from where the
+app is standing:
 
-- **It signals with a file, not an event.** MXB App is a native Linux process
-  outside the prefix, so it cannot pulse `Local\FrostModReload`. Reload from the
-  app arrives as `reload_mods` in `frostmod_cmd.json` instead, which the DLL picks
-  up within about a fifth of a second. `R` in the console and `F8` in game are
+- **It signals with a file, not an event.** MXB App is a native Linux or macOS
+  process outside the prefix, so it cannot pulse `Local\FrostModReload`. Reload from
+  the app arrives as `reload_mods` in `frostmod_cmd.json` instead, which the DLL
+  picks up within about a fifth of a second. `R` in the console and `F8` in game are
   unaffected — those are already inside.
 - **v0.13.0 or newer.** Older builds only read that file when an event told them
-  to, so an older FrostMod under Proton reloads on `F8` and ignores the app.
+  to, so an older FrostMod in a prefix reloads on `F8` and ignores the app.
+
+On macOS the app leaves FrostMod in its own data folder rather than copying it into
+the bottle, and reaches it as `Z:\Users\…` — so a bottle whose `Z:` drive has been
+removed can't be driven from the app at all. Add one mapped to `/` in the wrapper's
+drive settings.
 
 ### Server-filter rules (`frostmod_serverfilter.yaml`)
 

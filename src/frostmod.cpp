@@ -108,6 +108,90 @@ void Log(const char* fmt, ...) {
 // adapter so serverfilter (which takes a plain void(*)(const char*)) logs here
 void SfLog(const char* msg) { Log("%s", msg); }
 
+// ---------------------------------------------------------------------------------
+// Last-chance crash reporting.
+//
+// Every FrostMod log written before this existed simply stopped mid-line when the game
+// died. The last entry was whatever happened to be flushed before the fault, which is
+// why a crash report could never say more than "it crashed" - the one question the log
+// exists to answer was the one thing it never recorded.
+//
+// Deliberately the *unhandled* filter rather than a vectored handler: this file, and the
+// game, both use SEH for control flow in places, and a first-chance hook would log every
+// one of those as though it were a crash.
+//
+// Two things it cannot promise, so neither is claimed anywhere in the log: a filter
+// installed after ours replaces it, and a stack overflow may leave too little stack to
+// run this at all. It costs nothing while the game is healthy and usually turns the last
+// moment into one line, which is a large improvement on nothing.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevCrashFilter = nullptr;
+
+static const char* ExceptionName(DWORD code) {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:         return "access violation";
+        case EXCEPTION_IN_PAGE_ERROR:            return "in-page error - a mapped file could not be read";
+        case EXCEPTION_STACK_OVERFLOW:           return "stack overflow";
+        case EXCEPTION_ILLEGAL_INSTRUCTION:      return "illegal instruction";
+        case EXCEPTION_PRIV_INSTRUCTION:         return "privileged instruction";
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:       return "integer divide by zero";
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "float divide by zero";
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return "array bounds exceeded";
+        case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "non-continuable exception";
+        case 0xC0000374:                         return "heap corruption";
+        case 0xC0000409:                         return "stack buffer overrun";
+        default:                                 return "unhandled exception";
+    }
+}
+
+// "module+0xRVA" for an address, so a faulting site is something that can be looked up in
+// a disassembler rather than a bare pointer that means nothing once ASLR has moved on.
+static void DescribeAddress(void* addr, char* out, size_t n) {
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) &&
+        mod && GetModuleFileNameA(mod, name, sizeof(name))) {
+        const char* leaf = strrchr(name, '\\');
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%llX", leaf ? leaf + 1 : name,
+                    (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));
+    } else {
+        _snprintf_s(out, n, _TRUNCATE, "0x%016llX (no module)", (unsigned long long)(uintptr_t)addr);
+    }
+}
+
+static LONG WINAPI FrostCrashFilter(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord) {
+        const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+        char where[MAX_PATH + 64];
+        DescribeAddress(r->ExceptionAddress, where, sizeof(where));
+        Log("[crash] ***** %s (0x%08X) at %s *****",
+            ExceptionName(r->ExceptionCode), (unsigned)r->ExceptionCode, where);
+
+        // For these two the record carries what was being touched: parameter 0 is the
+        // kind of access, parameter 1 the address it was refused at.
+        if ((r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+             r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && r->NumberParameters >= 2) {
+            const ULONG_PTR op = r->ExceptionInformation[0];
+            Log("[crash] while %s address 0x%016llX",
+                op == 0 ? "reading" : op == 1 ? "writing" : "executing",
+                (unsigned long long)r->ExceptionInformation[1]);
+            // An in-page error carries the filesystem's own status as a third parameter,
+            // and this is the shape a cloud-backed mods folder crashes in: the bytes were
+            // never on the disk and the fetch failed underneath a mapped read.
+            if (r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR && r->NumberParameters >= 3)
+                Log("[crash] the filesystem returned NTSTATUS 0x%08X for that page. If the mods "
+                    "folder is on OneDrive/Dropbox, the file is a placeholder rather than real "
+                    "bytes - right-click the folder and pick \"Always keep on this device\".",
+                    (unsigned)r->ExceptionInformation[2]);
+        }
+        Log("[crash] FrostMod v" FROSTMOD_VERSION " was loaded; the log ends here because the "
+            "game process is going down.");
+    }
+    // Chain rather than swallow: whatever reporting the game or Steam had set up still runs.
+    return g_prevCrashFilter ? g_prevCrashFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
 // ---------------------------------------------------------------------------
 // game-thread task queue: UI thread enqueues, render thread drains
 // ---------------------------------------------------------------------------
@@ -1127,6 +1211,19 @@ void CloseModelSwap() { g_msOpen.store(false); }
 
 static int  g_sbRow = 0;           // running row index within the current populate pass
 static int  g_sbHexLeft = 0;       // hex windows still to dump this pass
+static int  g_sbHidden = 0;        // rows hidden in the pass currently being built
+static int  g_sbLastRows = -1;     // last tally reported, so a settled list stays quiet
+static int  g_sbLastHidden = -1;
+
+// Per-row [srv] dumping. OFF unless frostmod_srvdebug.flag exists (--srv-debug).
+//
+// This function runs inside the server-list populate loop, which the game re-runs
+// continuously while the browser is open - so a line per row per pass is a line per
+// server per repaint. Measured on a normal browse: 8,569 log lines in a single second,
+// and 16.5 MB of a 17.4 MB log, every byte of it a synchronous write on the game's own
+// thread. What anyone actually reads out of that log is the tally, so the tally is what
+// it writes by default, and only when it changes.
+bool g_srvVerbose = false;
 // When true, matching rows are actually skipped (hidden) via the game's own row-skip
 // label; when false the hook is a read-only PREVIEW (logs [srv] but hides nothing).
 bool g_sbHideEnabled = true;
@@ -1144,10 +1241,21 @@ extern "C" bool SB_SuppressRow(uint64_t index, void* gameRsp) {
     char* base = (char*)gameRsp + (size_t)index * mxb::SBE_STRIDE;   // this row's record
 
     if (index == 0) {                                // new populate pass (r14 restarts at 0)
+        // Report the pass that just ended. There is no end-of-pass hook, so the next
+        // pass starting is how we learn the last one finished - and reporting only a
+        // changed tally keeps a browser that is sitting still completely silent.
+        if (g_sbRow > 0 && (g_sbRow != g_sbLastRows || g_sbHidden != g_sbLastHidden)) {
+            Log("[srv] %d server(s), %d hidden (%s)", g_sbRow, g_sbHidden,
+                g_sbHideEnabled ? "hiding cheat/ad spam" : "PREVIEW - nothing hidden");
+            g_sbLastRows = g_sbRow;
+            g_sbLastHidden = g_sbHidden;
+        }
         g_sbRow = 0;
-        g_sbHexLeft = 1;                             // one hex window to re-confirm the record
-        Log("[srv] ===== server-list pass (%s) =====",
-            g_sbHideEnabled ? "hiding cheat/ad spam" : "PREVIEW - nothing hidden");
+        g_sbHidden = 0;
+        g_sbHexLeft = g_srvVerbose ? 1 : 0;          // one hex window to re-confirm the record
+        if (g_srvVerbose)
+            Log("[srv] ===== server-list pass (%s) =====",
+                g_sbHideEnabled ? "hiding cheat/ad spam" : "PREVIEW - nothing hidden");
     }
 
     char raw[0xE0];
@@ -1168,14 +1276,17 @@ extern "C" bool SB_SuppressRow(uint64_t index, void* gameRsp) {
     std::string why = frostmod::serverfilter::ShouldHide(si);
     bool hide = !why.empty() && g_sbHideEnabled;
 
-    char pingStr[16];
-    if (pingUnresolved) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
-    const char* tag = hide ? "HIDE" : (why.empty() ? "keep" : "WOULD-HIDE(preview)");
-    Log("[srv] #%02llu '%s' cur=%d cap=%d ping=%s | %s%s%s",
-        (unsigned long long)index, si.name.c_str(), nums.players, nums.maxPlayers, pingStr,
-        tag, why.empty() ? "" : ": ", why.c_str());
+    if (g_srvVerbose) {
+        char pingStr[16];
+        if (pingUnresolved) strcpy_s(pingStr, "---"); else sprintf_s(pingStr, "%d", ping);
+        const char* tag = hide ? "HIDE" : (why.empty() ? "keep" : "WOULD-HIDE(preview)");
+        Log("[srv] #%02llu '%s' cur=%d cap=%d ping=%s | %s%s%s",
+            (unsigned long long)index, si.name.c_str(), nums.players, nums.maxPlayers, pingStr,
+            tag, why.empty() ? "" : ": ", why.c_str());
+    }
 
     if (g_sbHexLeft > 0) { LogHexWindow(raw, n); --g_sbHexLeft; }
+    if (hide) ++g_sbHidden;
     ++g_sbRow;
     return hide;
 }
@@ -3455,6 +3566,10 @@ DWORD WINAPI Init(LPVOID) {
     // usually because the game had it locked). Close the game before rebuilding.
     Log("=============== FrostMod v" FROSTMOD_VERSION " loading (dll built " __DATE__ " " __TIME__ ") ===============");
 
+    // Before anything else that could fault, so a crash during our own setup is reported
+    // rather than being another log that simply stops.
+    g_prevCrashFilter = SetUnhandledExceptionFilter(FrostCrashFilter);
+
     DetectGame();
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // the game exe
     Log("[init] %s - module base = %p", g_game->display, (void*)g_base);
@@ -3773,6 +3888,20 @@ DWORD WINAPI Init(LPVOID) {
         else
             Log("[filter] rules loaded (inert). Run frostmod.exe --filter-servers to "
                 "install the read-only dump hook and preview the server list ([srv]).");
+    }
+
+    // Per-row server-list dump: opt-in via frostmod_srvdebug.flag (--srv-debug). Off by
+    // default because it is the single loudest thing this DLL can do - see g_srvVerbose.
+    {
+        char vflag[MAX_PATH] = {0};
+        if (g_logPath[0]) {
+            strcpy_s(vflag, g_logPath);
+            if (char* s = strrchr(vflag, '\\')) { *(s + 1) = 0; strcat_s(vflag, "frostmod_srvdebug.flag"); }
+        }
+        g_srvVerbose = vflag[0] && GetFileAttributesA(vflag) != INVALID_FILE_ATTRIBUTES;
+        if (g_srvVerbose)
+            Log("[srv] per-row dump ARMED (--srv-debug) - this writes a line per server per "
+                "repaint and will make the log very large.");
     }
 
     // Track switcher live-load: opt-in via frostmod_trackswitch.flag (--switch-live),

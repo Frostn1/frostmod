@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-20
+
+### Added
+- **A crash is written to the log before the process goes down.** Every FrostMod log before
+  this one simply stopped mid-line when the game died — the one question the log exists to
+  answer was the one thing it never recorded. A last-chance exception filter now names the
+  exception, the faulting `module+RVA`, and for an access violation or in-page error the
+  address and what was being done to it. An in-page error also reports the filesystem's own
+  NTSTATUS and points at cloud-backed mod folders, which is the shape that fault takes. It
+  chains to whatever filter was already installed rather than swallowing it. Two things it
+  can't promise, and doesn't claim: a filter installed after ours replaces it, and a stack
+  overflow may leave too little stack to run it.
+
+### Fixed
+- **The server browser no longer writes a log line per server per repaint.** `SB_SuppressRow`
+  runs inside the game's populate loop, which re-runs continuously while the browser is
+  open, and it logged every row plus a hex window on every pass — measured at 8,569 lines in
+  a single second, and 16.5 MB of a 17.4 MB log, every byte a synchronous write on the
+  game's own thread. It now reports a tally per pass, and only when that tally changes, so a
+  browser sitting still is silent. The per-row dump is still there behind
+  `frostmod.exe --srv-debug`.
+
 ## 2026-08-16 — v0.13.0
 
 ### Fixed

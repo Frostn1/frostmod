@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-08-25
+
+### Notes
+- **Replay keyframe camera — static RE complete, no shipped change yet.** Groundwork for
+  keyframed camera paths in replays (a community request: set keys while scrubbing, get a
+  smooth cinematic dolly between them). The game already owns a 6-DOF free-roam replay
+  camera whose entire state is flat statics — position, yaw/pitch/roll in degrees, FOV —
+  and the replay clock is a single writable `int32` of milliseconds, so scrubbing is one
+  dword write. The trap is that the replay update reseeds the free-roam pose from the live
+  camera every frame unless the camera mode is free-roam, which makes a correct pose write
+  look like it did nothing. Recovered addresses, struct layouts and AOB signatures are in
+  `tasks/replay-keyframe-camera.md` with per-area detail alongside it.
+- **Do not pin RVAs for this.** Diffing beta21d against beta21e — two days apart — every
+  function moved by non-uniform deltas, the camera-set global moved backwards by `0x260`,
+  and the engine's message IDs renumbered by −2. String-anchored resolution
+  (string → xref → containing `.pdata` function → read the global from its own `lea`)
+  resolved every target in both MX builds *and* GP Bikes, and is what a shipping resolver
+  has to be built on. Struct layouts, by contrast, were byte-identical across all three.
+
 ## 2026-08-20
 
 ### Added

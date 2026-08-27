@@ -16,9 +16,9 @@ FrostMod is a client-side toolkit for MX Bikes.
   your list. Purely client-side, nobody else is affected.
 - **In-game overlay** - a small status hint that shows FrostMod is live and
   reports each reload.
-- **Proximity voice (Mumble)** - riders on the same server hear each other from
-  where they actually are. FrostMod publishes your position through Mumble's Link
-  interface; Mumble does the voice. See [docs/MUMBLE.md](docs/MUMBLE.md).
+- **Session block for MXB App** - publishes which server you are on and where every
+  rider is, so the app can put you in voice with the people around you. Nobody
+  installs anything else: MXB App does the voice itself, peer to peer.
 - **FrostServer (dedicated servers)** - a server-side companion plugin that
   publishes the track a server is running plus its mxb-mods.com download link, so
   a client can fetch and install that track without leaving the game. The server

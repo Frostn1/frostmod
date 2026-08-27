@@ -57,7 +57,8 @@ A racing-spotter HUD built only on the callbacks above (no memory reads of other
   screen-edge directional arrow from the radar bearing — always something on screen.
 - **Lap colors** (both): white = same lap, red = a rider lapping you (a lap ahead),
   blue = a rider you are lapping (backmarker), from `m_iNumLaps`.
-- Toggles + range persist in `frostmod_radar.cfg` (next to `frostmod.log`).
+- Toggles + range persist in `frostmod_radar.cfg` (next to `frostmod.log`), which also
+  holds the overlay size (`uiscale`, menu `6`).
 
 **Calibration — settled.** The world-axis and yaw conventions (`GroundUV`, `RAD_YAW_SIGN`,
 `RAD_YAW_OFFSET` in `src/frostmod.cpp`) were confirmed against PiBoSo's own SDK header and

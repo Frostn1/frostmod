@@ -75,10 +75,14 @@ F-key per feature.
 | `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
 | `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
 | `5` | Rider outlines — on-screen box around each rider |
+| `6` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
 
-Radar blips and outlines are colored by lap status: **white** = same lap as you,
-**red** = a rider lapping you (a lap ahead), **blue** = a rider you are lapping
-(backmarker). Both toggles and the range persist across restarts.
+The overlay sizes itself to your screen, so it takes up the same share of a 4K display
+as it does of a 1080p one. Row `6` is on top of that, for when you want it bigger (or
+smaller) than that. Radar blips and outlines are colored by lap status: **white** = same
+lap as you, **red** = a rider lapping you (a lap ahead), **blue** = a rider you are
+lapping (backmarker). The toggles, the range and the overlay size persist across
+restarts, in `frostmod_radar.cfg` next to `frostmod.log`.
 
 ### Bike model swap (menu `3`)
 

@@ -43,7 +43,50 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "serverfilter.h"
-#include "mumblelink.h"
+#include "session.h"
+
+// The block MXB App reads. Null until Init maps it; every writer checks.
+static frostmod::session::Block* g_sessionBlock = nullptr;
+// The mapping handle, held for the life of the process and deliberately never closed:
+// closing it would unmap the block out from under a reader still polling it, and the
+// process exiting is the only moment this should ever go away.
+static void* g_sessionMapping = nullptr;
+
+// Create the mapping MXB App reads the session out of.
+//
+// Created rather than opened: the app may not be running yet, may be restarted, and on
+// Linux lives outside this Wine prefix entirely. Whoever is here first makes it, and a
+// reader that arrives later finds it already there.
+static bool SessionInit() {
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(frostmod::session::Block),
+                                  frostmod::session::kMappingName);
+    if (!h) return false;
+    void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostmod::session::Block));
+    if (!view) { CloseHandle(h); return false; }
+    // A mapping we just created is already zeroed; one we attached to belongs to a previous
+    // load of this dll and holds a session that has ended.
+    std::memset(view, 0, sizeof(frostmod::session::Block));
+    g_sessionMapping = h;
+    g_sessionBlock = (frostmod::session::Block*)view;
+    g_sessionBlock->version = frostmod::session::kVersion;
+    g_sessionBlock->raceNum = -1;
+    return true;
+}
+
+// Forget the session, keeping the block. Called when the event closes, so a rider back in
+// the menus does not leave the app talking to a room they have left.
+static void SessionClear() {
+    auto* block = g_sessionBlock;
+    if (!block) return;
+    frostmod::session::BeginWrite(*block);
+    frostmod::session::SetField(block->serverName, "");
+    frostmod::session::SetField(block->trackId, "");
+    frostmod::session::SetField(block->riderName, "");
+    block->raceNum = -1;
+    block->riderCount = 0;
+    frostmod::session::EndWrite(*block);
+}
 #include "cmdchannel.h" // MXB App command files: which one is new, and what it says
 #include "version.h"    // FROSTMOD_VERSION
 
@@ -1746,9 +1789,8 @@ static void RadarSettingsPath(char* out, size_t n) {
 static void SaveRadarSettings() {
     char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
-    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nmumble=%d\n",
-            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
-            mumblelink::Enabled() ? 1 : 0);
+    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\n",
+            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange);
     fclose(f);
 }
 static void LoadRadarSettings() {
@@ -1759,11 +1801,10 @@ static void LoadRadarSettings() {
         if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
-        else if (sscanf_s(line, "mumble=%d",   &v) == 1) mumblelink::SetEnabled(v != 0);
     }
     fclose(f);
-    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm mumble=%d",
-        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, mumblelink::Enabled());
+    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm",
+        g_radarOn.load(), g_espOn.load(), (int)g_radarRange);
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -1775,7 +1816,7 @@ struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int r
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
 // "me" = the RaceTrackPosition entry closest to my telemetry world pos. Caller holds
-// g_radMutex. Shared by the radar and by the Mumble publisher so the two can never
+// g_radMutex. Shared by the radar and by the session publisher so the two can never
 // disagree about which rider we are — they would be very hard to debug if they did.
 static int RadFindMe() {
     if (!g_radHaveMe || g_radN == 0) return -1;
@@ -1831,7 +1872,7 @@ static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
 
 // One line the first time each plugin callback fires, with the size the game passed.
 // Without this a callback that arrives with an unexpected payload size is indistinguishable
-// from one that never arrives -- which is exactly how the first Mumble context attempt
+// from one that never arrives -- which is exactly how the first server-context attempt
 // failed, silently, against RaceEvent.
 static void LogCallbackOnce(const char* name, int size) {
     static const char* seen[24] = {0};
@@ -1841,43 +1882,44 @@ static void LogCallbackOnce(const char* name, int size) {
     Log("[cb] %s fired (dataSize=%d)", name, size);
 }
 
-// ---- Mumble positional audio ------------------------------------------------
-// We publish only OUR OWN pose; Mumble's server distributes it and does the panning and
-// attenuation. That is the whole reason this is cheap: proximity chat without ever having
-// to match a voice stream to a rider on track.
+// ---- MXB App session block ---------------------------------------------------
+// What the app cannot see for itself: which server the game is on, and where everyone is.
+// Both reach this process through the plugin API and nowhere else, so this block is the
+// whole of the channel — FrostMod writes, MXB App reads, nothing comes back.
 //
-// Called every frame from Tick(). Off track — in menus, or before the first
-// RaceTrackPosition — there is no "me", and we clear rather than leave the last position
-// standing, so a rider sitting in a menu isn't heard from wherever they parked.
-static void MumblePublish() {
-    if (!mumblelink::Enabled()) return;
-    // Fail closed until RaceEvent has told us which server and track we are on. Without
-    // it every rider would share the empty context and be heard positionally from tracks
-    // they are not on — worse than being heard flat.
-    if (!mumblelink::HasContext()) return;
-    float x, y, z, yawDeg;
-    int meRaceNum = -1;
+// The app turns the server name into a voice room and the rider table into who you can
+// hear and from which direction. We publish the same table the radar draws, in the same
+// units the SDK gave us; the trigonometry is the reader's business.
+//
+// Written every frame from Tick(). Cheap: a memcpy of ~4 KB into a mapping that is already
+// resident, between two counter bumps.
+static void SessionPublish() {
+    auto* block = g_sessionBlock;
+    if (!block) return;
+
+    frostmod::session::BeginWrite(*block);
+    // The identity half is set by EventInit and cleared by EventDeinit; only the moving
+    // parts are refreshed here.
     {
         std::lock_guard<std::mutex> lk(g_radMutex);
         const int me = RadFindMe();
-        if (me < 0) { mumblelink::Clear(); return; }
-        x = g_radRiders[me].x; y = g_radRiders[me].y; z = g_radRiders[me].z;
-        yawDeg = g_radRiders[me].yawDeg;
-        meRaceNum = g_radRiders[me].raceNum;
-    }
-    // Identity is set from our GUID in EventInit — stable per install, where a race
-    // number is only unique within one session. Kept here only as the fallback for a
-    // session that somehow started without one.
-    static int lastRaceNum = -2;
-    if (meRaceNum != lastRaceNum) {
-        lastRaceNum = meRaceNum;
-        if (!mumblelink::HasIdentity()) {
-            char id[64];
-            _snprintf_s(id, sizeof(id), _TRUNCATE, "racenum:%d", meRaceNum);
-            mumblelink::SetIdentity(id);
+        block->raceNum = (me >= 0) ? g_radRiders[me].raceNum : -1;
+
+        int n = g_radN;
+        if (n > frostmod::session::kMaxRiders) n = frostmod::session::kMaxRiders;
+        block->riderCount = n;
+        for (int i = 0; i < n; ++i) {
+            const RadRider& r = g_radRiders[i];
+            frostmod::session::Rider& out = block->riders[i];
+            out.raceNum = r.raceNum;
+            out.x = r.x; out.y = r.y; out.z = r.z;
+            out.yawDeg = r.yawDeg;
+            out.crashed = r.crashed;
+            const int ei = RadFindEntry(r.raceNum);
+            frostmod::session::SetField(out.name, ei >= 0 ? g_radEntries[ei].name : "");
         }
     }
-    mumblelink::Update(x, y, z, yawDeg);
+    frostmod::session::EndWrite(*block);
 }
 
 // ---- lap-status colors (shared by both render paths) ------------------------
@@ -1990,7 +2032,6 @@ static const MenuItem kMenu[] = {
     { '3', "Bike model swap" },
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
-    { '6', "Proximity voice (Mumble)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2820,9 +2861,6 @@ void MenuAction(int d) {
     case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveRadarSettings();
               SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
               Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
-    case 6: { bool on = !mumblelink::Enabled(); mumblelink::SetEnabled(on); SaveRadarSettings();
-              SetStatus(on ? "proximity voice: on" : "proximity voice: off", 1500);
-              Log("[mumble] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -2836,10 +2874,10 @@ void Tick() {
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
 
-    // Mumble polls the shared block; publishing here keeps it at frame rate rather than
+    // MXB App polls the shared block; publishing here keeps it at frame rate rather than
     // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
     // ride past someone.
-    MumblePublish();
+    SessionPublish();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
@@ -3860,14 +3898,14 @@ DWORD WINAPI Init(LPVOID) {
         else
             cfg = "frostmod_serverfilter.yaml";
         frostmod::serverfilter::Init(cfg, &SfLog);
-        // Before LoadRadarSettings, which may switch it off: the block is created either
-        // way so Mumble can be started after the game and still find it.
-        if (mumblelink::Init()) {
-            Log("[mumble] link block ready");
+        // The app may attach before or after us, so the block exists from the moment we
+        // load rather than from the moment someone asks for it.
+        if (SessionInit()) {
+            Log("[session] block ready for MXB App");
         } else {
-            Log("[mumble] link block unavailable - positional audio will not work");
+            Log("[session] block unavailable - MXB App cannot see this session");
         }
-        LoadRadarSettings();   // restore radar / rider-outline toggles + range + mumble
+        LoadRadarSettings();   // restore radar / rider-outline toggles + range
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
@@ -4072,43 +4110,57 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 // firing on the dedicated server (see FROSTSERVER.md) and observed never firing here.
 // This one carries the server name, the track and our own GUID, which is more than we
 // need and all in one place.
+//
+// The server name is what MXB App keys a voice room on. It is the only identifier every
+// rider on a server has: an address reaches only the ones whose app launched the game, and
+// a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     LogCallbackOnce("EventInit", _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(SPluginsBikeEvent_t)) {
-        Log("[mumble] EventInit payload too small (%d < %d) - context not set",
+        Log("[session] EventInit payload too small (%d < %d) - server unknown",
             _iDataSize, (int)sizeof(SPluginsBikeEvent_t));
         return;
     }
     const auto* e = (const SPluginsBikeEvent_t*)_pData;
     // Fixed-size char arrays, not guaranteed NUL-terminated.
-    char server[65] = {0}, track[101] = {0}, guid[101] = {0};
+    char server[65] = {0}, track[101] = {0}, guid[101] = {0}, rider[101] = {0};
     memcpy(server, e->m_szServerName, 64);
     memcpy(track,  e->m_szTrackID,    100);
     memcpy(guid,   e->m_szGUID,       100);
+    memcpy(rider,  e->m_szRiderName,  100);
 
-    mumblelink::SetServer(server);
-    mumblelink::SetTrack(track);
-    if (guid[0]) mumblelink::SetIdentity(guid);
-    Log("[mumble] context: server='%s' track='%s' type=%d guid=%s",
+    if (auto* block = g_sessionBlock) {
+        frostmod::session::BeginWrite(*block);
+        frostmod::session::SetField(block->serverName, server);
+        frostmod::session::SetField(block->trackId, track);
+        frostmod::session::SetField(block->guid, guid);
+        frostmod::session::SetField(block->riderName, rider);
+        frostmod::session::EndWrite(*block);
+    }
+    Log("[session] server='%s' track='%s' type=%d guid=%s",
         server, track, e->m_iServerType, guid[0] ? "yes" : "no");
 }
 __declspec(dllexport) void EventDeinit() {
-    Log("[mumble] event closed - context cleared");
-    mumblelink::ClearContext();
-    mumblelink::Clear();
+    Log("[session] event closed");
+    SessionClear();
 }
 // Kept for the track half only: a server on a rotation changes track without a new event,
-// and this is confirmed to carry it. The server name set by EventInit survives.
+// and this is confirmed to carry it. The server name set by EventInit survives, which is
+// what keeps a voice room together across a track change.
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     LogCallbackOnce("RaceEvent", _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(SPluginsRaceEvent_t)) return;
     const auto* e = (const SPluginsRaceEvent_t*)_pData;
     char track[101] = {0};
     memcpy(track, e->m_szTrackName, 100);
-    mumblelink::SetTrack(track);
-    Log("[mumble] track now '%s'", track);
+    if (auto* block = g_sessionBlock) {
+        frostmod::session::BeginWrite(*block);
+        frostmod::session::SetField(block->trackId, track);
+        frostmod::session::EndWrite(*block);
+    }
+    Log("[session] track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); mumblelink::Clear(); }
-__declspec(dllexport) void RaceDeinit()             { RadResetRace(); mumblelink::Clear(); }
+__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); }
+__declspec(dllexport) void RaceDeinit()             { RadResetRace(); }
 
 } // extern "C"

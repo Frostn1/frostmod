@@ -1430,15 +1430,18 @@ struct SPluginsRaceClassificationEntry_t { // RaceClassification array element
     int m_iGap, m_iGapLaps, m_iPenalty, m_iPit;
 };
 
-// ---- CALIBRATION knobs (VERIFY on the Windows tester) -----------------------
+// ---- CALIBRATION knobs -------------------------------------------------------
+// All three match mxbmrp3 (MIT), which ships a working radar for this game off the
+// same callbacks and vendors PiBoSo's SDK header.
 // Which two world axes form the horizontal (ground) plane, and which is "up".
-// GL engines are commonly Y-up (ground = X,Z). If the radar looks squashed or a
-// rider directly ahead lands sideways, this is the first thing to flip.
 static inline void GroundUV(float x, float y, float z, float& u, float& v) {
-    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y  [verify]
+    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y
 }
-static constexpr float RAD_YAW_SIGN   = 1.0f;   // flip if the radar spins the wrong way
-static constexpr float RAD_YAW_OFFSET = 0.0f;   // add if "straight ahead" isn't at the top
+static constexpr float RAD_YAW_SIGN   = 1.0f;
+static constexpr float RAD_YAW_OFFSET = 0.0f;
+// m_fYaw arrives in degrees (SDK header: "angle from north. degrees"); cosf/sinf take
+// radians. Applied at ingest, so RadRider::yaw and every consumer are radians.
+static constexpr float RAD_DEG_TO_RAD = 0.01745329252f;
 
 // ---- shared rider snapshot (producer = game data threads; consumer = render) -
 static std::atomic<bool> g_radarOn{false};   // radar HUD panel
@@ -1478,7 +1481,8 @@ static void RadStoreTrackPositions(int n, const void* arr, int elem) {
         const auto* e = (const SPluginsRaceTrackPosition_t*)((const char*)arr + (size_t)i * elem);
         RadRider& r = g_radRiders[g_radN++];
         r.raceNum = e->m_iRaceNum; r.x = e->m_fPosX; r.y = e->m_fPosY; r.z = e->m_fPosZ;
-        r.yaw = e->m_fYaw; r.crashed = e->m_iCrashed;
+        // The SDK's m_fYaw is DEGREES from north; everything downstream wants radians.
+        r.yaw = e->m_fYaw * RAD_DEG_TO_RAD; r.crashed = e->m_iCrashed;
     }
 }
 static void RadAddEntry(const void* d, int size) {

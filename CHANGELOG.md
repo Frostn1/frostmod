@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-26
+
+### Fixed
+- **The radar's heading was in the wrong unit, so blips never landed where the riders were.**
+  The plugin API reports yaw in degrees — PiBoSo's own SDK header says so — and it was fed
+  straight to `cosf`/`sinf`, which take radians. A rider at 90° was rotated by 90 *radians*:
+  not a wrong angle so much as an arbitrary one, swinging wildly for a small change in
+  heading. Converted once at ingest, so everything downstream of the rider table gets
+  radians. The other three world-axis constants are confirmed against mxbmrp3, which ships a
+  working radar for this game off the same callbacks, so the calibration comments no longer
+  ask for a test they cannot fail.
+
 ## 2026-08-08
 
 ### Fixed

@@ -54,7 +54,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
-add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/mumblelink.cpp ${FROSTMOD_DLL_RC})
+add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp ${FROSTMOD_DLL_RC})
 target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
@@ -103,6 +103,15 @@ add_test(NAME offsets COMMAND offsets_test)
 # exactly this reason, so they run here too.
 add_executable(command_channel_test tests/command_channel_test.cpp)
 add_test(NAME command_channel COMMAND command_channel_test)
+
+# --- session block test --------------------------------------------------------
+# The block MXB App reads the server name and rider positions out of. Written by a game
+# thread that cannot block and read by another process that can be killed mid-read, so
+# the seqlock is the whole safety story — and its layout is a wire contract with a Rust
+# reader that is compiled separately. src/session.h keeps both apart from Win32 so this
+# runs in CI rather than only on a machine with the game on it.
+add_executable(session_test tests/session_test.cpp)
+add_test(NAME session COMMAND session_test)
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

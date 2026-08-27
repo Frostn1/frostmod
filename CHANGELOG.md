@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-08-26
+
+### Added
+- **FrostMod now tells MXB App which server you are on, and where everyone is.** A shared
+  block (`Local\FrostModSession`) carrying the server name, the track, your GUID and the
+  live rider table. The app cannot see any of it for itself — it is a separate program with
+  no view into the game — and it is what lets voice chat put you in a room with the people
+  on your server, whether you joined from the app or from the game's own browser. Written
+  every frame, read across the process boundary through a seqlock, so a reader that catches
+  a half-written update tries again instead of hearing someone in the wrong place.
+
+### Removed
+- **Mumble positional audio.** MXB App does the voice itself now: peer to peer, in the app
+  the rider already has, with nothing for anyone to install and nothing running on the
+  server. Publishing our position to Mumble meant every rider first had to download Mumble,
+  find a server to join and be on it at the same time — which is most of the reason nobody
+  did. The position data it needed did not go away; it moved into the session block above,
+  where the app can use it directly. The `6` row is gone from the F8 menu.
+
 ## 2026-08-20
 
 ### Added

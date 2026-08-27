@@ -1,21 +1,6 @@
 # Changelog
 
-## 2026-08-27
-
-### Fixed
-- **The overlay no longer shrinks on a big screen.** In the game's menus FrostMod draws the
-  overlay itself, and that path was laid out in raw pixels — so on a 4K display the F8 menu
-  came out at half the apparent size it has at 1080p, which is exactly as readable as it
-  sounds. It now sizes itself to the screen, so it takes the same share of a 4K one as of a
-  1080p one. Nothing changes at 1080p or below. Rider outlines still follow the resolution
-  only, so they keep fitting the riders they mark.
-
-### Added
-- **Overlay size, F8 → `6`.** Steps 75 → 200 % and the menu stays open while you press it, so
-  you can see the size you are choosing. It applies on track as well as in the menus, and it
-  persists in `frostmod_radar.cfg` alongside the radar settings.
-
-## 2026-08-26
+## 2026-08-27 — v0.14.0
 
 ### Added
 - **FrostMod now tells MXB App which server you are on, and where everyone is.** A shared
@@ -25,18 +10,6 @@
   on your server, whether you joined from the app or from the game's own browser. Written
   every frame, read across the process boundary through a seqlock, so a reader that catches
   a half-written update tries again instead of hearing someone in the wrong place.
-
-### Removed
-- **Mumble positional audio.** MXB App does the voice itself now: peer to peer, in the app
-  the rider already has, with nothing for anyone to install and nothing running on the
-  server. Publishing our position to Mumble meant every rider first had to download Mumble,
-  find a server to join and be on it at the same time — which is most of the reason nobody
-  did. The position data it needed did not go away; it moved into the session block above,
-  where the app can use it directly. The `6` row is gone from the F8 menu.
-
-## 2026-08-20
-
-### Added
 - **A crash is written to the log before the process goes down.** Every FrostMod log before
   this one simply stopped mid-line when the game died — the one question the log exists to
   answer was the one thing it never recorded. A last-chance exception filter now names the
@@ -46,8 +19,17 @@
   chains to whatever filter was already installed rather than swallowing it. Two things it
   can't promise, and doesn't claim: a filter installed after ours replaces it, and a stack
   overflow may leave too little stack to run it.
+- **Overlay size, F8 → `6`.** Steps 75 → 200 % and the menu stays open while you press it, so
+  you can see the size you are choosing. It applies on track as well as in the menus, and it
+  persists in `frostmod_radar.cfg` alongside the radar settings.
 
 ### Fixed
+- **The overlay no longer shrinks on a big screen.** In the game's menus FrostMod draws the
+  overlay itself, and that path was laid out in raw pixels — so on a 4K display the F8 menu
+  came out at half the apparent size it has at 1080p, which is exactly as readable as it
+  sounds. It now sizes itself to the screen, so it takes the same share of a 4K one as of a
+  1080p one. Nothing changes at 1080p or below. Rider outlines still follow the resolution
+  only, so they keep fitting the riders they mark.
 - **The server browser no longer writes a log line per server per repaint.** `SB_SuppressRow`
   runs inside the game's populate loop, which re-runs continuously while the browser is
   open, and it logged every row plus a hex window on every pass — measured at 8,569 lines in
@@ -55,6 +37,14 @@
   game's own thread. It now reports a tally per pass, and only when that tally changes, so a
   browser sitting still is silent. The per-row dump is still there behind
   `frostmod.exe --srv-debug`.
+
+### Removed
+- **Mumble positional audio.** MXB App does the voice itself now: peer to peer, in the app
+  the rider already has, with nothing for anyone to install and nothing running on the
+  server. Publishing our position to Mumble meant every rider first had to download Mumble,
+  find a server to join and be on it at the same time — which is most of the reason nobody
+  did. The position data it needed did not go away; it moved into the session block above,
+  where the app can use it directly. Its F8 row is gone; `6` is the overlay size now.
 
 ## 2026-08-16 — v0.13.0
 

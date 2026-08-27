@@ -1705,6 +1705,21 @@ static std::atomic<bool> g_radarOn{false};   // radar HUD panel
 static std::atomic<bool> g_espOn{false};     // on-screen rider outlines
 static float             g_radarRange = 80.0f; // metres shown edge-to-center
 
+// ---- overlay size ----------------------------------------------------------
+// The GL overlay lays out in device pixels, so on a 4K screen it drew at half the
+// apparent size it has at 1080p. Both renderers now multiply by a scale: the GL one
+// by the viewport height as well (so a panel is the same share of any screen, which
+// the normalized Draw() path already was), and both by this user setting (F8 > 6).
+static std::atomic<int> g_uiPct{100};                          // percent, persisted
+static const int        kUiSteps[] = { 75, 100, 125, 150, 175, 200 };
+static float UiUserScale() { return g_uiPct.load() * 0.01f; }
+static void  UiCycleScale() {
+    const int n = (int)(sizeof(kUiSteps) / sizeof(kUiSteps[0]));
+    int cur = g_uiPct.load(), next = kUiSteps[0];
+    for (int i = 0; i < n; ++i) if (kUiSteps[i] == cur) { next = kUiSteps[(i + 1) % n]; break; }
+    g_uiPct.store(next);
+}
+
 static std::mutex g_radMutex;                // guards everything below
 struct RadRider { int raceNum; float x, y, z, yawDeg; int crashed; };
 static bool     g_radHaveMe = false;
@@ -1780,31 +1795,35 @@ static void RadResetRace() {
 }
 
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
-static void RadarSettingsPath(char* out, size_t n) {
+// Radar/outline toggles and the overlay size. The filename stays as it was so an
+// existing install keeps its settings.
+static void OverlaySettingsPath(char* out, size_t n) {
     strncpy_s(out, n, g_logPath, _TRUNCATE);
     char* slash = strrchr(out, '\\');
     if (slash) slash[1] = 0; else out[0] = 0;
     strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
 }
-static void SaveRadarSettings() {
-    char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
+static void SaveOverlaySettings() {
+    char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
-    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\n",
-            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange);
+    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\n",
+            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
+            g_uiPct.load());
     fclose(f);
 }
-static void LoadRadarSettings() {
-    char p[MAX_PATH]; RadarSettingsPath(p, sizeof(p)); if (!p[0]) return;
+static void LoadOverlaySettings() {
+    char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[64]; int v;
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
+        else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
     }
     fclose(f);
-    Log("[radar] settings loaded: radar=%d outlines=%d range=%dm",
-        g_radarOn.load(), g_espOn.load(), (int)g_radarRange);
+    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%%",
+        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load());
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -2025,17 +2044,27 @@ char                   g_statusText[128] = {0};
 
 // The FrostMod menu (F8). One entry per action - press its key. New features add a
 // row here instead of another global F-key. Keep labels short (they set the width).
-struct MenuItem { char key; const char* label; };
+struct MenuItem { char key; const char* label; bool showsSize; };
 static const MenuItem kMenu[] = {
     { '1', "Reload mods" },
     { '2', "Toggle this overlay" },
     { '3', "Bike model swap" },
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
+    { '6', "Overlay size", true },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
 static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
+
+// A row's text, for both renderers. The size row carries its current value, so pressing
+// 6 reads as a setting changing rather than as nothing happening.
+static void MenuRowText(int i, char* out, size_t n) {
+    if (kMenu[i].showsSize)
+        sprintf_s(out, n, "  %c   %s  (%d%%)", kMenu[i].key, kMenu[i].label, g_uiPct.load());
+    else
+        sprintf_s(out, n, "  %c   %s", kMenu[i].key, kMenu[i].label);
+}
 
 void SetStatus(const char* s, unsigned ms) {
     std::lock_guard<std::mutex> lk(g_statusMutex);
@@ -2044,14 +2073,18 @@ void SetStatus(const char* s, unsigned ms) {
 }
 
 // GL bitmap font built from a GDI font via wglUseFontBitmaps. Needs a current GL
-// context, so we build it lazily on the first overlay draw.
-GLuint g_fontBase  = 0;
-bool   g_fontTried = false;
+// context, so we build it lazily on the first overlay draw. The glyphs are bitmaps in
+// device pixels - the projection below cannot scale them - so a size change rebuilds
+// the lists. g_fontPx is set before the attempt, so a failure isn't retried per frame.
+GLuint g_fontBase = 0;
+int    g_fontPx   = 0;            // pixel height the lists were built at (0 = none yet)
 
-void EnsureFont(HDC hdc) {
-    if (g_fontTried) return;
-    g_fontTried = true;
-    HFONT font = CreateFontA(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+void EnsureFont(HDC hdc, int px) {
+    px = px < 10 ? 10 : (px > 64 ? 64 : px);
+    if (px == g_fontPx) return;
+    g_fontPx = px;
+    if (g_fontBase) { glDeleteLists(g_fontBase, 256); g_fontBase = 0; }
+    HFONT font = CreateFontA(-px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                              ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                              ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     if (!font) return;
@@ -2061,7 +2094,7 @@ void EnsureFont(HDC hdc) {
     else if (base)                                    glDeleteLists(base, 256);
     SelectObject(hdc, old);
     DeleteObject(font);
-    Log("[overlay] font %s", g_fontBase ? "ready" : "unavailable (hint text hidden)");
+    Log("[overlay] font %dpx %s", px, g_fontBase ? "ready" : "unavailable (hint text hidden)");
 }
 
 void GlText(int x, int y, const char* s) {
@@ -2337,12 +2370,20 @@ void DrawOverlay(HDC hdc) {
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_radarOn.load() && !g_espOn.load()) return;
-    EnsureFont(hdc);
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
-    const int w = vp[2], h = vp[3];
-    if (w <= 0 || h <= 0) return;
+    const int pw = vp[2], ph = vp[3];
+    if (pw <= 0 || ph <= 0) return;
+
+    // Everything below is laid out in "design pixels"; the projection maps them onto the
+    // real viewport, so every constant here scales without being touched. autoS keeps a
+    // panel the same share of the screen at any resolution, and the user's overlay size
+    // (F8 > 6) rides on top of it.
+    const float autoS = ClampF(ph / 1080.0f, 1.0f, 3.0f);
+    const float S     = autoS * UiUserScale();
+    const int   w = (int)(pw / S), h = (int)(ph / S);
+    EnsureFont(hdc, (int)(15.0f * S + 0.5f));
 
     static unsigned frame = 0; ++frame;              // advances every presented frame
     const bool reloading = g_reloadActive.load();
@@ -2369,7 +2410,7 @@ void DrawOverlay(HDC hdc) {
     g_inOverlay.store(true, std::memory_order_relaxed);   // don't let our ortho corrupt VP capture
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-    glOrtho(0, w, 0, h, -1, 1);                  // origin bottom-left
+    glOrtho(0, w, 0, h, -1, 1);                  // origin bottom-left, design pixels
     glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
     glDisable(GL_DEPTH_TEST); glDisable(GL_TEXTURE_2D);
     glDisable(GL_LIGHTING);   glDisable(GL_CULL_FACE);
@@ -2387,7 +2428,7 @@ void DrawOverlay(HDC hdc) {
     } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
         const int rows = kMenuCount + 2;         // title + items + footer
-        const int bw = 260, bh = rows * lh + 8;
+        const int bw = 280, bh = rows * lh + 8;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
         glColor4f(0.04f, 0.05f, 0.08f, 0.86f);
         FillRect(x0, y0, x1, y1);
@@ -2396,7 +2437,7 @@ void DrawOverlay(HDC hdc) {
         GlText(x0 + 8, y, "FrostMod v" FROSTMOD_VERSION "  -  menu"); y -= lh;
         glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
         for (int i = 0; i < kMenuCount; ++i) {
-            char row[96]; sprintf_s(row, "  %c   %s", kMenu[i].key, kMenu[i].label);
+            char row[96]; MenuRowText(i, row, sizeof(row));
             GlText(x0 + 8, y, row); y -= lh;
         }
         glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
@@ -2417,8 +2458,15 @@ void DrawOverlay(HDC hdc) {
         }
     }
 
-    if (g_espOn.load())   DrawEspGL(w, h);       // HUD overlays draw on top of any panel
-    if (g_radarOn.load()) DrawRadarGL(w, h);
+    if (g_radarOn.load()) DrawRadarGL(w, h);     // HUD overlays draw on top of any panel
+    if (g_espOn.load()) {
+        // Outlines box riders on screen, so they track the resolution but NOT the user's
+        // overlay size - at 150% the boxes would stop fitting the riders they mark.
+        const int ew = (int)(pw / autoS), eh = (int)(ph / autoS);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, ew, 0, eh, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        DrawEspGL(ew, eh);
+    }
 
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
@@ -2466,8 +2514,14 @@ static unsigned long ToABGR(float r, float g, float b, float a) {
     return (c(a) << 24) | (c(b) << 16) | (c(g) << 8) | c(r);
 }
 
+// The whole layout is emitted through DQuad/DText, so one multiplier scales it without
+// touching a single constant below. It is the user's overlay size for the panels, and 1
+// for the radar/outline HUD, which is placed against the screen rather than the panel.
+static float g_dScale = 1.0f;
+
 static void DQuad(float x0, float y0, float x1, float y1, unsigned long abgr) {
     if (g_nDrawQuads >= (int)(sizeof(g_drawQuads) / sizeof(g_drawQuads[0]))) return;
+    x0 *= g_dScale; y0 *= g_dScale; x1 *= g_dScale; y1 *= g_dScale;
     SPluginQuad_t& q = g_drawQuads[g_nDrawQuads++];
     q.m_aafPos[0][0] = x0; q.m_aafPos[0][1] = y0;   // top-left
     q.m_aafPos[1][0] = x0; q.m_aafPos[1][1] = y1;   // bottom-left
@@ -2481,8 +2535,8 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
     if (g_nDrawStrs >= (int)(sizeof(g_drawStrs) / sizeof(g_drawStrs[0])) || !s || !*s) return;
     SPluginString_t& t = g_drawStrs[g_nDrawStrs++];
     strncpy_s(t.m_szString, s, _TRUNCATE);
-    t.m_afPos[0] = x; t.m_afPos[1] = y;
-    t.m_iFont = 1; t.m_fSize = size; t.m_iJustify = 0; t.m_ulColor = abgr;
+    t.m_afPos[0] = x * g_dScale; t.m_afPos[1] = y * g_dScale;
+    t.m_iFont = 1; t.m_fSize = size * g_dScale; t.m_iJustify = 0; t.m_ulColor = abgr;
 }
 
 // PiBoSo mirror of the radar/ESP HUD. Normalized 0..1, top-left origin; the disc
@@ -2539,7 +2593,7 @@ static void EmitEspPiBoSo() {
 // (no font needed), strings are labels (font index 1). Panel widths are fractions
 // tuned to match the GL layout's proportions - adjust here if text overflows.
 static void BuildOverlayDrawLists() {
-    g_nDrawQuads = 0; g_nDrawStrs = 0;
+    g_nDrawQuads = 0; g_nDrawStrs = 0; g_dScale = 1.0f;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_radarOn.load() && !g_espOn.load()) return;
@@ -2548,6 +2602,7 @@ static void BuildOverlayDrawLists() {
     // panels' quads sit on top of them and both share the 64-quad budget.
     if (g_espOn.load())   EmitEspPiBoSo();
     if (g_radarOn.load()) EmitRadarPiBoSo();
+    g_dScale = UiUserScale();                 // from here on: the panels
 
     const bool reloading = g_reloadActive.load();
     const bool menu = g_menuOpen.load() && !reloading;
@@ -2703,12 +2758,12 @@ static void BuildOverlayDrawLists() {
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
     } else if (menu) {
         const int rows = kMenuCount + 2;
-        const float w = 0.22f, h = rows * LH + 0.010f;
+        const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
         DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.86f));
         float y = MY + 0.006f;
         DText(MX + PADX, y, "FrostMod v" FROSTMOD_VERSION "  -  menu", cBlue, FS); y += LH;
         for (int i = 0; i < kMenuCount; ++i) {
-            char row[96]; sprintf_s(row, "  %c   %s", kMenu[i].key, kMenu[i].label);
+            char row[96]; MenuRowText(i, row, sizeof(row));
             DText(MX + PADX, y, row, cWhite, FS); y += LH;
         }
         DText(MX + PADX, y, "  F8 / Esc   close", cGray, FS);
@@ -2855,12 +2910,14 @@ void MenuAction(int d) {
     case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
-    case 4: { bool on = !g_radarOn.load(); g_radarOn.store(on); SaveRadarSettings();
+    case 4: { bool on = !g_radarOn.load(); g_radarOn.store(on); SaveOverlaySettings();
               SetStatus(on ? "radar: on" : "radar: off", 1500);
               Log("[radar] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
-    case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveRadarSettings();
+    case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveOverlaySettings();
               SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
               Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 6: UiCycleScale(); SaveOverlaySettings();                // menu stays OPEN, so
+            Log("[overlay] size %d%%", g_uiPct.load()); break;     // the change is visible
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -3136,8 +3193,8 @@ void Tick() {
         static bool prevPgUp = false, prevPgDn = false;
         bool pu = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;   // PageUp
         bool pd = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;   // PageDown
-        if (pu && !prevPgUp) { g_radarRange = ClampF(g_radarRange + 20.0f, 20.0f, 400.0f); SaveRadarSettings(); }
-        if (pd && !prevPgDn) { g_radarRange = ClampF(g_radarRange - 20.0f, 20.0f, 400.0f); SaveRadarSettings(); }
+        if (pu && !prevPgUp) { g_radarRange = ClampF(g_radarRange + 20.0f, 20.0f, 400.0f); SaveOverlaySettings(); }
+        if (pd && !prevPgDn) { g_radarRange = ClampF(g_radarRange - 20.0f, 20.0f, 400.0f); SaveOverlaySettings(); }
         prevPgUp = pu; prevPgDn = pd;
         RadValidateVP();
     }
@@ -3905,7 +3962,7 @@ DWORD WINAPI Init(LPVOID) {
         } else {
             Log("[session] block unavailable - MXB App cannot see this session");
         }
-        LoadRadarSettings();   // restore radar / rider-outline toggles + range
+        LoadOverlaySettings();  // restore radar / outline toggles, range, overlay size
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-08-27
+
+### Fixed
+- **The overlay no longer shrinks on a big screen.** In the game's menus FrostMod draws the
+  overlay itself, and that path was laid out in raw pixels — so on a 4K display the F8 menu
+  came out at half the apparent size it has at 1080p, which is exactly as readable as it
+  sounds. It now sizes itself to the screen, so it takes the same share of a 4K one as of a
+  1080p one. Nothing changes at 1080p or below. Rider outlines still follow the resolution
+  only, so they keep fitting the riders they mark.
+
+### Added
+- **Overlay size, F8 → `6`.** Steps 75 → 200 % and the menu stays open while you press it, so
+  you can see the size you are choosing. It applies on track as well as in the menus, and it
+  persists in `frostmod_radar.cfg` alongside the radar settings.
+
 ## 2026-08-26
 
 ### Added

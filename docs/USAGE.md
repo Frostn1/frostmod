@@ -34,9 +34,9 @@ treated as an explicit path to the DLL.
 | `--uninstall-startup` | — | — | Stop running at login (removes the entry above). |
 | `--no-filter-servers` | — | filter **on** | Turn the server filter off (reload only; leaves the browser untouched). |
 | `--filter-servers` | — | *(already on)* | Force the filter on. Redundant now that it's the default; kept for clarity. |
-| `--game <id>` | `mxb` \| `gpb` | `mxb` | Which title to attach to. On `gpb` (GP Bikes) reload is currently **off** — its offsets are derived but unconfirmed and crashed the game (see `--unsafe-reload`); the server-browser filter is off there too (its offsets are MX Bikes' and aren't ported). |
-| `--process <name>` | exe name | `mxbikes.exe` | Inject into a process by image name. `--game` is the friendlier form of the same thing. |
-| `--mods "<path>"` | folder | `Documents\PiBoSo\<title>\mods` | Watch a different mods folder. The default follows `--game`/`--process`, so GP Bikes reads GP Bikes' folder. |
+| `--game <id>` | `mxb` \| `gpb` \| `krp` | `mxb` | Which title to attach to. On `gpb` (GP Bikes) reload is **off** — its offsets are derived but unconfirmed and crashed the game (see `--unsafe-reload`). On `krp` (Kart Racing Pro) reload is off because its offsets are not derived at all yet: the plugin loads and the overlay, radar and session block work, and one capture run closes the gap (`tasks/kart-racing-pro-port.md`). The server-browser filter is MX Bikes only on both. |
+| `--process <name>` | exe name | `mxbikes.exe` | Inject into a process by image name (`gpbikes.exe`, `kart.exe`). `--game` is the friendlier form of the same thing, and both now set the mods folder and the plugin identity alike. |
+| `--mods "<path>"` | folder | `Documents\PiBoSo\<title>\mods` | Watch a different mods folder. The default follows `--game`/`--process`, so GP Bikes reads GP Bikes' folder and Kart Racing Pro reads `Kart Racing Pro\mods`. |
 | `<path>` | `.dll` path | `frostmod.dll` next to the exe | Positional: load a specific DLL build. |
 
 ### Advanced / diagnostic
@@ -163,9 +163,10 @@ defaults change it's rewritten and your old copy is kept as `.bak`.
 
 ## Run as a plugin instead
 
-Drop `frostmod.dll` into MX Bikes' `plugins` folder and the game loads it at
-startup — no launcher needed. You lose the console (mods list / log stream / `R`),
-but reload (`F8`), the overlay, and the filter all still work. Details:
+Drop `frostmod.dlo` into the game's `plugins` folder and the game loads it at
+startup — no launcher needed (`frostmod.exe --game <id> --install-plugin` does it for you).
+You lose the console (mods list / log stream / `R`), but reload (`F8`), the overlay, and the
+filter all still work, as far as they are ported for that title. Details:
 [PLUGIN.md](PLUGIN.md).
 
 ## Notes

@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-08-29
+
+### Added
+- **Kart Racing Pro is a title FrostMod knows.** `--game krp` attaches to `kart.exe`, reads
+  mods from `Documents\PiBoSo\Kart Racing Pro\mods`, and `--install-plugin` drops the
+  `.dlo` into KRP's own `plugins` folder. The plugin loads and the overlay, the radar and
+  rider outlines, and the session block MXB App reads all work there. Live mod reload does
+  **not** ship for KRP: `kart.exe` is SteamStub-wrapped like `gpbikes.exe`, so its
+  content-loader addresses cannot be read out of the file, and reload is refused rather than
+  run at another game's addresses — which is what took GP Bikes down twice. One capture run
+  on the game closes that gap; the recipe is in `tasks/kart-racing-pro-port.md`.
+- **A title with no derived offsets now collects its own.** Instead of trusting an RVA it
+  does not have, FrostMod sweeps `.text` for the scanner signature (byte-identical across
+  these builds), hooks what it finds, and logs the RVA plus a stack walk per content
+  category — one loader and one boot-init call site each. That log is the derivation. The
+  stack-shot cap is raised from 16 to 96 for such a title, because GP Bikes' port was left
+  guessing at 8 of its 13 categories when its log stopped short at 5.
+
+### Fixed
+- **Plugin mode now works on GP Bikes.** `GetModID` and `GetModDataVersion` answered
+  `"mxbikes"` and `8` no matter which game had loaded the DLL, and a PiBoSo title silently
+  drops a plugin whose identity is not its own — so the `.dlo` did nothing at all on GP
+  Bikes, with no error anywhere to say why. All three exports now answer for the host
+  process (`"gpbikes"`/12, `"krp"`/6, `"mxbikes"`/8), resolved at load time because the game
+  asks before our init thread has run.
+- **The radar reads each title's own structs.** The three games hand the same callbacks
+  different payloads, and the code read all of them as MX Bikes': Kart Racing Pro's track
+  position is 24 bytes where MX's is 28, so the size guard would have thrown away every kart
+  on the grid and left the radar empty; GP Bikes' and KRP's classification entries carry an
+  extra field ahead of the lap count, which the lap-status colouring would have read as a
+  lap time. Every layout is now transcribed per title in `src/pluginsdk.h`, checked against
+  PiBoSo's published examples by `tests/pluginsdk_test.cpp`.
+- **`--install-plugin` installs into the title you pointed it at.** It looked for a running
+  `mxbikes.exe` and warned about a missing `mxbikes.exe` whatever `--game` said, so
+  installing for another title reported nonsense while quietly doing the right thing only
+  when the folder was passed by hand.
+
 ## 2026-08-27 — v0.14.0
 
 ### Added

@@ -5,7 +5,7 @@ project(FrostMod CXX)
 #   cmake -B build -A x64
 #   cmake --build build --config Release
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "FrostMod must be built as x64 (mxbikes.exe is 64-bit). Use: cmake -A x64")
+    message(FATAL_ERROR "FrostMod must be built as x64 (the games are 64-bit). Use: cmake -A x64")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -39,8 +39,8 @@ function(frostmod_version_rc out_var filetype original_filename description)
     set(${out_var} "${_rc_out}" PARENT_SCOPE)
 endfunction()
 
-frostmod_version_rc(FROSTMOD_DLL_RC VFT_DLL "frostmod.dll" "FrostMod in-game overlay / mod loader for MX Bikes")
-frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for MX Bikes")
+frostmod_version_rc(FROSTMOD_DLL_RC VFT_DLL "frostmod.dll" "FrostMod in-game overlay / mod loader for PiBoSo sims")
+frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for PiBoSo sims")
 frostmod_version_rc(FROSTSERVER_DLL_RC VFT_DLL "frostserver.dlo" "FrostServer - dedicated-server map/link API for MX Bikes")
 frostmod_version_rc(FROSTSERVER_EXE_RC VFT_APP "frostserver.exe" "FrostServer standalone - map/link API for MX Bikes")
 
@@ -94,6 +94,15 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 enable_testing()
 add_executable(offsets_test tests/offsets_test.cpp)
 add_test(NAME offsets COMMAND offsets_test)
+
+# --- plugin ABI test -----------------------------------------------------------
+# The three titles hand the same callbacks different structs (KRP's track position has no
+# crashed flag, its classification header an extra field, its event a different shape).
+# Reading one title's payload with another's layout produces plausible garbage rather than
+# an error, so the layouts are pinned against PiBoSo's published examples here. Pure
+# constants, same as above.
+add_executable(pluginsdk_test tests/pluginsdk_test.cpp)
+add_test(NAME pluginsdk COMMAND pluginsdk_test)
 
 # --- command channel test ------------------------------------------------------
 # The MXB App command channel is read on an event *and* on a poll — the poll being all

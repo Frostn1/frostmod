@@ -4,11 +4,15 @@ FrostMod is a single `frostmod.dll` that (a) live-reloads the MX Bikes mods fold
 and (b) filters spam "ghost" servers from the browser. It can be loaded **two
 ways**, and runs the same code either way.
 
+The same binary serves **MX Bikes, GP Bikes and Kart Racing Pro** — same engine, three
+builds. It works out which one it is in from the host process and adjusts: the plugin
+identity, the payload layouts, the mods folder, and which features are ported at all.
+
 ## How it loads
 
 | Mode | How | Entry point | Notes |
 |------|-----|-------------|-------|
-| **PiBoSo plugin** (recommended) | Drop `frostmod.dlo` in MX Bikes' `plugins` folder (or run `frostmod.exe --install-plugin`) | game calls `Startup()` | Loaded by the game at startup — before the one-time mods scan — with no injector, no `CreateRemoteThread`, no SteamStub timing race. |
+| **PiBoSo plugin** (recommended) | Drop `frostmod.dlo` in the game's `plugins` folder (or run `frostmod.exe --install-plugin`) | game calls `Startup()` | Loaded by the game at startup — before the one-time mods scan — with no injector, no `CreateRemoteThread`, no SteamStub timing race. |
 | **Injected** | Run `frostmod.exe` | `DllMain` | Fallback / dev loop. Streams the log to a console, watches the mods folder, re-injects on relaunch. |
 
 Both paths call `EnsureInit()`, which starts `Init()` **exactly once** (guarded by
@@ -17,16 +21,26 @@ still initializes only once.
 
 ## PiBoSo plugin interface (what we implement)
 
-MX Bikes loads every DLL in its `plugins` folder and validates it by calling the
-three identity functions; if they don't match it unloads the DLL. Values are from
-`mxb_example.c` (https://www.mx-bikes.com/downloads/mxb_example.c) — **if a game
-update changes them, the game will reject the plugin and these must be updated.**
+Each PiBoSo game loads every DLL in its `plugins` folder and validates it by calling the
+three identity functions; if they don't match it unloads the DLL, silently. **The values
+are per title**, so FrostMod answers as whichever game is hosting it — resolved from the
+host process image at load time, because the game can ask before our init thread has run.
+They live in `GameOffsets` (`src/offsets.h`) and are pinned by `tests/offsets_test.cpp`.
+
+| Title | `GetModID` | `GetModDataVersion` | `GetInterfaceVersion` | Source |
+|-------|-----------|---------------------|-----------------------|--------|
+| MX Bikes | `"mxbikes"` | `8` | `9` | [mxb_example.c](https://www.mx-bikes.com/downloads/mxb_example.c) |
+| GP Bikes | `"gpbikes"` | `12` | `9` | [gpb_example.c](https://www.gp-bikes.com/downloads/gpb_example.c) |
+| Kart Racing Pro | `"krp"` | `6` | `9` | [krp_example.c](https://www.kartracing-pro.com/downloads/krp_example.c) |
+
+**If a game update changes them, that game will reject the plugin and these must be
+updated.** Until v0.15 FrostMod answered `"mxbikes"` / `8` to every host, which is why
+plugin mode worked on MX Bikes and did nothing whatsoever on GP Bikes.
+
+The rest of the mandatory pair:
 
 | Export | Signature | We return / do |
 |--------|-----------|----------------|
-| `GetModID` | `char* GetModID()` | `"mxbikes"` — which game this plugin is for. |
-| `GetModDataVersion` | `int GetModDataVersion()` | `8` — data-struct version for this MX Bikes build. |
-| `GetInterfaceVersion` | `int GetInterfaceVersion()` | `9` — plugin API version. |
 | `Startup` | `int Startup(char* savePath)` | Records `savePath` (game data folder), (re)ensures our hooks are up, returns `3` (telemetry rate 10 Hz; unused but must be valid to stay loaded). |
 | `Shutdown` | `void Shutdown()` | Logs; hooks tear down with the process. |
 
@@ -79,11 +93,34 @@ needed.
 
 ### Where the plugin goes
 The plugin file is **`frostmod.dlo`** (a byte-for-byte copy of `frostmod.dll` — the game
-auto-loads plugins named `*.dlo`). Drop it into MX Bikes'
-**`<install>\plugins\`** folder, next to `mxbikes.exe` (e.g.
-`…\steamapps\common\MX Bikes\plugins\`) — no `.ini` needed. Or run
+auto-loads plugins named `*.dlo`). Drop it into the game's **`<install>\plugins\`** folder,
+next to the game exe (e.g. `…\steamapps\common\MX Bikes\plugins\`, or
+`…\common\Kart Racing Pro\plugins\`) — no `.ini` needed. Or run
 **`frostmod.exe --install-plugin`** to copy it there for you (auto-detects a running
-game, or pass the folder: `--install-plugin "…\MX Bikes"`).
+game, or pass the folder: `--install-plugin "…\MX Bikes"`). Add `--game krp` / `--game gpb`
+when installing for a title other than MX Bikes, so it looks for the right exe.
+
+### Payload layouts differ per title
+The callback *names* are identical across the three games; the *structs* are not.
+`src/pluginsdk.h` holds one transcription per title, and `PluginAbi` picks the right one:
+
+| | MX Bikes | GP Bikes | Kart Racing Pro |
+|---|---|---|---|
+| `RaceTrackPosition` element | 28 B, ends `m_iCrashed` | 28 B, ends `m_iCrashed` | **24 B, no crashed flag** |
+| `RaceClassification` header | 16 B | 16 B | **20 B** (extra `m_iSessionSeries`) |
+| classification entry | 36 B | **40 B** (`m_fBestSpeed`) | **40 B** (`m_fBestSpeed`) |
+| `EventInit` payload | 820 B, has server name + GUID | 652 B, **neither** | 748 B, **neither** |
+
+Two consequences worth knowing: a size guard written against MX Bikes' 28-byte element
+throws away every kart on the grid (the radar just stays empty), and on a title whose
+event carries no server name the session block takes it from `RaceEvent`'s `m_szName`
+instead — the only string that names the session there.
+
+Note that a published example can lag its game: MX Bikes' still describes the event
+struct from *before* data version 8 appended the server name, GUID and server type, which
+FrostMod reads anyway because production proved they are there. So `EventInit` logs a
+`[session] NOTE:` line when a title hands it more bytes than its example describes — that
+tail is the same fields, waiting to be derived.
 
 ## Init sequence (`Init`, on its own thread)
 

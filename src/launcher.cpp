@@ -25,13 +25,15 @@
 //     frostmod.exe --install-startup       (run automatically at login from now on,
 //                                           minimized, and keep running now)
 //     frostmod.exe --update                (download + install the latest release)
-//     frostmod.exe --install-plugin [dir]  (copy frostmod.dlo into <MX Bikes>\plugins,
-//                                           so the game loads it at startup, no injector;
+//     frostmod.exe --install-plugin [dir]  (copy frostmod.dlo into <game>\plugins, so
+//                                           the game loads it at startup, no injector;
 //                                           dir optional - taken from a running game)
 //     frostmod.exe --uninstall-startup     (stop running at login)
 //     frostmod.exe --no-update-check       (don't check GitHub for a newer version)
 //     frostmod.exe --no-filter-servers     (reload only; leave the browser alone)
-//     frostmod.exe --process gpbikes.exe   (different game)
+//     frostmod.exe --game gpb              (a different title: mxb, gpb or krp - the
+//                                           mods folder and the plugin id follow it)
+//     frostmod.exe --process gpbikes.exe   (same thing, by image name)
 //     frostmod.exe --unsafe-reload         (run a reload table the title hasn't confirmed
 //                                           - GP Bikes: it has crashed the game. Only for
 //                                           collecting the step-level log that pins it)
@@ -508,9 +510,11 @@ static int DoUpdate() {
 }
 
 // ---------------------------------------------------------------------------
-// --install-plugin : copy frostmod.dlo into <MX Bikes>\plugins\ so the game loads
-// it at startup (no injector, no CreateRemoteThread). The install folder is taken
-// from the arg, else derived from a running mxbikes.exe (reusing FindProcess).
+// --install-plugin : copy frostmod.dlo into <game>\plugins\ so the game loads it at
+// startup (no injector, no CreateRemoteThread). The install folder is taken from the arg,
+// else derived from the running game (reusing FindProcess). Which title that is comes from
+// `--game` / `--process`; installing MX Bikes' plugin into a Kart Racing Pro folder would
+// be a plugin the game loads and then drops, with nothing to say why.
 // ---------------------------------------------------------------------------
 static bool CopyDirRecursive(const std::string& srcDir, const std::string& dstDir) {
     CreateDirectoryA(dstDir.c_str(), nullptr);
@@ -542,20 +546,21 @@ static std::string GameDirFromProcess(const char* processName) {
     return dir;
 }
 
-static int DoInstallPlugin(std::string gameDir, const char* processName) {
+static int DoInstallPlugin(std::string gameDir, const GameOffsets* game) {
     if (gameDir.empty()) {
-        gameDir = GameDirFromProcess(processName);
+        gameDir = GameDirFromProcess(game->exe);
         if (gameDir.empty()) {
-            printf("[!] couldn't find MX Bikes. Start the game first, or pass its folder:\n"
-                   "      frostmod.exe --install-plugin \"C:\\...\\steamapps\\common\\MX Bikes\"\n");
+            printf("[!] couldn't find %s. Start the game first, or pass its folder:\n"
+                   "      frostmod.exe --install-plugin \"C:\\...\\steamapps\\common\\%s\"\n",
+                   game->display, game->display);
             return 1;
         }
-        printf("[*] found MX Bikes at: %s\n", gameDir.c_str());
+        printf("[*] found %s at: %s\n", game->display, gameDir.c_str());
     }
     while (!gameDir.empty() && (gameDir.back() == '\\' || gameDir.back() == '/')) gameDir.pop_back();
 
-    if (GetFileAttributesA((gameDir + "\\mxbikes.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
-        printf("[!] note: mxbikes.exe not found in that folder - installing anyway.\n");
+    if (GetFileAttributesA((gameDir + "\\" + game->exe).c_str()) == INVALID_FILE_ATTRIBUTES)
+        printf("[!] note: %s not found in that folder - installing anyway.\n", game->exe);
 
     std::string src = ExeDir() + "frostmod.dlo";
     if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -622,7 +627,12 @@ int main(int argc, char** argv) {
                 if (_stricmp(want.c_str(), g->id) == 0 || _stricmp(want.c_str(), g->exe) == 0)
                     picked = g;
             if (!picked) {
-                printf("[!] unknown --game '%s' (expected mxb or gpb).\n", want.c_str());
+                // Built from the table rather than spelled out, so a title added to
+                // offsets.h is offered here without anyone remembering to edit a string.
+                printf("[!] unknown --game '%s'. This build knows:", want.c_str());
+                for (const GameOffsets* g : ALL_GAMES)
+                    printf(" %s (%s)", g->id, g->display);
+                printf("\n");
                 return 1;
             }
             game = picked;
@@ -659,6 +669,13 @@ int main(int argc, char** argv) {
         else                                     dllPath = a;
     }
 
+    // `--process <exe>` predates `--game` and is still the documented way to point at a
+    // different title, so honour it everywhere `--game` counts - otherwise `--process
+    // gpbikes.exe` would attach to GP Bikes while defaulting to MX Bikes' mods folder,
+    // and --install-plugin would look for the wrong exe in the folder it was handed.
+    for (const GameOffsets* g : ALL_GAMES)
+        if (_stricmp(processName, g->exe) == 0) game = g;
+
     // Clean up leftovers from a previous self-update (a running exe can't delete
     // itself, so the freshly-launched copy clears the old one here). Best-effort.
     DeleteFileA((ExeDir() + "frostmod.exe.old").c_str());
@@ -669,7 +686,7 @@ int main(int argc, char** argv) {
     if (doUpdate) return DoUpdate();
 
     // --install-plugin is a one-shot: copy frostmod.dlo into <game>\plugins\, exit.
-    if (doInstallPlugin) return DoInstallPlugin(gameDirArg, processName);
+    if (doInstallPlugin) return DoInstallPlugin(gameDirArg, game);
 
     // --uninstall-startup is a one-shot: remove the login entry and exit.
     if (uninstallStartup) {
@@ -697,12 +714,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // `--process <exe>` predates `--game` and is still the documented way to point at a
-    // different title, so honour it for the mods path too - otherwise `--process
-    // gpbikes.exe` would attach to GP Bikes while defaulting to MX Bikes' mods folder.
-    for (const GameOffsets* g : ALL_GAMES)
-        if (_stricmp(processName, g->exe) == 0) game = g;
-
     if (modsPath.empty()) modsPath = DefaultModsPath(game);
     bool modsExist = !modsPath.empty() &&
                      GetFileAttributesA(modsPath.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -716,7 +727,13 @@ int main(int argc, char** argv) {
            (!modsPath.empty() && !modsExist) ? "  (not found - pass --mods \"...\")" : "");
     // Whether reload works is per-title now, so say it here rather than let someone press
     // R in game and wonder. A title with an unconfirmed table is refused unless armed.
-    if (reloadFrom > 1)
+    // A title with NO table is its own case: --unsafe-reload cannot arm what does not
+    // exist, so saying "arm it" would send someone chasing a flag that changes nothing.
+    if (!game->reload_steps)
+        printf("[*] reload: OFF for %s - its content-load offsets are not derived yet. "
+               "Booting the game with this build logs what derives them; see\n"
+               "            tasks/kart-racing-pro-port.md.\n", game->display);
+    else if (reloadFrom > 1)
         printf("[*] reload: ARMED UNSAFELY from step %d (steps 1..%d skipped) - collecting a log\n",
                reloadFrom, reloadFrom - 1);
     else

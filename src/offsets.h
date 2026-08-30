@@ -395,6 +395,28 @@ constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadStep
 
 } // namespace gpb
 
+// ============ Kart Racing Pro =================================================
+// Same engine again, third build. NOTHING IS DERIVED YET, and that is why this namespace
+// is empty rather than populated with plausible numbers.
+//
+// `kart.exe` is SteamStub-wrapped exactly as `gpbikes.exe` was — `.bind` section, `.text`
+// entropy 8.000 — so no RVA can be read out of the shipped file. Unlike GP Bikes there is
+// no unpacked copy to work from, so the addresses come from the game itself instead: with
+// no content offsets for this title FrostMod pattern-scans `.text` for the scanner and
+// logs every scan's call stack (`[sig]` / `[stack]` lines). One boot of Kart Racing Pro
+// yields the scanner RVA, one loader RVA per content category, and the boot-init call site
+// above them — which is the whole of what `kReloadSteps` and `RVA_CONTENT_INIT` need.
+//
+// See tasks/kart-racing-pro-port.md for the capture recipe and how to read that log.
+//
+// What IS settled about this title needs no RE: `.rdata` is unencrypted and carries the
+// same plugin export table as the other two, and PiBoSo publishes the ABI in krp_example.c.
+// That is where GAME_KRP's plugin identity below comes from, and it is why plugin mode —
+// overlay, radar, the session block — works here with the reload still unported.
+namespace krp {
+// (empty by design — a wrong-but-present address is worse than a missing one)
+} // namespace krp
+
 // ============ which title we're attached to ===================================
 // The scanner signature is deliberately NOT part of this: GP's scanner prologue is
 // byte-identical to MX's, so mxb::SIG_SCAN_FOLDER resolves both games unchanged and the
@@ -410,6 +432,15 @@ struct GameOffsets {
     /// Folder under `Documents\PiBoSo` this title keeps its user content in. Matches the
     /// `user_dir` MXB App uses in `src-tauri/src/game.rs`, so both agree where mods live.
     const char* user_dir;
+    /// What `GetModID()` must return inside this title, and the data version that goes with
+    /// it. The game compares both against its own build and silently DROPS a plugin that
+    /// disagrees, so these are the difference between plugin mode working and the .dlo
+    /// being ignored. Taken from PiBoSo's published example for each title
+    /// (mxb_example.c / gpb_example.c / krp_example.c).
+    const char* plugin_id;
+    int plugin_data_version;
+    /// Boot content-load routine and the generic directory scanner. BOTH ZERO for a title
+    /// whose content offsets have not been derived — see `content_derived()`.
     uintptr_t content_init;
     uintptr_t scan_folder;
     /// The surgical reload's step table for this title, or null when it has not been
@@ -435,10 +466,23 @@ struct GameOffsets {
     /// direct connect, the in-game bike array) must stay OFF — their MX addresses are
     /// meaningless here, and hooking or reading them would land at a wild location.
     bool offsets_complete;
+
+    /// Whether the two content addresses above are real for this title. A title without
+    /// them is not "at RVA 0": `base + 0` is the PE header, and hooking or calling it is a
+    /// wild write. Callers gate on this and fall back to a pure signature scan instead —
+    /// which is also how a new title's addresses get collected in the first place.
+    constexpr bool content_derived() const { return content_init != 0 && scan_folder != 0; }
 };
+
+/// Every PiBoSo title in this file reports plugin interface version 9 — mxb_example.c,
+/// gpb_example.c and krp_example.c all return the same number. It is the ABI of the
+/// callback table itself, which has not changed across the three; the per-title
+/// `plugin_data_version` is the one that has.
+inline constexpr int kPluginInterfaceVersion = 9;
 
 inline constexpr GameOffsets GAME_MXB = {
     "mxb", "mxbikes.exe", "MX Bikes", "MX Bikes",
+    "mxbikes", 8,   // plugin identity, from mxb_example.c
     mxb::RVA_CONTENT_INIT, mxb::RVA_SCAN_FOLDER,
     mxb::kReloadSteps, mxb::kReloadStepCount,
     mxb::RVA_RELOAD_STR, mxb::RVA_RELOAD_MODS,
@@ -448,6 +492,9 @@ inline constexpr GameOffsets GAME_MXB = {
 
 inline constexpr GameOffsets GAME_GPB = {
     "gpb", "gpbikes.exe", "GP Bikes", "GP Bikes",
+    // gpb_example.c. FrostMod answered "mxbikes"/8 to every host until v0.15, so GP Bikes
+    // dropped the .dlo on sight and plugin mode never worked there — injection did.
+    "gpbikes", 12,
     gpb::RVA_CONTENT_INIT, gpb::RVA_SCAN_FOLDER,
     // Entirely SC, so no DIR operands: see gpb::kReloadSteps.
     gpb::kReloadSteps, gpb::kReloadStepCount, 0, 0,
@@ -455,5 +502,16 @@ inline constexpr GameOffsets GAME_GPB = {
     false,
 };
 
-inline constexpr const GameOffsets* ALL_GAMES[] = { &GAME_MXB, &GAME_GPB };
+inline constexpr GameOffsets GAME_KRP = {
+    "krp", "kart.exe", "Kart Racing Pro", "Kart Racing Pro",
+    "krp", 6,       // plugin identity, from krp_example.c
+    // No content addresses derived — see `namespace krp` above. Zero here is load-bearing:
+    // `content_derived()` reads it, and the scanner is resolved by signature scan instead.
+    0, 0,
+    nullptr, 0, 0, 0,   // no reload table, so RequestReload refuses cleanly
+    false,  // reload_verified: there is nothing to verify yet
+    false,  // offsets_complete: only the plugin ABI is ported
+};
+
+inline constexpr const GameOffsets* ALL_GAMES[] = { &GAME_MXB, &GAME_GPB, &GAME_KRP };
 

@@ -42,6 +42,7 @@
 
 #include "MinHook.h"
 #include "offsets.h"
+#include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
 
@@ -266,20 +267,45 @@ uintptr_t g_base = 0;
 
 // Which PiBoSo title this DLL is living inside.
 //
-// The same binary serves both games — the engine is identical and its scanner prologue is
-// byte-for-byte the same, so only a couple of RVAs differ (see offsets.h). Detected from
-// the host process's image name rather than passed in, because the DLL is injected and has
-// no argv of its own. Defaults to MX Bikes, which is what every existing install is.
-const GameOffsets* g_game = &GAME_MXB;
-
-// Pick `g_game` from the process we were loaded into.
-static void DetectGame() {
+// The same binary serves all three titles — the engine is identical and its scanner
+// prologue is byte-for-byte the same, so only a couple of RVAs differ (see offsets.h).
+// Detected from the host process's image name rather than passed in, because the DLL is
+// injected and has no argv of its own.
+//
+// Resolved at LOAD time, not in Init: in plugin mode the game calls GetModID() to decide
+// whether to keep us, and it can do that the instant it LoadLibrary's the .dlo — before
+// the Init thread has necessarily run. Answering that handshake with another title's id
+// gets the plugin dropped on the spot, which is how it looks when nothing happens at all.
+static const GameOffsets* ResolveHostGame() {
     char path[MAX_PATH] = {0};
-    if (!GetModuleFileNameA(nullptr, path, sizeof(path))) return;
+    if (!GetModuleFileNameA(nullptr, path, sizeof(path))) return nullptr;
     const char* exe = strrchr(path, '\\');
     exe = exe ? exe + 1 : path;
-    for (const GameOffsets* g : ALL_GAMES) {
-        if (_stricmp(exe, g->exe) == 0) { g_game = g; return; }
+    for (const GameOffsets* g : ALL_GAMES)
+        if (_stricmp(exe, g->exe) == 0) return g;
+    return nullptr;
+}
+
+// The host title, or MX Bikes for an unrecognised process — which is what every install
+// was before the ports, and the only guess with any chance of being right.
+static const GameOffsets* HostGame() {
+    static const GameOffsets* g = ResolveHostGame();
+    return g ? g : &GAME_MXB;
+}
+
+const GameOffsets* g_game = HostGame();
+// The callback payload layouts for that title. Reading one title's structs with another's
+// yields plausible garbage rather than an error — see pluginsdk.h.
+const PluginAbi*   g_abi  = PluginAbiFor(g_game);
+
+// Report what we're attached to. Resolution already happened above; this only says so.
+static void LogHostGame() {
+    if (ResolveHostGame()) return;
+    char path[MAX_PATH] = {0};
+    const char* exe = "?";
+    if (GetModuleFileNameA(nullptr, path, sizeof(path))) {
+        const char* slash = strrchr(path, '\\');
+        exe = slash ? slash + 1 : path;
     }
     Log("[init] unrecognised host process '%s' - assuming %s offsets.", exe, g_game->display);
 }
@@ -372,7 +398,13 @@ void LogScanCallers(const std::string& dir, const std::string& ext) {
         return nt ? (RtlCaptureStackBackTrace_t)GetProcAddress(nt, "RtlCaptureStackBackTrace")
                   : nullptr;
     }();
-    if (!cap || g_stackShots.fetch_add(1) >= 16) return;   // first few scans only
+    // On a ported title a handful of shots is plenty - they only confirm the build still
+    // looks the way offsets.h says. On a title with NO table this log is the derivation
+    // itself (one loader per content category, ~13 of them, each scanning two directories),
+    // and GP Bikes' port was left guessing at 8 of 13 categories precisely because this cap
+    // cut its log short. See tasks/kart-racing-pro-port.md.
+    const int limit = g_game->reload_steps ? 16 : 96;
+    if (!cap || g_stackShots.fetch_add(1) >= limit) return;
 
     void* frames[24] = {0};
     USHORT n = cap(1 /*skip LogScanCallers itself*/, 24, frames, nullptr);
@@ -1621,66 +1653,11 @@ void RequestReload() {
 // the radar itself no longer depends on anything unconfirmed.
 // ===========================================================================
 
-// ---- SDK structs (verbatim prefix from mxb_example.c; we read only early, fixed
-// fields, and every ingest guards on the reported _iDataSize) ----------------
-struct SPluginsBikeData_t {          // RunTelemetry payload (local bike)
-    int   m_iRPM;
-    float m_fEngineTemperature, m_fWaterTemperature;
-    int   m_iGear;
-    float m_fFuel, m_fSpeedometer;
-    float m_fPosX, m_fPosY, m_fPosZ; // world position  (all we read)
-    // ... velocity / accel / rotation / controls follow; unused here.
-};
-struct SPluginsRaceTrackPosition_t { // RaceTrackPosition array element
-    int   m_iRaceNum;
-    float m_fPosX, m_fPosY, m_fPosZ;  // metres
-    float m_fYaw;                     // angle from north, DEGREES (not radians)
-    float m_fTrackPos;                // 0..1 along the centreline
-    int   m_iCrashed;
-};
-// EventInit payload. Unlike the structs above we read fields at the *end* of this one,
-// so every preceding field must match the SDK exactly — a wrong size anywhere ahead of
-// m_szServerName silently yields garbage rather than an error. Verbatim from mxb_api.h.
-struct SPluginsBikeEvent_t {
-    char  m_szRiderName[100];
-    char  m_szBikeID[100];
-    char  m_szBikeName[100];
-    int   m_iNumberOfGears;
-    int   m_iMaxRPM;
-    int   m_iLimiter;
-    int   m_iShiftRPM;
-    float m_fEngineOptTemperature;
-    float m_afEngineTemperatureAlarm[2];
-    float m_fMaxFuel;
-    float m_afSuspMaxTravel[2];
-    float m_fSteerLock;
-    char  m_szCategory[100];
-    char  m_szTrackID[100];
-    char  m_szTrackName[100];
-    float m_fTrackLength;
-    int   m_iType;                   // 1 = testing; 2 = race; 4 = straight rhythm
-    char  m_szServerName[64];        // the server we joined
-    int   m_iServerType;
-    char  m_szGUID[100];             // OUR OWN guid - the local player only
-};
-struct SPluginsRaceEvent_t {         // RaceEvent payload
-    int  m_iType;                    // 1 = testing; 2 = race; 4 = straight rhythm; -1 = replay
-    char m_szName[100];              // the server/event name
-    char m_szTrackName[100];
-    float m_fTrackLength;            // metres
-};
-struct SPluginsRaceAddEntry_t {      // RaceAddEntry payload
-    int  m_iRaceNum;
-    char m_szName[100], m_szBikeName[100], m_szBikeShortName[100], m_szCategory[100];
-    int  m_iUnactive, m_iNumberOfGears, m_iMaxRPM;
-};
-struct SPluginsRaceClassification_t {      // RaceClassification header
-    int m_iSession, m_iSessionState, m_iSessionTime, m_iNumEntries;
-};
-struct SPluginsRaceClassificationEntry_t { // RaceClassification array element
-    int m_iRaceNum, m_iState, m_iBestLap, m_iBestLapNum, m_iNumLaps;
-    int m_iGap, m_iGapLaps, m_iPenalty, m_iPit;
-};
+// ---- SDK structs -----------------------------------------------------------
+// In pluginsdk.h, one layout per title: the three games hand these callbacks different
+// structs, and `g_abi` says which. What is shared (`sdk::`) is shared because all three
+// SDKs agree byte for byte, not because it was convenient. Every ingest below still
+// guards on the size the callback itself reports.
 
 // ---- World-axis / yaw conventions -------------------------------------------
 // Settled against PiBoSo's own SDK header and cross-checked against MXBMRP3
@@ -1738,8 +1715,8 @@ static int RadFindEntry(int raceNum) {       // caller holds g_radMutex
 
 // ---- ingest (called from the plugin callbacks; take the lock) ---------------
 static void RadStoreTelemetry(const void* d, int size) {
-    if (!d || size < (int)sizeof(SPluginsBikeData_t)) return;
-    const auto* b = (const SPluginsBikeData_t*)d;
+    if (!d || size < (int)sizeof(sdk::VehicleDataPrefix)) return;
+    const auto* b = (const sdk::VehicleDataPrefix*)d;
     std::lock_guard<std::mutex> lk(g_radMutex);
     g_radMeX = b->m_fPosX; g_radMeY = b->m_fPosY; g_radMeZ = b->m_fPosZ;
     g_radHaveMe = true;
@@ -1748,23 +1725,31 @@ static void RadStoreTelemetry(const void* d, int size) {
 // struct is fine and expected -- a later game build appending fields still puts the ones
 // we read at the same offsets. A stride SMALLER than it is not: we'd read each element's
 // tail out of the next element, and the last one off the end of the array.
+// The element size compared against is THIS TITLE's: Kart Racing Pro's entry is 24 bytes
+// where the bike titles' is 28 (it has no crashed flag), so a guard written against MX's
+// struct throws every kart on the grid away and the radar just stays empty.
 static void RadStoreTrackPositions(int n, const void* arr, int elem) {
-    if (!arr || elem < (int)sizeof(SPluginsRaceTrackPosition_t)) {
+    if (!arr || elem < g_abi->tp_size) {
         std::lock_guard<std::mutex> lk(g_radMutex); g_radN = 0; return;
     }
     std::lock_guard<std::mutex> lk(g_radMutex);
     if (n < 0) n = 0; if (n > 64) n = 64;
     g_radN = 0;
     for (int i = 0; i < n; ++i) {
-        const auto* e = (const SPluginsRaceTrackPosition_t*)((const char*)arr + (size_t)i * elem);
+        const char* p = (const char*)arr + (size_t)i * elem;
+        const auto* e = (const sdk::TrackPositionPrefix*)p;
         RadRider& r = g_radRiders[g_radN++];
         r.raceNum = e->m_iRaceNum; r.x = e->m_fPosX; r.y = e->m_fPosY; r.z = e->m_fPosZ;
-        r.yawDeg = e->m_fYaw; r.crashed = e->m_iCrashed;
+        r.yawDeg = e->m_fYaw;
+        // Absent on a title that has no such field: not crashed, rather than whatever the
+        // next element's race number happens to be.
+        r.crashed = (g_abi->tp_crashed >= 0 && elem >= g_abi->tp_crashed + (int)sizeof(int))
+                    ? *(const int*)(p + g_abi->tp_crashed) : 0;
     }
 }
 static void RadAddEntry(const void* d, int size) {
-    if (!d || size < (int)sizeof(SPluginsRaceAddEntry_t)) return;
-    const auto* a = (const SPluginsRaceAddEntry_t*)d;
+    if (!d || size < (int)sizeof(sdk::RaceAddEntry)) return;
+    const auto* a = (const sdk::RaceAddEntry*)d;
     std::lock_guard<std::mutex> lk(g_radMutex);
     int i = RadFindEntry(a->m_iRaceNum);
     if (i < 0 && g_radNEntries < 64) { i = g_radNEntries++; g_radEntries[i].numLaps = 0; }
@@ -1778,15 +1763,20 @@ static void RadRemoveEntry(const void* d, int size) {
     int i = RadFindEntry(raceNum);
     if (i >= 0) g_radEntries[i] = g_radEntries[--g_radNEntries];
 }
+// GP Bikes and Kart Racing Pro carry an m_fBestSpeed that MX Bikes does not, so both the
+// element size and where m_iNumLaps sits inside it are per-title (see pluginsdk.h). Read
+// with the wrong one, the lap-status colouring reads a best-lap time as a lap count.
 static void RadStoreClassification(const void* arr, int n, int elem) {
-    if (!arr || elem < (int)sizeof(SPluginsRaceClassificationEntry_t)) return;  // see above
+    if (!arr || elem < g_abi->cls_entry_size) return;  // see above
     std::lock_guard<std::mutex> lk(g_radMutex);
     if (n < 0) n = 0; if (n > 64) n = 64;
     for (int k = 0; k < n; ++k) {
-        const auto* c = (const SPluginsRaceClassificationEntry_t*)((const char*)arr + (size_t)k * elem);
-        int i = RadFindEntry(c->m_iRaceNum);
+        const char* c = (const char*)arr + (size_t)k * elem;
+        int raceNum = *(const int*)c;                            // first field in all three
+        int numLaps = *(const int*)(c + g_abi->cls_entry_num_laps);
+        int i = RadFindEntry(raceNum);
         if (i < 0 && g_radNEntries < 64) { i = g_radNEntries++; g_radEntries[i].name[0] = 0; }
-        if (i >= 0) { g_radEntries[i].raceNum = c->m_iRaceNum; g_radEntries[i].numLaps = c->m_iNumLaps; }
+        if (i >= 0) { g_radEntries[i].raceNum = raceNum; g_radEntries[i].numLaps = numLaps; }
     }
 }
 static void RadResetRace() {
@@ -3287,6 +3277,23 @@ uintptr_t ResolveScanner(intptr_t* outDelta) {
     uint8_t *b, *e;
     bool haveRange = GetExecRange(g_base, &b, &e);
 
+    // A title with no derived offsets has no RVA to check against: `base + 0` is the PE
+    // header, and "verifying" or hooking it would be a wild write. Signature only - and
+    // the RVA it finds is the first constant of that title's port, so it is logged loudly.
+    if (!g_game->content_derived()) {
+        uint8_t* found = haveRange
+            ? PatternScan(b, e, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK) : nullptr;
+        if (!found) {
+            Log("[sig] %s: no offsets derived for this title and the scanner signature is "
+                "not in .text (yet). Content hooks stay off.", g_game->display);
+            return 0;
+        }
+        Log("[sig] %s: scanner found at RVA 0x%zx by signature. This title has no derived "
+            "offsets - RECORD THIS RVA (see tasks/kart-racing-pro-port.md).",
+            g_game->display, (size_t)((uintptr_t)found - g_base));
+        return (uintptr_t)found;
+    }
+
     // only read the raw RVA if it actually lies inside an executable section
     bool rvaInRange = haveRange && expected >= b && expected + sigLen <= e;
     if (rvaInRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
@@ -3321,6 +3328,41 @@ uintptr_t ResolveScanner(intptr_t* outDelta) {
 // after unpack but (hopefully) before the game itself calls the scanner.
 uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
     *outDelta = 0;
+
+    // Nothing to wait AT when the title has no derived RVA: sweep .text for the signature
+    // until SteamStub has decrypted the code it lives in. A sweep is a few milliseconds, so
+    // poll it slowly rather than spinning. The scanner prologue is byte-identical between
+    // MX Bikes and GP Bikes, which is the reason to expect it to match a third title too -
+    // and if it doesn't, that is itself the answer, logged below.
+    if (!g_game->content_derived()) {
+        DWORD start = GetTickCount();
+        bool announced = false;
+        for (;;) {
+            uint8_t *b, *e;
+            if (GetExecRange(g_base, &b, &e))
+                if (uint8_t* found = PatternScan(b, e, mxb::SIG_SCAN_FOLDER,
+                                                 mxb::SIG_SCAN_FOLDER_MASK)) {
+                    Log("[sig] %s: scanner found at RVA 0x%zx by signature (after %lums). "
+                        "This title has no derived offsets - RECORD THIS RVA; the [stack] "
+                        "lines that follow carry the rest (tasks/kart-racing-pro-port.md).",
+                        g_game->display, (size_t)((uintptr_t)found - g_base),
+                        (unsigned long)(GetTickCount() - start));
+                    return (uintptr_t)found;
+                }
+            if (GetTickCount() - start > timeoutMs) break;
+            if (!announced) {
+                Log("[sig] %s: no derived offsets - sweeping .text for the scanner signature "
+                    "(waiting for the code to decrypt)...", g_game->display);
+                announced = true;
+            }
+            Sleep(100);
+        }
+        Log("[sig] %s: the scanner signature never appeared in .text. Content hooks stay off, "
+            "so the capture that would derive this title's offsets has nothing to hook - its "
+            "scanner prologue must differ. Nothing else is affected.", g_game->display);
+        return 0;
+    }
+
     uint8_t* expected = (uint8_t*)(g_base + g_game->scan_folder);
     size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
     DWORD    start    = GetTickCount();
@@ -3665,12 +3707,14 @@ DWORD WINAPI Init(LPVOID) {
     // rather than being another log that simply stops.
     g_prevCrashFilter = SetUnhandledExceptionFilter(FrostCrashFilter);
 
-    DetectGame();
+    LogHostGame();
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // the game exe
     Log("[init] %s - module base = %p", g_game->display, (void*)g_base);
     if (!g_game->offsets_complete)
-        Log("[init] NOTE: only the content-load offsets are ported for %s. The server "
-            "browser filter and anything else needing the un-ported groups stays off.",
+        Log("[init] NOTE: %s for %s. The server browser filter and anything else needing "
+            "the un-ported groups stays off.",
+            g_game->content_derived() ? "only the content-load offsets are ported"
+                                      : "NO offsets are derived - the plugin API only",
             g_game->display);
 
     if (MH_Initialize() != MH_OK) { Log("[init] MinHook init failed"); return 1; }
@@ -3686,7 +3730,8 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
-    Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
+    if (g_game->content_derived())
+        Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
 
     // CONTENT hooks first and ASAP - they're timing-critical: we must be hooked
     // before the game's one-time startup mods scan. Wait for the code to be
@@ -3703,7 +3748,12 @@ DWORD WINAPI Init(LPVOID) {
         // Resolve the content-load routine (fcn.1400ef210) - the reload target. It has
         // no signature, so apply the same delta the scanner moved by (best-effort) and
         // only accept it if it lands inside .text.
-        {
+        if (!g_game->content_init) {
+            // Not an error: this title's addresses have not been derived, and the scan
+            // hook installed just above is what collects them.
+            Log("[init] %s has no content-load RVA yet - reload stays off, capture is on.",
+                g_game->display);
+        } else {
             uintptr_t ci = g_base + g_game->content_init + delta;
             uint8_t *cb, *ce;
             if (GetExecRange(g_base, &cb, &ce) && (uint8_t*)ci >= cb && (uint8_t*)ci < ce) {
@@ -4086,11 +4136,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 }
 
 // ---------------------------------------------------------------------------
-// PiBoSo plugin interface (MX Bikes). Placing frostmod.dll in the game's
-// plugins folder makes the game load it at STARTUP and call these - which gets
-// our hooks installed before the one-time mods scan, no injector needed. The
-// game validates the plugin via GetModID + the two version numbers (must match
-// this MX Bikes build: "mxbikes", data 8, interface 9 - from mxb_example.c).
+// PiBoSo plugin interface. Placing frostmod.dlo in the game's plugins folder makes the
+// game load it at STARTUP and call these - which gets our hooks installed before the
+// one-time mods scan, no injector needed. The game validates the plugin via GetModID plus
+// the two version numbers, and DROPS it without a word if any disagrees with its own
+// build - so these three must answer for whichever title is hosting us, not for the one
+// FrostMod grew up in. (Until v0.15 they answered "mxbikes"/8 to every host, which is why
+// plugin mode worked on MX Bikes and did nothing at all on GP Bikes.) The per-title values
+// come from PiBoSo's published examples and live in offsets.h.
+//
 // We also implement the optional Draw() callback as the sanctioned overlay path
 // (on track/spectate/replay); other data/telemetry callbacks are omitted, and the
 // game only calls the exports that exist. See docs/PLUGIN.md.
@@ -4098,11 +4152,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 extern "C" {
 
 __declspec(dllexport) char* GetModID() {
-    static char id[] = "mxbikes";
+    // The game keeps this pointer, so it outlives the call.
+    static char id[32] = {0};
+    if (!id[0]) strncpy_s(id, sizeof(id), HostGame()->plugin_id, _TRUNCATE);
     return id;
 }
-__declspec(dllexport) int GetModDataVersion()   { return 8; }
-__declspec(dllexport) int GetInterfaceVersion() { return 9; }
+__declspec(dllexport) int GetModDataVersion()   { return HostGame()->plugin_data_version; }
+// The callback table's own ABI, and the one number all three titles agree on.
+__declspec(dllexport) int GetInterfaceVersion() { return kPluginInterfaceVersion; }
 
 // Called once at game startup. _szSavePath is the game's save/data folder.
 // Return value = requested telemetry rate (3 = 10Hz); we don't use telemetry,
@@ -4158,33 +4215,53 @@ __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
 }
 // Classification carries laps-done per race number -> the lap-status coloring.
 __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
-    int n = (_pData && _iDataSize >= (int)sizeof(SPluginsRaceClassification_t))
-            ? ((SPluginsRaceClassification_t*)_pData)->m_iNumEntries : 0;
+    // KRP's header has an extra m_iSessionSeries ahead of the count, so both the minimum
+    // size and where the count sits are this title's, not MX Bikes'.
+    int n = (_pData && _iDataSize >= g_abi->cls_hdr_size)
+            ? *(const int*)((const char*)_pData + g_abi->cls_num_entries) : 0;
     RadStoreClassification(_pArray, n, _iElemSize);
 }
-// EventInit is where the client learns which server it joined. RaceEvent -- the obvious
-// candidate -- does not reach the client; it is a *race*-session callback, confirmed
-// firing on the dedicated server (see FROSTSERVER.md) and observed never firing here.
-// This one carries the server name, the track and our own GUID, which is more than we
-// need and all in one place.
+// On MX Bikes, EventInit is where the client learns which server it joined. RaceEvent --
+// the obvious candidate -- does not reach the client there; it is a *race*-session
+// callback, confirmed firing on the dedicated server (see FROSTSERVER.md) and observed
+// never firing here. This one carries the server name, the track and our own GUID, which
+// is more than we need and all in one place.
+//
+// GP Bikes' and Kart Racing Pro's events carry none of those three, as published -- so on
+// those titles the room key comes from RaceEvent instead (see below), and whether that
+// callback reaches the client at all is the first thing their capture log answers.
 //
 // The server name is what MXB App keys a voice room on. It is the only identifier every
 // rider on a server has: an address reaches only the ones whose app launched the game, and
 // a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     LogCallbackOnce("EventInit", _iDataSize);
-    if (!_pData || _iDataSize < (int)sizeof(SPluginsBikeEvent_t)) {
-        Log("[session] EventInit payload too small (%d < %d) - server unknown",
-            _iDataSize, (int)sizeof(SPluginsBikeEvent_t));
+    const PluginAbi* abi = g_abi;
+    if (!_pData || _iDataSize < abi->ev_size) {
+        Log("[session] EventInit payload too small (%d < %d per %s) - server unknown",
+            _iDataSize, abi->ev_size, abi->sdk);
         return;
     }
-    const auto* e = (const SPluginsBikeEvent_t*)_pData;
-    // Fixed-size char arrays, not guaranteed NUL-terminated.
+    const char* d = (const char*)_pData;
+    // Fixed-size char arrays, not guaranteed NUL-terminated. Every field is read at THIS
+    // title's offset: KRP's event is a different struct, not a shorter one, so a driver
+    // name read at MX Bikes' track offset is a plausible-looking wrong answer.
     char server[65] = {0}, track[101] = {0}, guid[101] = {0}, rider[101] = {0};
-    memcpy(server, e->m_szServerName, 64);
-    memcpy(track,  e->m_szTrackID,    100);
-    memcpy(guid,   e->m_szGUID,       100);
-    memcpy(rider,  e->m_szRiderName,  100);
+    memcpy(rider, d + abi->ev_rider, 100);
+    memcpy(track, d + abi->ev_track, 100);
+    if (abi->ev_server >= 0) memcpy(server, d + abi->ev_server, 64);
+    if (abi->ev_guid   >= 0) memcpy(guid,   d + abi->ev_guid,   100);
+
+    // A title's published example can lag its shipped build: MX Bikes' still describes the
+    // struct from before data version 8 appended the server name, GUID and server type,
+    // and FrostMod reads them anyway because production proved they are there. So if a
+    // title we credit with no server name hands us MORE bytes than its example describes,
+    // that tail is very likely the same fields - which is worth a log line and a look, not
+    // a guess at the offsets. See tasks/kart-racing-pro-port.md.
+    if (abi->ev_server < 0 && _iDataSize > abi->ev_size)
+        Log("[session] NOTE: %s describes a %d-byte event; %s handed us %d. The extra %d "
+            "bytes may be the server-name tail MX Bikes has - worth deriving.",
+            abi->sdk, abi->ev_size, g_game->display, _iDataSize, _iDataSize - abi->ev_size);
 
     if (auto* block = g_sessionBlock) {
         frostmod::session::BeginWrite(*block);
@@ -4194,28 +4271,38 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
         frostmod::session::SetField(block->riderName, rider);
         frostmod::session::EndWrite(*block);
     }
-    Log("[session] server='%s' track='%s' type=%d guid=%s",
-        server, track, e->m_iServerType, guid[0] ? "yes" : "no");
+    Log("[session] rider='%s' server='%s' track='%s' guid=%s",
+        rider, server[0] ? server : "<none in this title's event>", track,
+        guid[0] ? "yes" : "no");
 }
 __declspec(dllexport) void EventDeinit() {
     Log("[session] event closed");
     SessionClear();
 }
-// Kept for the track half only: a server on a rotation changes track without a new event,
-// and this is confirmed to carry it. The server name set by EventInit survives, which is
-// what keeps a voice room together across a track change.
+// On MX Bikes this is kept for the track half only: a server on a rotation changes track
+// without a new event, and this is confirmed to carry it. The server name set by EventInit
+// survives, which is what keeps a voice room together across a track change.
+//
+// On a title whose EventInit carries no server name at all (GP Bikes and Kart Racing Pro,
+// as published), m_szName here is the only string that names the session, so it becomes
+// the room key. A replay (type -1) names no session and is skipped: keying a room on a
+// replay would put a rider watching one into a room with strangers watching another.
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     LogCallbackOnce("RaceEvent", _iDataSize);
-    if (!_pData || _iDataSize < (int)sizeof(SPluginsRaceEvent_t)) return;
-    const auto* e = (const SPluginsRaceEvent_t*)_pData;
-    char track[101] = {0};
+    if (!_pData || _iDataSize < (int)sizeof(sdk::RaceEvent)) return;
+    const auto* e = (const sdk::RaceEvent*)_pData;
+    char track[101] = {0}, name[101] = {0};
     memcpy(track, e->m_szTrackName, 100);
+    memcpy(name,  e->m_szName,      100);
+    const bool takeServerName = (g_abi->ev_server < 0) && name[0] && e->m_iType != -1;
     if (auto* block = g_sessionBlock) {
         frostmod::session::BeginWrite(*block);
         frostmod::session::SetField(block->trackId, track);
+        if (takeServerName) frostmod::session::SetField(block->serverName, name);
         frostmod::session::EndWrite(*block);
     }
-    Log("[session] track now '%s'", track);
+    if (takeServerName) Log("[session] server='%s' (from RaceEvent), track now '%s'", name, track);
+    else                Log("[session] track now '%s'", track);
 }
 __declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); }
 __declspec(dllexport) void RaceDeinit()             { RadResetRace(); }

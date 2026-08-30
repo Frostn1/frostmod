@@ -132,8 +132,16 @@ static void every_title_is_internally_consistent() {
         CHECK(g->id && *g->id, "a title has no id");
         CHECK(g->exe && *g->exe, "%s has no exe", g->id);
         CHECK(g->user_dir && *g->user_dir, "%s has no user_dir", g->id);
-        CHECK(g->content_init != 0, "%s has no content_init", g->id);
-        CHECK(g->scan_folder != 0, "%s has no scan_folder", g->id);
+        // Both or neither. One of the two derived is the dangerous middle: the DLL would
+        // gate the content hooks on `content_derived()` being false while some other path
+        // read the one address that is set, at `base + 0` - the PE header.
+        CHECK((g->content_init != 0) == (g->scan_folder != 0),
+              "%s has one content offset derived and not the other", g->id);
+        CHECK(g->content_derived() == (g->content_init != 0), "%s: content_derived() lies", g->id);
+        if (!g->content_derived())
+            CHECK(!g->reload_steps,
+                  "%s has a reload table but no content offsets - the table cannot be run "
+                  "without the addresses it is replayed alongside", g->id);
 
         if (!g->reload_steps) {
             CHECK(g->reload_count == 0, "%s has no table but a nonzero count", g->id);
@@ -155,8 +163,47 @@ static void every_title_is_internally_consistent() {
 static void ids_match_what_mxb_app_sends() {
     CHECK(std::strcmp(GAME_MXB.id, "mxb") == 0, "MX Bikes id changed");
     CHECK(std::strcmp(GAME_GPB.id, "gpb") == 0, "GP Bikes id changed");
+    CHECK(std::strcmp(GAME_KRP.id, "krp") == 0, "Kart Racing Pro id changed");
     CHECK(std::strcmp(GAME_MXB.user_dir, "MX Bikes") == 0, "MX Bikes user_dir changed");
     CHECK(std::strcmp(GAME_GPB.user_dir, "GP Bikes") == 0, "GP Bikes user_dir changed");
+    CHECK(std::strcmp(GAME_KRP.user_dir, "Kart Racing Pro") == 0, "Kart Racing Pro user_dir changed");
+}
+
+// The plugin handshake. The game asks for these three and silently DROPS the .dlo if any
+// of them is not its own - no log line, no error, just a plugin that never loads. They are
+// PiBoSo's numbers, one set per title (mxb_example.c / gpb_example.c / krp_example.c), and
+// the only way to notice a wrong one is on the game itself, which is why they are pinned
+// here. FrostMod answered "mxbikes"/8 to every host until v0.15; that is exactly why
+// plugin mode did nothing on GP Bikes.
+static void plugin_handshake_is_each_titles_own() {
+    CHECK(std::strcmp(GAME_MXB.plugin_id, "mxbikes") == 0, "MX Bikes plugin id changed");
+    CHECK(std::strcmp(GAME_GPB.plugin_id, "gpbikes") == 0, "GP Bikes plugin id changed");
+    CHECK(std::strcmp(GAME_KRP.plugin_id, "krp") == 0, "Kart Racing Pro plugin id changed");
+    CHECK(GAME_MXB.plugin_data_version == 8,  "MX Bikes data version changed");
+    CHECK(GAME_GPB.plugin_data_version == 12, "GP Bikes data version changed");
+    CHECK(GAME_KRP.plugin_data_version == 6,  "Kart Racing Pro data version changed");
+    CHECK(kPluginInterfaceVersion == 9, "the shared interface version changed");
+
+    for (const GameOffsets* a : ALL_GAMES) {
+        CHECK(a->plugin_id && *a->plugin_id, "%s has no plugin id", a->id);
+        for (const GameOffsets* b : ALL_GAMES)
+            if (a != b)
+                CHECK(std::strcmp(a->plugin_id, b->plugin_id) != 0,
+                      "%s and %s claim the same plugin id '%s'", a->id, b->id, a->plugin_id);
+    }
+}
+
+// Kart Racing Pro ships with the plugin ABI ported and nothing else. Asserting the
+// *absence* is the point: a later edit that fills in content_init from somewhere other
+// than a capture run on the title has to come past this.
+static void krp_is_plugin_only_until_its_offsets_are_derived() {
+    CHECK(std::strcmp(GAME_KRP.exe, "kart.exe") == 0, "Kart Racing Pro exe changed");
+    CHECK(!GAME_KRP.content_derived(),
+          "Kart Racing Pro has content offsets now - if they came from a capture run on the "
+          "game, update tasks/kart-racing-pro-port.md and this check together");
+    CHECK(!GAME_KRP.reload_steps, "Kart Racing Pro has a reload table but no derivation");
+    CHECK(!GAME_KRP.reload_verified, "Kart Racing Pro cannot have a verified table");
+    CHECK(!GAME_KRP.offsets_complete, "Kart Racing Pro's offsets are not complete");
 }
 
 int main() {
@@ -167,6 +214,8 @@ int main() {
     no_title_borrows_another_titles_offsets();
     every_title_is_internally_consistent();
     ids_match_what_mxb_app_sends();
+    plugin_handshake_is_each_titles_own();
+    krp_is_plugin_only_until_its_offsets_are_derived();
 
     if (g_failures) {
         std::printf("\n%d check(s) failed\n", g_failures);

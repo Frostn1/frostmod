@@ -11,7 +11,9 @@
 // ## Why the server name and not an address
 //
 // `EventInit` hands the client `m_szServerName`, and it is the same string for everyone who
-// joined that server. An address is not: a rider who picked the server from the game's own
+// joined that server. (On MX Bikes. GP Bikes' and Kart Racing Pro's events have no such
+// field, so there the same string is taken from `RaceEvent`'s `m_szName` — same key, one
+// callback further along.) An address is not: a rider who picked the server from the game's own
 // browser never sees one, and the app only knows an address when it launched the game
 // itself. A key that only some riders can compute puts them in different rooms, which is
 // the one failure that makes voice chat look broken while working perfectly.

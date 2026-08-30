@@ -6,7 +6,24 @@
 [![License: MIT](https://img.shields.io/github/license/Frostn1/frostmod)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue)](#build)
 
-FrostMod is a client-side toolkit for MX Bikes.
+FrostMod is a client-side toolkit for MX Bikes — and, as far as each title's offsets are
+derived, for the other two PiBoSo sims.
+
+## Titles
+
+| | MX Bikes | GP Bikes | Kart Racing Pro |
+|---|---|---|---|
+| Plugin loads (overlay, radar, voice session block) | yes | yes | yes |
+| Live mod reload | yes | not confirmed — refused unless armed | **not yet** |
+| Server-browser spam filter | yes | no | no |
+
+Pick a title with `--game mxb` / `gpb` / `krp` (or just start the game — the mods folder
+follows whichever one you point at). One binary serves all three.
+
+Reload on a title FrostMod has not derived the addresses for is **refused**, not attempted:
+replaying one game's function table inside another calls arbitrary code, and it has taken
+GP Bikes down twice. Kart Racing Pro needs one capture run to close that gap — see
+[tasks/kart-racing-pro-port.md](tasks/kart-racing-pro-port.md).
 
 ## Features
 
@@ -43,7 +60,9 @@ server-side companion (see [FrostServer](#frostserver-dedicated-servers)).
 ## Usage
 
 Run **`frostmod.exe`**. It waits for `mxbikes.exe`, injects `frostmod.dll`, and
-stays open as a console - listing the mods it finds and streaming its log.
+stays open as a console - listing the mods it finds and streaming its log. For another
+title, add `--game gpb` or `--game krp`: that picks the process to wait for, the mods
+folder to list, and the plugin identity to answer with.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
   console, or **`F8`** in-game to open the FrostMod menu and pick **Reload**.

@@ -1793,20 +1793,29 @@ static void OverlaySettingsPath(char* out, size_t n) {
     if (slash) slash[1] = 0; else out[0] = 0;
     strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
 }
+// the same file, and the editor re-reads it each time it opens so a change lands without
+// restarting the game.
+
+}
+
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
     fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\n",
             g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
             g_uiPct.load());
+    // Written every time, so a toggle made in-game cannot drop the bindings the app set.
+        char key[64], val[64];
+        fprintf(f, "%s=%s\n", key, val);
+    }
     fclose(f);
 }
 static void LoadOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
-    char line[64]; int v;
+    char line[128]; int v;
     while (fgets(line, sizeof(line), f)) {
-        if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
+        else if (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
         else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);

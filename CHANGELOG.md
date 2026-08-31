@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-31
+
+### Changed
+- The editor panel lists the keys actually bound rather than the shipped defaults.
+
 ## 2026-08-30 — v0.15.0
 
 ### Added

@@ -476,9 +476,9 @@ int64_t __fastcall hkReset(void* a0, void* a1) {
 // scene-level mesh loader or its identity/cache behaviour. Loose bike files are
 // real disk opens, so hooking kernel32!CreateFileW/A and logging every '.edf' open
 // WITH a stack walk answers both open questions from the log alone:
-//   (A) swap a model then RE-SELECT the SAME bike (no class change): if NO new
-//       [edf] line appears, the mesh is cached by identity -> the fix must
-//       replicate away-and-back; if a line appears, a single re-select suffices.
+//   (A) ANSWERED in play: a plain re-select of the same bike does NOT show the new
+//       model, so the mesh is cached by identity and the fix must replicate the
+//       away-and-back. The capture still names the loader that invalidates it.
 //   (B) switch class away+back: the [edf] line's stack names the mesh loader (the
 //       top mxbikes.exe RVA) and the "selected-bike-changed" caller above it.
 // Read-only: we call the original CreateFile unchanged and only log.
@@ -753,7 +753,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 }
 
 void RequestReload();                          // fwd (defined with the reload code below)
-void NoteModelNeedsReselect(const char* bikeId, const char* why);  // fwd (bike-apply code below)
+void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
 
@@ -1265,10 +1265,10 @@ static void MsApply(const std::string& bike, const std::string& target) {
     SetStatus("model swapped - reloading", 4000);
     g_msOpen.store(false);
     RequestReload();
-    // The files and the catalogs are updated; the live machine is not. Tell the player
-    // to re-select the bike. (v0.9.9 re-applied it for them and crashed the game doing
-    // so - see the bike-apply block.)
-    NoteModelNeedsReselect(bike.c_str(), "F8 model swap");
+    // The files and the catalogs are updated; the live machine is not. Tell the player to
+    // switch bike category away and back. (v0.9.9 re-applied it for them and crashed the
+    // game doing so - see the bike-apply block.)
+    NoteModelNeedsCategorySwitch(bike.c_str(), "F8 model swap");
 }
 
 void OpenModelSwap() {
@@ -3524,7 +3524,8 @@ uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
 // Doing this properly means building a descriptor WE own, which needs what Stage A
 // was always meant to settle: which field holds the picked bike's name, and which
 // call site is the garage one. Until a --bikecap run on Windows answers both, a
-// swapped model needs a manual re-select in the garage, and both swap paths say so.
+// swapped model needs a category switch away and back in the garage, and both swap
+// paths say so.
 // ---------------------------------------------------------------------------
 using BikeApply_t = int64_t(__fastcall*)(void*, void*);
 BikeApply_t g_origBikeApply = nullptr;
@@ -3607,21 +3608,26 @@ int64_t __fastcall hkBikeApply(void* rcx, void* rdx) {
     return g_origBikeApply(rcx, rdx);
 }
 
-// Tell the player their swapped model needs a manual re-select, and say so in the
-// log for whoever reads it afterwards. This is all a model swap does to the running
+// Tell the player their swapped model needs the category-switch dance, and say so in
+// the log for whoever reads it afterwards. This is all a model swap does to the running
 // game now: the files on disk have changed and the content catalogs have been
 // rebuilt, but the live machine is left strictly alone. Safe from any thread.
 //
+// It has to be a category switch away and back. Re-selecting the same bike leaves the
+// model as it was - the mesh is cached by identity (confirmed in play; the [edf] capture
+// below was built to settle exactly this).
+//
 // v0.9.9 tried to spare the player this step by replaying the game's own bike-apply
-// call; that is what crashed the game at the next hand-picked bike. Until the apply
-// can be driven from a descriptor we build ourselves, the re-select IS the feature.
-void NoteModelNeedsReselect(const char* bikeId, const char* why) {
+// call; that is what crashed the game at the next hand-picked bike. Until the apply can
+// be driven from a descriptor we build ourselves, the dance IS the feature.
+void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why) {
     std::string bike = bikeId ? bikeId : "";
     if (bike.empty()) return;
-    Log("[bikefresh] '%s' swapped (%s) - re-select the bike in the garage to load the new "
-        "model. (Live re-apply was removed in v0.9.11: it crashed the game.)",
+    Log("[bikefresh] '%s' swapped (%s) - switch bike category away and back in the garage "
+        "to load the new model; re-selecting the same bike does NOT re-read it. (Live "
+        "re-apply was removed in v0.9.11: it crashed the game.)",
         bike.c_str(), why ? why : "");
-    SetStatus("model swapped - re-select the bike to see it", 6000);
+    SetStatus("model swapped - switch bike category away and back", 6000);
 }
 
 // ---------------------------------------------------------------------------
@@ -3733,7 +3739,7 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // captured bike-apply call, which crashed the game at the next hand-picked bike
         // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
         // below v0.9.11, so reaching here means an older app - answer it truthfully.
-        NoteModelNeedsReselect(bikeId.c_str(), "MXB App model swap");
+        NoteModelNeedsCategorySwitch(bikeId.c_str(), "MXB App model swap");
     } else if (verb == "swap_bike") {
         // Stage B (whole-bike in-garage switch) isn't built yet. Say so instead of
         // silently doing nothing - MXB App's garage_swap_bike sends this today.
@@ -3998,9 +4004,9 @@ DWORD WINAPI Init(LPVOID) {
 
     // OPT-IN (create an empty frostmod_edfcap.flag next to frostmod.log): log every
     // bike-model (.edf) file the game opens, WITH its call stack, to RE the garage
-    // bike-preview reload path - which loader re-reads model.edf from disk, and
-    // whether re-selecting the SAME bike re-opens it (the mesh-cache test). See the
-    // hkCreateFileW/A capture hooks above. Read-only; off by default.
+    // bike-preview reload path: which loader re-reads model.edf from disk. A plain
+    // re-select does not - only a category switch away and back. See the hkCreateFileW/A
+    // capture hooks above. Read-only; off by default.
     {
         char flag[MAX_PATH] = {0};
         if (g_logPath[0]) {

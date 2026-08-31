@@ -194,35 +194,6 @@ tail is the same fields, waiting to be derived.
   safely we need, at the splice site (near `RVA_SB_HIDE_EMPTY_BR`): the exact
   address, the register holding the `SB_Entry` pointer, and the overwritten bytes.
 
-## Feature — keyframed replay camera (F8 → `7`)
-
-Set keys while scrubbing a replay; the camera flies a smooth path between them. See
-`docs/USAGE.md` for the keys and `tasks/replay-keyframe-camera.md` for the RE it is
-built on.
-
-Two plugin callbacks carry it, and neither needs an offset:
-
-| Export | Signature | We return / do |
-|--------|-----------|----------------|
-| `Draw` | `void Draw(int state, ...)` | `state == 2` is how we know a replay is on screen. |
-| `SpectateCameras` | `int SpectateCameras(int nCams, char* names, int cur, int* select)` | While a path is **armed**, writes the free-roam index into `*select` and returns 1. Otherwise returns 0 and the camera is the viewer's. |
-
-Holding the camera mode is not cosmetic: the replay update re-seeds the free-roam pose
-from the live camera at the end of every frame unless free-roam is the active mode, so a
-pose written without it is silently overwritten before it is ever drawn. Injected mode
-has no callbacks, so there it writes the mode global directly each frame instead.
-
-Everything else the feature touches — the pose, the FOV, the replay clock — is read and
-written directly, from `Tick()`. It hooks nothing and patches nothing. Each address is
-resolved at startup from the displacement of an instruction found by AOB (`SIG_RC_*` in
-`src/offsets.h`), because camera offsets moved between two builds released two days
-apart; a pattern that matches in more than one place must resolve to the same address in
-all of them or it is refused. Reads and writes are SEH-guarded, so a wrong address costs
-the feature and not the game.
-
-`src/replaycam.h` holds the path itself — interpolation, ±180° wrap handling and the
-`.fcam` file format — with no Win32 in it, so `tests/replaycam_test.cpp` runs in CI.
-
 ## Feature 3 — in-game overlay (hybrid render path)
 
 The overlay (status pill, reload progress bar, F8 menu, track manager/switcher) has
@@ -272,8 +243,6 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
   to the render thread via `EnqueueGameThreadTask` / `DrainGameThreadTasks`.
 - `Tick`, `hkSwapBuffers` / `hkWglSwapBuffers` — per-frame hook (F8, reload-event,
   task drain, heartbeat).
-- `rc::*` (`Resolve`, `Frame`, `SetKeyHere`, `SavePath`, …) — the replay keyframe
-  camera; `SpectateCameras` holds the camera mode while a path is armed.
 - `UiThread` / `WndProc` — the floating window.
 - `serverfilter::Init` / `Reload` / `ShouldHide` — the filter engine.
 - `DllMain`, `GetModID` / `GetModDataVersion` / `GetInterfaceVersion` / `Startup` /

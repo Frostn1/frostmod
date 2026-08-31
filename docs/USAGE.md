@@ -76,8 +76,7 @@ F-key per feature.
 | `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
 | `5` | Rider outlines — on-screen box around each rider |
 | `6` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
-| `7` | Replay camera — keyframe a camera path through a replay (see below) |
-| `8` | Hide overlay — everything FrostMod draws, for recording (see below) |
+| `7` | Hide overlay — everything FrostMod draws, for recording (see below) |
 
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `6` is on top of that, for when you want it bigger (or
@@ -86,157 +85,20 @@ lap as you, **red** = a rider lapping you (a lap ahead), **blue** = a rider you 
 lapping (backmarker). The toggles, the range and the overlay size persist across
 restarts, in `frostmod_radar.cfg` next to `frostmod.log`.
 
-### Replay camera (menu `7`)
+### Hide overlay (menu `7`)
 
-Keyframe a cinematic camera through a replay. You fly the game's own free-roam replay
-camera to a spot, press `K`, scrub on, press `K` again — the camera then flies a smooth
-path between the keys as the replay plays.
+`F7` hides **everything FrostMod draws** — the corner pill, the radar, the rider outlines.
+It is stronger than the overlay toggle at menu `2`, which only drops the corner hint. Press
+it again to bring it all back; it is also on the menu at F8 → `7`.
 
-1. Load a replay and switch to the game's **free-roam** camera.
-2. F8 → `7` opens the editor. It stays out of the way: the game's own replay controls
-   keep working underneath, so you scrub and play with them as usual.
-3. Position the camera, press `K` to set a key there. Repeat. Two keys is a path.
-4. Press `P` to arm it. From then on, whenever the replay is inside the path's time
-   range, the camera follows the path instead of you. Outside that range the camera is
-   yours again.
-
-These are the defaults — **every one of them can be changed** (see below).
-
-| Key | Action |
-|-----|--------|
-| `K` | Set a key at the current replay time (replaces one already there) |
-| `X` | Delete the key nearest the current time |
-| `C` | Clear the path |
-| `U` | Undo the last edit (24 deep) |
-| `,` / `.` | Jump the replay to the previous / next key |
-| `[` / `]` | Move the key here back / forward one 30 ms sample |
-| `E` | Cycle the key's ease: **smooth → hold → cut** |
-| `T` | Aim the key at a rider, then at the next race number, then at nobody |
-| `R` | Cycle the camera rig: locked → handheld → drone → crane |
-| `V` | Show the path in the world while you build it |
-| `Ctrl+R` | Respace the keys by distance (a constant-speed dolly) |
-| `P` | Arm or disarm the path |
-| `S` / `L` | Save / load the path in the current slot |
-| `1`–`9` | Pick a save slot |
-| `Esc` / `F8` | Close the editor (an armed path keeps running) |
-| `F7` | Hide / show everything FrostMod draws |
-
-Three more actions ship **unbound**, because they are set once per path and a letter the
-replay screen may already use is a worse default than no key at all: `curve`, `anchor` and
-`autofov`. Bind them in MXB App if you want them in-game — they are also on MXB App's own
-replay-camera panel.
-
-#### Shots, holds and cuts
-
-Each key says what the path does when it *leaves* it:
-
-- **smooth** — the default. The curve runs through the key without slowing.
-- **hold** — the camera eases in, settles on the key, and eases back out.
-- **cut** — the camera parks on the key until the next one, then cuts hard to it.
-
-A cut is a shot boundary, so one path can be a whole edit: fly, cut, hold, fly. The panel
-counts the shots. Nothing before or after a cut bends the curve across it.
-
-#### Aiming at a rider
-
-`T` on a key aims it at a rider instead of at the angles you flew. Playback then points the
-camera at wherever that rider is on the frame being drawn, which is what removes hand-keying
-yaw and pitch through a rhythm section. A key with no aim of its own inherits the segment's,
-so you mark where the aim starts and where it ends; two *different* riders on one segment is
-a look-off, easing from one to the other. Turn `autofov` on and the FOV holds the subject's
-apparent size as it comes and goes.
-
-Aiming needs FrostMod loaded **as a plugin** — the rider positions come from the game's own
-callbacks, and injected mode has none. The panel says so when they are missing.
-
-The first time you aim, the panel says *aim not calibrated yet*: swing the camera round once
-with the editor open and it goes away. FrostMod is reading which way this build's camera
-angles actually count out of the game's own view matrix rather than assuming it — the
-alternative is a camera that confidently points at the mirror image of your rider, which you
-would only notice on the finished clip.
-
-#### Curve, rig and the two axes
-
-- **curve** — `centripetal` (default) or `uniform`. Two keys set close together used to
-  throw a lurch into the path before it set off; centripetal is what removes it. Both hit
-  every key at exactly its own time.
-- **rig** — a small deterministic wobble over the finished pose: `handheld`, `drone`,
-  `crane`, or `locked` for none. It comes off the replay clock, not a random number
-  generator, so re-recording the same replay shakes identically.
-- **anchor** — `clock` (default) keys the path to this replay's milliseconds. `track` keys
-  it to the aimed rider's lap fraction instead, so the same path replays on **any lap, any
-  rider, any replay**. It needs an aimed key to follow.
-- **`Ctrl+R`** respaces the keys so the time between them follows the distance between them
-  — the constant-speed dolly. A cut keeps the length you gave it: a shot is a duration, not
-  a distance.
-
-#### Recording a clean pass
-
-`F7` hides **everything FrostMod draws** — the editor panel, the corner pill, the radar, the
-rider outlines. It is stronger than the overlay toggle in the menu, which only drops the
-corner hint. Press it again to bring it all back; it is also on the menu at F8 → `8`.
-
-The key keeps working while the overlay is hidden, and anything that opens a panel (F8, or
-the editor) brings the overlay back first — so you cannot get stuck looking at a UI you
-can't see. It is not remembered between sessions: it is something you turn on to record.
+The key keeps working while the overlay is hidden, and F8 brings the overlay back before
+opening anything — so you cannot get stuck looking at a UI you can't see. It is not
+remembered between sessions: it is something you turn on to record.
 
 **The game's own HUD and the replay control bar are not FrostMod's to hide.** Turn the HUD
 off in MX Bikes' own options; the replay bar belongs to the game's interface, and the only
 thing FrostMod could do to it is destroy the window, which would take the transport
 controls with it. So it leaves both alone.
-
-#### Changing the keys
-
-The editor reads the keyboard directly, which means **the game reads the same key on the
-same frame**. If you have `S` bound to move the camera backwards, pressing `S` to save also
-moves the camera. A modifier does not help — the game does not care whether Ctrl was held —
-so the fix is to move the action onto a key your game does not use at all. Function keys and
-the numpad are usually free.
-
-Edit them in **MXB App → Settings → FrostMod**, or by hand in `frostmod_radar.cfg` next to
-the log:
-
-```
-rcam_setkey=K
-rcam_delete=X
-rcam_clear=C
-rcam_play=P
-rcam_prev=Comma
-rcam_next=Period
-rcam_save=F9
-rcam_load=F10
-rcam_clean=F7
-rcam_ease=E
-rcam_target=T
-rcam_nudgeback=LeftBracket
-rcam_nudgefwd=RightBracket
-rcam_undo=U
-rcam_rig=R
-rcam_retime=Ctrl+R
-rcam_preview=V
-rcam_curve=none
-rcam_anchor=none
-rcam_autofov=none
-```
-
-Names are letters, digits, `F1`–`F16`, `Numpad0`–`Numpad9`, the punctuation keys
-(`Comma`, `Period`, `Slash`, …), `Home`/`End`/`Insert`/`Delete`, the arrows, and `none` to
-unbind. A modifier can be prefixed (`Ctrl+`, `Alt+`, `Shift+`) and is matched exactly, so
-`Ctrl+X` will not also fire plain `X`. The editor re-reads the file every time you open it,
-so a change applies without restarting the game, and the panel always lists the keys
-actually in force.
-
-Keys snap to the replay's own 30 ms sample grid. Paths are plain text under
-`FrostMod\replaycam\slot<N>.fcam` next to the log, so they can be hand-edited, copied
-between machines, or shared. Position, the three rotation angles and FOV are all
-interpolated, so a key can change the framing as well as the viewpoint.
-
-The file carries the whole-path settings on a `path` line and four extra columns per key
-(ease, aimed rider, its distance, lap fraction). Files written by earlier versions still
-load — the columns they never had take the values those versions behaved as if they had.
-
-MX Bikes only, and it needs the game's camera globals to resolve on your build — if
-they don't, the editor opens and says so rather than doing anything to the game.
 
 ### Bike model swap (menu `3`)
 

@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.15.4")
+set(FROSTMOD_VERSION "0.16.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -122,21 +122,6 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
-# --- replay camera test --------------------------------------------------------
-# The keyframed replay camera's path maths and file format. What it guards against is
-# silent wrongness the viewer sees but no error reports: a pan that swings the long way
-# round the +-180 seam, a path that keeps driving the camera past its last key, a saved
-# path that loses keys on load. src/replaycam.h keeps all of that apart from the game so
-# it runs here rather than only on a Windows box with a replay loaded.
-add_executable(replaycam_test tests/replaycam_test.cpp)
-add_test(NAME replaycam COMMAND replaycam_test)
-
-# --- keybinds test -------------------------------------------------------------
-# The replay camera editor's configurable keys. A binding that fails to parse, or one
-# that formats to something that cannot be read back, leaves someone with a key that
-# does nothing and nothing on screen saying why — so the round trip is pinned here.
-add_executable(keybinds_test tests/keybinds_test.cpp)
-add_test(NAME keybinds COMMAND keybinds_test)
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

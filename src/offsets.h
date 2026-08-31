@@ -261,6 +261,101 @@ constexpr char SIG_MP_MSG_HANDLER[] =
     "\x40\x53\x56\x57\x48\x81\xEC\x20\x07\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x84\x24\x10\x07\x00";
 constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 
+// ============ replay free-roam camera + replay clock (keyframe camera) =========
+// The keyframed replay camera (F8 > 7) needs eight globals. NONE of them is an RVA
+// here, on purpose: between beta21d and beta21e — two days apart — every function
+// moved by a different delta and the camera-set global moved BACKWARDS, so a pinned
+// address for a camera feature is a time bomb. Each global is instead read out of the
+// displacement of an instruction we find by signature, which survives a rebuild.
+// See tasks/replay-keyframe-camera.md for how these were recovered.
+//
+// A RipRef says where inside a match the instruction sits, where its disp32 sits
+// inside that instruction, and how long the instruction is — everything needed to
+// turn a match into `insn + insnLen + disp`.
+//
+// All of the below was re-verified against beta21e's unpacked binary: every signature
+// matches in .text, and every resolved address equals the one the RE recorded. Three
+// of the signatures match TWICE (the same store inlined into two branches) and both
+// matches resolve to the same global — the resolver requires that agreement rather
+// than taking the first hit.
+struct RipRef {
+    int insnOff;   // bytes from the start of the match to the instruction
+    int dispOff;   // bytes from the start of the instruction to its disp32
+    int insnLen;   // total instruction length (the disp is relative to its end)
+};
+
+// Camera-mode dispatch head: mov edi,[numOnboardCams] / mov edx,[cameraMode].
+// -> beta21e 0xC65B0, yielding 0x4C91D4 and 0x4CA2A0. Unique.
+constexpr char SIG_RC_CAM[] =
+    "\x8B\x3D\x00\x00\x00\x00\x8B\x15\x00\x00\x00\x00\xF2\x44\x0F\x10\x3D\x00\x00\x00\x00\x41\x8D\x0C\x3F\x4C\x8D\x2D";
+constexpr char SIG_RC_CAM_MASK[] = "xx????xx????xxxxx????xxxxxxx";
+constexpr RipRef RC_NUM_ONBOARD = { 0, 2, 6 };   // int   count of onboard cameras, N
+constexpr RipRef RC_CAM_MODE    = { 6, 2, 6 };   // int   active camera; N+3 = free-roam
+
+// Yaw store in the free-roam integrator: movss [yaw], xmm1.
+// -> beta21e 0xC6FBC, yielding 0x4C91A0. Unique. Pitch and roll are the next two
+// floats (0x4C91A4 / 0x4C91A8) — the RE calls the three contiguous, and the pitch
+// signature below is carried purely to prove that at runtime.
+constexpr char SIG_RC_YAW[] =
+    "\xF3\x0F\x11\x0D\x00\x00\x00\x00\x0F\x14\xF6\x0F\x5A\xC6\xF2\x0F\x59\xC7\xF2\x41\x0F\x59\xC6";
+constexpr char SIG_RC_YAW_MASK[] = "xxxx????xxxxxxxxxxxxxxx";
+constexpr RipRef RC_YAW = { 0, 4, 8 };           // float[3] yaw, pitch, roll — degrees
+
+// Pitch store (clamped branch): movss [pitch], xmm2. -> 0xC704F, yielding 0x4C91A4.
+// Unique. Used only as a cross-check that pitch == yaw + 4 in this build.
+constexpr char SIG_RC_PITCH[] =
+    "\xF3\x0F\x11\x15\x00\x00\x00\x00\x76\x09\xF3\x44\x0F\x11\x05";
+constexpr char SIG_RC_PITCH_MASK[] = "xxxx????xxxxxxx";
+constexpr RipRef RC_PITCH = { 0, 4, 8 };
+
+// FOV store (zoom-in clamp at 1.5 deg): movss [fov], xmm6. -> 0xC70C3 / 0x4C91FC. Unique.
+constexpr char SIG_RC_FOV[] =
+    "\xF3\x0F\x11\x35\x00\x00\x00\x00\x76\x0B\x0F\x28\xF0\xF3\x0F\x11\x35";
+constexpr char SIG_RC_FOV_MASK[] = "xxxx????xxxxxxxxx";
+constexpr RipRef RC_FOV = { 0, 4, 8 };           // float, degrees
+
+// Fly-speed level (1..6, multiplier 1.25 * 2^level). -> 0xC7147 / 0x4CA3F0.
+// Matches twice (increment and decrement paths); both resolve to the same global.
+constexpr char SIG_RC_SPEED[] =
+    "\x8B\x05\x00\x00\x00\x00\x83\xF8\x06\x7D\x10\xFF\xC0\x89\x05";
+constexpr char SIG_RC_SPEED_MASK[] = "xx????xxxxxxxxx";
+constexpr RipRef RC_SPEED_LEVEL = { 0, 2, 6 };   // int
+
+// Position store: movss [pos.x], xmm0 inside the move integration.
+// -> 0xC783A / 0x4CA3C8. Matches twice; both resolve to the same global. y and z are
+// the next two floats (0x4CA3CC / 0x4CA3D0), confirmed by the second store in the
+// pattern itself.
+constexpr char SIG_RC_POS[] =
+    "\xF3\x0F\x11\x05\x00\x00\x00\x00\x0F\x5A\xCC\xF2\x0F\x59\xCE\xF2\x0F\x5A\xC2\xF2\x0F\x5C\xD9\xF3\x0F\x11\x05";
+constexpr char SIG_RC_POS_MASK[] = "xxxx????xxxxxxxxxxxxxxxxxxx";
+constexpr RipRef RC_POS = { 0, 4, 8 };           // float[3] x, y, z — world metres, Y up
+
+// The replay clock advance. One signature yields the whole block: dt, the slow-motion
+// flag, the speed and the current time. -> 0xC4EE1, yielding 0xE54388 / 0xE56660 /
+// 0xE56674 / 0xE5666C. Unique.
+constexpr char SIG_RC_CLOCK[] =
+    "\x8B\x15\x00\x00\x00\x00\x44\x39\x35\x00\x00\x00\x00\x75\x24\x0F\xAF\x15\x00\x00\x00\x00\x8B\x0D\x00\x00\x00\x00\x03\x15";
+constexpr char SIG_RC_CLOCK_MASK[] = "xx????xxx????xxxxx????xx????xx";
+constexpr RipRef RC_CLOCK_DT    = { 0,  2, 6 };  // int  frame dt, ms
+constexpr RipRef RC_CLOCK_SLOW  = { 6,  3, 7 };  // int  slow-mo flag (speed becomes a divisor)
+constexpr RipRef RC_CLOCK_SPEED = { 15, 3, 7 };  // int  playback speed, +-1..16; 0 = paused
+constexpr RipRef RC_CLOCK_CUR   = { 22, 2, 6 };  // int  current playback time, ms
+
+// The rest of the clock block, by layout from `cur`. Confirmed by the game's own
+// transport handlers: rewind-to-start copies [cur+0xC] into cur, and the slider reads
+// [cur+0xC] and [cur-0x14] as its two ends. Deltas within one block are the kind of
+// thing that survives a rebuild, but the resolver still sanity-checks start < end
+// before trusting them and disables only the jump-to-ends if it fails.
+constexpr int RC_CLOCK_START_DELTA = 0x0C;       // int  replay start, ms
+constexpr int RC_CLOCK_END_DELTA   = -0x14;      // int  replay end, ms
+constexpr int RC_CLOCK_LIVE_DELTA  = -0x04;      // int  pinned-to-tail flag; cleared when scrubbing
+
+// The free-roam camera index, relative to the onboard count N. The replay update
+// re-seeds the free-roam pose from the live camera every frame UNLESS the mode is
+// one of these two, so driving the camera means holding the mode as well as the pose.
+constexpr int RC_MODE_FREEROAM_OFFSET = 3;       // N+3 free-roam (N+4 is VR)
+
+
 // ---- surgical reload: the content-load section of fcn.1400ef210 ---------------
 // Transcribed verbatim from boot init, RVA 0xef68e..0xef8xx. Every content list is
 // cleared and rescanned from disk (tracks, bikes, tyres, helmets, boots, riders, ...),

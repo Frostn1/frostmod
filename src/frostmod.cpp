@@ -45,6 +45,7 @@
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
+#include "replaycam.h"  // keyframed replay camera: maths + path file format
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -2021,6 +2022,445 @@ static void RadValidateVP() {
 }
 
 // ---------------------------------------------------------------------------
+// REPLAY KEYFRAME CAMERA  (F8 > 7)
+//
+// Set keys while scrubbing a replay and the camera flies a smooth path between them.
+// The camera we want already exists: the game's free-roam replay camera is 6-DOF and
+// its whole state is flat statics, so capturing a key is reading them and playing a
+// path back is writing them. src/replaycam.h holds the maths and the file format;
+// this is the half that touches the game.
+//
+// Two findings from the RE that this leans on (tasks/replay-keyframe-camera.md):
+//  - The replay update re-seeds the free-roam pose from the live camera at the END of
+//    every frame unless the camera mode IS free-roam. Write a pose without holding the
+//    mode and it looks exactly like the write never landed. In plugin mode we hold it
+//    the sanctioned way, from SpectateCameras; injected, we write the mode global.
+//  - Scrubbing is one dword write to the clock; the stream re-seeks itself next frame.
+//
+// Nothing is hooked and nothing is patched - we read and write data the game owns, from
+// the frame callback we already have. Every address is resolved by signature at runtime
+// (offsets.h explains why none of them is an RVA), every resolved pointer is checked to
+// land inside the module image, and the whole read/write path is SEH-guarded so a wrong
+// address disables the feature instead of taking the game down.
+// ---------------------------------------------------------------------------
+bool MatchAt(const uint8_t* p, const char* pat, const char* mask);   // fwd (defined below)
+
+namespace rc {
+
+// ---- resolved game state ---------------------------------------------------
+float* g_pos        = nullptr;   // float[3] x,y,z - world metres, Y up
+float* g_ang        = nullptr;   // float[3] yaw,pitch,roll - degrees
+float* g_fov        = nullptr;
+int*   g_speedLevel = nullptr;   // 1..6 (read only; the editor shows it)
+int*   g_camMode    = nullptr;
+int*   g_numOnboard = nullptr;
+int*   g_clkCur     = nullptr;
+int*   g_clkSpeed   = nullptr;
+int*   g_clkSlow    = nullptr;
+int*   g_clkStart   = nullptr;
+int*   g_clkEnd     = nullptr;
+int*   g_clkLive    = nullptr;
+
+std::atomic<bool> g_ready{false};      // signatures resolved; the feature can run
+std::atomic<bool> g_dead{false};       // a fault took it out for this session
+bool              g_tried = false;     // resolve attempted (game thread only)
+constexpr char    kUntried[] = "not tried yet";
+char              g_why[128] = "not tried yet";   // why it is unavailable, for the panel
+
+// ---- editor state (touched from Tick only) ---------------------------------
+std::vector<rcam::Key> g_keys;
+std::atomic<bool> g_open{false};       // editor panel open
+std::atomic<bool> g_drive{false};      // path is driving the camera
+std::atomic<int>  g_slot{1};
+
+// published for the overlay, which is built on another thread
+std::atomic<int>  g_uiKeys{0};
+std::atomic<int>  g_uiClock{0};
+std::atomic<int>  g_uiFirst{0};
+std::atomic<int>  g_uiLast{0};
+std::atomic<bool> g_uiInReplay{false};
+
+// what the game last told the plugin it was drawing: 0 track, 1 spectate, 2 replay
+std::atomic<int>       g_drawState{-1};
+std::atomic<ULONGLONG> g_drawStamp{0};
+
+void Fail(const char* doing) {
+    if (g_dead.exchange(true)) return;
+    sprintf_s(g_why, "a fault while %s - disabled for this session", doing);
+    Log("[rcam] FAULT while %s. Replay camera disabled for this session.", doing);
+}
+
+// ---- resolution ------------------------------------------------------------
+
+// The module's whole mapped image, used to reject a resolved pointer that lands
+// outside it. Data globals are not in the executable range, so GetExecRange won't do.
+bool ImageRange(uintptr_t base, uint8_t** lo, uint8_t** hi) {
+    auto dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    *lo = (uint8_t*)base;
+    *hi = (uint8_t*)(base + nt->OptionalHeader.SizeOfImage);
+    return true;
+}
+
+void* RipTarget(uint8_t* match, const mxb::RipRef& r) {
+    int32_t disp = 0;
+    memcpy(&disp, match + r.insnOff + r.dispOff, sizeof(disp));
+    return match + r.insnOff + r.insnLen + disp;
+}
+
+// Resolve one global from the displacement of an instruction found by signature.
+// Scans EVERY match rather than stopping at the first: three of these patterns match
+// twice, because the same store is inlined into two branches, and requiring the
+// matches to agree is what tells a harmless duplicate from a signature that has gone
+// ambiguous in a new build.
+void* ResolveGlobal(uint8_t* b, uint8_t* e, const char* pat, const char* mask,
+                    const mxb::RipRef& ref, const char* what) {
+    uint8_t *lo = nullptr, *hi = nullptr;
+    if (!ImageRange(g_base, &lo, &hi)) return nullptr;
+
+    const size_t len = strlen(mask);
+    void* first = nullptr;
+    int   hits  = 0;
+    for (uint8_t* p = b; p <= e - len; ++p) {
+        if (!MatchAt(p, pat, mask)) continue;
+        void* t = RipTarget(p, ref);
+        if (++hits == 1) { first = t; continue; }
+        if (t != first) {
+            Log("[rcam] %s: signature matches in more than one place and they disagree "
+                "(RVA 0x%zx vs 0x%zx) - not trusting it.", what,
+                (size_t)((uintptr_t)first - g_base), (size_t)((uintptr_t)t - g_base));
+            return nullptr;
+        }
+    }
+    if (!hits) { Log("[rcam] %s: signature not found.", what); return nullptr; }
+    if ((uint8_t*)first < lo || (uint8_t*)first >= hi) {
+        Log("[rcam] %s: resolved %p, outside the module image - rejected.", what, first);
+        return nullptr;
+    }
+    Log("[rcam] %s -> RVA 0x%zx (%d match%s)", what,
+        (size_t)((uintptr_t)first - g_base), hits, hits == 1 ? "" : "es");
+    return first;
+}
+
+void Resolve() {
+    if (g_tried) return;
+    g_tried = true;
+
+    if (!g_base) { strcpy_s(g_why, "the game module is not resolved yet"); g_tried = false; return; }
+    if (!g_game || strcmp(g_game->id, "mxb") != 0) {
+        strcpy_s(g_why, "MX Bikes only - these signatures do not cross titles");
+        Log("[rcam] not MX Bikes (%s); replay camera stays off.", g_game ? g_game->id : "?");
+        return;
+    }
+    uint8_t *b = nullptr, *e = nullptr;
+    if (!GetExecRange(g_base, &b, &e)) {
+        strcpy_s(g_why, "could not read the game's section headers");
+        return;
+    }
+
+    g_numOnboard = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_CAM,   mxb::SIG_RC_CAM_MASK,   mxb::RC_NUM_ONBOARD,  "onboard camera count");
+    g_camMode    = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_CAM,   mxb::SIG_RC_CAM_MASK,   mxb::RC_CAM_MODE,     "active camera");
+    g_ang        = (float*)ResolveGlobal(b, e, mxb::SIG_RC_YAW,   mxb::SIG_RC_YAW_MASK,   mxb::RC_YAW,          "camera yaw");
+    g_fov        = (float*)ResolveGlobal(b, e, mxb::SIG_RC_FOV,   mxb::SIG_RC_FOV_MASK,   mxb::RC_FOV,          "camera fov");
+    g_speedLevel = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_SPEED, mxb::SIG_RC_SPEED_MASK, mxb::RC_SPEED_LEVEL,  "fly speed level");
+    g_pos        = (float*)ResolveGlobal(b, e, mxb::SIG_RC_POS,   mxb::SIG_RC_POS_MASK,   mxb::RC_POS,          "camera position");
+    g_clkCur     = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_CLOCK, mxb::SIG_RC_CLOCK_MASK, mxb::RC_CLOCK_CUR,    "replay clock");
+    g_clkSpeed   = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_CLOCK, mxb::SIG_RC_CLOCK_MASK, mxb::RC_CLOCK_SPEED,  "replay speed");
+    g_clkSlow    = (int*)  ResolveGlobal(b, e, mxb::SIG_RC_CLOCK, mxb::SIG_RC_CLOCK_MASK, mxb::RC_CLOCK_SLOW,   "replay slow-motion flag");
+
+    // Pitch and roll are the two floats after yaw. The pitch store has its own
+    // signature purely so that assumption is checked against the build in front of us
+    // rather than believed: if it fails, roll would be written into a stranger.
+    float* pitch = (float*)ResolveGlobal(b, e, mxb::SIG_RC_PITCH, mxb::SIG_RC_PITCH_MASK, mxb::RC_PITCH, "camera pitch");
+    if (g_ang && pitch != g_ang + 1) {
+        Log("[rcam] pitch is at %p but yaw+4 is %p - the angle triple is not contiguous "
+            "in this build. Refusing to write angles.", (void*)pitch, (void*)(g_ang + 1));
+        strcpy_s(g_why, "the angle globals are not laid out as this build expects");
+        g_ang = nullptr;
+    }
+
+    if (!g_pos || !g_ang || !g_fov || !g_camMode || !g_numOnboard || !g_clkCur) {
+        if (strcmp(g_why, kUntried) == 0)      // nothing more specific was recorded
+            strcpy_s(g_why, "the game's camera globals did not resolve in this build");
+        Log("[rcam] unavailable: %s", g_why);
+        return;
+    }
+
+    // The rest of the clock block sits at fixed deltas from `cur` (the game's own
+    // rewind and slider handlers read them there). Sanity is checked at use, not here:
+    // nothing in the block means anything until a replay is loaded.
+    g_clkStart = (int*)((uint8_t*)g_clkCur + mxb::RC_CLOCK_START_DELTA);
+    g_clkEnd   = (int*)((uint8_t*)g_clkCur + mxb::RC_CLOCK_END_DELTA);
+    g_clkLive  = (int*)((uint8_t*)g_clkCur + mxb::RC_CLOCK_LIVE_DELTA);
+
+    g_ready.store(true);
+    strcpy_s(g_why, "");
+    Log("[rcam] replay keyframe camera ready.");
+}
+
+// ---- guarded access to the game's state ------------------------------------
+// Each of these is its own function because __try cannot live in a function that also
+// needs C++ unwinding, and because a fault in any one of them means the same thing.
+
+bool ReadPose(rcam::Key* k) {
+    __try {
+        k->x = g_pos[0]; k->y = g_pos[1]; k->z = g_pos[2];
+        k->yaw = g_ang[0]; k->pitch = g_ang[1]; k->roll = g_ang[2];
+        k->fov = *g_fov;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool WritePose(const rcam::Pose* p) {
+    __try {
+        g_pos[0] = p->x; g_pos[1] = p->y; g_pos[2] = p->z;
+        g_ang[0] = p->yaw; g_ang[1] = p->pitch; g_ang[2] = p->roll;
+        *g_fov = p->fov;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool ReadClock(int* cur, int* start, int* end) {
+    __try {
+        *cur   = *g_clkCur;
+        *start = g_clkStart ? *g_clkStart : 0;
+        *end   = g_clkEnd   ? *g_clkEnd   : 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Scrub. The game's own transport does exactly this - write the time, drop the
+// pinned-to-tail flag - and lets the next frame re-seek the stream.
+bool WriteClock(int ms) {
+    __try {
+        *g_clkCur = ms;
+        if (g_clkLive) *g_clkLive = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int OnboardCount() {
+    __try { return *g_numOnboard; } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+bool WriteMode(int mode) {
+    __try { *g_camMode = mode; return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int ReadSpeedLevel() {
+    if (!g_speedLevel) return 0;
+    __try { return *g_speedLevel; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/// Index of the free-roam camera, or -1 if the onboard count is not believable.
+int FreeRoamIndex() {
+    const int n = OnboardCount();
+    if (n < 0 || n > 64) return -1;
+    return n + mxb::RC_MODE_FREEROAM_OFFSET;
+}
+
+// ---- where we are ----------------------------------------------------------
+
+/// Is the game calling our plugin Draw()? If so it tells us the state outright and we
+/// need no offsets to know we are in a replay.
+bool PluginDrawFresh() {
+    const ULONGLONG s = g_drawStamp.load(std::memory_order_relaxed);
+    return s && (GetTickCount64() - s) < 1000;
+}
+
+bool InReplay() {
+    if (PluginDrawFresh()) return g_drawState.load(std::memory_order_relaxed) == 2;
+    // Injected: no callback to ask, so read the clock block. A loaded replay has a
+    // span and a time inside it; nothing else in the game leaves it looking like that.
+    int cur = 0, start = 0, end = 0;
+    if (!g_ready.load() || !ReadClock(&cur, &start, &end)) return false;
+    return end > start && end > 0 && cur >= start && cur <= end;
+}
+
+// ---- the path --------------------------------------------------------------
+
+void Publish() {
+    g_uiKeys.store((int)g_keys.size(), std::memory_order_relaxed);
+    int first = 0, last = 0;
+    if (rcam::Span(g_keys, first, last)) { g_uiFirst.store(first); g_uiLast.store(last); }
+    else { g_uiFirst.store(0); g_uiLast.store(0); }
+}
+
+void PathFile(int slot, char* out, size_t n) {
+    char dir[MAX_PATH] = {0};
+    if (g_savePath[0]) {
+        strcpy_s(dir, g_savePath);
+    } else if (g_selfModule && GetModuleFileNameA(g_selfModule, dir, sizeof(dir))) {
+        if (char* slash = strrchr(dir, '\\')) *slash = 0;
+    }
+    size_t len = strlen(dir);
+    while (len && dir[len - 1] == '\\') dir[--len] = 0;
+    sprintf_s(out, n, "%s\\FrostMod\\replaycam\\slot%d.fcam", dir, slot);
+}
+
+bool SavePath(int slot, std::string* err) {
+    char path[MAX_PATH];
+    PathFile(slot, path, sizeof(path));
+    EnsureDirTree(path);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || !f) { *err = "could not write the file"; return false; }
+    const std::string text = rcam::Serialize(g_keys);
+    const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    fclose(f);
+    if (!ok) { *err = "the write was short"; return false; }
+    Log("[rcam] saved %d key(s) to %s", (int)g_keys.size(), path);
+    return true;
+}
+
+bool LoadPath(int slot, std::string* err) {
+    char path[MAX_PATH];
+    PathFile(slot, path, sizeof(path));
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || !f) { *err = "no path saved in that slot"; return false; }
+    std::string text;
+    char buf[4096];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+    fclose(f);
+
+    std::vector<rcam::Key> loaded;
+    if (!rcam::Parse(text, loaded, err)) return false;
+    g_keys.swap(loaded);
+    Publish();
+    Log("[rcam] loaded %d key(s) from %s", (int)g_keys.size(), path);
+    return true;
+}
+
+/// Called once per presented frame. Reads the clock for the panel, and when the path is
+/// armed and covers the current time, writes the pose it evaluates to.
+void Frame() {
+    if (!g_ready.load() || g_dead.load()) return;
+
+    int cur = 0, start = 0, end = 0;
+    if (!ReadClock(&cur, &start, &end)) { Fail("reading the replay clock"); return; }
+    g_uiClock.store(cur, std::memory_order_relaxed);
+    const bool inReplay = InReplay();
+    g_uiInReplay.store(inReplay, std::memory_order_relaxed);
+
+    if (!g_drive.load() || !inReplay) return;
+
+    rcam::Pose p;
+    if (!rcam::Evaluate(g_keys, cur, p)) return;    // outside the path: hands off the camera
+
+    // In plugin mode SpectateCameras holds the mode for us every frame, which is the
+    // sanctioned route; injected there is no callback, so write it ourselves. Either
+    // way it must be free-roam before the pose is worth writing at all.
+    if (!PluginDrawFresh()) {
+        const int idx = FreeRoamIndex();
+        if (idx < 0 || !WriteMode(idx)) { Fail("forcing the free-roam camera"); return; }
+    }
+    if (!WritePose(&p)) Fail("writing the camera pose");
+}
+
+// ---- editor ----------------------------------------------------------------
+
+void Open() {
+    Resolve();
+    g_open.store(true);
+    Publish();
+    Log("[rcam] editor opened (%s)", g_ready.load() ? "ready" : g_why);
+}
+
+void Close() { g_open.store(false); }
+
+void SetKeyHere() {
+    int cur = 0, start = 0, end = 0;
+    if (!ReadClock(&cur, &start, &end)) { Fail("reading the replay clock"); return; }
+    rcam::Key k;
+    if (!ReadPose(&k)) { Fail("reading the camera pose"); return; }
+    k.t = cur;
+    const bool replacing = rcam::IndexAt(g_keys, rcam::SnapMs(cur)) >= 0;
+    if (rcam::Upsert(g_keys, k) < 0) { SetStatus("Replay camera: the path is full", 2500); return; }
+    Publish();
+    char msg[96];
+    sprintf_s(msg, "Replay camera: key %s (%d total)", replacing ? "replaced" : "set",
+              (int)g_keys.size());
+    SetStatus(msg, 1800);
+}
+
+void DeleteKeyHere() {
+    int cur = 0, start = 0, end = 0;
+    if (!ReadClock(&cur, &start, &end)) { Fail("reading the replay clock"); return; }
+    // Half a second either side: keys sit on a 30 ms grid, so this is "the one you can
+    // see", not "the one you are exactly on".
+    if (!rcam::EraseNearest(g_keys, cur, 500)) { SetStatus("Replay camera: no key here", 1500); return; }
+    Publish();
+    char msg[96];
+    sprintf_s(msg, "Replay camera: key deleted (%d left)", (int)g_keys.size());
+    SetStatus(msg, 1800);
+}
+
+void JumpKey(bool forward) {
+    int cur = 0, start = 0, end = 0;
+    if (!ReadClock(&cur, &start, &end)) { Fail("reading the replay clock"); return; }
+    const int t = forward ? rcam::NextKeyTime(g_keys, cur) : rcam::PrevKeyTime(g_keys, cur);
+    if (t < 0) { SetStatus(forward ? "Replay camera: no later key" : "Replay camera: no earlier key", 1500); return; }
+    if (!WriteClock(t)) Fail("scrubbing the replay clock");
+}
+
+/// mm:ss.t
+void ClockText(int ms, char* out, size_t n) {
+    if (ms < 0) ms = 0;
+    sprintf_s(out, n, "%d:%02d.%d", ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100);
+}
+
+/// The editor's rows, built once so the GL and PiBoSo panels cannot drift apart.
+/// Returns how many of `out` were filled; row 0 is the title, the last is the key hint.
+int PanelLines(char out[8][96]) {
+    int n = 0;
+    sprintf_s(out[n++], 96, "FrostMod - Replay Camera   (slot %d)", g_slot.load());
+
+    if (!g_ready.load()) {
+        sprintf_s(out[n++], 96, "  ! unavailable: %s", g_why);
+        sprintf_s(out[n++], 96, "  Esc / F8   close");
+        return n;
+    }
+
+    char now[24], a[24], b[24];
+    ClockText(g_uiClock.load(), now, sizeof(now));
+    const int keys = g_uiKeys.load();
+    sprintf_s(out[n++], 96, "  clock %s      keys %d", now, keys);
+
+    const int first = g_uiFirst.load(), last = g_uiLast.load();
+    if (keys >= 2) {
+        ClockText(first, a, sizeof(a));
+        ClockText(last, b, sizeof(b));
+        sprintf_s(out[n++], 96, "  path  %s - %s   %s", a, b, g_drive.load() ? "ARMED" : "off");
+    } else {
+        sprintf_s(out[n++], 96, "  path  needs two keys before it can fly");
+    }
+    if (!g_uiInReplay.load())
+        sprintf_s(out[n++], 96, "  ! waiting for a replay - load one, then set keys");
+
+    sprintf_s(out[n++], 96, "  K set key   X delete   C clear   , . jump");
+    sprintf_s(out[n++], 96, "  P play/stop   S save   L load   1-9 slot");
+    sprintf_s(out[n++], 96, "  Esc / F8   close");
+    return n;
+}
+
+void ToggleDrive() {
+    if (!g_ready.load()) { SetStatus("Replay camera: unavailable in this build", 2500); return; }
+    int first = 0, last = 0;
+    if (!rcam::Span(g_keys, first, last)) {
+        SetStatus("Replay camera: set at least two keys first", 2500);
+        return;
+    }
+    const bool on = !g_drive.load();
+    g_drive.store(on);
+    SetStatus(on ? "Replay camera: path armed" : "Replay camera: path off", 1800);
+    Log("[rcam] path %s (%d keys, %d..%d ms)", on ? "armed" : "off", (int)g_keys.size(), first, last);
+}
+
+} // namespace rc
+
+// ---------------------------------------------------------------------------
 // in-game overlay - a corner hint drawn with immediate-mode GL inside the
 // wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
 // On a core GL profile the fixed-function calls are no-ops (overlay stays hidden);
@@ -2042,6 +2482,7 @@ static const MenuItem kMenu[] = {
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
     { '6', "Overlay size", true },
+    { '7', "Replay camera" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2202,6 +2643,25 @@ static void DrawSwitcher(int w, int h, int lh) {
 
 // The direct-connect panel: a single IP:port text line (green, with a caret) plus an
 // optional red error line. Mirrors the track-search box styling.
+static void DrawReplayCam(int w, int h, int lh) {
+    char rows[8][96];
+    const int n = rc::PanelLines(rows);
+    const int bw = 460, bh = n * lh + 10;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+
+    int y = y1 - 17;
+    glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+    GlText(x0 + 8, y, rows[0]); y -= lh;
+    for (int i = 1; i < n; ++i) {
+        if (i == n - 1)            glColor4f(0.60f, 0.66f, 0.76f, 1.0f);   // key hint
+        else if (rows[i][2] == '!') glColor4f(0.95f, 0.75f, 0.45f, 1.0f);  // something is off
+        else                        glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        GlText(x0 + 8, y, rows[i]); y -= lh;
+    }
+}
+
 static void DrawDirectConnect(int w, int h, int lh) {
     const bool hasErr = !g_dcError.empty();
     const int rows = hasErr ? 4 : 3;             // title + input [+ error] + footer
@@ -2359,7 +2819,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !rc::g_open.load() && !g_radarOn.load() && !g_espOn.load()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -2382,6 +2842,7 @@ void DrawOverlay(HDC hdc) {
     const bool sw        = g_swOpen.load()  && !reloading;
     const bool dc        = g_dcOpen.load()  && !reloading;
     const bool ms        = g_msOpen.load()  && !reloading;
+    const bool rcam      = rc::g_open.load() && !reloading;
     const int  done = g_reloadDone.load(), total = g_game->reload_count;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -2415,6 +2876,8 @@ void DrawOverlay(HDC hdc) {
         DrawSwitcher(w, h, lh);
     } else if (dc) {
         DrawDirectConnect(w, h, lh);
+    } else if (rcam) {
+        DrawReplayCam(w, h, lh);
     } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
         const int rows = kMenuCount + 2;         // title + items + footer
@@ -2586,7 +3049,7 @@ static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0; g_dScale = 1.0f;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !rc::g_open.load() && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -2600,6 +3063,7 @@ static void BuildOverlayDrawLists() {
     const bool sw   = g_swOpen.load()   && !reloading;
     const bool dc   = g_dcOpen.load()   && !reloading;
     const bool ms   = g_msOpen.load()   && !reloading;
+    const bool rcam = rc::g_open.load() && !reloading;
     const int  done = g_reloadDone.load(), total = g_game->reload_count;
     const float frac = (reloading && total) ? (float)done / (float)total : 0.0f;
 
@@ -2746,6 +3210,19 @@ static void BuildOverlayDrawLists() {
             DText(MX + PADX, y, el, ToABGR(0.95f, 0.55f, 0.55f, 1.0f), FS); y += LH;
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
+    } else if (rcam) {
+        char rows[8][96];
+        const int n = rc::PanelLines(rows);
+        const float w = 0.34f, h = n * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        DText(MX + PADX, y, rows[0], cBlue, FS); y += LH;
+        for (int i = 1; i < n; ++i) {
+            const unsigned long c = (i == n - 1)          ? cGray
+                                  : (rows[i][2] == '!')   ? ToABGR(0.95f, 0.75f, 0.45f, 1.0f)
+                                                          : cWhite;
+            DText(MX + PADX, y, rows[i], c, FS); y += LH;
+        }
     } else if (menu) {
         const int rows = kMenuCount + 2;
         const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
@@ -2908,6 +3385,7 @@ void MenuAction(int d) {
               Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     case 6: UiCycleScale(); SaveOverlaySettings();                // menu stays OPEN, so
             Log("[overlay] size %d%%", g_uiPct.load()); break;     // the change is visible
+    case 7: g_menuOpen.store(false); rc::Open();        break;   // keyframed replay camera
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -2925,6 +3403,10 @@ void Tick() {
     // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
     // ride past someone.
     SessionPublish();
+
+    // The replay camera reads the clock every frame and, when a path is armed, writes the
+    // pose for the next one. It no-ops unless it resolved and something is armed.
+    rc::Frame();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
@@ -2967,6 +3449,8 @@ void Tick() {
             CloseSwitcher(); Log("[switch] switcher closed (F8).");
         } else if (g_dcOpen.load()) {
             CloseDirectConnect(); Log("[connect] direct connect closed (F8).");
+        } else if (rc::g_open.load()) {
+            rc::Close(); Log("[rcam] editor closed (F8).");
         } else {
             bool open = !g_menuOpen.load();
             g_menuOpen.store(open);
@@ -2983,6 +3467,68 @@ void Tick() {
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
         prevEsc = esc;
+    }
+
+    // Replay camera editor (F8 > 7). Modal, but deliberately NOT a key-swallowing one:
+    // the game's own replay transport keeps working underneath, which is the point - you
+    // scrub with the game's controls and press K where you want the camera to be. The
+    // letters chosen are ones the replay screen does not use.
+    if (rc::g_open.load()) {
+        struct RcKey { int vk; char id; };
+        static const RcKey kRcKeys[] = {
+            { 'K', 'K' }, { 'X', 'X' }, { 'C', 'C' }, { 'P', 'P' },
+            { VK_OEM_COMMA, ',' }, { VK_OEM_PERIOD, '.' },
+            { 'S', 'S' }, { 'L', 'L' },
+        };
+        static bool prevRc[sizeof(kRcKeys) / sizeof(kRcKeys[0])] = {false};
+        static bool prevRcDigit[10] = {false};
+        static bool prevRcEsc = false;
+
+        for (size_t i = 0; i < sizeof(kRcKeys) / sizeof(kRcKeys[0]); ++i) {
+            const bool down = (GetAsyncKeyState(kRcKeys[i].vk) & 0x8000) != 0;
+            if (down && !prevRc[i]) {
+                switch (kRcKeys[i].id) {
+                case 'K': rc::SetKeyHere();     break;
+                case 'X': rc::DeleteKeyHere();  break;
+                case 'C': rc::g_keys.clear(); rc::g_drive.store(false); rc::Publish();
+                          SetStatus("Replay camera: path cleared", 1800); break;
+                case 'P': rc::ToggleDrive();    break;
+                case ',': rc::JumpKey(false);   break;
+                case '.': rc::JumpKey(true);    break;
+                case 'S': { std::string err;
+                            if (rc::SavePath(rc::g_slot.load(), &err)) {
+                                char m[96]; sprintf_s(m, "Replay camera: saved to slot %d", rc::g_slot.load());
+                                SetStatus(m, 2000);
+                            } else {
+                                char m[160]; sprintf_s(m, "Replay camera: save failed - %s", err.c_str());
+                                SetStatus(m, 3000);
+                            } } break;
+                case 'L': { std::string err;
+                            if (rc::LoadPath(rc::g_slot.load(), &err)) {
+                                char m[96]; sprintf_s(m, "Replay camera: loaded slot %d (%d keys)",
+                                                     rc::g_slot.load(), (int)rc::g_keys.size());
+                                SetStatus(m, 2000);
+                            } else {
+                                char m[160]; sprintf_s(m, "Replay camera: load failed - %s", err.c_str());
+                                SetStatus(m, 3000);
+                            } } break;
+                default: break;
+                }
+            }
+            prevRc[i] = down;
+        }
+        for (int d = 1; d <= 9; ++d) {                       // digit picks the save slot
+            const bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;
+            if (k && !prevRcDigit[d]) {
+                rc::g_slot.store(d);
+                char m[64]; sprintf_s(m, "Replay camera: slot %d", d);
+                SetStatus(m, 1500);
+            }
+            prevRcDigit[d] = k;
+        }
+        const bool rcEsc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        if (rcEsc && !prevRcEsc) { rc::Close(); Log("[rcam] editor closed (Esc)."); }
+        prevRcEsc = rcEsc;
     }
 
     // Track manager (F8 > 2): modal keyboard list with two sub-modes.
@@ -4183,14 +4729,37 @@ __declspec(dllexport) void Shutdown() {
 // the (persistent) arrays to render. Bumping g_drawCalls tells the swap hook the
 // sanctioned path is live so it skips the GL fallback (no double image). The
 // out-arrays stay valid after return because they are static.
-__declspec(dllexport) void Draw(int /*_iState*/, int* _piNumQuads, void** _ppQuad,
+__declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
                                 int* _piNumString, void** _ppString) {
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    // The state the engine hands us is how the replay camera knows it is in a replay
+    // without resolving a single offset for it.
+    rc::g_drawState.store(_iState, std::memory_order_relaxed);
+    rc::g_drawStamp.store(GetTickCount64(), std::memory_order_relaxed);
     BuildOverlayDrawLists();
     if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
     if (_ppQuad)      *_ppQuad      = g_drawQuads;
     if (_piNumString) *_piNumString = g_nDrawStrs;
     if (_ppString)    *_ppString    = g_drawStrs;
+}
+
+// Optional. Polled every frame while spectating or in a replay: return 1 and write an
+// index into _piSelect to choose the camera. This is the sanctioned way to hold the
+// free-roam camera, and holding it is what stops the replay update re-seeding the pose
+// we just wrote (see the REPLAY KEYFRAME CAMERA section). We only take it over while a
+// path is actually armed - the rest of the time the camera is the viewer's.
+//
+// _pCameraData is NOT a struct array: it is _iNumCameras packed NUL-terminated names.
+// We don't read it - the index is the stable identity, the text is localised.
+__declspec(dllexport) int SpectateCameras(int _iNumCameras, char* /*_pCameraData*/,
+                                          int _iCurrent, int* _piSelect) {
+    if (!_piSelect || !rc::g_drive.load()) return 0;
+    int idx = rc::FreeRoamIndex();
+    if (idx < 0) return 0;
+    if (_iNumCameras > 0 && idx > _iNumCameras - 1) idx = _iNumCameras - 1;
+    if (idx == _iCurrent) return 0;              // already there; don't fight the engine
+    *_piSelect = idx;
+    return 1;
 }
 
 // ---- radar / rider-outline data feed (all read-only; see the RADAR section) --

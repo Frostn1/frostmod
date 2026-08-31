@@ -46,6 +46,7 @@
 #include "serverfilter.h"
 #include "session.h"
 #include "replaycam.h"  // keyframed replay camera: maths + path file format
+#include "keybinds.h"   // the editor's keys, and their names in the config file
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -1794,20 +1795,42 @@ static void OverlaySettingsPath(char* out, size_t n) {
     if (slash) slash[1] = 0; else out[0] = 0;
     strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
 }
+// Replay camera key bindings. Defaults until the config is read; MXB App edits them in
+// the same file, and the editor re-reads it each time it opens so a change lands without
+// restarting the game.
+kb::Bind g_rcBinds[kb::ActionCount];
+bool     g_rcBindsInit = false;
+
+static void EnsureBindDefaults() {
+    if (g_rcBindsInit) return;
+    kb::LoadDefaults(g_rcBinds);
+    g_rcBindsInit = true;
+}
+
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
     fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\n",
             g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
             g_uiPct.load());
+    // Written every time, so a toggle made in-game cannot drop the bindings the app set.
+    EnsureBindDefaults();
+    for (int a = 0; a < kb::ActionCount; ++a) {
+        char key[64], val[64];
+        kb::ConfigKey(a, key, sizeof(key));
+        kb::FormatBind(g_rcBinds[a], val, sizeof(val));
+        fprintf(f, "%s=%s\n", key, val);
+    }
     fclose(f);
 }
 static void LoadOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
-    char line[64]; int v;
+    EnsureBindDefaults();
+    char line[128]; int v;
     while (fgets(line, sizeof(line), f)) {
-        if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
+        if      (kb::ApplyConfigLine(line, g_rcBinds)) continue;
+        else if (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
         else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
@@ -2363,6 +2386,7 @@ void Frame() {
 
 void Open() {
     Resolve();
+    LoadOverlaySettings();      // pick up key bindings MXB App may have changed
     g_open.store(true);
     Publish();
     Log("[rcam] editor opened (%s)", g_ready.load() ? "ready" : g_why);
@@ -2439,9 +2463,22 @@ int PanelLines(char out[8][96]) {
     if (!g_uiInReplay.load())
         sprintf_s(out[n++], 96, "  ! waiting for a replay - load one, then set keys");
 
-    sprintf_s(out[n++], 96, "  K set key   X delete   C clear   , . jump");
-    sprintf_s(out[n++], 96, "  P play/stop   S save   L load   1-9 slot");
-    sprintf_s(out[n++], 96, "  Esc / F8   close");
+    // The key hints are built from the bindings in force, not from the defaults - the
+    // whole point of making them editable is that yours may not be the shipped ones.
+    char row[96] = "  ";
+    for (int a = 0; a < kb::ActionCount && n < 7; ++a) {
+        if (!g_rcBinds[a].bound()) continue;
+        char keyText[64], item[96];
+        kb::FormatBind(g_rcBinds[a], keyText, sizeof(keyText));
+        sprintf_s(item, "%s %s   ", keyText, kb::Actions()[a].label);
+        if (strlen(row) + strlen(item) >= 60) {
+            sprintf_s(out[n++], 96, "%s", row);
+            strcpy_s(row, "  ");
+        }
+        strcat_s(row, item);
+    }
+    if (row[2] && n < 7) sprintf_s(out[n++], 96, "%s", row);
+    if (n < 8) sprintf_s(out[n++], 96, "  1-9 slot   Esc / F8 close");
     return n;
 }
 
@@ -3474,28 +3511,31 @@ void Tick() {
     // scrub with the game's controls and press K where you want the camera to be. The
     // letters chosen are ones the replay screen does not use.
     if (rc::g_open.load()) {
-        struct RcKey { int vk; char id; };
-        static const RcKey kRcKeys[] = {
-            { 'K', 'K' }, { 'X', 'X' }, { 'C', 'C' }, { 'P', 'P' },
-            { VK_OEM_COMMA, ',' }, { VK_OEM_PERIOD, '.' },
-            { 'S', 'S' }, { 'L', 'L' },
-        };
-        static bool prevRc[sizeof(kRcKeys) / sizeof(kRcKeys[0])] = {false};
+        static bool prevRc[kb::ActionCount] = {false};
         static bool prevRcDigit[10] = {false};
         static bool prevRcEsc = false;
 
-        for (size_t i = 0; i < sizeof(kRcKeys) / sizeof(kRcKeys[0]); ++i) {
-            const bool down = (GetAsyncKeyState(kRcKeys[i].vk) & 0x8000) != 0;
-            if (down && !prevRc[i]) {
-                switch (kRcKeys[i].id) {
-                case 'K': rc::SetKeyHere();     break;
-                case 'X': rc::DeleteKeyHere();  break;
-                case 'C': rc::g_keys.clear(); rc::g_drive.store(false); rc::Publish();
+        // Modifiers are matched exactly, so a binding of Ctrl+X cannot also fire plain X.
+        // It does NOT stop the game seeing the key - see keybinds.h.
+        const bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+        const bool shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
+
+        for (int a = 0; a < kb::ActionCount; ++a) {
+            const kb::Bind& bind = g_rcBinds[a];
+            const bool down = bind.bound()
+                              && (GetAsyncKeyState(bind.vk) & 0x8000) != 0
+                              && bind.ctrl == ctrl && bind.alt == alt && bind.shift == shift;
+            if (down && !prevRc[a]) {
+                switch (a) {
+                case kb::RcSetKey: rc::SetKeyHere();    break;
+                case kb::RcDelete: rc::DeleteKeyHere(); break;
+                case kb::RcClear:  rc::g_keys.clear(); rc::g_drive.store(false); rc::Publish();
                           SetStatus("Replay camera: path cleared", 1800); break;
-                case 'P': rc::ToggleDrive();    break;
-                case ',': rc::JumpKey(false);   break;
-                case '.': rc::JumpKey(true);    break;
-                case 'S': { std::string err;
+                case kb::RcPlay:   rc::ToggleDrive();   break;
+                case kb::RcPrev:   rc::JumpKey(false);  break;
+                case kb::RcNext:   rc::JumpKey(true);   break;
+                case kb::RcSave: { std::string err;
                             if (rc::SavePath(rc::g_slot.load(), &err)) {
                                 char m[96]; sprintf_s(m, "Replay camera: saved to slot %d", rc::g_slot.load());
                                 SetStatus(m, 2000);
@@ -3503,7 +3543,7 @@ void Tick() {
                                 char m[160]; sprintf_s(m, "Replay camera: save failed - %s", err.c_str());
                                 SetStatus(m, 3000);
                             } } break;
-                case 'L': { std::string err;
+                case kb::RcLoad: { std::string err;
                             if (rc::LoadPath(rc::g_slot.load(), &err)) {
                                 char m[96]; sprintf_s(m, "Replay camera: loaded slot %d (%d keys)",
                                                      rc::g_slot.load(), (int)rc::g_keys.size());
@@ -3515,7 +3555,7 @@ void Tick() {
                 default: break;
                 }
             }
-            prevRc[i] = down;
+            prevRc[a] = down;
         }
         for (int d = 1; d <= 9; ++d) {                       // digit picks the save slot
             const bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;

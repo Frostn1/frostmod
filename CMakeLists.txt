@@ -131,6 +131,13 @@ add_test(NAME session COMMAND session_test)
 add_executable(replaycam_test tests/replaycam_test.cpp)
 add_test(NAME replaycam COMMAND replaycam_test)
 
+# --- keybinds test -------------------------------------------------------------
+# The replay camera editor's configurable keys. A binding that fails to parse, or one
+# that formats to something that cannot be read back, leaves someone with a key that
+# does nothing and nothing on screen saying why — so the round trip is pinned here.
+add_executable(keybinds_test tests/keybinds_test.cpp)
+add_test(NAME keybinds COMMAND keybinds_test)
+
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).
 set_target_properties(frostmod frostmod_app frostserver frostserver_app PROPERTIES

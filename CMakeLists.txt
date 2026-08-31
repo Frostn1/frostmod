@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.15.4")
+set(FROSTMOD_VERSION "0.16.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -122,12 +122,6 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
-# silent wrongness the viewer sees but no error reports: a pan that swings the long way
-# round the +-180 seam, a path that keeps driving the camera past its last key, a saved
-# it runs here rather than only on a Windows box with a replay loaded.
-
-# that formats to something that cannot be read back, leaves someone with a key that
-# does nothing and nothing on screen saying why — so the round trip is pinned here.
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

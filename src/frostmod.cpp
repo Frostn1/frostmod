@@ -757,6 +757,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 void RequestReload();                          // fwd (defined with the reload code below)
 void NoteModelNeedsReselect(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
+void ClearClean();                             // fwd (defined with the overlay below)
 
 // One track in the manager list. `active` = current on-disk state (true => the .pkz
 // lives under mods\tracks); `staged` = the state the user wants after Apply.
@@ -2386,6 +2387,7 @@ void Frame() {
 
 void Open() {
     Resolve();
+    ClearClean();               // an editor you cannot see would look like it never opened
     LoadOverlaySettings();      // pick up key bindings MXB App may have changed
     g_open.store(true);
     Publish();
@@ -2504,6 +2506,12 @@ void ToggleDrive() {
 // everything is push/pop-wrapped so the game's GL state is never disturbed.
 // ---------------------------------------------------------------------------
 std::atomic<bool>      g_overlayOn{true};
+// Clean view: hide EVERYTHING FrostMod draws, for recording a replay. Stronger than
+// g_overlayOn, which only drops the corner hint and leaves the radar, the outlines and any
+// open panel on screen. Input is untouched while it is on - that is what lets the same key
+// bring the overlay back, and it is why this can never leave someone stranded with a UI
+// they cannot see. Not persisted: it is a per-session thing you turn on to record.
+std::atomic<bool>      g_cleanView{false};
 std::atomic<bool>      g_menuOpen{false};       // F8 opens the FrostMod action menu
 std::atomic<ULONGLONG> g_statusUntil{0};        // show g_statusText until this tick
 std::mutex             g_statusMutex;
@@ -2520,6 +2528,7 @@ static const MenuItem kMenu[] = {
     { '5', "Rider outlines" },
     { '6', "Overlay size", true },
     { '7', "Replay camera" },
+    { '8', "Hide overlay (recording)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2532,6 +2541,12 @@ static void MenuRowText(int i, char* out, size_t n) {
         sprintf_s(out, n, "  %c   %s  (%d%%)", kMenu[i].key, kMenu[i].label, g_uiPct.load());
     else
         sprintf_s(out, n, "  %c   %s", kMenu[i].key, kMenu[i].label);
+}
+
+// Clean view is cleared by anything that puts a panel on screen, so opening something can
+// never look like it did nothing. Called before the panel opens, not after.
+void ClearClean() {
+    if (g_cleanView.exchange(false)) Log("[clean] overlay shown again (a panel opened)");
 }
 
 void SetStatus(const char* s, unsigned ms) {
@@ -2852,6 +2867,9 @@ static void DrawEspGL(int w, int h) {
 }
 
 void DrawOverlay(HDC hdc) {
+    // Clean view wins over everything, including an open panel: the point is a frame with
+    // nothing of ours in it. Anything that opens a panel clears it first (see ClearClean).
+    if (g_cleanView.load()) return;
     // The menu always draws (even if the corner hint was toggled off), so it's never
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
@@ -3084,6 +3102,7 @@ static void EmitEspPiBoSo() {
 // tuned to match the GL layout's proportions - adjust here if text overflows.
 static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0; g_dScale = 1.0f;
+    if (g_cleanView.load()) return;      // hand the engine nothing at all
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !rc::g_open.load() && !g_radarOn.load() && !g_espOn.load()) return;
@@ -3423,6 +3442,11 @@ void MenuAction(int d) {
     case 6: UiCycleScale(); SaveOverlaySettings();                // menu stays OPEN, so
             Log("[overlay] size %d%%", g_uiPct.load()); break;     // the change is visible
     case 7: g_menuOpen.store(false); rc::Open();        break;   // keyframed replay camera
+    // Closes the menu on the way out: the whole point is a clean frame, and a menu left
+    // open behind an invisible overlay is a trap the next keypress falls into.
+    case 8: g_menuOpen.store(false); g_cleanView.store(true);
+            Log("[clean] overlay hidden - press the replay camera's hide key to bring it back");
+            break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -3473,11 +3497,34 @@ void Tick() {
         }
     }
 
+    // The hide-overlay key is polled here rather than inside the editor block: you press it
+    // with the replay running and the editor closed, which is the whole point of it. It is
+    // the one FrostMod key that still works while nothing of ours is on screen - which is
+    // also what stops clean view being a trap.
+    {
+        EnsureBindDefaults();
+        const kb::Bind& hide = g_rcBinds[kb::RcClean];
+        static bool prevHide = false;
+        const bool down = hide.bound()
+                          && (GetAsyncKeyState(hide.vk) & 0x8000) != 0
+                          && hide.ctrl  == ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)
+                          && hide.alt   == ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0)
+                          && hide.shift == ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0);
+        if (down && !prevHide) {
+            const bool on = !g_cleanView.load();
+            g_cleanView.store(on);
+            if (!on) SetStatus("FrostMod overlay back", 1500);
+            Log("[clean] overlay %s", on ? "hidden" : "shown");
+        }
+        prevHide = down;
+    }
+
     // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
     static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
+        ClearClean();                                    // never open something invisible
         if (g_msOpen.load()) {                               // F8 also closes an open list
             CloseModelSwap(); Log("[model] model swap closed (F8).");
         } else if (g_trkOpen.load()) {
@@ -3522,6 +3569,7 @@ void Tick() {
         const bool shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
 
         for (int a = 0; a < kb::ActionCount; ++a) {
+            if (a == kb::RcClean) continue;              // polled globally, above
             const kb::Bind& bind = g_rcBinds[a];
             const bool down = bind.bound()
                               && (GetAsyncKeyState(bind.vk) & 0x8000) != 0

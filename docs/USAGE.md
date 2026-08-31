@@ -77,6 +77,7 @@ F-key per feature.
 | `5` | Rider outlines — on-screen box around each rider |
 | `6` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
 | `7` | Replay camera — keyframe a camera path through a replay (see below) |
+| `8` | Hide overlay — everything FrostMod draws, for recording (see below) |
 
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `6` is on top of that, for when you want it bigger (or
@@ -111,6 +112,22 @@ These are the defaults — **every one of them can be changed** (see below).
 | `S` / `L` | Save / load the path in the current slot |
 | `1`–`9` | Pick a save slot |
 | `Esc` / `F8` | Close the editor (an armed path keeps running) |
+| `F7` | Hide / show everything FrostMod draws |
+
+#### Recording a clean pass
+
+`F7` hides **everything FrostMod draws** — the editor panel, the corner pill, the radar, the
+rider outlines. It is stronger than the overlay toggle in the menu, which only drops the
+corner hint. Press it again to bring it all back; it is also on the menu at F8 → `8`.
+
+The key keeps working while the overlay is hidden, and anything that opens a panel (F8, or
+the editor) brings the overlay back first — so you cannot get stuck looking at a UI you
+can't see. It is not remembered between sessions: it is something you turn on to record.
+
+**The game's own HUD and the replay control bar are not FrostMod's to hide.** Turn the HUD
+off in MX Bikes' own options; the replay bar belongs to the game's interface, and the only
+thing FrostMod could do to it is destroy the window, which would take the transport
+controls with it. So it leaves both alone.
 
 #### Changing the keys
 
@@ -132,6 +149,7 @@ rcam_prev=Comma
 rcam_next=Period
 rcam_save=F9
 rcam_load=F10
+rcam_clean=F7
 ```
 
 Names are letters, digits, `F1`–`F16`, `Numpad0`–`Numpad9`, the punctuation keys

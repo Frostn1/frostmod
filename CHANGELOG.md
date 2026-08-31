@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-31
+
+### Added
+- `F7` hides everything FrostMod draws — panel, pill, radar, outlines — for recording a
+  replay. Also on the menu at F8 → `8`, and rebindable like the other replay camera keys.
+  The key still works while the overlay is hidden, and opening any panel brings it back.
+
 ## 2026-08-31 — v0.15.1
 
 ### Changed

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-08-31
+## 2026-08-31 — v0.15.1
 
 ### Changed
 - The replay camera editor's keys can be changed. They live in `frostmod_radar.cfg` as

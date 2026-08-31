@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-08-31
+## 2026-08-31 — v0.15.2
 
 ### Added
 - `F7` hides everything FrostMod draws — panel, pill, radar, outlines — for recording a

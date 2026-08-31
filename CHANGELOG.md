@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Replay camera keys can aim at a rider. The camera points at wherever they are, and two
+  riders on one segment eases from one to the other.
+- Optional auto FOV holds the aimed rider's apparent size as the distance changes.
+- Per-key ease: smooth, hold, or cut. A cut parks the camera and then cuts hard to the next
+  key, so one path can be a whole edit. The panel counts the shots.
+- Camera rigs: handheld, drone and crane lay a small wobble over the path. It comes off the
+  replay clock, so re-recording a replay shakes identically.
+- Paths can be keyed to a rider's lap fraction instead of the replay clock, and then replay
+  on any lap, any rider, any replay.
+- `V` draws the path in the world while you build it, with a marker per key.
+- `U` undoes the last edit, 24 deep.
+- `[` and `]` move the key at the clock by one 30 ms sample.
+- `Ctrl+R` respaces the keys by distance, for a constant-speed dolly. A cut keeps the length
+  it was given.
+- Eleven new editor actions, all rebindable; `curve`, `anchor` and `autofov` ship unbound.
+- Path files gained a `path` settings line and four columns per key. Files from earlier
+  versions still load.
+
+### Changed
+- Tangents are measured on centripetal knots by default. Two keys set close together used to
+  lurch the camera backwards before it set off.
+- FrostMod reads how this build's camera angles count out of the game's own view matrix
+  instead of assuming it. Aiming says "not calibrated yet" until it has.
+
 ## 2026-08-31 — v0.15.2
 
 ### Added

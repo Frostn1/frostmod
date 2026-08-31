@@ -2143,6 +2143,7 @@ std::atomic<int>  g_uiRigPct{100};
 std::atomic<int>  g_uiAnchor{rcam::AnchorClock};
 std::atomic<bool> g_uiAutoFov{false};
 std::atomic<int>  g_uiRiders{0};
+std::atomic<int>  g_uiAnchorRider{rcam::kNoTarget};
 std::atomic<unsigned> g_gen{0};        // bumped on every edit; the preview rebuilds on a change
 
 // ---- how the camera's angles count -----------------------------------------
@@ -2379,6 +2380,12 @@ void Publish() {
     g_uiHereEase.store(i >= 0 ? g_path.keys[i].ease : -1, std::memory_order_relaxed);
     g_uiHereTarget.store(i >= 0 ? g_path.keys[i].target : rcam::kNoTarget,
                          std::memory_order_relaxed);
+    // Published rather than looked up in the panel: PanelLines is built on the game's
+    // thread for the PiBoSo renderer, and the key list belongs to this one.
+    int anchor = rcam::kNoTarget;
+    for (const rcam::Key& k : g_path.keys)
+        if (k.target != rcam::kNoTarget) { anchor = k.target; break; }
+    g_uiAnchorRider.store(anchor, std::memory_order_relaxed);
 }
 
 /// The rider a lap-anchored path follows: the first key that names one. A path with no
@@ -2812,7 +2819,7 @@ int PanelLines(char out[kPanelRows][96]) {
               g_uiAutoFov.load() ? "framed" : "keyed");
 
     if (g_uiAnchor.load() == rcam::AnchorTrack)
-        sprintf_s(out[n++], 96, "  axis  #%d's lap - plays on any lap", AnchorRider());
+        sprintf_s(out[n++], 96, "  axis  #%d's lap - plays on any lap", g_uiAnchorRider.load());
     else
         sprintf_s(out[n++], 96, "  axis  the replay clock");
 

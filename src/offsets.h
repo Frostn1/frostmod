@@ -261,6 +261,9 @@ constexpr char SIG_MP_MSG_HANDLER[] =
     "\x40\x53\x56\x57\x48\x81\xEC\x20\x07\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x84\x24\x10\x07\x00";
 constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 
+       // N+3 free-roam (N+4 is VR)
+
+
 // ---- surgical reload: the content-load section of fcn.1400ef210 ---------------
 // Transcribed verbatim from boot init, RVA 0xef68e..0xef8xx. Every content list is
 // cleared and rescanned from disk (tracks, bikes, tyres, helmets, boots, riders, ...),

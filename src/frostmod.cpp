@@ -2020,6 +2020,7 @@ static void RadValidateVP() {
     g_vpValid.store(ok, std::memory_order_relaxed);
 }
 
+
 // ---------------------------------------------------------------------------
 // in-game overlay - a corner hint drawn with immediate-mode GL inside the
 // wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
@@ -2202,6 +2203,7 @@ static void DrawSwitcher(int w, int h, int lh) {
 
 // The direct-connect panel: a single IP:port text line (green, with a caret) plus an
 // optional red error line. Mirrors the track-search box styling.
+
 static void DrawDirectConnect(int w, int h, int lh) {
     const bool hasErr = !g_dcError.empty();
     const int rows = hasErr ? 4 : 3;             // title + input [+ error] + footer
@@ -2359,7 +2361,6 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -2586,7 +2587,6 @@ static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0; g_dScale = 1.0f;
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -2746,6 +2746,17 @@ static void BuildOverlayDrawLists() {
             DText(MX + PADX, y, el, ToABGR(0.95f, 0.55f, 0.55f, 1.0f), FS); y += LH;
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
+        char rows[8][96];
+        const float w = 0.34f, h = n * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        DText(MX + PADX, y, rows[0], cBlue, FS); y += LH;
+        for (int i = 1; i < n; ++i) {
+            const unsigned long c = (i == n - 1)          ? cGray
+                                  : (rows[i][2] == '!')   ? ToABGR(0.95f, 0.75f, 0.45f, 1.0f)
+                                                          : cWhite;
+            DText(MX + PADX, y, rows[i], c, FS); y += LH;
+        }
     } else if (menu) {
         const int rows = kMenuCount + 2;
         const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
@@ -2926,6 +2937,8 @@ void Tick() {
     // ride past someone.
     SessionPublish();
 
+    // pose for the next one. It no-ops unless it resolved and something is armed.
+
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
     // plugin Draw() callback (g_drawCalls). On track both track the framerate. If frames/s
@@ -2985,6 +2998,7 @@ void Tick() {
         prevEsc = esc;
     }
 
+    
     // Track manager (F8 > 2): modal keyboard list with two sub-modes.
     //   NAV (default): Up/Down move the cursor over the *filtered* view (held-key repeat so
     //     a long list scrolls); Space toggles the cursor row's staged state; A selects /
@@ -4183,14 +4197,29 @@ __declspec(dllexport) void Shutdown() {
 // the (persistent) arrays to render. Bumping g_drawCalls tells the swap hook the
 // sanctioned path is live so it skips the GL fallback (no double image). The
 // out-arrays stay valid after return because they are static.
-__declspec(dllexport) void Draw(int /*_iState*/, int* _piNumQuads, void** _ppQuad,
+__declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
                                 int* _piNumString, void** _ppString) {
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    // without resolving a single offset for it.
     BuildOverlayDrawLists();
     if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
     if (_ppQuad)      *_ppQuad      = g_drawQuads;
     if (_piNumString) *_piNumString = g_nDrawStrs;
     if (_ppString)    *_ppString    = g_drawStrs;
+}
+
+// Optional. Polled every frame while spectating or in a replay: return 1 and write an
+// index into _piSelect to choose the camera. This is the sanctioned way to hold the
+// path is actually armed - the rest of the time the camera is the viewer's.
+//
+// _pCameraData is NOT a struct array: it is _iNumCameras packed NUL-terminated names.
+// We don't read it - the index is the stable identity, the text is localised.
+                                          int _iCurrent, int* _piSelect) {
+    if (idx < 0) return 0;
+    if (_iNumCameras > 0 && idx > _iNumCameras - 1) idx = _iNumCameras - 1;
+    if (idx == _iCurrent) return 0;              // already there; don't fight the engine
+    *_piSelect = idx;
+    return 1;
 }
 
 // ---- radar / rider-outline data feed (all read-only; see the RADAR section) --

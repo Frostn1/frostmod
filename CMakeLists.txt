@@ -122,6 +122,10 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
+# silent wrongness the viewer sees but no error reports: a pan that swings the long way
+# round the +-180 seam, a path that keeps driving the camera past its last key, a saved
+# it runs here rather than only on a Windows box with a replay loaded.
+
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).
 set_target_properties(frostmod frostmod_app frostserver frostserver_app PROPERTIES

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-30
+
+### Added
+  replay, press `K` where you want it, and the camera flies a smooth path between the keys.
+
 ## 2026-08-29
 
 ### Added

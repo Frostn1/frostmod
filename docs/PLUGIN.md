@@ -194,6 +194,29 @@ tail is the same fields, waiting to be derived.
   safely we need, at the splice site (near `RVA_SB_HIDE_EMPTY_BR`): the exact
   address, the register holding the `SB_Entry` pointer, and the overwritten bytes.
 
+
+Set keys while scrubbing a replay; the camera flies a smooth path between them. See
+built on.
+
+Two plugin callbacks carry it, and neither needs an offset:
+
+| Export | Signature | We return / do |
+|--------|-----------|----------------|
+| `Draw` | `void Draw(int state, ...)` | `state == 2` is how we know a replay is on screen. |
+
+Holding the camera mode is not cosmetic: the replay update re-seeds the free-roam pose
+from the live camera at the end of every frame unless free-roam is the active mode, so a
+pose written without it is silently overwritten before it is ever drawn. Injected mode
+has no callbacks, so there it writes the mode global directly each frame instead.
+
+Everything else the feature touches — the pose, the FOV, the replay clock — is read and
+written directly, from `Tick()`. It hooks nothing and patches nothing. Each address is
+`src/offsets.h`), because camera offsets moved between two builds released two days
+apart; a pattern that matches in more than one place must resolve to the same address in
+all of them or it is refused. Reads and writes are SEH-guarded, so a wrong address costs
+the feature and not the game.
+
+
 ## Feature 3 — in-game overlay (hybrid render path)
 
 The overlay (status pill, reload progress bar, F8 menu, track manager/switcher) has

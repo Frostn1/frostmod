@@ -1794,10 +1794,6 @@ static void OverlaySettingsPath(char* out, size_t n) {
     if (slash) slash[1] = 0; else out[0] = 0;
     strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
 }
-// the same file, and the editor re-reads it each time it opens so a change lands without
-// restarting the game.
-
-}
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -1805,10 +1801,6 @@ static void SaveOverlaySettings() {
     fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\n",
             g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
             g_uiPct.load());
-    // Written every time, so a toggle made in-game cannot drop the bindings the app set.
-        char key[64], val[64];
-        fprintf(f, "%s=%s\n", key, val);
-    }
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -1816,7 +1808,7 @@ static void LoadOverlaySettings() {
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128]; int v;
     while (fgets(line, sizeof(line), f)) {
-        else if (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
+        if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
         else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
@@ -1832,17 +1824,6 @@ static void LoadOverlaySettings() {
 // coords in [-1,1] (ry up = ahead). bearing is the world heading to them
 // relative to my facing, for the ESP arrow fallback. wx/wy/wz = world pos.
 struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int raceNum; };
-// number. Empty in injected mode, where no callback ever fires - which is exactly what makes
-// aiming and lap-anchored paths a plugin-mode feature.
-    std::lock_guard<std::mutex> lk(g_radMutex);
-    out.n = 0;
-    for (int i = 0; i < g_radN && out.n < 64; ++i) {
-        r.raceNum = g_radRiders[i].raceNum;
-        r.x  = g_radRiders[i].x; r.y = g_radRiders[i].y; r.z = g_radRiders[i].z;
-        r.tp = g_radRiders[i].trackPos;
-    }
-}
-
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
 // "me" = the RaceTrackPosition entry closest to my telemetry world pos. Caller holds
@@ -1994,7 +1975,7 @@ void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
     // glLoadMatrixf is hot; only do capture work when the outline feature (or the
     // one-shot diagnostic) actually needs it. Otherwise this is a cheap passthrough.
     if (m && !g_inOverlay.load(std::memory_order_relaxed)
-        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed)
+        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed))) {
         if (int d = g_glDiag.load(std::memory_order_relaxed)) {
             Log("[esp/diag] loadMatrix mode=0x%X persp=%d m11=%.3f m15=%.3f",
                 g_glMode, (int)IsPerspectiveProj(m), m[11], m[15]);
@@ -2042,7 +2023,6 @@ static void RadValidateVP() {
     g_vpValid.store(ok, std::memory_order_relaxed);
 }
 
-
 // ---------------------------------------------------------------------------
 // in-game overlay - a corner hint drawn with immediate-mode GL inside the
 // wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
@@ -2071,7 +2051,7 @@ static const MenuItem kMenu[] = {
     { '4', "Radar (riders around you)" },
     { '5', "Rider outlines" },
     { '6', "Overlay size", true },
-    { '8', "Hide overlay (recording)" },
+    { '7', "Hide overlay (recording)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2238,7 +2218,6 @@ static void DrawSwitcher(int w, int h, int lh) {
 
 // The direct-connect panel: a single IP:port text line (green, with a caret) plus an
 // optional red error line. Mirrors the track-search box styling.
-
 static void DrawDirectConnect(int w, int h, int lh) {
     const bool hasErr = !g_dcError.empty();
     const int rows = hasErr ? 4 : 3;             // title + input [+ error] + footer
@@ -2366,14 +2345,6 @@ static void DrawRadarGL(int w, int h) {
 
 // On-screen rider outlines. Box when the VP projects them on-screen; otherwise a
 // screen-edge directional arrow (needs no matrix). Colored by lap status.
-// The path as it will actually fly, drawn in the world: a ribbon through the poses the
-// spline evaluates, a marker on every key coloured by its ease, and a dot on the pose the
-// clock is sitting at. Keyframing was blind before this - you flew somewhere, pressed a key,
-// and nothing on screen told you what the curve between two of them would do.
-//
-// Rebuilt only when the path changes. Evaluating a few hundred poses is cheap once and
-// wasteful sixty times a second.
-
 static void DrawEspGL(int w, int h) {
     RadBlip blips[64]; float meYawDeg,mx,my,mz;
     int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
@@ -2407,6 +2378,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
+        && !g_radarOn.load() && !g_espOn.load()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -2496,12 +2468,6 @@ void DrawOverlay(HDC hdc) {
     }
 
     if (g_radarOn.load()) DrawRadarGL(w, h);     // HUD overlays draw on top of any panel
-        // World-anchored like the outlines, so it tracks the resolution and not the user's
-        // overlay size - a path drawn at 150% would not sit on the ground it flies over.
-        const int ew = (int)(pw / autoS), eh = (int)(ph / autoS);
-        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, ew, 0, eh, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-    }
     if (g_espOn.load()) {
         // Outlines box riders on screen, so they track the resolution but NOT the user's
         // overlay size - at 150% the boxes would stop fitting the riders they mark.
@@ -2640,6 +2606,7 @@ static void BuildOverlayDrawLists() {
     if (g_cleanView.load()) return;      // hand the engine nothing at all
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
+        && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -2799,16 +2766,6 @@ static void BuildOverlayDrawLists() {
             DText(MX + PADX, y, el, ToABGR(0.95f, 0.55f, 0.55f, 1.0f), FS); y += LH;
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
-        const float w = 0.34f, h = n * LH + 0.010f;
-        DQuad(MX, MY, MX + w, MY + h, cPanel);
-        float y = MY + 0.006f;
-        DText(MX + PADX, y, rows[0], cBlue, FS); y += LH;
-        for (int i = 1; i < n; ++i) {
-            const unsigned long c = (i == n - 1)          ? cGray
-                                  : (rows[i][2] == '!')   ? ToABGR(0.95f, 0.75f, 0.45f, 1.0f)
-                                                          : cWhite;
-            DText(MX + PADX, y, rows[i], c, FS); y += LH;
-        }
     } else if (menu) {
         const int rows = kMenuCount + 2;
         const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
@@ -2973,7 +2930,8 @@ void MenuAction(int d) {
             Log("[overlay] size %d%%", g_uiPct.load()); break;     // the change is visible
     // Closes the menu on the way out: the whole point is a clean frame, and a menu left
     // open behind an invisible overlay is a trap the next keypress falls into.
-    case 8: g_menuOpen.store(false); g_cleanView.store(true);
+    case 7: g_menuOpen.store(false); g_cleanView.store(true);
+            Log("[clean] overlay hidden - press F7 to bring it back");
             break;
     default: break;
     }
@@ -2992,8 +2950,6 @@ void Tick() {
     // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
     // ride past someone.
     SessionPublish();
-
-    // pose for the next one. It no-ops unless it resolved and something is armed.
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
@@ -3023,17 +2979,12 @@ void Tick() {
         }
     }
 
-    // The hide-overlay key is polled here rather than inside the editor block: you press it
-    // with the replay running and the editor closed, which is the whole point of it. It is
-    // the one FrostMod key that still works while nothing of ours is on screen - which is
-    // also what stops clean view being a trap.
+    // F7 hides everything FrostMod draws, for recording. Polled unconditionally, so the
+    // same key always brings it back - which is what stops clean view being a trap you
+    // cannot see your way out of.
     {
         static bool prevHide = false;
-        const bool down = hide.bound()
-                          && (GetAsyncKeyState(hide.vk) & 0x8000) != 0
-                          && hide.ctrl  == ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)
-                          && hide.alt   == ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0)
-                          && hide.shift == ((GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0);
+        const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
         if (down && !prevHide) {
             const bool on = !g_cleanView.load();
             g_cleanView.store(on);
@@ -3057,6 +3008,7 @@ void Tick() {
             CloseSwitcher(); Log("[switch] switcher closed (F8).");
         } else if (g_dcOpen.load()) {
             CloseDirectConnect(); Log("[connect] direct connect closed (F8).");
+
         } else {
             bool open = !g_menuOpen.load();
             g_menuOpen.store(open);
@@ -3075,7 +3027,6 @@ void Tick() {
         prevEsc = esc;
     }
 
-    
     // Track manager (F8 > 2): modal keyboard list with two sub-modes.
     //   NAV (default): Up/Down move the cursor over the *filtered* view (held-key repeat so
     //     a long list scrolls); Space toggles the cursor row's staged state; A selects /
@@ -4283,26 +4234,11 @@ __declspec(dllexport) void Shutdown() {
 __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
                                 int* _piNumString, void** _ppString) {
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
-    // without resolving a single offset for it.
     BuildOverlayDrawLists();
     if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
     if (_ppQuad)      *_ppQuad      = g_drawQuads;
     if (_piNumString) *_piNumString = g_nDrawStrs;
     if (_ppString)    *_ppString    = g_drawStrs;
-}
-
-// Optional. Polled every frame while spectating or in a replay: return 1 and write an
-// index into _piSelect to choose the camera. This is the sanctioned way to hold the
-// path is actually armed - the rest of the time the camera is the viewer's.
-//
-// _pCameraData is NOT a struct array: it is _iNumCameras packed NUL-terminated names.
-// We don't read it - the index is the stable identity, the text is localised.
-                                          int _iCurrent, int* _piSelect) {
-    if (idx < 0) return 0;
-    if (_iNumCameras > 0 && idx > _iNumCameras - 1) idx = _iNumCameras - 1;
-    if (idx == _iCurrent) return 0;              // already there; don't fight the engine
-    *_piSelect = idx;
-    return 1;
 }
 
 // ---- radar / rider-outline data feed (all read-only; see the RADAR section) --

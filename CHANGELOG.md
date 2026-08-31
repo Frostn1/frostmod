@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-31
+
+### Added
+- `F7` hides everything FrostMod draws — panel, pill, radar, outlines — for recording a
+  The key still works while the overlay is hidden, and opening any panel brings it back.
+
 ## 2026-08-31 — v0.15.1
 
 ### Changed

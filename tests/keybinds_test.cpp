@@ -96,13 +96,24 @@ int main() {
     {
         Bind binds[ActionCount];
         LoadDefaults(binds);
+        // A few actions ship deliberately unbound - they are set-once path settings, and a
+        // letter the replay screen may want is a worse default than no key at all. Named
+        // here so an accidental unbind of anything else still fails.
+        auto unboundOnPurpose = [](const char* id) {
+            return std::strcmp(id, "curve") == 0 || std::strcmp(id, "anchor") == 0 ||
+                   std::strcmp(id, "autofov") == 0;
+        };
         for (int a = 0; a < ActionCount; ++a) {
-            CHECK(binds[a].bound(), "action %s ships unbound", Actions()[a].id);
+            const char* id = Actions()[a].id;
             char out[64];
             FormatBind(binds[a], out, sizeof(out));
-            CHECK(std::strcmp(out, "none") != 0, "action %s has a default with no name",
-                  Actions()[a].id);
-            CHECK(Conflict(binds, a) < 0, "default for %s collides with %s", Actions()[a].id,
+            if (unboundOnPurpose(id)) {
+                CHECK(!binds[a].bound(), "action %s ships bound to %s", id, out);
+                continue;
+            }
+            CHECK(binds[a].bound(), "action %s ships unbound", id);
+            CHECK(std::strcmp(out, "none") != 0, "action %s has a default with no name", id);
+            CHECK(Conflict(binds, a) < 0, "default for %s collides with %s", id,
                   Conflict(binds, a) >= 0 ? Actions()[Conflict(binds, a)].id : "?");
         }
         // the keys the feature shipped with, so a config-less install is unchanged

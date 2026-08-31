@@ -108,6 +108,9 @@ int main() {
         // the keys the feature shipped with, so a config-less install is unchanged
         CHECK(binds[RcSetKey].vk == 'K' && binds[RcSave].vk == 'S' && binds[RcLoad].vk == 'L',
               "the shipped defaults moved");
+        // Hiding the overlay defaults to a function key on purpose: it is pressed while
+        // recording, so a letter the game might have bound would be the wrong choice.
+        CHECK(binds[RcClean].vk == 0x76, "hide-overlay no longer defaults to F7");
     }
 
     // ---- config lines --------------------------------------------------------

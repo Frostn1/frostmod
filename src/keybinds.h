@@ -32,7 +32,7 @@ struct Bind {
 };
 
 enum Action {
-    RcSetKey = 0, RcDelete, RcClear, RcPlay, RcPrev, RcNext, RcSave, RcLoad,
+    RcSetKey = 0, RcDelete, RcClear, RcPlay, RcPrev, RcNext, RcSave, RcLoad, RcClean,
     ActionCount
 };
 
@@ -55,6 +55,9 @@ inline const ActionInfo* Actions() {
         { "next",   "next key",   0xBE, false },   // VK_OEM_PERIOD
         { "save",   "save",       'S',  false },
         { "load",   "load",       'L',  false },
+        // Hiding the overlay is for recording, so its default is a key nothing else wants
+        // rather than a letter: you press it with the replay running.
+        { "clean",  "hide overlay", 0x76, false },  // VK_F7
     };
     return kActions;
 }

@@ -1699,7 +1699,7 @@ static void  UiCycleScale() {
 }
 
 static std::mutex g_radMutex;                // guards everything below
-struct RadRider { int raceNum; float x, y, z, yawDeg, trackPos; int crashed; };
+struct RadRider { int raceNum; float x, y, z, yawDeg; int crashed; };
 static bool     g_radHaveMe = false;
 static float    g_radMeX = 0, g_radMeY = 0, g_radMeZ = 0;   // from RunTelemetry
 static int      g_radN = 0;

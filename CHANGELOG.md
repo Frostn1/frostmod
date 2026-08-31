@@ -3,7 +3,11 @@
 ## 2026-08-31 — v0.16.0
 
 ### Removed
+- The in-game camera path editor. It is a separate mod now, with its own release.
+
+### Changed
 - `F7` still hides everything FrostMod draws for recording, and is now the menu's row `7`.
+  It used to be one of the editor's rebindable keys, so it is a fixed key now.
 
 ## 2026-08-31 — v0.15.4
 

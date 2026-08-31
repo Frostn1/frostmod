@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-08-31
+## 2026-08-31 — v0.15.4
 
 ### Fixed
 - After a model swap, the on-screen note says to switch bike category away and back.

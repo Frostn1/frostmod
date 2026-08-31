@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026-08-31 — v0.15.3
 
 ### Added
   riders on one segment eases from one to the other.

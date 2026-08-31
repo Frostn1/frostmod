@@ -33,6 +33,10 @@ struct Bind {
 
 enum Action {
     RcSetKey = 0, RcDelete, RcClear, RcPlay, RcPrev, RcNext, RcSave, RcLoad, RcClean,
+    // Added after the first release. Appended on purpose: the config key is the action's
+    // id, so a binding someone already set keeps working whatever order this ends up in.
+    RcEase, RcTarget, RcNudgeBack, RcNudgeFwd, RcUndo, RcRig, RcRetime, RcPreview,
+    RcCurve, RcAnchor, RcAutoFov,
     ActionCount
 };
 
@@ -58,6 +62,20 @@ inline const ActionInfo* Actions() {
         // Hiding the overlay is for recording, so its default is a key nothing else wants
         // rather than a letter: you press it with the replay running.
         { "clean",  "hide overlay", 0x76, false },  // VK_F7
+        // Per-key edits, pressed while scrubbing.
+        { "ease",   "ease",       'E',  false },
+        { "target", "aim",        'T',  false },
+        { "nudgeback", "nudge -", 0xDB, false },   // VK_OEM_4  '['
+        { "nudgefwd",  "nudge +", 0xDD, false },   // VK_OEM_6  ']'
+        { "undo",   "undo",       'U',  false },
+        { "rig",    "rig",        'R',  false },
+        { "retime", "retime",     'R',  true  },   // Ctrl+R: it respaces the whole path
+        { "preview","preview",    'V',  false },
+        // Whole-path settings. Unbound by default: they are set once and MXB App has a
+        // panel for them, so they are not worth a letter the replay screen may want.
+        { "curve",  "curve",      0,    false },
+        { "anchor", "anchor",     0,    false },
+        { "autofov","auto fov",   0,    false },
     };
     return kActions;
 }

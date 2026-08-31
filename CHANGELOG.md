@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-30
+
+### Added
+- Keyframed replay camera, F8 → `7` (MX Bikes). Fly the game's free-roam camera in a
+  replay, press `K` where you want it, and the camera flies a smooth path between the keys.
+- Camera paths save to nine slots as plain text, so they can be hand-edited or shared.
+- `SpectateCameras` plugin callback, which is what holds the camera while a path plays.
+
 ## 2026-08-29
 
 ### Added

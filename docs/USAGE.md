@@ -76,6 +76,7 @@ F-key per feature.
 | `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
 | `5` | Rider outlines — on-screen box around each rider |
 | `6` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
+| `7` | Replay camera — keyframe a camera path through a replay (see below) |
 
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `6` is on top of that, for when you want it bigger (or
@@ -83,6 +84,39 @@ smaller) than that. Radar blips and outlines are colored by lap status: **white*
 lap as you, **red** = a rider lapping you (a lap ahead), **blue** = a rider you are
 lapping (backmarker). The toggles, the range and the overlay size persist across
 restarts, in `frostmod_radar.cfg` next to `frostmod.log`.
+
+### Replay camera (menu `7`)
+
+Keyframe a cinematic camera through a replay. You fly the game's own free-roam replay
+camera to a spot, press `K`, scrub on, press `K` again — the camera then flies a smooth
+path between the keys as the replay plays.
+
+1. Load a replay and switch to the game's **free-roam** camera.
+2. F8 → `7` opens the editor. It stays out of the way: the game's own replay controls
+   keep working underneath, so you scrub and play with them as usual.
+3. Position the camera, press `K` to set a key there. Repeat. Two keys is a path.
+4. Press `P` to arm it. From then on, whenever the replay is inside the path's time
+   range, the camera follows the path instead of you. Outside that range the camera is
+   yours again.
+
+| Key | Action |
+|-----|--------|
+| `K` | Set a key at the current replay time (replaces one already there) |
+| `X` | Delete the key nearest the current time |
+| `C` | Clear the path |
+| `,` / `.` | Jump the replay to the previous / next key |
+| `P` | Arm or disarm the path |
+| `S` / `L` | Save / load the path in the current slot |
+| `1`–`9` | Pick a save slot |
+| `Esc` / `F8` | Close the editor (an armed path keeps running) |
+
+Keys snap to the replay's own 30 ms sample grid. Paths are plain text under
+`FrostMod\replaycam\slot<N>.fcam` next to the log, so they can be hand-edited, copied
+between machines, or shared. Position, the three rotation angles and FOV are all
+interpolated, so a key can change the framing as well as the viewpoint.
+
+MX Bikes only, and it needs the game's camera globals to resolve on your build — if
+they don't, the editor opens and says so rather than doing anything to the game.
 
 ### Bike model swap (menu `3`)
 

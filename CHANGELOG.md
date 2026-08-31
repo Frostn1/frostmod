@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026-08-31 — v0.15.3
 
 ### Added
 - Replay camera keys can aim at a rider. The camera points at wherever they are, and two

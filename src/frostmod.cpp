@@ -1699,7 +1699,7 @@ static void  UiCycleScale() {
 }
 
 static std::mutex g_radMutex;                // guards everything below
-struct RadRider { int raceNum; float x, y, z, yawDeg; int crashed; };
+struct RadRider { int raceNum; float x, y, z, yawDeg, trackPos; int crashed; };
 static bool     g_radHaveMe = false;
 static float    g_radMeX = 0, g_radMeY = 0, g_radMeZ = 0;   // from RunTelemetry
 static int      g_radN = 0;
@@ -1832,6 +1832,17 @@ static void LoadOverlaySettings() {
 // coords in [-1,1] (ry up = ahead). bearing is the world heading to them
 // relative to my facing, for the ESP arrow fallback. wx/wy/wz = world pos.
 struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int raceNum; };
+// number. Empty in injected mode, where no callback ever fires - which is exactly what makes
+// aiming and lap-anchored paths a plugin-mode feature.
+    std::lock_guard<std::mutex> lk(g_radMutex);
+    out.n = 0;
+    for (int i = 0; i < g_radN && out.n < 64; ++i) {
+        r.raceNum = g_radRiders[i].raceNum;
+        r.x  = g_radRiders[i].x; r.y = g_radRiders[i].y; r.z = g_radRiders[i].z;
+        r.tp = g_radRiders[i].trackPos;
+    }
+}
+
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
 // "me" = the RaceTrackPosition entry closest to my telemetry world pos. Caller holds
@@ -1949,6 +1960,7 @@ static void LapColorRGB(int lap, float& r, float& g, float& b) {
     else              { r = 0.94f; g = 0.96f; b = 1.00f; }   // white
 }
 
+
 // ---- camera view-projection capture (fixed-function OpenGL) -----------------
 // The engine sets a perspective PROJECTION then loads the camera view as the
 // first MODELVIEW before any per-object matrix. We snoop glMatrixMode +
@@ -1982,7 +1994,7 @@ void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
     // glLoadMatrixf is hot; only do capture work when the outline feature (or the
     // one-shot diagnostic) actually needs it. Otherwise this is a cheap passthrough.
     if (m && !g_inOverlay.load(std::memory_order_relaxed)
-        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed))) {
+        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed)
         if (int d = g_glDiag.load(std::memory_order_relaxed)) {
             Log("[esp/diag] loadMatrix mode=0x%X persp=%d m11=%.3f m15=%.3f",
                 g_glMode, (int)IsPerspectiveProj(m), m[11], m[15]);
@@ -2354,6 +2366,14 @@ static void DrawRadarGL(int w, int h) {
 
 // On-screen rider outlines. Box when the VP projects them on-screen; otherwise a
 // screen-edge directional arrow (needs no matrix). Colored by lap status.
+// The path as it will actually fly, drawn in the world: a ribbon through the poses the
+// spline evaluates, a marker on every key coloured by its ease, and a dot on the pose the
+// clock is sitting at. Keyframing was blind before this - you flew somewhere, pressed a key,
+// and nothing on screen told you what the curve between two of them would do.
+//
+// Rebuilt only when the path changes. Evaluating a few hundred poses is cheap once and
+// wasteful sixty times a second.
+
 static void DrawEspGL(int w, int h) {
     RadBlip blips[64]; float meYawDeg,mx,my,mz;
     int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
@@ -2476,6 +2496,12 @@ void DrawOverlay(HDC hdc) {
     }
 
     if (g_radarOn.load()) DrawRadarGL(w, h);     // HUD overlays draw on top of any panel
+        // World-anchored like the outlines, so it tracks the resolution and not the user's
+        // overlay size - a path drawn at 150% would not sit on the ground it flies over.
+        const int ew = (int)(pw / autoS), eh = (int)(ph / autoS);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, ew, 0, eh, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+    }
     if (g_espOn.load()) {
         // Outlines box riders on screen, so they track the resolution but NOT the user's
         // overlay size - at 150% the boxes would stop fitting the riders they mark.
@@ -2773,7 +2799,6 @@ static void BuildOverlayDrawLists() {
             DText(MX + PADX, y, el, ToABGR(0.95f, 0.55f, 0.55f, 1.0f), FS); y += LH;
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
-        char rows[8][96];
         const float w = 0.34f, h = n * LH + 0.010f;
         DQuad(MX, MY, MX + w, MY + h, cPanel);
         float y = MY + 0.006f;

@@ -1,13 +1,9 @@
 # Changelog
 
-## 2026-08-30
+## 2026-08-30 — v0.15.0
 
 ### Added
   replay, press `K` where you want it, and the camera flies a smooth path between the keys.
-
-## 2026-08-29
-
-### Added
 - **Kart Racing Pro is a title FrostMod knows.** `--game krp` attaches to `kart.exe`, reads
   mods from `Documents\PiBoSo\Kart Racing Pro\mods`, and `--install-plugin` drops the
   `.dlo` into KRP's own `plugins` folder. The plugin loads and the overlay, the radar and

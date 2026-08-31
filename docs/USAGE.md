@@ -99,6 +99,8 @@ path between the keys as the replay plays.
    range, the camera follows the path instead of you. Outside that range the camera is
    yours again.
 
+These are the defaults — **every one of them can be changed** (see below).
+
 | Key | Action |
 |-----|--------|
 | `K` | Set a key at the current replay time (replaces one already there) |
@@ -109,6 +111,35 @@ path between the keys as the replay plays.
 | `S` / `L` | Save / load the path in the current slot |
 | `1`–`9` | Pick a save slot |
 | `Esc` / `F8` | Close the editor (an armed path keeps running) |
+
+#### Changing the keys
+
+The editor reads the keyboard directly, which means **the game reads the same key on the
+same frame**. If you have `S` bound to move the camera backwards, pressing `S` to save also
+moves the camera. A modifier does not help — the game does not care whether Ctrl was held —
+so the fix is to move the action onto a key your game does not use at all. Function keys and
+the numpad are usually free.
+
+Edit them in **MXB App → Settings → FrostMod**, or by hand in `frostmod_radar.cfg` next to
+the log:
+
+```
+rcam_setkey=K
+rcam_delete=X
+rcam_clear=C
+rcam_play=P
+rcam_prev=Comma
+rcam_next=Period
+rcam_save=F9
+rcam_load=F10
+```
+
+Names are letters, digits, `F1`–`F16`, `Numpad0`–`Numpad9`, the punctuation keys
+(`Comma`, `Period`, `Slash`, …), `Home`/`End`/`Insert`/`Delete`, the arrows, and `none` to
+unbind. A modifier can be prefixed (`Ctrl+`, `Alt+`, `Shift+`) and is matched exactly, so
+`Ctrl+X` will not also fire plain `X`. The editor re-reads the file every time you open it,
+so a change applies without restarting the game, and the panel always lists the keys
+actually in force.
 
 Keys snap to the replay's own 30 ms sample grid. Paths are plain text under
 `FrostMod\replaycam\slot<N>.fcam` next to the log, so they can be hand-edited, copied

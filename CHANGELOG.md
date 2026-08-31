@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-31
+
+### Changed
+- The replay camera editor's keys can be changed. They live in `frostmod_radar.cfg` as
+  `rcam_save=F9` lines, MXB App edits them, and the editor re-reads them each time it opens.
+- The editor panel lists the keys actually bound rather than the shipped defaults.
+
 ## 2026-08-30 — v0.15.0
 
 ### Added

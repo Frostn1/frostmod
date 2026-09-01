@@ -35,7 +35,31 @@ So: `settings[+0x190] != 0` means the overjump crash is **disabled**.
       `0x27` it logs the `overjump_crash` value the ini gave (dedicated-server runs).
 - [x] `launcher.cpp`: `--probe-overjump`, and `--force-overjump-off` which implies it.
 - [x] `USAGE.md`: both flags.
-- [ ] Windows run (below) — nothing here is exercised yet.
+- [x] Windows run — done, and it went badly. See "What the first run actually found".
+
+## What the first run actually found (v0.16.1, 2026-09-01)
+
+The probe shipped in v0.16.1 **armed by default**, and this checklist's Windows run was
+still unticked when it did. The first player logs back answered a question nobody asked:
+
+- 22 launches, 22 `[overjump] session start #0` lines, 22 crashes. Every one an access
+  violation reading `0x0` at `mxbikes.exe+0x297b20`, 0–1s after the probe's own line. Not
+  one session survived.
+- The same machine, same game build, on v0.9.8 (no probe): nine runs across four hours,
+  content reloads, menus, server browsing — zero faults.
+- The minidump puts `hkBus` on the crashing stack twice over (`frostmod.dll+0x170b7` and
+  `+0x170c6`), and the `settings=` pointer the probe logs is the same object the faulting
+  code is walking when it reads a null member.
+
+So the swap is not free, and "the bus only reads what its own command needs" was the wrong
+assumption to ship on. v0.16.2 puts the probe back behind `--probe-overjump`.
+
+If it is ever armed by default again, `hkBus` has to stop re-marshalling: a naked thunk that
+tests `cmd` in `ecx` and `jmp`s straight to `g_origBus` for anything but `0x310` keeps the
+caller's stack, the integer registers, `xmm0-3` and every stack arg exactly as they were,
+which is the only safe way to sit in front of a function whose signature we inferred. The
+`0x27` branch needs a structural check too — `offsets.h` warns the id itself is build-specific
+(21d numbers it `0x25`), and unlike the `0x310` branch it validates nothing before acting.
 
 ## The run that settles it
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-08-31 — unreleased
+## 2026-08-31 — v0.16.1
 
 ### Added
 - Every session start now writes a line saying whether the overjump crash is on for that

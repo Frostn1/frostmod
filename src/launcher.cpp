@@ -791,19 +791,21 @@ int main(int argc, char** argv) {
     } else {
         DeleteFileA(switchFlag.c_str());
     }
-    // The file's presence arms the probe; the word "force" in it also clears the flag.
+    // The overjump probe itself is always on (one [overjump] line per session start). This
+    // file only raises it: "hex" adds the block dump, "force" clears the crash flag.
     std::string overjumpFlag = ExeDir() + "frostmod_overjump.flag";
-    if (probeOverjump) {
+    if (probeOverjump || forceOverjump) {
         if (FILE* f = nullptr; fopen_s(&f, overjumpFlag.c_str(), "w") == 0 && f) {
-            if (forceOverjump) fprintf(f, "force");
+            fprintf(f, "%s%s", probeOverjump ? "hex " : "", forceOverjump ? "force" : "");
             fclose(f);
         }
-        printf("[*] --probe-overjump ON: DLL logs the session settings block at every session\n"
-               "    start ([overjump] lines + a hex dump). Run testing, host with the option\n"
-               "    unchecked, and join a server that sets overjump_crash = 0, then send the log.\n");
+        if (probeOverjump)
+            printf("[*] --probe-overjump ON: DLL also hex-dumps the session settings block\n"
+                   "    ([overjump.hex] lines). The one-line [overjump] verdict is logged anyway.\n");
         if (forceOverjump)
-            printf("[!] --force-overjump-off ON: the DLL also CLEARS the crash flag. Offline and\n"
-                   "    testing only - on a server that wants the crash this is a client-side cheat.\n");
+            printf("[!] --force-overjump-off ON: the DLL CLEARS the crash flag as a session\n"
+                   "    starts. Offline and testing only - on a server that wants the crash this\n"
+                   "    is a client-side cheat.\n");
     } else {
         DeleteFileA(overjumpFlag.c_str());
     }

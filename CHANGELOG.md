@@ -3,9 +3,10 @@
 ## 2026-08-31 — unreleased
 
 ### Added
-- `--probe-overjump` logs the settings the game starts each session with, and says whether
-  the overjump crash is on for that session. `--force-overjump-off` implies it and also
-  clears the flag — offline and testing only.
+- Every session start now writes a line saying whether the overjump crash is on for that
+  session, read from the settings the game starts it with.
+- `--probe-overjump` adds a hex dump of that settings block. `--force-overjump-off` clears
+  the crash flag as a session starts — offline and testing only.
 
 ## 2026-08-31 — v0.16.0
 

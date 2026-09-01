@@ -209,6 +209,34 @@ constexpr int       CMD_JOIN          = 0x389;    // bus cmd id that initiates t
 constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0FE7;  // the `call [bus]` inside the JOIN handler
 constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is omitted
 
+// ---- session settings / overjump crash (capstone sweep of beta21e, 2026-08-31) ----
+// beta21e's changelog adds "new: overjump crash option", and it does not stick: players
+// uncheck it, join, and the crash is back. The setting is ONE dword inside the session
+// settings block the command bus is handed at session start:
+//
+//     cmd 0x310: ... arg13 = &settings, arg14 = 0x21C (its size)
+//     settings[+0x190] != 0  =>  overjump crash DISABLED   (stored INVERTED)
+//
+// How +0x190 was pinned, all in mxbikes.exe beta21e (base 0x140000000):
+//   0x02546B  the dedicated-server config loader reads `[hardcore] overjump_crash`
+//             (bus cmd 0x27 = read int, default 1 = crash ON) into a local,
+//   0x02549D  stores `value == 0` into the block at [rsp+0x2D0],
+//   0x026FCC  hands the block ([rsp+0x140], so the field is +0x190) to cmd 0x310.
+// The client and single-player paths dispatch the same command at 0x0921B7 and 0x111F5E,
+// both with the same (ptr, 0x21C) pair in arg13/arg14.
+//
+// beta21d parses that key with byte-identical code - same section, same default, same
+// inverted store - so the ini side did NOT change in 21e, only the client-side option
+// did. That is why a server's `overjump_crash = 0` is not enough on its own, and why the
+// probe reads the block on the CLIENT.
+//
+// Both ids are build-specific: 21d numbers the same config read 0x25, not 0x27. Sanity
+// check a dispatch on the 0x21C size arg, never on the id alone.
+constexpr int    CMD_SESSION_START     = 0x310;  // bus cmd handed the settings block
+constexpr int    CMD_CFG_READ_INT      = 0x27;   // bus cmd: read an int out of the ini
+constexpr size_t SESSION_CFG_SIZE      = 0x21C;  // arg14 at every 0x310 dispatch
+constexpr size_t OFF_OVERJUMP_DISABLED = 0x190;  // dword; non-zero = crash disabled
+
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write
 // auto-extends the widget, there is no separate addRow. So to hide a row we must skip

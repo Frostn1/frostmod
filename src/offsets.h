@@ -7,6 +7,8 @@
 // .text in place at the same virtual addresses, so these RVAs match the running
 // process. If a game update shifts them, use the AOB signature below instead.
 #pragma once
+#include <cstddef>   // size_t — the session-settings sizes below; frostmod.cpp gets it from
+                     // windows.h, but offsets_test.cpp includes this header on its own.
 #include <cstdint>
 
 /// One step of the surgical content reload: replay of a single content-list rebuild

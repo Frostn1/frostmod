@@ -791,8 +791,10 @@ int main(int argc, char** argv) {
     } else {
         DeleteFileA(switchFlag.c_str());
     }
-    // The overjump probe itself is always on (one [overjump] line per session start). This
-    // file only raises it: "hex" adds the block dump, "force" clears the crash flag.
+    // This file is what arms the overjump probe at all: without it the DLL never swaps the
+    // command bus. Its contents raise it further - "hex" adds the block dump, "force" clears
+    // the crash flag. Deleting it below is what turns the probe back off for a player who
+    // ran with it once.
     std::string overjumpFlag = ExeDir() + "frostmod_overjump.flag";
     if (probeOverjump || forceOverjump) {
         if (FILE* f = nullptr; fopen_s(&f, overjumpFlag.c_str(), "w") == 0 && f) {
@@ -800,8 +802,10 @@ int main(int argc, char** argv) {
             fclose(f);
         }
         if (probeOverjump)
-            printf("[*] --probe-overjump ON: DLL also hex-dumps the session settings block\n"
-                   "    ([overjump.hex] lines). The one-line [overjump] verdict is logged anyway.\n");
+            printf("[*] --probe-overjump ON: the DLL swaps the engine command bus to read the\n"
+                   "    session settings block ([overjump] + [overjump.hex] lines). That puts us\n"
+                   "    in front of every command the game issues - arm it to answer the question,\n"
+                   "    on a machine you are watching, then run without it again.\n");
         if (forceOverjump)
             printf("[!] --force-overjump-off ON: the DLL CLEARS the crash flag as a session\n"
                    "    starts. Offline and testing only - on a server that wants the crash this\n"

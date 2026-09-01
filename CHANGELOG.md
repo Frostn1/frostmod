@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-01 — v0.16.2
+
+### Fixed
+- **MX Bikes no longer crashes the moment a session starts.** v0.16.1 read the overjump-crash
+  setting by standing in front of the engine's command bus, and did it for everyone rather
+  than only for whoever asked. One player's logs came back with 22 launches, 22 session
+  starts and 22 crashes — every single attempt to ride, on the same instruction, where the
+  build before it had run four hours without a fault. The probe is behind
+  `--probe-overjump` again, so a normal run does not touch the bus at all.
+
 ## 2026-08-31 — v0.16.1
 
 ### Added

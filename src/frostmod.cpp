@@ -709,7 +709,8 @@ static void LogPrintableRuns(const char* tag, const char* buf, size_t len) {
 using BusFn = int64_t(__fastcall*)(uint32_t, void*, void*, void*, void*, void*, void*, void*,
                                    void*, void*, void*, void*, void*, void*, void*, void*);
 static BusFn  g_origBus       = nullptr;
-static bool   g_overjumpForce = false;
+static bool   g_overjumpForce = false;   // --force-overjump-off: clear the flag
+static bool   g_overjumpHex   = false;   // --probe-overjump: also dump the whole block
 
 static bool SafeWriteInt(int* p, int v) {
     __try { *p = v; return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -741,7 +742,9 @@ int64_t __fastcall hkBus(uint32_t cmd, void* a2, void* a3, void* a4, void* a5, v
                 "NOT the flag here. Re-derive it before trusting this line.",
                 mxb::SESSION_CFG_SIZE, mxb::OFF_OVERJUMP_DISABLED);
         } else {
-            if (i < 8) {   // first sessions only, the block is 540 bytes a time
+            // The dump is 34 lines a session, so it stays behind --probe-overjump: the
+            // default line above is the one that answers the question.
+            if (g_overjumpHex && i < 8) {
                 char raw[mxb::SESSION_CFG_SIZE];
                 size_t got = SafeReadBytes(cfg, raw, sizeof(raw));
                 LogHexTag("[overjump.hex]", raw, got);
@@ -790,8 +793,9 @@ static void InstallOverjumpProbe() {
     g_origBus = (BusFn)cur;
     *(void**)slot = (void*)&hkBus;
     VirtualProtect((void*)slot, sizeof(void*), old, &old);
-    Log("[overjump] probe armed: bus fn-ptr @ RVA 0x%zx -> hkBus (orig %p)%s",
+    Log("[overjump] probe armed: bus fn-ptr @ RVA 0x%zx -> hkBus (orig %p)%s%s",
         (size_t)(slot - g_base), cur,
+        g_overjumpHex ? ", block dump on" : "",
         g_overjumpForce ? ", FORCE ON - offline/testing only" : "");
 }
 
@@ -3963,9 +3967,12 @@ DWORD WINAPI Init(LPVOID) {
             "until offsets.h is updated. (mods listing + logs still work.)");
     }
 
-    // OPT-IN PROBE: frostmod.exe --probe-overjump leaves a flag next to us, holding
-    // "force" when --force-overjump-off came with it. MX Bikes only: the bus RVA is this
-    // title's, and on another one we would swap a pointer that is not the bus.
+    // OVERJUMP PROBE: armed by default on MX Bikes, because the one line it writes per
+    // session start is what tells us whether the client honoured the setting it was given -
+    // and every log we are already sent then carries the answer, without anyone passing a
+    // flag. The flag file only raises it: "hex" adds the block dump, "force" clears the
+    // crash flag. MX Bikes only - the bus RVA is this title's, and on another one we would
+    // swap a pointer that is not the bus.
     {
         char ojFlag[MAX_PATH] = {0};
         if (g_logPath[0]) {
@@ -3973,19 +3980,17 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(ojFlag, '\\')) { *(s + 1) = 0; strcat_s(ojFlag, "frostmod_overjump.flag"); }
         }
         if (ojFlag[0] && GetFileAttributesA(ojFlag) != INVALID_FILE_ATTRIBUTES) {
-            if (!g_game->offsets_complete) {
-                Log("[overjump] probe is MX Bikes-only - %s has no derived bus address.",
-                    g_game->display);
-            } else {
-                char body[32] = {0};
-                if (FILE* f = nullptr; fopen_s(&f, ojFlag, "r") == 0 && f) {
-                    fread(body, 1, sizeof(body) - 1, f);
-                    fclose(f);
-                }
-                g_overjumpForce = strstr(body, "force") != nullptr;
-                InstallOverjumpProbe();
+            char body[32] = {0};
+            if (FILE* f = nullptr; fopen_s(&f, ojFlag, "r") == 0 && f) {
+                fread(body, 1, sizeof(body) - 1, f);
+                fclose(f);
             }
+            g_overjumpForce = strstr(body, "force") != nullptr;
+            g_overjumpHex   = strstr(body, "hex") != nullptr || g_overjumpForce;
         }
+        if (g_game->offsets_complete) InstallOverjumpProbe();
+        else Log("[overjump] probe is MX Bikes-only - %s has no derived bus address.",
+                 g_game->display);
     }
 
     // RENDER hooks (drive Tick: F8, the reload-event check, and running reloads on

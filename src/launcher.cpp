@@ -608,6 +608,8 @@ int main(int argc, char** argv) {
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool unsafeReload = false;// --unsafe-reload: replay a step table the title hasn't confirmed
     int  reloadFrom   = 0;    // --unsafe-reload-from=N: start the replay at step N (0 = step 1)
+    bool probeOverjump = false; // --probe-overjump: log the session settings block at session start
+    bool forceOverjump = false; // --force-overjump-off: also clear the crash flag (offline only)
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
@@ -648,6 +650,10 @@ int main(int argc, char** argv) {
         else if (a == "--dump-serverlist")       dumpList = true;
         else if (a == "--capture-master")        captureMaster = true;
         else if (a == "--switch-live")           switchLive = true;
+        else if (a == "--probe-overjump")        probeOverjump = true;
+        // Forcing without the probe would leave no record of what was changed, so this
+        // implies --probe-overjump rather than making you pass both.
+        else if (a == "--force-overjump-off")  { forceOverjump = true; probeOverjump = true; }
         else if (a == "--unsafe-reload")         unsafeReload = true;
         // Skipping a step is only ever useful with the table already armed, so this
         // implies --unsafe-reload rather than making you pass both.
@@ -784,6 +790,22 @@ int main(int argc, char** argv) {
                "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n");
     } else {
         DeleteFileA(switchFlag.c_str());
+    }
+    // The file's presence arms the probe; the word "force" in it also clears the flag.
+    std::string overjumpFlag = ExeDir() + "frostmod_overjump.flag";
+    if (probeOverjump) {
+        if (FILE* f = nullptr; fopen_s(&f, overjumpFlag.c_str(), "w") == 0 && f) {
+            if (forceOverjump) fprintf(f, "force");
+            fclose(f);
+        }
+        printf("[*] --probe-overjump ON: DLL logs the session settings block at every session\n"
+               "    start ([overjump] lines + a hex dump). Run testing, host with the option\n"
+               "    unchecked, and join a server that sets overjump_crash = 0, then send the log.\n");
+        if (forceOverjump)
+            printf("[!] --force-overjump-off ON: the DLL also CLEARS the crash flag. Offline and\n"
+                   "    testing only - on a server that wants the crash this is a client-side cheat.\n");
+    } else {
+        DeleteFileA(overjumpFlag.c_str());
     }
     std::string unsafeFlag = ExeDir() + "frostmod_unsafe_reload.flag";
     if (unsafeReload) {

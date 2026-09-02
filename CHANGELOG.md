@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-01 — unreleased
+## 2026-09-01 — v0.16.3
 
 ### Added
 - `tools/rederive` re-derives the offsets when PiBoSo ships a build. It decrypts the

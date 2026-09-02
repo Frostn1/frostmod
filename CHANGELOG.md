@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-01 — unreleased
+
+### Added
+- `tools/rederive` re-derives the offsets when PiBoSo ships a build. It decrypts the
+  Steam DRM wrapper itself and looks each offset up by what it is — the strings a
+  function owns, the imports it calls, the array it multiplies an index through — so a
+  build that moves everything is a diff to read rather than a week of RE. 42 of the 60
+  entries come back automatically; the 18 that are struct fields and protocol ids are
+  carried from the baseline and always labelled as carried.
+- `tools/rederive/selftest.py` proves it on known ground: the unpack matches Steamless
+  byte for byte, every current MX Bikes offset comes back out unchanged, and the same
+  rules find GP Bikes' content-init and folder-scanner unaided.
+
 ## 2026-09-01 — v0.16.2
 
 ### Fixed

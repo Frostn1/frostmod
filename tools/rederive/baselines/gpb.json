@@ -1,0 +1,9 @@
+{
+  "title": "GP Bikes",
+  "build": "b25 (the copy in ~/Downloads)",
+  "note": "Only the two values offsets.h states for GP Bikes. Everything else here is a first observation, not a confirmed offset — treat a 'same' on those as 'the tool is repeatable', not as 'verified against the game'.",
+  "values": {
+    "RVA_CONTENT_INIT": "0xfb650",
+    "RVA_SCAN_FOLDER": "0x18f150"
+  }
+}

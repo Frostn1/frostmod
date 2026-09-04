@@ -145,6 +145,19 @@ int main() {
         CHECK(torn == 0, "%d of %d reads were torn", torn, reads);
     }
 
+    // The two blocks are two blocks. The session plugin exists precisely so the server
+    // name is not written by the same seqlock the injected copy is writing riders into,
+    // and one name shared by both would put them back in it without anything failing
+    // loudly enough to notice.
+    {
+        CHECK(std::strcmp(kMappingName, kPluginMappingName) != 0,
+              "the injected block and the plugin block share a mapping name");
+        // The mode is read off the module's own file name, so this string is the whole
+        // contract between the app that installs the copy and the binary that is it.
+        CHECK(std::strcmp(kSessionPluginFileName, "frostmod_session.dlo") == 0,
+              "the session plugin's file name changed: MXB App installs it by this name");
+    }
+
     if (g_failures == 0) {
         std::printf("session: all checks passed\n");
         return 0;

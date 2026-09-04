@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-04
+
+### Added
+- **Session-only plugin mode.** A copy of `frostmod.dll` named `frostmod_session.dlo`,
+  placed in the game's `plugins` folder, now loads with no hooks, no overlay and no
+  offsets — it answers the plugin handshake and publishes the session to its own shared
+  block, and nothing else. That block is how MXB App learns which server a rider is on:
+  the server name arrives in `EventInit`, the game only calls that on a plugin it loaded
+  itself, and the injected `frostmod.dll` is never asked. The mode is decided from the
+  module's own file name, so there is no flag file to lose and no window in which it is
+  not yet known. A hand-installed `frostmod.dlo` is a different name and keeps full plugin
+  mode. `src/session.h`, `src/frostmod.cpp`, `tests/session_test.cpp`.
+
 ## 2026-09-01 — v0.16.3
 
 ### Added

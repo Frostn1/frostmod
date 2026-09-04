@@ -51,6 +51,32 @@ constexpr int kMaxRiders = 64;
 // and a global name would need privileges the app does not have and should not want.
 constexpr const char kMappingName[] = "Local\\FrostModSession";
 
+// ## Why there are two blocks
+//
+// The server name arrives through `EventInit`, and the game only calls that on a plugin it
+// loaded itself from `plugins\*.dlo`. FrostMod injected as a `.dll` is never asked — so for
+// every player the app drives, `serverName` above stayed empty forever and the app could not
+// tell which server anyone was on.
+//
+// The fix is a second copy of this binary sitting in the game's plugins folder purely to
+// receive those callbacks. It publishes here, in its own block, and the two never share a
+// writer: one seqlock with two independent writers in it would corrupt under exactly the
+// interleaving that is hardest to reproduce. The app reads both and takes the server name
+// from this one and the grid from the other.
+constexpr const char kPluginMappingName[] = "Local\\FrostModPluginSession";
+
+// The file name that puts this binary in session-only mode.
+//
+// Mode is taken from the module's own name rather than a flag file beside it: there is
+// nothing to lose, nothing to get out of step with the binary, and no window in which the
+// mode is not yet known. The game loads every `*.dlo` in its plugins folder, so a copy
+// under this name is loaded and asked for callbacks like any other plugin — and answers
+// only the three that name the session.
+//
+// A hand-installed `frostmod.dlo` is deliberately *not* this name and keeps full plugin
+// mode, which is what someone who installed it by hand asked for.
+constexpr const char kSessionPluginFileName[] = "frostmod_session.dlo";
+
 // One rider, as the game reports them.
 struct Rider {
     int32_t raceNum;

@@ -53,6 +53,27 @@ static frostmod::session::Block* g_sessionBlock = nullptr;
 // process exiting is the only moment this should ever go away.
 static void* g_sessionMapping = nullptr;
 
+// Whether this copy is the plugin whose only job is to name the session.
+//
+// True when the module was loaded under `frostmod_session.dlo` — the copy MXB App puts in
+// the game's plugins folder because the callbacks that carry the server name are only ever
+// delivered to a plugin, never to the injected dll. See `session.h`.
+//
+// Everything this mode does is: answer the plugin handshake, copy four strings out of two
+// callbacks, and publish them. It installs no hooks, starts no threads, draws nothing and
+// reads no offsets — so it cannot fight the injected copy for them, and there is nothing in
+// it that could take the game down with it.
+static bool g_sessionOnly = false;
+
+// Decide the mode from our own module name, at load, before anything else runs.
+static bool ModuleIsSessionPlugin(HMODULE self) {
+    char path[MAX_PATH] = {0};
+    if (!self || !GetModuleFileNameA(self, path, sizeof(path))) return false;
+    const char* name = strrchr(path, '\\');
+    name = name ? name + 1 : path;
+    return _stricmp(name, frostmod::session::kSessionPluginFileName) == 0;
+}
+
 // Create the mapping MXB App reads the session out of.
 //
 // Created rather than opened: the app may not be running yet, may be restarted, and on
@@ -61,7 +82,8 @@ static void* g_sessionMapping = nullptr;
 static bool SessionInit() {
     HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                   (DWORD)sizeof(frostmod::session::Block),
-                                  frostmod::session::kMappingName);
+                                  g_sessionOnly ? frostmod::session::kPluginMappingName
+                                                : frostmod::session::kMappingName);
     if (!h) return false;
     void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostmod::session::Block));
     if (!view) { CloseHandle(h); return false; }
@@ -118,7 +140,10 @@ void InitLogPath(HMODULE self) {
         if (char* slash = strrchr(p, '\\')) *(slash + 1) = 0;
         char cand[MAX_PATH];
         strcpy_s(cand, p);
-        strcat_s(cand, "frostmod.log");
+        // Its own file: the session plugin's folder is the game's `plugins`, which is also
+        // where a hand-installed `frostmod.dlo` logs, and two of us appending to one file
+        // makes both halves harder to read at the moment someone needs them.
+        strcat_s(cand, g_sessionOnly ? "frostmod_session.log" : "frostmod.log");
         if (FILE* f; fopen_s(&f, cand, "a") == 0 && f) { fclose(f); strcpy_s(g_logPath, cand); return; }
     }
     char t[MAX_PATH];
@@ -4335,8 +4360,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_selfModule = hModule;
+        g_sessionOnly = ModuleIsSessionPlugin(hModule);
         InitLogPath(hModule);   // resolve <dll folder>\frostmod.log before we log
-        EnsureInit();
+        // No Init in session-only mode, and that is the whole design: the injected copy
+        // owns the hooks, the overlay and the offsets, and two copies installing the same
+        // hooks in one process is how a plugin takes the game down. Everything this mode
+        // does waits for `Startup`, which the game calls on its own thread.
+        if (!g_sessionOnly) EnsureInit();
     }
     return TRUE;
 }
@@ -4373,8 +4403,19 @@ __declspec(dllexport) int GetInterfaceVersion() { return kPluginInterfaceVersion
 __declspec(dllexport) int Startup(char* _szSavePath) {
     if (_szSavePath) strncpy_s(g_savePath, sizeof(g_savePath), _szSavePath, _TRUNCATE);
     if (g_selfModule) InitLogPath(g_selfModule);
-    Log("=============== FrostMod plugin Startup() savePath='%s' ===============",
+    Log("=============== FrostMod %s plugin Startup()%s savePath='%s' ===============",
+        FROSTMOD_VERSION, g_sessionOnly ? " [session only: no hooks, no overlay]" : "",
         g_savePath[0] ? g_savePath : "<null>");
+    if (g_sessionOnly) {
+        // Mapped here rather than in DllMain: it only has to exist before the first
+        // `EventInit`, and the loader lock is not the place to be creating one.
+        Log("[session] %s", SessionInit()
+                ? "plugin block ready for MXB App"
+                : "plugin block unavailable - MXB App cannot name this server");
+        // A rate the game accepts, so it keeps us loaded and goes on delivering the event
+        // callbacks. The telemetry itself is dropped on the floor below.
+        return 3;
+    }
     EnsureInit();
     return 3;
 }
@@ -4391,6 +4432,12 @@ __declspec(dllexport) void Shutdown() {
 // out-arrays stay valid after return because they are static.
 __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
                                 int* _piNumString, void** _ppString) {
+    // The overlay belongs to the injected copy, which built the lists this would hand over.
+    if (g_sessionOnly) {
+        if (_piNumQuads)  *_piNumQuads  = 0;
+        if (_piNumString) *_piNumString = 0;
+        return;
+    }
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
     BuildOverlayDrawLists();
     if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
@@ -4404,23 +4451,28 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+    if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
 }
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    if (g_sessionOnly) return;
     LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    if (g_sessionOnly) return;
     LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
 // Classification carries laps-done per race number -> the lap-status coloring.
 __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
+    if (g_sessionOnly) return;
     // KRP's header has an extra m_iSessionSeries ahead of the count, so both the minimum
     // size and where the count sits are this title's, not MX Bikes'.
     int n = (_pData && _iDataSize >= g_abi->cls_hdr_size)
@@ -4510,7 +4562,7 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (takeServerName) Log("[session] server='%s' (from RaceEvent), track now '%s'", name, track);
     else                Log("[session] track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { RadResetRace(); }
-__declspec(dllexport) void RaceDeinit()             { RadResetRace(); }
+__declspec(dllexport) void RaceSession(void*, int)  { if (!g_sessionOnly) RadResetRace(); }
+__declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly) RadResetRace(); }
 
 } // extern "C"

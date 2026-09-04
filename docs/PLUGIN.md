@@ -14,10 +14,37 @@ identity, the payload layouts, the mods folder, and which features are ported at
 |------|-----|-------------|-------|
 | **PiBoSo plugin** (recommended) | Drop `frostmod.dlo` in the game's `plugins` folder (or run `frostmod.exe --install-plugin`) | game calls `Startup()` | Loaded by the game at startup — before the one-time mods scan — with no injector, no `CreateRemoteThread`, no SteamStub timing race. |
 | **Injected** | Run `frostmod.exe` | `DllMain` | Fallback / dev loop. Streams the log to a console, watches the mods folder, re-injects on relaunch. |
+| **Session plugin** | The same binary, copied into `plugins` as `frostmod_session.dlo` (MXB App does this) | game calls `Startup()` | Publishes the session and nothing else — no hooks, no overlay, no offsets. Safe to load *beside* the injected copy. |
 
-Both paths call `EnsureInit()`, which starts `Init()` **exactly once** (guarded by
-an atomic flag) — so if the DLL is both in the plugins folder *and* injected, it
-still initializes only once.
+Both of the first two paths call `EnsureInit()`, which starts `Init()` **exactly once**
+(guarded by an atomic flag) — so if the DLL is both in the plugins folder *and* injected,
+it still initializes only once. That guard is per *module*, though, and a `.dlo` and a
+`.dll` are two modules: two full copies in one process would install the same hooks twice.
+Session-only mode is how the third row avoids that.
+
+## Session-only mode
+
+**Why it exists.** `EventInit` carries the name of the server the client joined, and it is
+the only place that name appears. The game delivers it to plugins it loaded itself from
+`plugins\*.dlo` — never to a DLL somebody injected. So MXB App, which drives FrostMod by
+injection, could not tell which server any of its players were on; paint sync had no roster
+to scope itself to, and voice chat had no room to key on.
+
+**How it is chosen.** From the module's own file name, at load: a copy named
+`frostmod_session.dlo` (`session::kSessionPluginFileName`) runs session-only. There is no
+flag file to lose, nothing to get out of step with the binary, and no window in which the
+mode is not yet known. A hand-installed `frostmod.dlo` is a different name and keeps full
+plugin mode, which is what someone who installed it by hand asked for.
+
+**What it does.** Answers the three identity functions, returns a telemetry rate from
+`Startup()` so the game keeps it loaded, and fills its block from `EventInit`, `RaceEvent`
+and `EventDeinit`. Every other callback returns immediately, `Init()` never runs, and
+`Draw()` hands back zero quads and zero strings.
+
+**Its own block.** It publishes to `Local\FrostModPluginSession`, not the block the
+injected copy writes. One seqlock with two independent writers in it would corrupt under
+exactly the interleaving that is hardest to reproduce; the app reads both blocks and takes
+the server name from this one and the grid from the other.
 
 ## PiBoSo plugin interface (what we implement)
 

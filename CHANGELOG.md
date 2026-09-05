@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-04
+## 2026-09-04 — v0.17.0
 
 ### Added
 - **Session-only plugin mode.** A copy of `frostmod.dll` named `frostmod_session.dlo`,

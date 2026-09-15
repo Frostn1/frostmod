@@ -296,6 +296,39 @@ first sample and whenever stance changes.
 The byte layouts are at the top of `src/stance.h` and pinned by `tests/stance_test.cpp`. A
 reader that predates them skips both records by their length.
 
+It also records **the other riders**, from the `Race*` callbacks, so the app can put the rider
+next to the one just ahead, section by section, and see the lines others take through each
+corner. Practice and races alike, but only while a stint is recording, like `SAMPLE`.
+
+- `RaceAddEntry` / `RaceRemoveEntry` keep a roster for the event, cleared on `RaceEvent` and
+  `RaceDeinit` (the entries arrive when the event starts, often before the rider goes out, so
+  `EventInit`/`EventDeinit` don't touch it). A stint opens with one `ENTRY` per rider in it,
+  then writes another whenever an entry is added, changed or removed.
+- `RaceTrackPosition` becomes a `POSITIONS` record at most 10 times a second of track time,
+  stamped with the latest `SAMPLE`'s time. The first comes with the stint's first sample.
+- `RaceLap` / `RaceSplit` are written raw, after the latest sample's time, as `RACE_LAP` /
+  `RACE_SPLIT`.
+
+The plugin API never says which entry is the local rider. The recorder flags, in each
+`POSITIONS` record, the bike within 3 m of its own latest telemetry position (the closest one),
+the same way FrostMod's radar finds itself. No bike is flagged before the stint's first sample
+or when none is that close.
+
+Tags (in `src/coachrec.h`), little-endian:
+
+| Tag | Record | Bytes | Layout |
+| --- | --- | --- | --- |
+| 12 | `ENTRY` | 152 | `i32` race number · `u8` 1 riding, 0 left · `u8[3]` 0 · `char[64]` name · `char[40]` bike short name · `char[40]` category (NUL-padded) |
+| 13 | `POSITIONS` | 8 + 20 per bike | `f32` track time · `u16` bikes · `u16` bytes per bike (20), then per bike: `u16` race number · `u8` flags (bit 0 crashed, bit 1 local rider) · `u8` 0 · `f32` track position 0..1 · `f32` x · `f32` y · `f32` z (m) |
+| 14 | `RACE_LAP` | 36 | `f32` track time, then raw `SPluginsRaceLap_t` (session, race number, lap, invalid, lap ms, split ms ×2, best) |
+| 15 | `RACE_SPLIT` | 24 | `f32` track time, then raw `SPluginsRaceSplit_t` (session, race number, lap, split, split ms) |
+
+Size: with 20 riders, `POSITIONS` is 416 bytes a record with its header, about 250 KB a minute
+at 10 Hz, next to about 610 KB a minute of `SAMPLE` at 50 Hz. The rest is small: 3 KB of
+entries a stint, 44 bytes a lap and 32 a split per rider. The layouts are at the top of
+`src/others.h` and pinned by `tests/others_test.cpp`. A reader that predates them skips all
+four by their length.
+
 ## Key internal functions (reference)
 
 - `Log`, `InitLogPath` — logging to `<dll folder>\frostmod.log`.

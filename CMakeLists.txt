@@ -187,6 +187,12 @@ if(WIN32)
     add_test(NAME coachvoice_res COMMAND coachvoice_res_test "$<TARGET_FILE:mxbcoach>")
 endif()
 
+# --- coach in-game HUD test ----------------------------------------------------
+# The .hud file is a wire contract with MXB Coach's Rust writer; src/coachhud.h holds it, hud.ini,
+# the gap to Coach's lap, the track map and where every part goes on screen.
+add_executable(coachhud_test tests/coachhud_test.cpp)
+add_test(NAME coachhud COMMAND coachhud_test)
+
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).

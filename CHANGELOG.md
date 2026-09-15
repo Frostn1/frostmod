@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-15 — v0.19.0
+
+### Added
+- **Live cues in `mxbcoach.dlo`.** In practice (a testing event, or a race event's practice
+  session; never qualifying or a race), the recorder now shows the cues MXB Coach writes to
+  `<save path>\mxbcoach\cues\<track>.<bike>.cue` (or `<track>.cue`): one short line, such as
+  "Brake" or "Hold the gas", a moment before its spot at the bike's speed, on a dark backing
+  near the top of the screen, through the game's `Draw` callback. The app picks the cues and
+  sets the lead time, how long each shows, the gap between them and the cap per lap; the plugin
+  holds a lower-priority cue when a more important one is due within the gap, skips a cue it
+  has already passed, and clears on a crash. A sheet made for a track of another length is
+  ignored. `src/coachcue.h`, `tests/coachcue_test.cpp`.
+
 ## 2026-09-14 — v0.18.0
 
 ### Added

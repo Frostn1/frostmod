@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.18.0")
+set(FROSTMOD_VERSION "0.19.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -90,7 +90,8 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 # --- mxbcoach (MXB Coach lap recorder) ------------------------------------------
 # mxbcoach.dlo is a PiBoSo plugin the MXB Coach app installs into <MX Bikes>\plugins\. It
 # records the rider's own telemetry to <save path>\mxbcoach\sessions\*.mxbc for the app to
-# analyse. Hooks nothing and draws nothing; the file rules live in src/coachrec.h.
+# analyse, and shows the app's live cues in practice. Hooks nothing; the file rules live in
+# src/coachrec.h and the cue rules in src/coachcue.h.
 add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
 set_target_properties(mxbcoach PROPERTIES OUTPUT_NAME "mxbcoach" PREFIX "")
 
@@ -135,6 +136,12 @@ add_test(NAME session COMMAND session_test)
 # rules for it apart from Win32, so they run here.
 add_executable(coachrec_test tests/coachrec_test.cpp)
 add_test(NAME coachrec COMMAND coachrec_test)
+
+# --- coach live cues test ------------------------------------------------------
+# The .cue file is a wire contract with MXB Coach's Rust writer; src/coachcue.h holds it and
+# the rules for when a cue shows.
+add_executable(coachcue_test tests/coachcue_test.cpp)
+add_test(NAME coachcue COMMAND coachcue_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

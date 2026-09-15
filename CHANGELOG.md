@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-15 — unreleased
+## 2026-09-15 — v0.20.0
 
 ### Added
 - **Sit and stand in MXB Coach recordings.** `mxbcoach.dlo` now notes when you sit and when

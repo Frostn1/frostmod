@@ -14,9 +14,14 @@
 // And the other riders, from the Race* callbacks (others.h): who is in the event, where every
 // bike is at 10 Hz, and everyone's lap and split times. Only while a stint is recording.
 //
+// It can also say each cue out loud as it shows, when <save path>\mxbcoach\cues\voice.ini
+// turns that on (coachvoice.h). The clips are embedded as resources and played through
+// winmm's waveOut, which mixes with other plugins' sounds and runs under Wine and Proton.
+//
 // MX Bikes only for now. GP Bikes and Kart Racing Pro send different telemetry structs.
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <mmsystem.h>
 #include <dinput.h>
 #include <xinput.h>
 
@@ -28,6 +33,7 @@
 
 #include "coachcue.h"
 #include "coachrec.h"
+#include "coachvoice.h"
 #include "offsets.h"
 #include "others.h"
 #include "stance.h"
@@ -91,6 +97,155 @@ void LoadCues() {
         }
     }
     g_cues.clear();
+}
+
+// ---------------------------------------------------------------------------------------
+// Speaking the cues.
+//
+// One waveOut device, opened on the first cue spoken and kept. Two buffers, so a new clip
+// never touches one the device may still be reading. waveOutWrite returns at once; a buffer
+// is finished when the device sets WHDR_DONE, checked before it is reused.
+
+struct VoiceSlot {
+    WAVEHDR              hdr{};
+    std::vector<int16_t> pcm;
+    bool                 prepared = false;
+};
+
+struct Voice {
+    coachvoice::Settings settings;
+    // voice.ini as last read: whether it was there, when it was written and its size.
+    bool                 seen   = false;
+    FILETIME             stamp{};
+    DWORD                size   = 0;
+    bool                 read   = false;
+    float                next_check = 0;
+    int                  loaded_volume = -1;  // the volume the clips below were scaled to
+    std::vector<int16_t> clips[coachvoice::kClipCount];
+    HWAVEOUT             out    = nullptr;
+    bool                 failed = false;  // the device wouldn't open; not retried until the next event
+    VoiceSlot            slots[2];
+    uint8_t              priority = 0;  // of the cue last spoken
+};
+Voice g_voice;
+
+HMODULE ThisModule() {
+    HMODULE h = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&ThisModule), &h);
+    return h;
+}
+
+// The embedded clips, scaled to the rider's volume.
+void LoadClips() {
+    const HMODULE mod = ThisModule();
+    for (int i = 0; i < coachvoice::kClipCount; ++i) {
+        g_voice.clips[i].clear();
+        HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(coachvoice::kResourceBase + i + 1), MAKEINTRESOURCEA(10));
+        HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
+        const void* p = data ? LockResource(data) : nullptr;
+        std::vector<int16_t> pcm;
+        if (p && coachvoice::ParseWav(static_cast<const uint8_t*>(p), SizeofResource(mod, res), pcm))
+            g_voice.clips[i] = coachvoice::Scale(pcm, g_voice.settings.volume);
+    }
+    g_voice.loaded_volume = g_voice.settings.volume;
+}
+
+bool VoiceBusy() {
+    for (const VoiceSlot& s : g_voice.slots)
+        if (s.prepared && !(s.hdr.dwFlags & WHDR_DONE)) return true;
+    return false;
+}
+
+// Hands back the buffers the device has finished with.
+void ReapSlots() {
+    for (VoiceSlot& s : g_voice.slots) {
+        if (!s.prepared || !(s.hdr.dwFlags & WHDR_DONE)) continue;
+        waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
+        s.prepared = false;
+    }
+}
+
+// Silence now: on a crash, leaving practice, or the voice turned off.
+void StopVoice() {
+    if (!g_voice.out) return;
+    waveOutReset(g_voice.out);  // marks every queued buffer done
+    ReapSlots();
+}
+
+void CloseVoice() {
+    StopVoice();
+    if (g_voice.out) waveOutClose(g_voice.out);
+    g_voice.out = nullptr;
+}
+
+// voice.ini, when it is new or has changed. Missing means off.
+void ReadVoiceSettings(bool force) {
+    const std::string path = g_base + "cues\\voice.ini";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    const bool seen = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a) != 0;
+    if (!force && g_voice.read && seen == g_voice.seen &&
+        (!seen || (CompareFileTime(&a.ftLastWriteTime, &g_voice.stamp) == 0 && a.nFileSizeLow == g_voice.size)))
+        return;
+    g_voice.read  = true;
+    g_voice.seen  = seen;
+    g_voice.stamp = a.ftLastWriteTime;
+    g_voice.size  = a.nFileSizeLow;
+    g_voice.settings = seen ? coachvoice::ReadSettings(path) : coachvoice::Settings{};
+    if (!g_voice.settings.enabled) {
+        StopVoice();
+        return;
+    }
+    if (g_voice.loaded_volume != g_voice.settings.volume) {
+        StopVoice();  // the buffers hold copies, but keep what's heard in step with the setting
+        LoadClips();
+    }
+}
+
+bool OpenVoice() {
+    if (g_voice.out) return true;
+    if (g_voice.failed) return false;
+    WAVEFORMATEX f{};
+    f.wFormatTag      = WAVE_FORMAT_PCM;
+    f.nChannels       = 1;
+    f.nSamplesPerSec  = coachvoice::kRate;
+    f.wBitsPerSample  = 16;
+    f.nBlockAlign     = 2;
+    f.nAvgBytesPerSec = coachvoice::kRate * 2;
+    if (waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_voice.out    = nullptr;
+        g_voice.failed = true;
+    }
+    return g_voice.out != nullptr;
+}
+
+// Says the cue that has just come up, by its kind. Never waits on the device.
+void Speak(const coachcue::Cue& c) {
+    if (!g_voice.settings.enabled || g_voice.settings.volume <= 0) return;
+    const int clip = coachvoice::ClipFor(c.kind);
+    if (clip < 0 || g_voice.clips[clip].empty() || !OpenVoice()) return;
+    switch (coachvoice::Choose(VoiceBusy(), g_voice.priority, c.priority)) {
+        case coachvoice::SKIP: return;
+        case coachvoice::CUT_IN: waveOutReset(g_voice.out); break;
+        case coachvoice::SPEAK: break;
+    }
+    ReapSlots();
+    for (VoiceSlot& s : g_voice.slots) {
+        if (s.prepared) continue;
+        s.pcm = g_voice.clips[clip];
+        s.hdr = WAVEHDR{};
+        s.hdr.lpData         = reinterpret_cast<LPSTR>(s.pcm.data());
+        s.hdr.dwBufferLength = DWORD(s.pcm.size() * sizeof(int16_t));
+        if (waveOutPrepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) return;
+        s.prepared = true;
+        if (waveOutWrite(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) {
+            waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
+            s.prepared = false;
+            return;
+        }
+        g_voice.priority = c.priority;
+        return;
+    }
 }
 
 unsigned long CueColour(uint8_t kind) {
@@ -355,6 +510,7 @@ __declspec(dllexport) void Shutdown() {
     ReleaseDevice();
     if (g_sit.di) g_sit.di->Release();
     g_sit.di = nullptr;
+    CloseVoice();
 }
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
@@ -362,6 +518,8 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
     LoadCues();
+    g_voice.failed = false;
+    ReadVoiceSettings(true);
     // Before any stint, only a testing event is practice; a race event waits for its session.
     g_cues.set_practice(g_event.type == 1);
 }
@@ -371,6 +529,7 @@ __declspec(dllexport) void EventDeinit() {
     g_rec.on_event_end();
     g_cues.clear();
     ReleaseDevice();
+    StopVoice();
 }
 
 __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment, void*) {
@@ -386,12 +545,14 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
         WriteRoster();
     }
     g_cues.set_practice(coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize)));
+    ReadVoiceSettings(false);
 }
 
 __declspec(dllexport) void RunDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
     g_cues.set_practice(false);
+    StopVoice();
 }
 
 __declspec(dllexport) void RunStart() {
@@ -423,7 +584,16 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     if (_pData && _iDataSize >= int(kDataCrashed + 4)) {
         const auto* b = static_cast<const uint8_t*>(_pData);
         crashed       = coachcue::U32(b + kDataCrashed) != 0;
+        const uint32_t fired = g_cues.fires();
         g_cues.on_sample(_fPos, coachcue::F32(b + kDataSpeed), _fTime, crashed);
+        // Spoken the moment it shows. A cue the player skipped never fires, so is never said.
+        if (crashed) StopVoice();
+        else if (g_cues.fires() != fired && g_cues.showing()) Speak(*g_cues.showing());
+    }
+    // voice.ini changed while riding: MXB Coach can be switched to mid-stint.
+    if (_fTime >= g_voice.next_check || _fTime + 2.0f < g_voice.next_check) {
+        g_voice.next_check = _fTime + 2.0f;
+        ReadVoiceSettings(false);
     }
     PollStance(_fTime, _fPos, crashed);
 }

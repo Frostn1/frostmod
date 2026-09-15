@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-15 — v0.22.0
+
+### Added
+- **MXB Coach can say its live cues out loud.** When you turn the voice on in MXB Coach,
+  `mxbcoach.dlo` speaks each cue as it shows in practice, like "Brake", "Gas" or "Stand up",
+  at the volume you pick. It plays alongside your other plugins' sounds, such as a spotter,
+  and a more important cue cuts off a less important one rather than talking over it. It's
+  off until you turn it on. The voice is a free, offline one built into the plugin (credits
+  in `NOTICE`). `src/coachvoice.h`, `tests/coachvoice_test.cpp`.
+
 ## 2026-09-15 — v0.21.0
 
 ### Added

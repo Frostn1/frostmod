@@ -1,0 +1,14 @@
+FrostMod
+Copyright (C) FrostMod contributors. MIT Licensed (see LICENSE).
+
+This project includes third-party material:
+
+MXB Coach spoken cue clips (src/voice/*.wav, embedded in mxbcoach.dlo)
+  Generated offline by tools/voice/make_clips.py with Piper text-to-speech
+  (https://github.com/OHF-Voice/piper1-gpl), using the voice "en_US-ljspeech-high"
+  from https://huggingface.co/rhasspy/piper-voices (MIT License).
+  The voice was trained from scratch on the LJ Speech dataset by Keith Ito and
+  Linda Johnson (https://keithito.com/LJ-Speech-Dataset/), which is in the public
+  domain. Voice training by Bryce Beattie (https://brycebeattie.com/files/tts/).
+  Piper is only used to make the clips and isn't shipped; its licence doesn't
+  cover the audio it outputs.

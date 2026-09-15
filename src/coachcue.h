@@ -126,7 +126,7 @@ struct Event {
 /// A fixed-size string field in a raw game struct.
 inline std::string Field(const uint8_t* b, size_t n, size_t at, size_t len) {
     if (!b || at >= n) return {};
-    len = std::min(len, n - at);
+    len = (std::min)(len, n - at);
     const char* p = reinterpret_cast<const char*>(b + at);
     return std::string(p, strnlen(p, len));
 }
@@ -213,7 +213,7 @@ public:
         }
         if (fired_count_ >= sheet_.max_per_lap || (any_ && t - last_fire_ < sheet_.gap_s)) return;
         const float m    = pos * sheet_.track_len;
-        const float lead = std::max(0.0f, speed) * sheet_.lead_s;
+        const float lead = (std::max)(0.0f, speed) * sheet_.lead_s;
         int best = -1;
         for (size_t i = 0; i < sheet_.cues.size(); ++i) {
             const Cue& c = sheet_.cues[i];
@@ -225,7 +225,7 @@ public:
         if (best < 0) return;
         // A more important cue coming due within the gap this one would open would be shut out
         // by it: hold, and let that one through.
-        const float horizon = m + std::max(0.0f, speed) * sheet_.gap_s;
+        const float horizon = m + (std::max)(0.0f, speed) * sheet_.gap_s;
         for (size_t i = 0; i < sheet_.cues.size(); ++i) {
             const Cue& c = sheet_.cues[i];
             const float due = c.at_m - lead;

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-15 — unreleased
+
+### Added
+- **Sit and stand in MXB Coach recordings.** `mxbcoach.dlo` now notes when you sit and when
+  you stand, so MXB Coach can show where you sat and where the fast lap stood. It watches the
+  Sit button you set in the game's controls, on the keyboard or a controller, whether you hold
+  it or press it to switch. With the game's automatic sitting switched on it can't tell, and
+  the recording says so. `src/stance.h`, `tests/stance_test.cpp`.
+
 ## 2026-09-15 — v0.19.0
 
 ### Added

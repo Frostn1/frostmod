@@ -93,6 +93,8 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 # analyse, and shows the app's live cues in practice. Hooks nothing; the file rules live in
 # src/coachrec.h and the cue rules in src/coachcue.h.
 add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
+# dinput8/dxguid: reading the rider's Sit bind on the controller the game reads it from.
+target_link_libraries(mxbcoach PRIVATE user32 dinput8 dxguid)
 set_target_properties(mxbcoach PROPERTIES OUTPUT_NAME "mxbcoach" PREFIX "")
 
 # --- offsets invariants test --------------------------------------------------
@@ -142,6 +144,12 @@ add_test(NAME coachrec COMMAND coachrec_test)
 # the rules for when a cue shows.
 add_executable(coachcue_test tests/coachcue_test.cpp)
 add_test(NAME coachcue COMMAND coachcue_test)
+
+# --- coach sit/stand test ------------------------------------------------------
+# Reading the Sit bind from the rider's profile, turning polls into stance, and the two
+# records it adds to the .mxbc file. src/stance.h keeps that apart from Win32.
+add_executable(stance_test tests/stance_test.cpp)
+add_test(NAME stance COMMAND stance_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

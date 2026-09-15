@@ -21,6 +21,10 @@
 //   SPLIT       raw SPluginsBikeSplit_t
 //   START/STOP  no payload - simulation resumed / paused
 //   END         no payload - the bike left the track; absent if the game died
+//   STANCE_BIND the rider's Sit bind and how far to trust it - once, after SESSION (stance.h)
+//   STANCE      f32 time, f32 position, u8 stand/sit/unknown - on each change (stance.h)
+//
+// A reader skips a tag it doesn't know by its length, so new tags keep the format version.
 #pragma once
 
 #include <cstdint>
@@ -55,6 +59,8 @@ enum Tag : uint8_t {
     START      = 7,
     STOP       = 8,
     END        = 9,
+    STANCE_BIND = 10,
+    STANCE      = 11,
 };
 
 /// Appends records to one file.
@@ -171,6 +177,9 @@ public:
             since_flush_ = 0;
         }
     }
+
+    /// A record another module builds, such as stance. Dropped outside a stint.
+    void record(Tag tag, const void* payload, uint32_t size) { w_.record(tag, payload, size); }
 
     bool recording() const { return w_.is_open(); }
     const std::string& path() const { return path_; }

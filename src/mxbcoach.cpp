@@ -7,10 +7,17 @@
 // hooks nothing: everything arrives through the published callbacks, and the rules live in
 // coachrec.h and coachcue.h.
 //
+// It also records sitting and standing, by polling the rider's Sit bind (stance.h): a key
+// through GetAsyncKeyState, a controller button through DirectInput or XInput.
+//
 // MX Bikes only for now. GP Bikes and Kart Racing Pro send different telemetry structs.
+#define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <dinput.h>
+#include <xinput.h>
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -18,6 +25,7 @@
 #include "coachcue.h"
 #include "coachrec.h"
 #include "offsets.h"
+#include "stance.h"
 
 namespace {
 
@@ -25,6 +33,7 @@ std::mutex         g_mu;
 coachrec::Recorder g_rec;
 coachcue::Player   g_cues;
 coachcue::Event    g_event;
+std::string        g_user;  // <save path>, the game's user folder
 std::string        g_base;  // <save path>\mxbcoach\
 
 // SPluginsBikeData_t: speedometer m/s, and the crashed flag.
@@ -60,6 +69,11 @@ std::vector<uint8_t> ReadFile(const std::string& path) {
     return out;
 }
 
+std::string ReadText(const std::string& path) {
+    std::vector<uint8_t> b = ReadFile(path);
+    return std::string(b.begin(), b.end());
+}
+
 // The app's sheet for this track and bike, else for the track, if it was made for this track.
 void LoadCues() {
     for (const std::string& name : coachcue::SheetNames(g_event)) {
@@ -92,6 +106,198 @@ std::string Stamp() {
     return s;
 }
 
+// ---------------------------------------------------------------------------------------
+// Sit and stand: polling the rider's Sit bind.
+
+using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+
+struct SitInput {
+    stance::Source        source = stance::SRC_NONE;
+    int32_t               button = -1;
+    int                   vk     = 0;
+    IDirectInput8A*       di     = nullptr;
+    IDirectInputDevice8A* dev    = nullptr;
+    stance::Guid          dev_guid;  // as the bind names it
+    XInputGetStateFn      xget  = nullptr;
+    DWORD                 xslot = 0;
+};
+SitInput        g_sit;
+stance::Tracker g_stance;
+
+// The game's own top-level window: DirectInput wants one for its cooperative level.
+HWND GameWindow() {
+    struct Find {
+        DWORD pid;
+        HWND  hwnd;
+    } f{GetCurrentProcessId(), nullptr};
+    EnumWindows(
+        [](HWND h, LPARAM p) -> BOOL {
+            auto* f   = reinterpret_cast<Find*>(p);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid != f->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+            f->hwnd = h;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&f));
+    return f.hwnd;
+}
+
+bool GameFocused() {
+    HWND  h   = GetForegroundWindow();
+    DWORD pid = 0;
+    if (h) GetWindowThreadProcessId(h, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+void ReleaseDevice() {
+    if (!g_sit.dev) return;
+    g_sit.dev->Unacquire();
+    g_sit.dev->Release();
+    g_sit.dev = nullptr;
+}
+
+// The attached controller the bind names, by instance or product GUID, opened to read in the
+// background without taking it from the game. Kept across stints while the bind is the same.
+bool OpenDevice(const stance::Guid& want) {
+    if (g_sit.dev && std::memcmp(&g_sit.dev_guid, &want, sizeof(want)) == 0) return true;
+    ReleaseDevice();
+    if (!g_sit.di &&
+        FAILED(DirectInput8Create(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8A,
+                                  reinterpret_cast<void**>(&g_sit.di), nullptr))) {
+        g_sit.di = nullptr;
+        return false;
+    }
+    struct Match {
+        const stance::Guid* want;
+        GUID                found;
+        bool                ok;
+    } m{&want, {}, false};
+    g_sit.di->EnumDevices(
+        DI8DEVCLASS_GAMECTRL,
+        [](LPCDIDEVICEINSTANCEA d, LPVOID p) -> BOOL {
+            auto* m = static_cast<Match*>(p);
+            if (std::memcmp(&d->guidInstance, m->want, 16) != 0 && std::memcmp(&d->guidProduct, m->want, 16) != 0)
+                return DIENUM_CONTINUE;
+            m->found = d->guidInstance;
+            m->ok    = true;
+            return DIENUM_STOP;
+        },
+        &m, DIEDFL_ATTACHEDONLY);
+    if (!m.ok) return false;
+    IDirectInputDevice8A* dev = nullptr;
+    if (FAILED(g_sit.di->CreateDevice(m.found, &dev, nullptr))) return false;
+    HWND wnd = GameWindow();
+    if (!wnd || FAILED(dev->SetDataFormat(&c_dfDIJoystick2)) ||
+        FAILED(dev->SetCooperativeLevel(wnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))) {
+        dev->Release();
+        return false;
+    }
+    dev->Acquire();
+    g_sit.dev      = dev;
+    g_sit.dev_guid = want;
+    return true;
+}
+
+XInputGetStateFn LoadXInput() {
+    static XInputGetStateFn fn    = nullptr;
+    static bool             tried = false;
+    if (tried) return fn;
+    tried = true;
+    for (const char* name : {"xinput1_4.dll", "xinput9_1_0.dll", "xinput1_3.dll"}) {
+        HMODULE m = LoadLibraryA(name);
+        if (!m) continue;
+        fn = reinterpret_cast<XInputGetStateFn>(reinterpret_cast<void*>(GetProcAddress(m, "XInputGetState")));
+        if (fn) break;
+    }
+    return fn;
+}
+
+// Reads the rider's setup from their profile and gets ready to poll the bind. Writes the
+// stint's STANCE_BIND record.
+void SetupStance() {
+    stance::Setup s;
+    const std::string profile = stance::IniValue(ReadText(g_user + "global.ini"), "", "lastprofile");
+    if (!profile.empty()) {
+        const std::string dir = g_user + "profiles\\" + profile + "\\";
+        s = stance::ReadSetup(ReadText(dir + "profile.ini"), ReadText(dir + "controls.txt"));
+    }
+    g_sit.source = stance::SRC_NONE;
+    g_sit.button = s.bind.index;
+    g_sit.vk     = 0;
+    g_sit.xget   = nullptr;
+    // Auto-sit makes every sample unknown; there is nothing to poll.
+    if (s.auto_sit != stance::FLAG_ON && s.bind.input == stance::IN_KEY) {
+        g_sit.vk = stance::FixedVk(s.bind.index);
+        if (!g_sit.vk) g_sit.vk = int(MapVirtualKeyA(UINT(s.bind.index), MAPVK_VSC_TO_VK_EX));
+        if (g_sit.vk) g_sit.source = stance::SRC_KEYBOARD;
+    } else if (s.auto_sit != stance::FLAG_ON && s.bind.input == stance::IN_PAD_BUTTON) {
+        stance::Guid g;
+        if (stance::ParseGuid(s.bind.device, g) && OpenDevice(g)) {
+            g_sit.source = stance::SRC_DIRECTINPUT;
+        } else if (stance::XInputMask(s.bind.index) && LoadXInput()) {
+            XINPUT_STATE st;
+            for (DWORD slot = 0; slot < 4; ++slot) {
+                std::memset(&st, 0, sizeof(st));
+                if (LoadXInput()(slot, &st) != ERROR_SUCCESS) continue;
+                g_sit.xget   = LoadXInput();
+                g_sit.xslot  = slot;
+                g_sit.source = stance::SRC_XINPUT;
+                break;
+            }
+        }
+    }
+    if (g_sit.source != stance::SRC_DIRECTINPUT) ReleaseDevice();
+    const stance::Confidence c = stance::Rate(s, g_sit.source);
+    const std::vector<uint8_t> p = stance::BindPayload(s, g_sit.source, c);
+    g_rec.record(coachrec::STANCE_BIND, p.data(), uint32_t(p.size()));
+    g_stance.configure(s.mode, c != stance::CONF_NONE);
+}
+
+// Whether the bind is down now. False when it can't be read.
+bool ReadSit(bool& down) {
+    down = false;
+    switch (g_sit.source) {
+        case stance::SRC_KEYBOARD:
+            if (!GameFocused()) return false;
+            down = (GetAsyncKeyState(g_sit.vk) & 0x8000) != 0;
+            return true;
+        case stance::SRC_DIRECTINPUT: {
+            if (!g_sit.dev) return false;
+            if (FAILED(g_sit.dev->Poll())) {
+                g_sit.dev->Acquire();
+                g_sit.dev->Poll();
+            }
+            DIJOYSTATE2 js;
+            HRESULT hr = g_sit.dev->GetDeviceState(sizeof(js), &js);
+            if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+                g_sit.dev->Acquire();
+                hr = g_sit.dev->GetDeviceState(sizeof(js), &js);
+            }
+            if (FAILED(hr) || g_sit.button < 0 || g_sit.button >= 128) return false;
+            down = (js.rgbButtons[g_sit.button] & 0x80) != 0;
+            return true;
+        }
+        case stance::SRC_XINPUT: {
+            XINPUT_STATE st;
+            std::memset(&st, 0, sizeof(st));
+            if (!g_sit.xget || g_sit.xget(g_sit.xslot, &st) != ERROR_SUCCESS) return false;
+            down = (st.Gamepad.wButtons & stance::XInputMask(g_sit.button)) != 0;
+            return true;
+        }
+        default: return false;
+    }
+}
+
+void PollStance(float time, float pos, bool crashed) {
+    if (!g_rec.recording()) return;
+    bool down     = false;
+    const bool ok = ReadSit(down);
+    if (!g_stance.update(ok, down, crashed)) return;
+    const auto p = stance::EventPayload(time, pos, g_stance.state());
+    g_rec.record(coachrec::STANCE, p.data(), uint32_t(p.size()));
+}
+
 }  // namespace
 
 extern "C" {
@@ -108,10 +314,12 @@ __declspec(dllexport) int GetInterfaceVersion() { return kPluginInterfaceVersion
 __declspec(dllexport) int Startup(char* _szSavePath) {
     std::string dir = _szSavePath ? _szSavePath : "";
     if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') dir += '\\';
+    const std::string user = dir;
     dir += "mxbcoach\\";
     CreateDirectoryA(dir.c_str(), nullptr);
     {
         std::lock_guard<std::mutex> lock(g_mu);
+        g_user = user;
         g_base = dir;
     }
     dir += "sessions\\";
@@ -124,6 +332,9 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 __declspec(dllexport) void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
+    ReleaseDevice();
+    if (g_sit.di) g_sit.di->Release();
+    g_sit.di = nullptr;
 }
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
@@ -139,6 +350,7 @@ __declspec(dllexport) void EventDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     g_cues.clear();
+    ReleaseDevice();
 }
 
 __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment, void*) {
@@ -148,7 +360,7 @@ __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment,
 
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
-    g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str());
+    if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) SetupStance();
     g_cues.set_practice(coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize)));
 }
 
@@ -182,10 +394,13 @@ __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_sample(_pData, _iDataSize, _fTime, _fPos);
+    bool crashed = false;
     if (_pData && _iDataSize >= int(kDataCrashed + 4)) {
         const auto* b = static_cast<const uint8_t*>(_pData);
-        g_cues.on_sample(_fPos, coachcue::F32(b + kDataSpeed), _fTime, coachcue::U32(b + kDataCrashed) != 0);
+        crashed       = coachcue::U32(b + kDataCrashed) != 0;
+        g_cues.on_sample(_fPos, coachcue::F32(b + kDataSpeed), _fTime, crashed);
     }
+    PollStance(_fTime, _fPos, crashed);
 }
 
 // Each frame on track, spectating or in a replay: the cue showing, if any, as one line of text

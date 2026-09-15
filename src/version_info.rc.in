@@ -42,3 +42,6 @@ BEGIN
         VALUE "Translation", 0x409, 1200
     END
 END
+
+// Any other resources a target embeds (mxbcoach.dlo: its voice clips). Empty for the rest.
+@FROSTMOD_RC_EXTRA@

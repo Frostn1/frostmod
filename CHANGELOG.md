@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-09-15 — v0.22.0
+
+### Added
+- **MXB Coach can say its live cues out loud.** When you turn the voice on in MXB Coach,
+  `mxbcoach.dlo` speaks each cue as it shows in practice, like "Brake", "Gas" or "Stand up",
+  at the volume you pick. It plays alongside your other plugins' sounds, such as a spotter,
+  and a more important cue cuts off a less important one rather than talking over it. It's
+  off until you turn it on. The voice is a free, offline one built into the plugin (credits
+  in `NOTICE`). `src/coachvoice.h`, `tests/coachvoice_test.cpp`.
+- **MXB Coach's in-game HUD.** In practice, `mxbcoach.dlo` now shows more round the cue:
+  - the section you're in and a tip for it
+  - your gap to Coach's lap ("vs Coach +0.34")
+  - whether you're sitting or standing
+  - a small track map with Coach's ghost and the next cue spots
+  - your setup name when you stop, with a reminder to measure sag if Coach asks for one
+
+  MXB Coach picks which parts show. The map stays off when MXBMRP3 is installed, since it has
+  its own. The cue now sits lower, clear of MXBMRP3's panels. Parts of the map and gap code
+  come from MXBMRP3 (credits in `NOTICE`). `src/coachhud.h`, `tests/coachhud_test.cpp`.
+
 ## 2026-09-15 — v0.21.0
 
 ### Added

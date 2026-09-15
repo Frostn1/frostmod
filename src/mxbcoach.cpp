@@ -14,9 +14,18 @@
 // And the other riders, from the Race* callbacks (others.h): who is in the event, where every
 // bike is at 10 Hz, and everyone's lap and split times. Only while a stint is recording.
 //
+// It can also say each cue out loud as it shows, when <save path>\mxbcoach\cues\voice.ini
+// turns that on (coachvoice.h). The clips are embedded as resources and played through
+// winmm's waveOut, which mixes with other plugins' sounds and runs under Wine and Proton.
+//
+// In practice it draws MXB Coach's HUD round the cue (coachhud.h): the section and its tip, the
+// gap to Coach's lap, sit or stand, a track map with Coach's ghost, and the setup card while
+// stopped. The app's <save path>\mxbcoach\cues\<track>.<bike>.hud and hud.ini say what shows.
+//
 // MX Bikes only for now. GP Bikes and Kart Racing Pro send different telemetry structs.
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <mmsystem.h>
 #include <dinput.h>
 #include <xinput.h>
 
@@ -27,7 +36,9 @@
 #include <vector>
 
 #include "coachcue.h"
+#include "coachhud.h"
 #include "coachrec.h"
+#include "coachvoice.h"
 #include "offsets.h"
 #include "others.h"
 #include "stance.h"
@@ -42,12 +53,34 @@ others::Tracker    g_others;
 std::string        g_user;  // <save path>, the game's user folder
 std::string        g_base;  // <save path>\mxbcoach\
 
-// SPluginsBikeData_t: speedometer m/s, and the crashed flag.
+// SPluginsBikeData_t: speedometer m/s, world x and z, and the crashed flag.
 constexpr size_t kDataSpeed   = 20;
+constexpr size_t kDataPosX    = 24;
+constexpr size_t kDataPosZ    = 32;
 constexpr size_t kDataCrashed = 136;
 
+// The HUD (coachhud.h).
+std::string          g_plugins;  // the folder this .dlo was loaded from
+coachhud::Sheet      g_hud_sheet;
+coachhud::RefLap     g_ref;
+coachhud::LapClock   g_clock;
+coachhud::StopWatch  g_stop;
+coachhud::Track      g_track;
+coachhud::Settings   g_hud_set;
+coachhud::Frame      g_frame;
+std::string          g_setup;
+bool                 g_practice = false;
+bool                 g_have_sample = false;
+float                g_time = 0, g_pos = 0;
+coachhud::Pt         g_rider;
+stance::Confidence   g_stance_conf = stance::CONF_NONE;
+// hud.ini as last read: whether it was there and when it was written.
+bool                 g_ini_seen = false;
+FILETIME             g_ini_time = {};
+ULONGLONG            g_ini_checked = 0;
+
 // PiBoSo draw items, as in mxb_example.c. The game reads them after Draw() returns, so they
-// live in these statics.
+// live in these statics. No DrawInit: text uses font 1, the game's own, as the cue always has.
 struct SPluginQuad_t {
     float         m_aafPos[4][2];  // corners, 0..1, counter-clockwise from the top left
     int           m_iSprite;       // 0 = solid fill
@@ -61,8 +94,8 @@ struct SPluginString_t {
     int           m_iJustify;      // 0 left, 1 centre, 2 right
     unsigned long m_ulColor;       // ABGR
 };
-SPluginQuad_t   g_quad[1];
-SPluginString_t g_text[1];
+SPluginQuad_t   g_quad[coachhud::kMaxQuads];
+SPluginString_t g_text[coachhud::kMaxTexts];
 
 std::vector<uint8_t> ReadFile(const std::string& path) {
     std::vector<uint8_t> out;
@@ -93,13 +126,199 @@ void LoadCues() {
     g_cues.clear();
 }
 
-unsigned long CueColour(uint8_t kind) {
-    switch (kind) {
-        case coachcue::BRAKE: return 0xFF4B4BFFul;       // red
-        case coachcue::THROTTLE: return 0xFF5CD65Cul;    // green
-        case coachcue::OFF_BRAKES: return 0xFF5CD6FFul;  // amber
-        default: return 0xFFFFFFFFul;                    // white
+// ---------------------------------------------------------------------------------------
+// Speaking the cues.
+//
+// One waveOut device, opened on the first cue spoken and kept. Two buffers, so a new clip
+// never touches one the device may still be reading. waveOutWrite returns at once; a buffer
+// is finished when the device sets WHDR_DONE, checked before it is reused.
+
+struct VoiceSlot {
+    WAVEHDR              hdr{};
+    std::vector<int16_t> pcm;
+    bool                 prepared = false;
+};
+
+struct Voice {
+    coachvoice::Settings settings;
+    // voice.ini as last read: whether it was there, when it was written and its size.
+    bool                 seen   = false;
+    FILETIME             stamp{};
+    DWORD                size   = 0;
+    bool                 read   = false;
+    float                next_check = 0;
+    int                  loaded_volume = -1;  // the volume the clips below were scaled to
+    std::vector<int16_t> clips[coachvoice::kClipCount];
+    HWAVEOUT             out    = nullptr;
+    bool                 failed = false;  // the device wouldn't open; not retried until the next event
+    VoiceSlot            slots[2];
+    uint8_t              priority = 0;  // of the cue last spoken
+};
+Voice g_voice;
+
+HMODULE ThisModule() {
+    HMODULE h = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&ThisModule), &h);
+    return h;
+}
+
+// The embedded clips, scaled to the rider's volume.
+void LoadClips() {
+    const HMODULE mod = ThisModule();
+    for (int i = 0; i < coachvoice::kClipCount; ++i) {
+        g_voice.clips[i].clear();
+        HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(coachvoice::kResourceBase + i + 1), MAKEINTRESOURCEA(10));
+        HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
+        const void* p = data ? LockResource(data) : nullptr;
+        std::vector<int16_t> pcm;
+        if (p && coachvoice::ParseWav(static_cast<const uint8_t*>(p), SizeofResource(mod, res), pcm))
+            g_voice.clips[i] = coachvoice::Scale(pcm, g_voice.settings.volume);
     }
+    g_voice.loaded_volume = g_voice.settings.volume;
+}
+
+bool VoiceBusy() {
+    for (const VoiceSlot& s : g_voice.slots)
+        if (s.prepared && !(s.hdr.dwFlags & WHDR_DONE)) return true;
+    return false;
+}
+
+// Hands back the buffers the device has finished with.
+void ReapSlots() {
+    for (VoiceSlot& s : g_voice.slots) {
+        if (!s.prepared || !(s.hdr.dwFlags & WHDR_DONE)) continue;
+        waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
+        s.prepared = false;
+    }
+}
+
+// Silence now: on a crash, leaving practice, or the voice turned off.
+void StopVoice() {
+    if (!g_voice.out) return;
+    waveOutReset(g_voice.out);  // marks every queued buffer done
+    ReapSlots();
+}
+
+void CloseVoice() {
+    StopVoice();
+    if (g_voice.out) waveOutClose(g_voice.out);
+    g_voice.out = nullptr;
+}
+
+// voice.ini, when it is new or has changed. Missing means off.
+void ReadVoiceSettings(bool force) {
+    const std::string path = g_base + "cues\\voice.ini";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    const bool seen = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a) != 0;
+    if (!force && g_voice.read && seen == g_voice.seen &&
+        (!seen || (CompareFileTime(&a.ftLastWriteTime, &g_voice.stamp) == 0 && a.nFileSizeLow == g_voice.size)))
+        return;
+    g_voice.read  = true;
+    g_voice.seen  = seen;
+    g_voice.stamp = a.ftLastWriteTime;
+    g_voice.size  = a.nFileSizeLow;
+    g_voice.settings = seen ? coachvoice::ReadSettings(path) : coachvoice::Settings{};
+    if (!g_voice.settings.enabled) {
+        StopVoice();
+        return;
+    }
+    if (g_voice.loaded_volume != g_voice.settings.volume) {
+        StopVoice();  // the buffers hold copies, but keep what's heard in step with the setting
+        LoadClips();
+    }
+}
+
+bool OpenVoice() {
+    if (g_voice.out) return true;
+    if (g_voice.failed) return false;
+    WAVEFORMATEX f{};
+    f.wFormatTag      = WAVE_FORMAT_PCM;
+    f.nChannels       = 1;
+    f.nSamplesPerSec  = coachvoice::kRate;
+    f.wBitsPerSample  = 16;
+    f.nBlockAlign     = 2;
+    f.nAvgBytesPerSec = coachvoice::kRate * 2;
+    if (waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_voice.out    = nullptr;
+        g_voice.failed = true;
+    }
+    return g_voice.out != nullptr;
+}
+
+// Says the cue that has just come up, by its kind. Never waits on the device.
+void Speak(const coachcue::Cue& c) {
+    if (!g_voice.settings.enabled || g_voice.settings.volume <= 0) return;
+    const int clip = coachvoice::ClipFor(c.kind);
+    if (clip < 0 || g_voice.clips[clip].empty() || !OpenVoice()) return;
+    switch (coachvoice::Choose(VoiceBusy(), g_voice.priority, c.priority)) {
+        case coachvoice::SKIP: return;
+        case coachvoice::CUT_IN: waveOutReset(g_voice.out); break;
+        case coachvoice::SPEAK: break;
+    }
+    ReapSlots();
+    for (VoiceSlot& s : g_voice.slots) {
+        if (s.prepared) continue;
+        s.pcm = g_voice.clips[clip];
+        s.hdr = WAVEHDR{};
+        s.hdr.lpData         = reinterpret_cast<LPSTR>(s.pcm.data());
+        s.hdr.dwBufferLength = DWORD(s.pcm.size() * sizeof(int16_t));
+        if (waveOutPrepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) return;
+        s.prepared = true;
+        if (waveOutWrite(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) {
+            waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
+            s.prepared = false;
+            return;
+        }
+        g_voice.priority = c.priority;
+        return;
+    }
+}
+
+// The app's HUD sheet, found the same way as the cues.
+void LoadHud() {
+    g_hud_sheet = coachhud::Sheet{};
+    for (const std::string& name : coachhud::HudNames(g_event)) {
+        std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
+        coachhud::Sheet s;
+        if (!b.empty() && coachhud::Parse(b.data(), b.size(), s) && coachhud::Fits(s, g_event)) {
+            g_hud_sheet = std::move(s);
+            break;
+        }
+    }
+    g_ref.load(g_hud_sheet.ref);
+}
+
+// hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
+// own map, in the same plugins folder, turns ours off unless the file asks for it.
+void ReadHudSettings(bool force) {
+    const std::string path = g_base + "hud.ini";
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    const bool seen = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a) != 0;
+    if (!force && seen == g_ini_seen && (!seen || CompareFileTime(&a.ftLastWriteTime, &g_ini_time) == 0)) return;
+    g_ini_seen = seen;
+    if (seen) g_ini_time = a.ftLastWriteTime;
+    const bool mxbmrp3 = !g_plugins.empty() && GetFileAttributesA((g_plugins + "mxbmrp3.dlo").c_str()) != INVALID_FILE_ATTRIBUTES;
+    g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
+}
+
+// At most once a second, from the telemetry callback rather than Draw.
+void MaybeReloadHudSettings() {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_ini_checked < 1000) return;
+    g_ini_checked = now;
+    ReadHudSettings(false);
+}
+
+std::string ModuleFolder() {
+    const HMODULE self = ThisModule();
+    if (!self) return {};
+    char path[MAX_PATH] = {0};
+    const DWORD n = GetModuleFileNameA(self, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    std::string s(path, n);
+    const size_t slash = s.find_last_of("\\/");
+    return slash == std::string::npos ? std::string() : s.substr(0, slash + 1);
 }
 
 // "20260914-153012-042": sortable, and a quick re-entry within a second doesn't collide.
@@ -266,6 +485,7 @@ void SetupStance() {
     const std::vector<uint8_t> p = stance::BindPayload(s, g_sit.source, c);
     g_rec.record(coachrec::STANCE_BIND, p.data(), uint32_t(p.size()));
     g_stance.configure(s.mode, c != stance::CONF_NONE);
+    g_stance_conf = c;
 }
 
 // Whether the bind is down now. False when it can't be read.
@@ -318,6 +538,29 @@ void WriteRoster() {
         g_rec.record(coachrec::ENTRY, kv.second.data(), uint32_t(kv.second.size()));
 }
 
+// Everything the HUD shows this frame. Under g_mu.
+void BuildHud() {
+    coachhud::View v;
+    v.set = g_hud_set;
+    v.cue = g_cues.showing();
+    const float m = g_pos * g_event.track_len;
+    if (g_have_sample) {
+        v.section = coachhud::SectionAt(g_hud_sheet, m);
+        v.has_gap = coachhud::Gap(g_ref, g_clock, g_time, g_pos, v.gap);
+        if (g_clock.valid()) v.has_ghost = g_ref.world_at(g_clock.elapsed(g_time), v.ghost.x, v.ghost.y);
+        v.has_rider = true;
+        v.rider     = g_rider;
+        v.stopped   = g_stop.stopped();
+        if (g_cues.active()) v.upcoming = coachhud::Upcoming(g_cues.sheet(), m, 5);
+    }
+    v.stance = g_stance.state();
+    v.conf   = g_stance_conf;
+    v.track  = &g_track;
+    v.setup  = g_setup;
+    v.sag    = (g_hud_sheet.flags & coachhud::FLAG_SAG) != 0;
+    coachhud::Build(v, g_frame);
+}
+
 }  // namespace
 
 extern "C" {
@@ -339,8 +582,10 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
     CreateDirectoryA(dir.c_str(), nullptr);
     {
         std::lock_guard<std::mutex> lock(g_mu);
-        g_user = user;
-        g_base = dir;
+        g_user    = user;
+        g_base    = dir;
+        g_plugins = ModuleFolder();
+        ReadHudSettings(true);
     }
     dir += "sessions\\";
     CreateDirectoryA(dir.c_str(), nullptr);
@@ -355,6 +600,7 @@ __declspec(dllexport) void Shutdown() {
     ReleaseDevice();
     if (g_sit.di) g_sit.di->Release();
     g_sit.di = nullptr;
+    CloseVoice();
 }
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
@@ -362,36 +608,58 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
     LoadCues();
+    LoadHud();
+    g_voice.failed = false;
+    ReadVoiceSettings(true);
     // Before any stint, only a testing event is practice; a race event waits for its session.
-    g_cues.set_practice(g_event.type == 1);
+    g_practice = g_event.type == 1;
+    g_cues.set_practice(g_practice);
 }
 
 __declspec(dllexport) void EventDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     g_cues.clear();
+    g_hud_sheet = coachhud::Sheet{};
+    g_ref.load({});
+    g_track.clear();
+    g_practice = false;
     ReleaseDevice();
+    StopVoice();
 }
 
-__declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment, void*) {
+// _pRaceData: floats, the start/finish line's distance along the centreline first.
+__declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment, void* _pRaceData) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_centreline(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize);
+    g_track.build(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize, static_cast<const float*>(_pRaceData));
 }
 
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
+    g_stance_conf = stance::CONF_NONE;
     if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) {
         SetupStance();
         g_others.on_stint();
         WriteRoster();
     }
-    g_cues.set_practice(coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize)));
+    g_practice = coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize));
+    g_cues.set_practice(g_practice);
+    ReadVoiceSettings(false);
+    g_setup = coachhud::SetupName(_pData, _iDataSize);
+    g_clock.reset();
+    g_stop.reset();
+    g_have_sample = false;
+    ReadHudSettings(true);
 }
 
 __declspec(dllexport) void RunDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
     g_cues.set_practice(false);
+    StopVoice();
+    g_practice    = false;
+    g_have_sample = false;
 }
 
 __declspec(dllexport) void RunStart() {
@@ -423,9 +691,26 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     if (_pData && _iDataSize >= int(kDataCrashed + 4)) {
         const auto* b = static_cast<const uint8_t*>(_pData);
         crashed       = coachcue::U32(b + kDataCrashed) != 0;
-        g_cues.on_sample(_fPos, coachcue::F32(b + kDataSpeed), _fTime, crashed);
+        const float    speed = coachcue::F32(b + kDataSpeed);
+        const uint32_t fired = g_cues.fires();
+        g_cues.on_sample(_fPos, speed, _fTime, crashed);
+        // Spoken the moment it shows. A cue the player skipped never fires, so is never said.
+        if (crashed) StopVoice();
+        else if (g_cues.fires() != fired && g_cues.showing()) Speak(*g_cues.showing());
+        g_clock.on_sample(_fTime, _fPos);
+        g_stop.on_sample(_fTime, speed);
+        g_rider       = {coachcue::F32(b + kDataPosX), coachcue::F32(b + kDataPosZ)};
+        g_time        = _fTime;
+        g_pos         = _fPos;
+        g_have_sample = true;
+    }
+    // voice.ini changed while riding: MXB Coach can be switched to mid-stint.
+    if (_fTime >= g_voice.next_check || _fTime + 2.0f < g_voice.next_check) {
+        g_voice.next_check = _fTime + 2.0f;
+        ReadVoiceSettings(false);
     }
     PollStance(_fTime, _fPos, crashed);
+    MaybeReloadHudSettings();
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries
@@ -476,33 +761,37 @@ __declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
         g_rec.record(coachrec::RACE_SPLIT, p.data(), uint32_t(p.size()));
 }
 
-// Each frame on track, spectating or in a replay: the cue showing, if any, as one line of text
-// on a dark backing near the top of the screen. Only while riding.
+// Each frame on track, spectating or in a replay: the HUD, only while riding in practice. The
+// cue sits below MXBMRP3's Notices and Timing panels, the rest round it (coachhud.h). Nothing
+// may throw into the game, so the body is guarded like MXBMRP3's API_GUARD_CATCH.
 __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, int* _piNumString,
                                 void** _ppString) {
     int quads = 0, strings = 0;
-    {
+    try {
         std::lock_guard<std::mutex> lock(g_mu);
-        const coachcue::Cue* c = _iState == 0 ? g_cues.showing() : nullptr;
-        if (c) {
-            const float x0 = 0.35f, x1 = 0.65f, y0 = 0.14f, y1 = 0.21f;
-            SPluginQuad_t& q = g_quad[0];
-            q.m_aafPos[0][0] = x0; q.m_aafPos[0][1] = y0;
-            q.m_aafPos[1][0] = x0; q.m_aafPos[1][1] = y1;
-            q.m_aafPos[2][0] = x1; q.m_aafPos[2][1] = y1;
-            q.m_aafPos[3][0] = x1; q.m_aafPos[3][1] = y0;
-            q.m_iSprite = 0;
-            q.m_ulColor = 0xA0000000ul;
-            SPluginString_t& s = g_text[0];
-            strncpy_s(s.m_szString, c->text.c_str(), _TRUNCATE);
-            s.m_afPos[0] = 0.5f;
-            s.m_afPos[1] = 0.155f;
-            s.m_iFont = 1;
-            s.m_fSize = 0.045f;
-            s.m_iJustify = 1;
-            s.m_ulColor = CueColour(c->kind);
-            quads = strings = 1;
+        if (_iState == 0 && g_practice) {
+            BuildHud();
+            for (const coachhud::Quad& in : g_frame.quads) {
+                if (quads >= int(coachhud::kMaxQuads)) break;
+                SPluginQuad_t& q = g_quad[quads++];
+                std::memcpy(q.m_aafPos, in.p, sizeof(q.m_aafPos));
+                q.m_iSprite = in.sprite;
+                q.m_ulColor = in.color;
+            }
+            for (const coachhud::Text& in : g_frame.texts) {
+                if (strings >= int(coachhud::kMaxTexts)) break;
+                SPluginString_t& s = g_text[strings++];
+                strncpy_s(s.m_szString, in.s.c_str(), _TRUNCATE);
+                s.m_afPos[0] = in.x;
+                s.m_afPos[1] = in.y;
+                s.m_iFont    = 1;
+                s.m_fSize    = in.size;
+                s.m_iJustify = in.justify;
+                s.m_ulColor  = in.color;
+            }
         }
+    } catch (...) {
+        quads = strings = 0;
     }
     if (_piNumQuads) *_piNumQuads = quads;
     if (_ppQuad) *_ppQuad = g_quad;

@@ -233,6 +233,7 @@ public:
         }
         fired_[size_t(best)] = true;
         ++fired_count_;
+        ++fires_;
         any_       = true;
         last_fire_ = t;
         showing_   = best;
@@ -241,6 +242,9 @@ public:
 
     /// A lap completed: every cue can show again.
     void on_lap() { reset_lap(); }
+
+    /// Counts every cue fired: when it changes, the one showing() has just come up.
+    uint32_t fires() const { return fires_; }
 
     /// The cue to show now, or null.
     const Cue* showing() const {
@@ -260,6 +264,7 @@ private:
     bool              practice_    = false;
     bool              any_         = false;
     uint32_t          fired_count_ = 0;
+    uint32_t          fires_       = 0;
     float             last_pos_    = -1;
     float             last_fire_   = 0;
     float             shown_at_    = 0;

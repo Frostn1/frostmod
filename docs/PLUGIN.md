@@ -267,6 +267,15 @@ the `Run*` callbacks, `EventInit`/`EventDeinit` and `TrackCenterline`, asks for 
 payloads, byte for byte; the layout is documented at the top of `coachrec.h` and pinned by
 `tests/coachrec_test.cpp`. MX Bikes only: the other titles send different telemetry structs.
 
+In practice it also shows **live cues**. On `EventInit` it loads
+`<save path>\mxbcoach\cues\<track>.<bike>.cue`, else `<track>.cue`, written by the app and
+ignored unless it was made for a track of the same length. On `RunInit` it turns cues on only
+for a testing event or a race event's practice session. Each `RunTelemetry` sample moves the
+cue player (`src/coachcue.h`), and the `Draw` export shows the cue that's up as one line of
+text on a dark backing, only while riding. The `.cue` layout, and the rules for lead time, the
+gap, the cap per lap and priority, are at the top of `coachcue.h` and pinned by
+`tests/coachcue_test.cpp`.
+
 ## Key internal functions (reference)
 
 - `Log`, `InitLogPath` — logging to `<dll folder>\frostmod.log`.

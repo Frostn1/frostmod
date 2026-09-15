@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-09-15 — v0.21.0
+
+### Added
+- **The other riders in MXB Coach recordings.** `mxbcoach.dlo` now also records who else is
+  on track, where they ride and their lap times, so MXB Coach can compare you with the rider
+  just ahead and show the lines others take through each corner. It writes the event's riders
+  (`ENTRY`), every bike's track position and x/y/z ten times a second with crashed and "this
+  is you" flags (`POSITIONS`), and everyone's lap and split times (`RACE_LAP`, `RACE_SPLIT`),
+  tags 12-15, only while a stint is recording. About 250 KB a minute with 20 riders.
+  `src/others.h`, `tests/others_test.cpp`.
+
 ## 2026-09-15 — v0.20.0
 
 ### Added

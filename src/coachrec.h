@@ -23,6 +23,10 @@
 //   END         no payload - the bike left the track; absent if the game died
 //   STANCE_BIND the rider's Sit bind and how far to trust it - once, after SESSION (stance.h)
 //   STANCE      f32 time, f32 position, u8 stand/sit/unknown - on each change (stance.h)
+//   ENTRY       a rider in the event: race number, riding/left, name, bike, category (others.h)
+//   POSITIONS   every bike's race number, flags, track position and x/y/z, 10 Hz (others.h)
+//   RACE_LAP    f32 time, raw SPluginsRaceLap_t - any rider's lap (others.h)
+//   RACE_SPLIT  f32 time, raw SPluginsRaceSplit_t - any rider's split (others.h)
 //
 // A reader skips a tag it doesn't know by its length, so new tags keep the format version.
 #pragma once
@@ -61,6 +65,10 @@ enum Tag : uint8_t {
     END        = 9,
     STANCE_BIND = 10,
     STANCE      = 11,
+    ENTRY       = 12,
+    POSITIONS   = 13,
+    RACE_LAP    = 14,
+    RACE_SPLIT  = 15,
 };
 
 /// Appends records to one file.

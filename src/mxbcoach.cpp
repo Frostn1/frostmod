@@ -10,6 +10,9 @@
 // It also records sitting and standing, by polling the rider's Sit bind (stance.h): a key
 // through GetAsyncKeyState, a controller button through DirectInput or XInput.
 //
+// And the other riders, from the Race* callbacks (others.h): who is in the event, where every
+// bike is at 10 Hz, and everyone's lap and split times. Only while a stint is recording.
+//
 // MX Bikes only for now. GP Bikes and Kart Racing Pro send different telemetry structs.
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
@@ -25,6 +28,7 @@
 #include "coachcue.h"
 #include "coachrec.h"
 #include "offsets.h"
+#include "others.h"
 #include "stance.h"
 
 namespace {
@@ -33,6 +37,7 @@ std::mutex         g_mu;
 coachrec::Recorder g_rec;
 coachcue::Player   g_cues;
 coachcue::Event    g_event;
+others::Tracker    g_others;
 std::string        g_user;  // <save path>, the game's user folder
 std::string        g_base;  // <save path>\mxbcoach\
 
@@ -298,6 +303,12 @@ void PollStance(float time, float pos, bool crashed) {
     g_rec.record(coachrec::STANCE, p.data(), uint32_t(p.size()));
 }
 
+// Everyone already in the event, at the top of a stint.
+void WriteRoster() {
+    for (const auto& kv : g_others.roster())
+        g_rec.record(coachrec::ENTRY, kv.second.data(), uint32_t(kv.second.size()));
+}
+
 }  // namespace
 
 extern "C" {
@@ -360,7 +371,11 @@ __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment,
 
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
-    if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) SetupStance();
+    if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) {
+        SetupStance();
+        g_others.on_stint();
+        WriteRoster();
+    }
     g_cues.set_practice(coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize)));
 }
 
@@ -394,6 +409,7 @@ __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_sample(_pData, _iDataSize, _fTime, _fPos);
+    g_others.on_sample(_fTime, _pData, _iDataSize);
     bool crashed = false;
     if (_pData && _iDataSize >= int(kDataCrashed + 4)) {
         const auto* b = static_cast<const uint8_t*>(_pData);
@@ -401,6 +417,54 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         g_cues.on_sample(_fPos, coachcue::F32(b + kDataSpeed), _fTime, crashed);
     }
     PollStance(_fTime, _fPos, crashed);
+}
+
+// The other riders. The roster is kept whether or not a stint is recording, since the entries
+// arrive when the event starts; everything else is written only while one is.
+__declspec(dllexport) void RaceEvent(void*, int) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_others.clear_roster();
+}
+
+__declspec(dllexport) void RaceDeinit() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_others.clear_roster();
+}
+
+__declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    others::Entry e;
+    if (g_others.added(_pData, _iDataSize, e) && g_rec.recording())
+        g_rec.record(coachrec::ENTRY, e.data(), uint32_t(e.size()));
+}
+
+__declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    others::Entry e;
+    if (g_others.removed(_pData, _iDataSize, e) && g_rec.recording())
+        g_rec.record(coachrec::ENTRY, e.data(), uint32_t(e.size()));
+}
+
+__declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_rec.recording()) return;
+    std::vector<uint8_t> p;
+    if (g_others.positions(_iNumVehicles, _pArray, _iElemSize, p))
+        g_rec.record(coachrec::POSITIONS, p.data(), uint32_t(p.size()));
+}
+
+__declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    std::vector<uint8_t> p;
+    if (g_rec.recording() && g_others.lap(_pData, _iDataSize, p))
+        g_rec.record(coachrec::RACE_LAP, p.data(), uint32_t(p.size()));
+}
+
+__declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    std::vector<uint8_t> p;
+    if (g_rec.recording() && g_others.split(_pData, _iDataSize, p))
+        g_rec.record(coachrec::RACE_SPLIT, p.data(), uint32_t(p.size()));
 }
 
 // Each frame on track, spectating or in a replay: the cue showing, if any, as one line of text

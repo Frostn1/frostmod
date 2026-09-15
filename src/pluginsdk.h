@@ -101,6 +101,23 @@ struct SPluginsRaceClassificationEntry_t {
 static_assert(sizeof(SPluginsRaceClassification_t) == 16, "MX classification header moved");
 static_assert(sizeof(SPluginsRaceClassificationEntry_t) == 36, "MX classification entry moved");
 
+// RaceLap / RaceSplit: every rider's lap and split times (mxb_api.h). MXB Coach's recorder
+// stores them raw (src/others.h).
+struct SPluginsRaceLap_t {
+    int m_iSession;
+    int m_iRaceNum;
+    int m_iLapNum;                     // lap index
+    int m_iInvalid;
+    int m_iLapTime;                    // ms
+    int m_aiSplit[2];                  // ms
+    int m_iBest;                       // 1 = personal best; 2 = overall best
+};
+struct SPluginsRaceSplit_t {
+    int m_iSession, m_iRaceNum, m_iLapNum, m_iSplit, m_iSplitTime;  // times in ms
+};
+static_assert(sizeof(SPluginsRaceLap_t) == 32, "MX race lap moved");
+static_assert(sizeof(SPluginsRaceSplit_t) == 20, "MX race split moved");
+
 // EventInit payload. We read fields at the *end* of this one, so every preceding field must
 // match the build exactly - a wrong size anywhere ahead of m_szServerName silently yields
 // garbage rather than an error.

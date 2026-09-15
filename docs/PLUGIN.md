@@ -286,12 +286,15 @@ first sample and whenever stance changes.
 
 - A keyboard key (`KEY <scan code>`) is read with `GetAsyncKeyState`, only while the game has
   focus. Stance is unknown while it doesn't.
-- A controller button (`C_BUTTON <GUID> <n>`) is read through DirectInput, from the device with
-  that GUID, in non-exclusive background mode: the same device and button the game reads. If
-  that device isn't found, buttons 0-9 fall back to the first XInput pad (A B X Y LB RB Back
-  Start LS RS), marked as a guess.
+- A controller button (`BUTTON <GUID> <n>`, the device's DirectInput instance GUID and its
+  button number) is read through DirectInput, from that device, in non-exclusive background
+  mode: the same device and button the game reads. If the device is attached but DirectInput
+  can't open it, buttons 0-9 fall back to the first XInput pad (A B X Y LB RB Back Start LS
+  RS), marked as a guess. A device that isn't attached isn't read at all.
 - In toggle mode each press flips stance and a crash resets it to standing, so it is marked as
-  a guess. Axes, POV hats, mice, and auto-sit switched on all record stance as unknown.
+  a guess. Axes (`AXIS`), POV hats (`POV`), plugin controllers (`C_BUTTON`, `C_AXIS`,
+  `C_SLIDER`, `C_POV`, `C_DIAL`), an unbound Sit, and auto-sit switched on all record stance
+  as unknown.
 
 The byte layouts are at the top of `src/stance.h` and pinned by `tests/stance_test.cpp`. A
 reader that predates them skips both records by their length.

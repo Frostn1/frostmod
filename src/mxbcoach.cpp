@@ -8,7 +8,8 @@
 // coachrec.h and coachcue.h.
 //
 // It also records sitting and standing, by polling the rider's Sit bind (stance.h): a key
-// through GetAsyncKeyState, a controller button through DirectInput or XInput.
+// through GetAsyncKeyState, a controller button through DirectInput from the device the bind
+// names (XInput only as a guess, when DirectInput won't open it).
 //
 // And the other riders, from the Race* callbacks (others.h): who is in the event, where every
 // bike is at 10 Hz, and everyone's lap and split times. Only while a stint is recording.
@@ -162,16 +163,20 @@ void ReleaseDevice() {
     g_sit.dev = nullptr;
 }
 
-// The attached controller the bind names, by instance or product GUID, opened to read in the
-// background without taking it from the game. Kept across stints while the bind is the same.
-bool OpenDevice(const stance::Guid& want) {
-    if (g_sit.dev && std::memcmp(&g_sit.dev_guid, &want, sizeof(want)) == 0) return true;
+enum class Open { OK, MISSING, FAILED };
+
+// The attached controller the bind names, by instance GUID (as the game writes it) or product
+// GUID, opened to read in the background without taking it from the game. Kept across stints
+// while the bind is the same. MISSING: no attached device has that GUID, so the game can't
+// read the bind either. FAILED: it may be there, but DirectInput wouldn't open it.
+Open OpenDevice(const stance::Guid& want) {
+    if (g_sit.dev && std::memcmp(&g_sit.dev_guid, &want, sizeof(want)) == 0) return Open::OK;
     ReleaseDevice();
     if (!g_sit.di &&
         FAILED(DirectInput8Create(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8A,
                                   reinterpret_cast<void**>(&g_sit.di), nullptr))) {
         g_sit.di = nullptr;
-        return false;
+        return Open::FAILED;
     }
     struct Match {
         const stance::Guid* want;
@@ -189,19 +194,19 @@ bool OpenDevice(const stance::Guid& want) {
             return DIENUM_STOP;
         },
         &m, DIEDFL_ATTACHEDONLY);
-    if (!m.ok) return false;
+    if (!m.ok) return Open::MISSING;
     IDirectInputDevice8A* dev = nullptr;
-    if (FAILED(g_sit.di->CreateDevice(m.found, &dev, nullptr))) return false;
+    if (FAILED(g_sit.di->CreateDevice(m.found, &dev, nullptr))) return Open::FAILED;
     HWND wnd = GameWindow();
     if (!wnd || FAILED(dev->SetDataFormat(&c_dfDIJoystick2)) ||
         FAILED(dev->SetCooperativeLevel(wnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))) {
         dev->Release();
-        return false;
+        return Open::FAILED;
     }
     dev->Acquire();
     g_sit.dev      = dev;
     g_sit.dev_guid = want;
-    return true;
+    return Open::OK;
 }
 
 XInputGetStateFn LoadXInput() {
@@ -237,10 +242,14 @@ void SetupStance() {
         if (!g_sit.vk) g_sit.vk = int(MapVirtualKeyA(UINT(s.bind.index), MAPVK_VSC_TO_VK_EX));
         if (g_sit.vk) g_sit.source = stance::SRC_KEYBOARD;
     } else if (s.auto_sit != stance::FLAG_ON && s.bind.input == stance::IN_PAD_BUTTON) {
+        // The bind's GUID already parsed in stance::ParseLine. XInput only when the pad is
+        // there but DirectInput won't open it: the first XInput pad, so only a guess (Rate).
         stance::Guid g;
-        if (stance::ParseGuid(s.bind.device, g) && OpenDevice(g)) {
+        stance::ParseGuid(s.bind.device, g);
+        const Open o = OpenDevice(g);
+        if (o == Open::OK) {
             g_sit.source = stance::SRC_DIRECTINPUT;
-        } else if (stance::XInputMask(s.bind.index) && LoadXInput()) {
+        } else if (o == Open::FAILED && stance::XInputMask(s.bind.index) && LoadXInput()) {
             XINPUT_STATE st;
             for (DWORD slot = 0; slot < 4; ++slot) {
                 std::memset(&st, 0, sizeof(st));

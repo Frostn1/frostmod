@@ -26,44 +26,85 @@ static int g_failures = 0;
 
 using namespace stance;
 
-static const char* kPad = "028E045E-0000-0000-0000-504944564944";
+// A DIDEVICEINSTANCE.guidInstance, as the game writes it.
+static const char* kPad = "6F1D2B60-D5A0-11CF-BFC7-444553540000";
 
-// Lines as the game's writer emits them: name, type, device for a controller, number, then
+// The 10 tuning values that end every line.
+static const std::string kTune = " 0.000000 0.000000 1.000000 0 0.000000 0.000000 0 0.000000 0.000000 0.000000";
+
+// Lines as the game's writer emits them: name, binding tokens (none when unbound), then the
 // tuning values this reader ignores.
 static const std::string kControls =
-    "CTRL_THROTTLE C_AXIS 028E045E-0000-0000-0000-504944564944 5 1 0.020000 0.000000 1.000000\r\n"
-    "CTRL_SITDirect C_BUTTON 028E045E-0000-0000-0000-504944564944 1 0.000000\r\n"
-    "CTRL_SIT KEY 18 0.000000\r\n"
-    "CTRL_LRLEAN C_POV 028E045E-0000-0000-0000-504944564944 0 0\r\n";
+    "CTRL_THROTTLE AXIS 6F1D2B60-D5A0-11CF-BFC7-444553540000 2 0 0.020000 0.000000 1.000000 1 0.200000 0.100000 0 1.000000 0.000000 0.000000\r\n"
+    "CTRL_SIT BUTTON 6F1D2B60-D5A0-11CF-BFC7-444553540000 1 0.000000 0.000000 1.000000 0 0.000000 0.000000 0 0.000000 0.000000 0.000000\r\n"
+    "CTRL_SITDirect KEY 18 0.000000 0.000000 1.000000 0 0.000000 0.000000 0 0.000000 0.000000 0.000000\r\n"
+    "CTRL_LRLEAN KEY 203 205" + kTune + "\r\n"
+    "CTRL_CLUTCH" + kTune + "\r\n"
+    "CTRL_CAMERA POV 6F1D2B60-D5A0-11CF-BFC7-444553540000 0" + kTune + "\r\n";
 
 static void ParsesBindLines() {
     std::string name;
     Bind b;
-    CHECK(ParseLine("CTRL_SIT KEY 18 0.000000", name, b) && name == "CTRL_SIT", "key line");
+    CHECK(ParseLine("CTRL_SIT KEY 18" + kTune, name, b) && name == "CTRL_SIT", "key line");
     CHECK(b.input == IN_KEY && b.index == 18 && b.device.empty(), "key %d %d", b.input, b.index);
+    CHECK(ParseLine("CTRL_LRLEAN KEY 203 205" + kTune, name, b) && b.input == IN_KEY && b.index == 203,
+          "two-sided key %d %d", b.input, b.index);
 
-    CHECK(ParseLine(std::string("  CTRL_SITDirect\tC_BUTTON ") + kPad + " 3 1.0\r", name, b), "button line");
+    // A DirectInput pad button: BUTTON <guidInstance> <n>.
+    CHECK(ParseLine(std::string("  CTRL_SITDirect\tBUTTON ") + kPad + " 3" + kTune + "\r", name, b), "button line");
     CHECK(name == "CTRL_SITDirect" && b.input == IN_PAD_BUTTON && b.index == 3 && b.device == kPad,
           "button %s %d %d %s", name.c_str(), b.input, b.index, b.device.c_str());
+    CHECK(ParseLine(std::string("CTRL_SIT BUTTON ") + kPad + " 0" + kTune, name, b) && b.input == IN_PAD_BUTTON &&
+              b.index == 0,
+          "button 0 %d %d", b.input, b.index);
 
-    CHECK(ParseLine(std::string("CTRL_SIT C_AXIS ") + kPad + " 2 1", name, b) && b.input == IN_PAD_AXIS, "axis");
-    CHECK(ParseLine(std::string("CTRL_SIT C_POV ") + kPad + " 0", name, b) && b.input == IN_PAD_POV, "pov");
-    CHECK(ParseLine("CTRL_SIT BUTTON mouse 0", name, b) && b.input == IN_OTHER, "plain button");
+    CHECK(ParseLine(std::string("CTRL_SIT AXIS ") + kPad + " 2 1" + kTune, name, b) && b.input == IN_PAD_AXIS &&
+              b.index == 2 && b.device == kPad,
+          "axis");
+    CHECK(ParseLine(std::string("CTRL_SIT POV ") + kPad + " 0" + kTune, name, b) && b.input == IN_PAD_POV &&
+              b.index == 0,
+          "pov");
+
+    // Plugin (.dli) controllers: DirectInput can't read them, so they are other.
+    for (const char* type : {"C_BUTTON", "C_AXIS", "C_SLIDER", "C_POV", "C_DIAL"}) {
+        CHECK(ParseLine(std::string("CTRL_SIT ") + type + " 1 3 0" + kTune, name, b) && b.input == IN_OTHER &&
+                  b.index == -1 && b.device.empty(),
+              "%s %d %d", type, b.input, b.index);
+    }
+
+    // Unbound: the name, then straight to the tuning values.
+    CHECK(ParseLine("CTRL_SIT" + kTune, name, b) && name == "CTRL_SIT" && b.input == IN_NONE && b.index == -1 &&
+              b.device.empty(),
+          "unbound %d %d", b.input, b.index);
+
+    // Tuning floats are never taken for a device or a number.
+    CHECK(ParseLine("CTRL_SIT BUTTON" + kTune, name, b) && b.input == IN_NONE, "button, float for the GUID");
+    CHECK(ParseLine(std::string("CTRL_SIT BUTTON ") + kPad + kTune, name, b) && b.input == IN_NONE,
+          "button, float for the number");
+    CHECK(ParseLine("CTRL_SIT AXIS" + kTune, name, b) && b.input == IN_PAD_AXIS && b.index == -1 && b.device.empty(),
+          "axis, floats only");
 
     // Broken numbers leave the control unbound rather than bound to something else.
     CHECK(ParseLine("CTRL_SIT KEY E", name, b) && b.input == IN_NONE, "a key name is not a scan code");
     CHECK(ParseLine("CTRL_SIT KEY 0", name, b) && b.input == IN_NONE, "scan code 0");
     CHECK(ParseLine("CTRL_SIT KEY 256", name, b) && b.input == IN_NONE, "scan code past 255");
-    CHECK(ParseLine(std::string("CTRL_SIT C_BUTTON ") + kPad, name, b) && b.input == IN_NONE, "button with no number");
+    CHECK(ParseLine(std::string("CTRL_SIT BUTTON ") + kPad, name, b) && b.input == IN_NONE, "button with no number");
+    CHECK(ParseLine(std::string("CTRL_SIT BUTTON ") + kPad + " 128", name, b) && b.input == IN_NONE, "button past 127");
+    CHECK(ParseLine("CTRL_SIT BUTTON mouse 0", name, b) && b.input == IN_NONE, "button, not a GUID");
     CHECK(ParseLine("CTRL_SIT NONE", name, b) && b.input == IN_NONE, "unknown type");
     CHECK(!ParseLine("CTRL_SIT", name, b) && !ParseLine("   ", name, b), "not a bind line");
 }
 
 static void FindsTheControlByExactName() {
     // CTRL_SIT is a prefix of CTRL_SITDirect: each must find its own line, whichever comes first.
-    Bind hold = FindBind(kControls, kHoldControl), toggle = FindBind(kControls, kToggleControl);
-    CHECK(hold.input == IN_PAD_BUTTON && hold.index == 1, "hold bind %d %d", hold.input, hold.index);
-    CHECK(toggle.input == IN_KEY && toggle.index == 18, "toggle bind %d %d", toggle.input, toggle.index);
+    Bind toggle = FindBind(kControls, kToggleControl), hold = FindBind(kControls, kHoldControl);
+    CHECK(toggle.input == IN_PAD_BUTTON && toggle.index == 1 && toggle.device == kPad, "toggle bind %d %d",
+          toggle.input, toggle.index);
+    CHECK(hold.input == IN_KEY && hold.index == 18, "hold bind %d %d", hold.input, hold.index);
+    CHECK(FindBind(kControls, "CTRL_THROTTLE").input == IN_PAD_AXIS, "throttle axis");
+    CHECK(FindBind(kControls, "CTRL_LRLEAN").index == 203, "two-sided key");
+    CHECK(FindBind(kControls, "CTRL_CLUTCH").input == IN_NONE, "unbound control");
+    CHECK(FindBind(kControls, "CTRL_CAMERA").input == IN_PAD_POV, "pov");
     CHECK(FindBind(kControls, "CTRL_DAB").input == IN_NONE, "absent control");
     CHECK(FindBind("", kHoldControl).input == IN_NONE, "empty file");
 }
@@ -83,11 +124,22 @@ static void ReadsIniValues() {
 
 static void ReadsTheSetup() {
     Setup s = ReadSetup("[input]\nsit_direct=1\n[aids]\nautoridersit=0\n", kControls);
-    CHECK(s.mode == HOLD && s.auto_sit == FLAG_OFF && s.bind.input == IN_PAD_BUTTON, "hold setup");
+    CHECK(s.mode == HOLD && s.auto_sit == FLAG_OFF && s.bind.input == IN_KEY && s.bind.index == 18,
+          "hold setup reads CTRL_SITDirect");
 
     s = ReadSetup("[input]\nsit_direct=0\n[aids]\nautoridersit=1\n", kControls);
-    CHECK(s.mode == TOGGLE && s.auto_sit == FLAG_ON && s.bind.input == IN_KEY && s.bind.index == 18,
+    CHECK(s.mode == TOGGLE && s.auto_sit == FLAG_ON && s.bind.input == IN_PAD_BUTTON && s.bind.index == 1 &&
+              s.bind.device == kPad,
           "toggle setup reads CTRL_SIT");
+
+    // A plugin controller's button: nothing to poll, so every sample is unknown.
+    s = ReadSetup("[input]\nsit_direct=1\n[aids]\nautoridersit=0\n", "CTRL_SITDirect C_BUTTON 2 1" + kTune + "\r\n");
+    CHECK(s.mode == HOLD && s.bind.input == IN_OTHER && Rate(s, SRC_NONE) == CONF_NONE, "plugin controller");
+    std::vector<uint8_t> p = BindPayload(s, SRC_NONE, Rate(s, SRC_NONE));
+    CHECK(p[1] == IN_OTHER && p[4] == CONF_NONE && p[5] == SRC_NONE && p[12] == 0, "plugin controller payload");
+
+    s = ReadSetup("[input]\nsit_direct=1\n[aids]\nautoridersit=0\n", "CTRL_SITDirect" + kTune + "\r\n");
+    CHECK(s.mode == HOLD && s.bind.input == IN_NONE && s.bind.index == -1, "unbound Sit");
 
     s = ReadSetup("[input]\ncombined_brakes=0\n", kControls);
     CHECK(s.mode == MODE_UNKNOWN && s.auto_sit == FLAG_UNKNOWN && s.bind.input == IN_NONE, "no sit_direct");
@@ -116,6 +168,8 @@ static void RatesConfidence() {
     s.auto_sit   = FLAG_OFF;
     s.bind.input = IN_PAD_AXIS;
     CHECK(Rate(s, SRC_DIRECTINPUT) == CONF_NONE, "an axis");
+    s.bind.input = IN_OTHER;
+    CHECK(Rate(s, SRC_DIRECTINPUT) == CONF_NONE, "a plugin controller");
     s.bind.input = IN_KEY;
     s.mode       = MODE_UNKNOWN;
     CHECK(Rate(s, SRC_KEYBOARD) == CONF_NONE, "unknown mode");
@@ -199,10 +253,10 @@ static void UnusableIsAlwaysUnknown() {
 }
 
 static void PayloadBytes() {
-    Setup s = ReadSetup("[input]\nsit_direct=1\n[aids]\nautoridersit=0\n", kControls);
-    std::vector<uint8_t> p = BindPayload(s, SRC_DIRECTINPUT, CONF_SURE);
+    Setup s = ReadSetup("[input]\nsit_direct=0\n[aids]\nautoridersit=0\n", kControls);
+    std::vector<uint8_t> p = BindPayload(s, SRC_DIRECTINPUT, CONF_GUESS);
     CHECK(p.size() == 52, "bind size %zu", p.size());
-    const uint8_t head[8] = {1, IN_PAD_BUTTON, HOLD, FLAG_OFF, CONF_SURE, SRC_DIRECTINPUT, 0, 0};
+    const uint8_t head[8] = {1, IN_PAD_BUTTON, TOGGLE, FLAG_OFF, CONF_GUESS, SRC_DIRECTINPUT, 0, 0};
     CHECK(std::memcmp(p.data(), head, 8) == 0, "bind head");
     int32_t index;
     std::memcpy(&index, &p[8], 4);
@@ -242,7 +296,7 @@ static void RecordsAndOldReadersSkipThem() {
     uint8_t session[112] = {0};
     CHECK(r.on_run_init(session, sizeof(session), "stance-test"), "open");
     Setup s = ReadSetup("[input]\nsit_direct=1\n", kControls);
-    std::vector<uint8_t> bind = BindPayload(s, SRC_DIRECTINPUT, Rate(s, SRC_DIRECTINPUT));
+    std::vector<uint8_t> bind = BindPayload(s, SRC_KEYBOARD, Rate(s, SRC_KEYBOARD));
     r.record(coachrec::STANCE_BIND, bind.data(), uint32_t(bind.size()));
 
     Tracker tr;

@@ -11,6 +11,11 @@
   tags 12-15, only while a stint is recording. About 250 KB a minute with 20 riders.
   `src/others.h`, `tests/others_test.cpp`.
 
+### Fixed
+- **Sit and stand now read controller buttons bound in the game the usual way.** A Sit button
+  on a gamepad is read from that pad. Buttons from controller plugins, and a Sit left unbound,
+  are recorded as unknown.
+
 ## 2026-09-15 — v0.20.0
 
 ### Added

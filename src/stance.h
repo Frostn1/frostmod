@@ -6,10 +6,19 @@
 //   profile.ini   [input] sit_direct=1   hold the bind to sit     (control CTRL_SITDirect)
 //                 [input] sit_direct=0   press it to sit or stand (control CTRL_SIT)
 //                 [aids]  autoridersit=1 the game sits the rider itself: stance unknown
-//   controls.txt  one line per control, as the game's writer emits them:
-//                   CTRL_SIT KEY <DirectInput scan code> ...
-//                   CTRL_SITDirect C_BUTTON <DirectInput device GUID> <button> ...
-//                 C_AXIS, C_SLIDER, C_DIAL, C_POV, AXIS, POV, BUTTON: not read here.
+//   controls.txt  one line per control, as the game's writer emits them: the case-sensitive
+//                 CTRL_* name, the binding tokens, then always 10 tuning values
+//                 (%f %f %f %d %f %f %d %f %f %f) that this reader never looks at:
+//                   CTRL_SIT KEY <DIK scan code> [second code, two-sided controls]
+//                   CTRL_SIT BUTTON <guid> <button>   DirectInput pad, rgbButtons index
+//                   CTRL_SIT AXIS <guid> <n> <0|1>    DirectInput pad axis
+//                   CTRL_SIT POV <guid> <n>           DirectInput pad hat
+//                   CTRL_SIT C_BUTTON <plugin id> ... a .dli plugin controller, as are
+//                                                     C_AXIS C_SLIDER C_POV C_DIAL: not
+//                                                     readable through DirectInput
+//                   CTRL_SIT 0.000000 ...             unbound: straight to the tuning values
+//                 <guid> is the device's DIDEVICEINSTANCE.guidInstance, upper case, no braces.
+//                 Only KEY and BUTTON can be polled; the rest record stance as unknown.
 //   global.ini    lastprofile=<the profile folder in use>
 //
 // No Win32 here, so tests/stance_test.cpp runs anywhere. mxbcoach.cpp reads the files,
@@ -18,14 +27,15 @@
 // Records in the .mxbc file (tags in coachrec.h; little-endian):
 //   STANCE_BIND  52 bytes, once per stint, right after SESSION
 //      0  u8   layout version (1)
-//      1  u8   input: 0 none, 1 key, 2 controller button, 3 axis, 4 POV, 5 other
+//      1  u8   input: 0 none, 1 key, 2 controller button, 3 axis, 4 POV,
+//              5 other (a .dli plugin controller)
 //      2  u8   mode: 0 hold, 1 toggle, 2 unknown
 //      3  u8   auto-sit: 0 off, 1 on, 2 unknown
 //      4  u8   confidence: 0 none (every STANCE is unknown), 1 guess, 2 sure
 //      5  u8   read through: 0 nothing, 1 keyboard, 2 DirectInput, 3 XInput
 //      6  u16  zero
 //      8  i32  scan code for a key, button number for a controller, -1 for none
-//      12 char[40] device GUID as the game wrote it, NUL-padded ("" for a key)
+//      12 char[40] device GUID as the game wrote it, NUL-padded ("" for a key or other)
 //   STANCE       12 bytes, on the stint's first sample and then only when stance changes
 //      0  f32  track time s        (as in the SAMPLE it came with)
 //      4  f32  lap position 0..1
@@ -139,36 +149,71 @@ inline std::string IniValue(const std::string& text, const std::string& section,
 // ---------------------------------------------------------------------------------------
 // controls.txt
 
+/// Laid out like a Win32 GUID, so it compares with memcmp against one.
+struct Guid {
+    uint32_t d1 = 0;
+    uint16_t d2 = 0, d3 = 0;
+    uint8_t  d4[8] = {};
+};
+static_assert(sizeof(Guid) == 16, "Guid must match the Win32 layout");
+
+/// "6F1D2B61-D5A0-11CF-BFC7-444553540000", with or without braces, any case.
+inline bool ParseGuid(std::string s, Guid& out) {
+    if (s.size() == 38 && s.front() == '{' && s.back() == '}') s = s.substr(1, 36);
+    if (s.size() != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') return false;
+    uint8_t b[16];
+    size_t  k = 0;
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
+        const int c = std::tolower(static_cast<unsigned char>(s[i]));
+        const int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        if (v < 0) return false;
+        if (k % 2 == 0) b[k / 2] = uint8_t(v << 4);
+        else b[k / 2] |= uint8_t(v);
+        ++k;
+    }
+    Guid g;
+    g.d1 = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
+    g.d2 = uint16_t(b[4] << 8 | b[5]);
+    g.d3 = uint16_t(b[6] << 8 | b[7]);
+    std::memcpy(g.d4, b + 8, 8);
+    out = g;
+    return true;
+}
+
 /// One controls.txt line: the control's name and its bind. False if it isn't a bind line.
+/// Reads only the binding tokens after the name. A device must be a GUID and a number an
+/// integer, so a tuning float is never taken for either; a line that goes straight from the
+/// name to the tuning values is unbound.
 inline bool ParseLine(const std::string& line, std::string& name, Bind& out) {
     const std::vector<std::string> t = Tokens(line);
     if (t.size() < 2) return false;
     name = t[0];
     out  = Bind{};
     const std::string& type = t[1];
+    Guid       g;
+    int32_t    n   = -1;
+    const bool dev = t.size() >= 3 && ParseGuid(t[2], g);
+    const bool num = dev && t.size() >= 4 && ToInt(t[3], n);
     if (type == "KEY") {
-        int32_t code;
-        if (t.size() >= 3 && ToInt(t[2], code) && code > 0 && code < 256) {
+        // A second code (two-sided controls) is left alone: Sit has one.
+        if (t.size() >= 3 && ToInt(t[2], n) && n > 0 && n < 256) {
             out.input = IN_KEY;
-            out.index = code;
+            out.index = n;
         }
-    } else if (type == "C_BUTTON") {
-        int32_t button;
-        if (t.size() >= 4 && ToInt(t[3], button) && button >= 0 && button < 128) {
+    } else if (type == "BUTTON") {
+        if (num && n >= 0 && n < 128) {
             out.input  = IN_PAD_BUTTON;
             out.device = t[2];
-            out.index  = button;
+            out.index  = n;
         }
-    } else if (type == "C_AXIS" || type == "C_SLIDER" || type == "C_DIAL" || type == "AXIS") {
-        out.input = IN_PAD_AXIS;
-    } else if (type == "C_POV" || type == "POV") {
-        out.input = IN_PAD_POV;
-    } else if (type == "BUTTON") {
-        out.input = IN_OTHER;  // not a controller: the game writes controllers as C_*
-    }
-    if (out.input == IN_PAD_AXIS || out.input == IN_PAD_POV || out.input == IN_OTHER) {
-        out.device = t.size() >= 3 ? t[2] : "";
-        if (t.size() < 4 || !ToInt(t[3], out.index)) out.index = -1;
+    } else if (type == "AXIS" || type == "POV") {
+        out.input = type == "AXIS" ? IN_PAD_AXIS : IN_PAD_POV;
+        if (dev) out.device = t[2];
+        if (num) out.index = n;
+    } else if (type == "C_BUTTON" || type == "C_AXIS" || type == "C_SLIDER" || type == "C_POV" ||
+               type == "C_DIAL") {
+        out.input = IN_OTHER;  // a .dli plugin controller: DirectInput can't see it
     }
     return true;
 }
@@ -216,38 +261,6 @@ inline Confidence Rate(const Setup& s, Source src) {
 
 // ---------------------------------------------------------------------------------------
 // Devices
-
-/// Laid out like a Win32 GUID, so it compares with memcmp against one.
-struct Guid {
-    uint32_t d1 = 0;
-    uint16_t d2 = 0, d3 = 0;
-    uint8_t  d4[8] = {};
-};
-static_assert(sizeof(Guid) == 16, "Guid must match the Win32 layout");
-
-/// "6F1D2B61-D5A0-11CF-BFC7-444553540000", with or without braces, any case.
-inline bool ParseGuid(std::string s, Guid& out) {
-    if (s.size() == 38 && s.front() == '{' && s.back() == '}') s = s.substr(1, 36);
-    if (s.size() != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') return false;
-    uint8_t b[16];
-    size_t  k = 0;
-    for (size_t i = 0; i < 36; ++i) {
-        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
-        const int c = std::tolower(static_cast<unsigned char>(s[i]));
-        const int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-        if (v < 0) return false;
-        if (k % 2 == 0) b[k / 2] = uint8_t(v << 4);
-        else b[k / 2] |= uint8_t(v);
-        ++k;
-    }
-    Guid g;
-    g.d1 = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
-    g.d2 = uint16_t(b[4] << 8 | b[5]);
-    g.d3 = uint16_t(b[6] << 8 | b[7]);
-    std::memcpy(g.d4, b + 8, 8);
-    out = g;
-    return true;
-}
 
 /// An Xbox pad's DirectInput button number as an XINPUT_GAMEPAD button bit. 0 past 9.
 inline uint16_t XInputMask(int32_t button) {

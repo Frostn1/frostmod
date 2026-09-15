@@ -231,6 +231,7 @@ static void PayloadBytes() {
 // original tags (MXB Coach before stance) reads the rest of the file unchanged.
 static void RecordsAndOldReadersSkipThem() {
     const char* tmp = std::getenv("TMPDIR");
+    if (!tmp) tmp = std::getenv("TEMP");  // Windows
     std::string dir = tmp ? tmp : "/tmp";
     if (dir.back() != '/' && dir.back() != '\\') dir += '/';
 

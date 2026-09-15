@@ -276,6 +276,26 @@ text on a dark backing, only while riding. The `.cue` layout, and the rules for 
 gap, the cap per lap and priority, are at the top of `coachcue.h` and pinned by
 `tests/coachcue_test.cpp`.
 
+It also records **when the rider sits and stands**. The game tells plugins nothing about the
+rider's pose, so the recorder watches the rider's own Sit bind. On `RunInit` it reads
+`lastprofile` from `<save path>\global.ini`, then that profile's `profile.ini` (`[input]
+sit_direct`: 1 = hold to sit, bind `CTRL_SITDirect`; 0 = press to toggle, bind `CTRL_SIT`;
+`[aids] autoridersit`) and `controls.txt` (the bind line). It writes one `STANCE_BIND` record
+after `SESSION`, then polls the bind with every sample and writes a `STANCE` record on the
+first sample and whenever stance changes.
+
+- A keyboard key (`KEY <scan code>`) is read with `GetAsyncKeyState`, only while the game has
+  focus. Stance is unknown while it doesn't.
+- A controller button (`C_BUTTON <GUID> <n>`) is read through DirectInput, from the device with
+  that GUID, in non-exclusive background mode: the same device and button the game reads. If
+  that device isn't found, buttons 0-9 fall back to the first XInput pad (A B X Y LB RB Back
+  Start LS RS), marked as a guess.
+- In toggle mode each press flips stance and a crash resets it to standing, so it is marked as
+  a guess. Axes, POV hats, mice, and auto-sit switched on all record stance as unknown.
+
+The byte layouts are at the top of `src/stance.h` and pinned by `tests/stance_test.cpp`. A
+reader that predates them skips both records by their length.
+
 ## Key internal functions (reference)
 
 - `Log`, `InitLogPath` — logging to `<dll folder>\frostmod.log`.

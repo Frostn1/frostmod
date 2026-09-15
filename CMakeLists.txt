@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.17.0")
+set(FROSTMOD_VERSION "0.18.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -43,6 +43,7 @@ frostmod_version_rc(FROSTMOD_DLL_RC VFT_DLL "frostmod.dll" "FrostMod in-game ove
 frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for PiBoSo sims")
 frostmod_version_rc(FROSTSERVER_DLL_RC VFT_DLL "frostserver.dlo" "FrostServer - dedicated-server map/link API for MX Bikes")
 frostmod_version_rc(FROSTSERVER_EXE_RC VFT_APP "frostserver.exe" "FrostServer standalone - map/link API for MX Bikes")
+frostmod_version_rc(MXBCOACH_DLL_RC VFT_DLL "mxbcoach.dlo" "MXB Coach lap recorder - telemetry plugin for MX Bikes")
 
 # --- MinHook (function hooking) ------------------------------------------------
 include(FetchContent)
@@ -86,6 +87,13 @@ target_compile_definitions(frostserver_app PRIVATE FROSTSERVER_EXE)
 target_link_libraries(frostserver_app PRIVATE ws2_32)
 set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 
+# --- mxbcoach (MXB Coach lap recorder) ------------------------------------------
+# mxbcoach.dlo is a PiBoSo plugin the MXB Coach app installs into <MX Bikes>\plugins\. It
+# records the rider's own telemetry to <save path>\mxbcoach\sessions\*.mxbc for the app to
+# analyse. Hooks nothing and draws nothing; the file rules live in src/coachrec.h.
+add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
+set_target_properties(mxbcoach PROPERTIES OUTPUT_NAME "mxbcoach" PREFIX "")
+
 # --- offsets invariants test --------------------------------------------------
 # Asserts that each title's offset tables belong to that title (see
 # tests/offsets_test.cpp for why). Pure constants - no Win32, no game - so unlike
@@ -122,10 +130,16 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
+# --- coach recorder test -------------------------------------------------------
+# The .mxbc file is a wire contract with MXB Coach's Rust reader. src/coachrec.h keeps the
+# rules for it apart from Win32, so they run here.
+add_executable(coachrec_test tests/coachrec_test.cpp)
+add_test(NAME coachrec COMMAND coachrec_test)
+
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).
-set_target_properties(frostmod frostmod_app frostserver frostserver_app PROPERTIES
+set_target_properties(frostmod frostmod_app frostserver frostserver_app mxbcoach PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -156,7 +170,7 @@ if(FROSTMOD_SIGN)
     else()
         message(FATAL_ERROR "FROSTMOD_SIGN=ON but neither FROSTMOD_SIGN_PFX nor FROSTMOD_SIGN_SHA1 is set.")
     endif()
-    foreach(_frostmod_target frostmod frostmod_app frostserver frostserver_app)
+    foreach(_frostmod_target frostmod frostmod_app frostserver frostserver_app mxbcoach)
         add_custom_command(TARGET ${_frostmod_target} POST_BUILD
             COMMAND "${FROSTMOD_SIGNTOOL}" sign /fd SHA256 ${_frostmod_sign_id}
                     /tr "${FROSTMOD_SIGN_TIMESTAMP_URL}" /td SHA256
@@ -185,3 +199,10 @@ add_custom_command(TARGET frostserver POST_BUILD
             "$<TARGET_FILE:frostserver>" "$<TARGET_FILE_DIR:frostserver>/frostserver.dlo"
     VERBATIM
     COMMENT "Copying frostserver.dll -> frostserver.dlo (PiBoSo server plugin)")
+
+# mxbcoach.dlo - same again for the coach recorder. Runs LAST so it inherits any signature.
+add_custom_command(TARGET mxbcoach POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:mxbcoach>" "$<TARGET_FILE_DIR:mxbcoach>/mxbcoach.dlo"
+    VERBATIM
+    COMMENT "Copying mxbcoach.dll -> mxbcoach.dlo (MXB Coach recorder plugin)")

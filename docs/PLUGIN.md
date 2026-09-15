@@ -257,6 +257,16 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 | `Local\FrostModReload` | named auto-reset event; cross-process reload trigger (`R`) |
 | `Local\FrostModCycle` | named auto-reset event; cross-process cycle-strategy trigger (`S`) |
 
+## mxbcoach.dlo (MXB Coach recorder)
+
+A separate plugin built from the same tree (`src/mxbcoach.cpp`, rules in `src/coachrec.h`),
+not part of FrostMod. The MXB Coach app installs it into `<MX Bikes>\plugins\`. It exports
+the `Run*` callbacks, `EventInit`/`EventDeinit` and `TrackCenterline`, asks for telemetry at
+50 Hz, and writes one `.mxbc` file per stint on track to
+`<save path>\mxbcoach\sessions\<yyyymmdd-hhmmss-mmm>.mxbc`. The records are the game's own
+payloads, byte for byte; the layout is documented at the top of `coachrec.h` and pinned by
+`tests/coachrec_test.cpp`. MX Bikes only: the other titles send different telemetry structs.
+
 ## Key internal functions (reference)
 
 - `Log`, `InitLogPath` — logging to `<dll folder>\frostmod.log`.

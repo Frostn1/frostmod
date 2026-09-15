@@ -40,7 +40,7 @@ jobs:
           # MSVC is a multi-config generator, so RUNTIME_OUTPUT_DIRECTORY .../bin
           # gets the config appended: build/bin/Release.
           $bin = 'build/bin/Release'
-          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo') {
+          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo','mxbcoach.dlo') {
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
           }
           Get-ChildItem $bin

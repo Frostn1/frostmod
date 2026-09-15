@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-14 — v0.18.0
+
+### Added
+- **`mxbcoach.dlo`, the MXB Coach lap recorder.** A new plugin, separate from FrostMod, that
+  the MXB Coach app installs into the game's `plugins` folder. It records the rider's own
+  telemetry at 50 Hz, with lap and split times and the track centreline, to one `.mxbc`
+  file per stint under `<save path>\mxbcoach\sessions\`, for the app to turn into lap-time
+  advice. It hooks nothing and draws nothing. Built and released alongside FrostMod.
+  `src/mxbcoach.cpp`, `src/coachrec.h`, `tests/coachrec_test.cpp`.
+
 ## 2026-09-04 — v0.17.0
 
 ### Added

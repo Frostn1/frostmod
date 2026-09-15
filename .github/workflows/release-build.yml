@@ -50,7 +50,8 @@ jobs:
           $bin = 'build/bin/Release'
           New-Item -ItemType Directory -Force dist | Out-Null
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
-                         'frostserver.exe','frostserver.dll','frostserver.dlo') {
+                         'frostserver.exe','frostserver.dll','frostserver.dlo',
+                         'mxbcoach.dlo') {
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
             Copy-Item "$bin/$f" dist/
           }
@@ -183,4 +184,5 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" `
             dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
-            dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip --clobber
+            dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip `
+            dist/mxbcoach.dlo --clobber

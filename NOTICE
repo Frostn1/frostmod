@@ -13,6 +13,22 @@ MXB Coach spoken cue clips (src/voice/*.wav, embedded in mxbcoach.dlo)
   Piper is only used to make the clips and isn't shipped; its licence doesn't
   cover the audio it outputs.
 
+MXB Coach HUD font (src/font/coach.fnt, embedded in mxbcoach.dlo)
+  Roboto Mono, rasterised into PiBoSo's .fnt bitmap-font format. The plugin
+  writes it beside itself and registers it in DrawInit, which is the only way a
+  PiBoSo plugin can draw text at all.
+
+  Copyright 2015 The Roboto Mono Project Authors
+  (https://github.com/googlefonts/robotomono)
+
+  Licensed under the SIL Open Font License, Version 1.1, available with a FAQ
+  at https://openfontlicense.org. The font is redistributed here in a
+  rasterised form; it is not sold, and it carries no reserved font name.
+
+  The .fnt was produced by MXBMRP3's fontgen (tools/fontgen in
+  https://github.com/thomas4f/mxbmrp3), MIT licensed, Copyright (c) 2025-2026
+  thomas4f - the same licence text reproduced below.
+
 MXB Coach in-game HUD (src/coachhud.h, built into mxbcoach.dlo)
   Adapts code from MXBMRP3 (https://github.com/thomas4f/mxbmrp3): the track
   centreline walk and bounds, the map's world-to-screen fit, the dot and line

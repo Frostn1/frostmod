@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.22.0")
+set(FROSTMOD_VERSION "0.23.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -58,6 +58,12 @@ foreach(_clip IN LISTS MXBCOACH_VOICE_CLIPS)
     string(APPEND MXBCOACH_VOICE_RC "${_clip_id} RCDATA \"${CMAKE_SOURCE_DIR}/src/voice/${_clip}.wav\"\n")
     math(EXPR _clip_id "${_clip_id} + 1")
 endforeach()
+# The HUD's font. SPluginString_t::m_iFont is a 1-based index into the font table the PLUGIN
+# registers in DrawInit, so a plugin that registers none can draw no text at all. mxbcoach.dlo
+# embeds one font here and writes it out beside itself at DrawInit (src/mxbcoach.cpp).
+set(MXBCOACH_FONT_RESOURCE_ID 200)
+string(APPEND MXBCOACH_VOICE_RC
+       "${MXBCOACH_FONT_RESOURCE_ID} RCDATA \"${CMAKE_SOURCE_DIR}/src/font/coach.fnt\"\n")
 frostmod_version_rc(MXBCOACH_DLL_RC VFT_DLL "mxbcoach.dlo" "MXB Coach lap recorder - telemetry plugin for MX Bikes"
                     "${MXBCOACH_VOICE_RC}")
 
@@ -186,6 +192,24 @@ if(WIN32)
     add_dependencies(coachvoice_res_test mxbcoach)
     add_test(NAME coachvoice_res COMMAND coachvoice_res_test "$<TARGET_FILE:mxbcoach>")
 endif()
+
+# --- coach plugin exports test -------------------------------------------------
+# That the game can actually find every callback it looks for. A missing or mangled export is
+# silent - the game calls what it finds and says nothing about the rest - and for Draw/DrawInit
+# there is no other symptom, since a callback that is never called cannot log that it wasn't.
+if(WIN32)
+    add_executable(coachexports_test tests/coachexports_test.cpp)
+    add_dependencies(coachexports_test mxbcoach)
+    add_test(NAME coachexports COMMAND coachexports_test "$<TARGET_FILE:mxbcoach>")
+endif()
+
+# --- coach diagnostic log test -------------------------------------------------
+# The log is what a rider sends us when the HUD or the voice does not work, so what each line
+# SAYS is the thing that has to hold: a line that still reads plausibly but no longer records
+# which way a decision went would cost us the one report we get. src/coachlog.h keeps the
+# wording apart from Win32 so it is pinned here.
+add_executable(coachlog_test tests/coachlog_test.cpp)
+add_test(NAME coachlog COMMAND coachlog_test)
 
 # --- coach in-game HUD test ----------------------------------------------------
 # The .hud file is a wire contract with MXB Coach's Rust writer; src/coachhud.h holds it, hud.ini,

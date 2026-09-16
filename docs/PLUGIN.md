@@ -261,8 +261,8 @@ found, that hook is skipped rather than pointed at the wrong code. Logged as
 
 A separate plugin built from the same tree (`src/mxbcoach.cpp`, rules in `src/coachrec.h`),
 not part of FrostMod. The MXB Coach app installs it into `<MX Bikes>\plugins\`. It exports
-the `Run*` callbacks, `EventInit`/`EventDeinit` and `TrackCenterline`, asks for telemetry at
-50 Hz, and writes one `.mxbc` file per stint on track to
+the `Run*` callbacks, `EventInit`/`EventDeinit`, `TrackCenterline`, and `DrawInit`/`Draw`,
+asks for telemetry at 50 Hz, and writes one `.mxbc` file per stint on track to
 `<save path>\mxbcoach\sessions\<yyyymmdd-hhmmss-mmm>.mxbc`. The records are the game's own
 payloads, byte for byte; the layout is documented at the top of `coachrec.h` and pinned by
 `tests/coachrec_test.cpp`. MX Bikes only: the other titles send different telemetry structs.
@@ -353,8 +353,9 @@ top left. They were chosen to stay clear of MXBMRP3's Notices (y 0.099-0.165) an
   is the world's z.
 - **The setup name** is `SPluginsBikeSession_t::m_szSetupFileName` from `RunInit`, without a
   folder. An empty name shows as `default`.
-- **Text** uses font 1, the game's own, as the cue always has. No `DrawInit` is exported.
-  Widths are estimated at 0.275 x size a character, since the game can't measure text.
+- **Text** uses font 1, which is **the plugin's own font, registered in `DrawInit`** — see
+  *The font* below. Widths are estimated at 0.275 x size a character, since the game can't
+  measure text.
 - **Errors:** the `Draw` body is guarded, like MXBMRP3's `API_GUARD_CATCH`, so nothing throws
   into the game.
 
@@ -376,6 +377,73 @@ A missing file or key means on. The one exception is the map: it defaults to off
 `map=1` is set. A value other than `0` or `1` keeps the default. The plugin reads the file at
 `Startup` and `RunInit`, then checks its write time at most once a second from
 `RunTelemetry` (never from `Draw`).
+
+### The font (why text needs `DrawInit`)
+
+`SPluginString_t::m_iFont` is documented as a **"1 based index in FontName buffer"** — the
+buffer *this plugin* hands back from `DrawInit`, not a handle to a font the game already has.
+`DrawInit` sets `_piNumFonts` to the number of zero-separated filenames in `_pszFontName`, and
+those names resolve against the **plugins folder**.
+
+A plugin that registers no fonts can therefore draw **no text at all**: every string it hands
+back indexes an empty table and the engine drops it without a word. Quads are unaffected —
+`m_iSprite = 0` means "fill with `m_ulColor`" and needs no table — so the symptom is a HUD of
+plain boxes and a map with no writing anywhere on it.
+
+Until v0.23 `mxbcoach.dlo` exported no `DrawInit` and still asked for font 1. That is why the
+live cue, shipped in v0.19, had never once been seen in game.
+
+Now it embeds one font (`src/font/coach.fnt`, Roboto Mono rasterised to PiBoSo's `.fnt` format,
+credits in `NOTICE`) as `RCDATA` resource 200, and `DrawInit`:
+
+1. writes it to `<plugins>\mxbcoach_data\coach.fnt`, creating the folder;
+2. hands back that relative path as the single registered font;
+3. returns `0` when the pointers are set and `-1` when they are not, as PiBoSo's own
+   `mxb_example.c` does.
+
+The file is written **from inside `DrawInit`** rather than shipped beside the `.dlo`, because
+that is the only point at which it is certainly on disk before the game reads it, and it means
+a recorder installed by any means brings its own font with it. It is rewritten every run, so a
+half-written file from a crash can't survive. **Adding or changing a font needs a game
+restart**, since `DrawInit` runs once at startup.
+
+### `<save path>\mxbcoach\mxbcoach.log`
+
+One file per run of the game, rewritten each time and capped at 256 KB. It records the
+decisions the recorder used to make in silence, which is what makes a report of "the HUD does
+not work" answerable:
+
+| Tag | Says |
+|---|---|
+| `mxbcoach` | the plugin version that is actually running, and when it shut down |
+| `paths` | the save path and the plugins folder it resolved |
+| `drawinit` | whether the font was written and registered — **if this failed, no text can draw** |
+| `hud.ini` | whether the file was found, and every part's on/off as parsed |
+| `event` | `EventInit`'s type (testing / race / straight rhythm), track, bike, length, and whether the rider is on a server |
+| `cues` / `hud` | which sheet was taken, or that none fitted this track and bike |
+| `run` | `RunInit`'s session and whether it counts as practice — with the reason when it doesn't |
+| `draw` | the first `Draw` of each stint: its state, practice, and the quad and string counts |
+| `voice` | `voice.ini` as read, how many clips are loaded, and `waveOutOpen`'s result |
+| `cue` | each cue as it fires, with its distance along the lap |
+
+It deliberately holds **no rider name, no GUID and no server name** — a server is recorded only
+as the fact that there was one. The wording of each line is pinned by `tests/coachlog_test.cpp`,
+since a line that still reads plausibly but no longer says which way a decision went would cost
+us the one report we get. The rules live in `src/coachlog.h`.
+
+### `<save path>\mxbcoach\recorder.ini`
+
+Written at `Startup`:
+
+```ini
+[recorder]
+version=0.23.0
+```
+
+MXB Coach reads it to show which recorder **actually ran**, rather than trusting the version of
+whatever `.dlo` is sitting in the plugins folder. A player certain they are on the latest and a
+stale `.dlo` the game is still holding look identical from the app otherwise. It only appears
+once the game has been started with the recorder installed.
 
 **`<save path>\mxbcoach\cues\<track>.<bike>.hud`**, else `<track>.hud`, is written by MXB Coach
 alongside the `.cue` and named the same way: the ids made safe for a file name, `.hud` in place

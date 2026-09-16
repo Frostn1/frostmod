@@ -37,11 +37,13 @@
 
 #include "coachcue.h"
 #include "coachhud.h"
+#include "coachlog.h"
 #include "coachrec.h"
 #include "coachvoice.h"
 #include "offsets.h"
 #include "others.h"
 #include "stance.h"
+#include "version.h"
 
 namespace {
 
@@ -78,9 +80,21 @@ stance::Confidence   g_stance_conf = stance::CONF_NONE;
 bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
 ULONGLONG            g_ini_checked = 0;
+// Whether this stint has already written its one "the game called Draw" line, and how many
+// frames it has been asked to draw. Zero at the end of a stint means the game never called
+// Draw at all - which no line inside Draw could ever tell us.
+bool                 g_logged_draw = false;
+uint32_t             g_draw_calls  = 0;
 
 // PiBoSo draw items, as in mxb_example.c. The game reads them after Draw() returns, so they
-// live in these statics. No DrawInit: text uses font 1, the game's own, as the cue always has.
+// live in these statics.
+//
+// m_iFont is "1 based index in FontName buffer" (mxb_api.h): the buffer THIS plugin hands back
+// from DrawInit, not a font the game already has. Until v0.23 the recorder registered no fonts
+// and still asked for font 1, so every string it drew indexed an empty table and was dropped
+// without a word - which is why the cue had never been seen in game since it shipped. The font
+// is registered in DrawInit below; quads are unaffected, since sprite 0 means "fill with
+// m_ulColor" and needs no table.
 struct SPluginQuad_t {
     float         m_aafPos[4][2];  // corners, 0..1, counter-clockwise from the top left
     int           m_iSprite;       // 0 = solid fill
@@ -113,17 +127,70 @@ std::string ReadText(const std::string& path) {
     return std::string(b.begin(), b.end());
 }
 
+// ---------------------------------------------------------------------------------------
+// The diagnostic log (coachlog.h).
+//
+// One file per run of the game, at <save path>\mxbcoach\mxbcoach.log, so "send me your log"
+// means this session and not a year of them. Every decision the recorder makes about drawing,
+// sheets, practice and sound goes in it: each one used to be invisible, which made a report of
+// "the HUD does not work" impossible to tell apart from "the sheet was for another track".
+// Flushed every line, because the game is often closed by being killed.
+std::FILE* g_log       = nullptr;
+size_t     g_log_bytes = 0;
+
+std::string LogStamp() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char s[32];
+    snprintf(s, sizeof(s), "%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return s;
+}
+
+void Log(const char* tag, const std::string& message) {
+    if (!g_log) return;
+    const std::string line = coachlog::Line(LogStamp(), tag, message);
+    // Full: stop writing rather than grow without limit. The head of the log holds the startup
+    // decisions, which are the ones worth keeping.
+    if (coachlog::ShouldRestart(g_log_bytes, line.size())) return;
+    std::fwrite(line.data(), 1, line.size(), g_log);
+    std::fflush(g_log);
+    g_log_bytes += line.size();
+}
+
+void LogOpen() {
+    if (g_log) std::fclose(g_log);
+    g_log       = std::fopen((g_base + "mxbcoach.log").c_str(), "wb");
+    g_log_bytes = 0;
+}
+
+void LogClose() {
+    if (g_log) std::fclose(g_log);
+    g_log = nullptr;
+}
+
+/// The version that actually ran, for MXB Coach to show. A rider who believes they are on the
+/// latest recorder and a plugins folder holding an older .dlo look identical from the app.
+void WriteRecorderInfo() {
+    std::FILE* f = std::fopen((g_base + "recorder.ini").c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "[recorder]\nversion=%s\n", FROSTMOD_VERSION);
+    std::fclose(f);
+}
+
 // The app's sheet for this track and bike, else for the track, if it was made for this track.
 void LoadCues() {
     for (const std::string& name : coachcue::SheetNames(g_event)) {
         std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
         coachcue::Sheet s;
         if (!b.empty() && coachcue::Parse(b.data(), b.size(), s) && coachcue::Fits(s, g_event)) {
+            const int cues = int(s.cues.size());
             g_cues.load(std::move(s));
+            Log("cues", coachlog::SheetText("cue sheet", name, true, cues));
             return;
         }
     }
     g_cues.clear();
+    Log("cues", coachlog::SheetText("cue sheet", "", false, 0));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -221,12 +288,20 @@ void ReadVoiceSettings(bool force) {
     g_voice.settings = seen ? coachvoice::ReadSettings(path) : coachvoice::Settings{};
     if (!g_voice.settings.enabled) {
         StopVoice();
+        Log("voice", coachlog::VoiceSettingsText(seen, false, g_voice.settings.volume, 0));
         return;
     }
     if (g_voice.loaded_volume != g_voice.settings.volume) {
         StopVoice();  // the buffers hold copies, but keep what's heard in step with the setting
         LoadClips();
     }
+    // The clips are embedded, so zero of them with the voice on means the resources are not in
+    // this build - which sounds exactly like a broken sound device from the rider's chair.
+    int ready = 0;
+    for (const std::vector<int16_t>& c : g_voice.clips) {
+        if (!c.empty()) ++ready;
+    }
+    Log("voice", coachlog::VoiceSettingsText(seen, true, g_voice.settings.volume, ready));
 }
 
 bool OpenVoice() {
@@ -239,10 +314,14 @@ bool OpenVoice() {
     f.wBitsPerSample  = 16;
     f.nBlockAlign     = 2;
     f.nAvgBytesPerSec = coachvoice::kRate * 2;
-    if (waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+    // The one step here that depends on the rider's machine, and the one that used to fail in
+    // silence: no sound and no reason. The device is not retried until the next event.
+    const MMRESULT mr = waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
+    if (mr != MMSYSERR_NOERROR) {
         g_voice.out    = nullptr;
         g_voice.failed = true;
     }
+    Log("voice", coachlog::VoiceDeviceText(g_voice.out != nullptr, uint32_t(mr)));
     return g_voice.out != nullptr;
 }
 
@@ -275,18 +354,61 @@ void Speak(const coachcue::Cue& c) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// The font the HUD draws its text with.
+//
+// A PiBoSo plugin draws text through its OWN font table: m_iFont indexes the zero-separated
+// list handed back from DrawInit, and the base path for those names is the plugins folder
+// (mxb_api.h). A plugin that registers nothing can draw no text at all, and the engine says
+// nothing about it - the string is simply dropped.
+//
+// The .fnt is embedded and written out from inside DrawInit rather than shipped beside the
+// .dlo. DrawInit is the only point at which the file is certainly on disk before the game
+// reads it, and doing it here means a recorder installed by any means - the app, by hand, or
+// already sitting in a plugins folder - brings its own font with it.
+constexpr int         kFontResourceId = 200;
+constexpr const char* kFontFolder     = "mxbcoach_data";
+constexpr const char* kFontName       = "mxbcoach_data\\coach.fnt";
+char                  g_font_name[64] = {0};  // handed to the game; must outlive DrawInit
+
+bool WriteFont(uint32_t& bytes) {
+    bytes = 0;
+    if (g_plugins.empty()) return false;
+    const HMODULE mod  = ThisModule();
+    HRSRC         res  = FindResourceA(mod, MAKEINTRESOURCEA(kFontResourceId), MAKEINTRESOURCEA(10));
+    HGLOBAL       data = res ? LoadResource(mod, res) : nullptr;
+    const void*   p    = data ? LockResource(data) : nullptr;
+    const DWORD   n    = res ? SizeofResource(mod, res) : 0;
+    if (!p || n == 0) return false;
+    CreateDirectoryA((g_plugins + kFontFolder).c_str(), nullptr);
+    // Rewritten every run: the file belongs to this build, and one left half-written by a crash
+    // would draw nothing at all.
+    std::FILE* f = std::fopen((g_plugins + kFontName).c_str(), "wb");
+    if (!f) return false;
+    const size_t wrote = std::fwrite(p, 1, n, f);
+    std::fclose(f);
+    if (wrote != n) return false;
+    bytes = n;
+    return true;
+}
+
 // The app's HUD sheet, found the same way as the cues.
 void LoadHud() {
     g_hud_sheet = coachhud::Sheet{};
+    std::string taken;
     for (const std::string& name : coachhud::HudNames(g_event)) {
         std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
         coachhud::Sheet s;
         if (!b.empty() && coachhud::Parse(b.data(), b.size(), s) && coachhud::Fits(s, g_event)) {
             g_hud_sheet = std::move(s);
+            taken       = name;
             break;
         }
     }
     g_ref.load(g_hud_sheet.ref);
+    // Without a sheet the map, the stance and the setup card still draw; only the gap, the
+    // ghost and the section tips need one, so this is a note rather than a failure.
+    Log("hud", coachlog::SheetText("HUD sheet", taken, !taken.empty(), int(g_hud_sheet.sections.size())));
 }
 
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
@@ -300,6 +422,16 @@ void ReadHudSettings(bool force) {
     if (seen) g_ini_time = a.ftLastWriteTime;
     const bool mxbmrp3 = !g_plugins.empty() && GetFileAttributesA((g_plugins + "mxbmrp3.dlo").c_str()) != INVALID_FILE_ATTRIBUTES;
     g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
+}
+
+/// hud.ini as it ended up, since a part switched off looks exactly like a part that is broken.
+void LogHudSettings() {
+    const coachhud::Settings& s = g_hud_set;
+    auto on = [](bool v) { return v ? "1" : "0"; };
+    Log("hud.ini", std::string(g_ini_seen ? "found" : "no file, so every part is on") +
+                       " enabled=" + on(s.enabled) + " cue=" + on(s.cue) + " section=" + on(s.section) +
+                       " gap=" + on(s.gap) + " stance=" + on(s.stance) + " map=" + on(s.map) +
+                       " setup=" + on(s.setup));
 }
 
 // At most once a second, from the telemetry callback rather than Draw.
@@ -585,7 +717,12 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         g_user    = user;
         g_base    = dir;
         g_plugins = ModuleFolder();
+        LogOpen();
+        Log("mxbcoach", std::string(FROSTMOD_VERSION) + " starting");
+        Log("paths", "save=" + g_user + " plugins=" + g_plugins);
+        WriteRecorderInfo();
         ReadHudSettings(true);
+        LogHudSettings();
     }
     dir += "sessions\\";
     CreateDirectoryA(dir.c_str(), nullptr);
@@ -601,12 +738,15 @@ __declspec(dllexport) void Shutdown() {
     if (g_sit.di) g_sit.di->Release();
     g_sit.di = nullptr;
     CloseVoice();
+    Log("mxbcoach", "shutting down");
+    LogClose();
 }
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
+    Log("event", coachlog::EventText(g_event.type, g_event.track, g_event.bike, g_event.track_len, g_event.server));
     LoadCues();
     LoadHud();
     g_voice.failed = false;
@@ -643,8 +783,12 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
         g_others.on_stint();
         WriteRoster();
     }
-    g_practice = coachcue::Practice(g_event.type, coachcue::ReadSession(_pData, _iDataSize));
+    const int session = coachcue::ReadSession(_pData, _iDataSize);
+    g_practice        = coachcue::Practice(g_event.type, session);
     g_cues.set_practice(g_practice);
+    Log("run", coachlog::PracticeText(g_event.type, session, g_practice));
+    g_logged_draw = false;
+    g_draw_calls  = 0;
     ReadVoiceSettings(false);
     g_setup = coachhud::SetupName(_pData, _iDataSize);
     g_clock.reset();
@@ -658,6 +802,12 @@ __declspec(dllexport) void RunDeinit() {
     g_rec.on_run_end();
     g_cues.set_practice(false);
     StopVoice();
+    // The whole stint in one line, and the one that separates the two worlds: frames=0 means
+    // the game never called Draw, so nothing we build could ever have appeared.
+    Log("draw", "stint ended: frames=" + std::to_string(g_draw_calls) +
+                    " practice=" + (g_practice ? "yes" : "no") +
+                    " cues fired=" + std::to_string(g_cues.fires()) +
+                    " hud=" + (g_hud_set.enabled ? "on" : "off") + " map=" + (g_hud_set.map ? "on" : "off"));
     g_practice    = false;
     g_have_sample = false;
 }
@@ -695,8 +845,13 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         const uint32_t fired = g_cues.fires();
         g_cues.on_sample(_fPos, speed, _fTime, crashed);
         // Spoken the moment it shows. A cue the player skipped never fires, so is never said.
-        if (crashed) StopVoice();
-        else if (g_cues.fires() != fired && g_cues.showing()) Speak(*g_cues.showing());
+        if (crashed) {
+            StopVoice();
+        } else if (g_cues.fires() != fired && g_cues.showing()) {
+            const coachcue::Cue& c = *g_cues.showing();
+            Speak(c);
+            Log("cue", "\"" + c.text + "\" at " + std::to_string(int(c.at_m)) + "m");
+        }
         g_clock.on_sample(_fTime, _fPos);
         g_stop.on_sample(_fTime, speed);
         g_rider       = {coachcue::F32(b + kDataPosX), coachcue::F32(b + kDataPosZ)};
@@ -761,6 +916,29 @@ __declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
         g_rec.record(coachrec::RACE_SPLIT, p.data(), uint32_t(p.size()));
 }
 
+// Called once when the game starts, to register the sprites and fonts this plugin draws with.
+// The names are zero-separated and resolve against the plugins folder; the buffer must outlive
+// the call, so it is a static. Returns 0 when the pointers are set, -1 when they are not, as
+// PiBoSo's own mxb_example.c does.
+//
+// This is what makes our text appear at all - see the font block above.
+__declspec(dllexport) int DrawInit(int* _piNumSprites, char** _pszSpriteName, int* _piNumFonts,
+                                   char** _pszFontName) {
+    if (_piNumSprites) *_piNumSprites = 0;
+    if (_pszSpriteName) *_pszSpriteName = nullptr;
+    if (_piNumFonts) *_piNumFonts = 0;
+    if (_pszFontName) *_pszFontName = nullptr;
+    std::lock_guard<std::mutex> lock(g_mu);
+    uint32_t   bytes = 0;
+    const bool ok    = WriteFont(bytes);
+    Log("drawinit", coachlog::DrawInitText(ok, kFontName, bytes));
+    if (!ok || !_piNumFonts || !_pszFontName) return -1;
+    strncpy_s(g_font_name, sizeof(g_font_name), kFontName, _TRUNCATE);
+    *_piNumFonts  = 1;
+    *_pszFontName = g_font_name;
+    return 0;
+}
+
 // Each frame on track, spectating or in a replay: the HUD, only while riding in practice. The
 // cue sits below MXBMRP3's Notices and Timing panels, the rest round it (coachhud.h). Nothing
 // may throw into the game, so the body is guarded like MXBMRP3's API_GUARD_CATCH.
@@ -769,6 +947,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
     int quads = 0, strings = 0;
     try {
         std::lock_guard<std::mutex> lock(g_mu);
+        ++g_draw_calls;
         if (_iState == 0 && g_practice) {
             BuildHud();
             for (const coachhud::Quad& in : g_frame.quads) {
@@ -789,6 +968,13 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
                 s.m_iJustify = in.justify;
                 s.m_ulColor  = in.color;
             }
+        }
+        // One line a stint, whatever it drew. Zero quads while riding says the HUD was switched
+        // off or this is not practice; the line proves the game is calling us either way, which
+        // is the first thing worth knowing when nothing shows.
+        if (!g_logged_draw) {
+            g_logged_draw = true;
+            Log("draw", coachlog::DrawText(_iState, g_practice, quads, strings));
         }
     } catch (...) {
         quads = strings = 0;

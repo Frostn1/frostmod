@@ -97,15 +97,32 @@ static void TheVoice() {
     const std::string bad = VoiceDeviceText(false, 4);
     CHECK(bad.find("waveOutOpen failed (4)") != std::string::npos && bad.find("cannot be spoken") != std::string::npos,
           "the device failure carries its code: '%s'", bad.c_str());
-    CHECK(VoiceSettingsText(true, true, 80, 10) == "enabled=1 volume=80 clips=10", "got '%s'",
-          VoiceSettingsText(true, true, 80, 10).c_str());
+    CHECK(VoiceSettingsText(true, true, 80, 10, "female") == "enabled=1 volume=80 voice=female clips=10", "got '%s'",
+          VoiceSettingsText(true, true, 80, 10, "female").c_str());
+    // Which voice spoke is the rider's own setting, so the log has to say which one ran: "it
+    // still sounds like a woman" and "the male clips are missing" read the same otherwise.
+    CHECK(VoiceSettingsText(true, true, 80, 10, "male").find("voice=male") != std::string::npos, "the male voice");
     // Off is the default, and that is not a fault: the line says so rather than reading as one.
-    const std::string none = VoiceSettingsText(false, false, 0, 0);
+    const std::string none = VoiceSettingsText(false, false, 0, 0, "female");
     CHECK(none.find("no voice.ini") != std::string::npos && none.find("until MXB Coach turns them on") != std::string::npos,
           "got '%s'", none.c_str());
     // Clips at zero with the voice on is the "it is on but silent" case, and must be visible.
-    CHECK(VoiceSettingsText(true, true, 80, 0) == "enabled=1 volume=80 clips=0", "got '%s'",
-          VoiceSettingsText(true, true, 80, 0).c_str());
+    CHECK(VoiceSettingsText(true, true, 80, 0, "male") == "enabled=1 volume=80 voice=male clips=0", "got '%s'",
+          VoiceSettingsText(true, true, 80, 0, "male").c_str());
+
+    // Every waveOut call, whichever way it went: a success carries its 0 so the log shows the
+    // call happened at all, and a failure is marked so it can be found by eye.
+    CHECK(VoiceCallText("waveOutWrite", 1, 0) == "waveOutWrite slot=1 mmresult=0", "got '%s'",
+          VoiceCallText("waveOutWrite", 1, 0).c_str());
+    const std::string still = VoiceCallText("waveOutUnprepareHeader", 0, 33);
+    CHECK(still == "waveOutUnprepareHeader slot=0 mmresult=33 FAILED", "got '%s'", still.c_str());
+    CHECK(VoiceCallText("waveOutReset", -1, 0) == "waveOutReset mmresult=0", "no slot: '%s'",
+          VoiceCallText("waveOutReset", -1, 0).c_str());
+
+    // The buffer count is the line that shows the voice running dry rather than merely quiet.
+    CHECK(VoiceBuffersText(12, 12, 0) == "buffers given=12 returned=12 in flight=0", "got '%s'",
+          VoiceBuffersText(12, 12, 0).c_str());
+    CHECK(VoiceBuffersText(2, 0, 2).find("returned=0") != std::string::npos, "stuck buffers show as given > returned");
 }
 
 static void WhichSheet() {

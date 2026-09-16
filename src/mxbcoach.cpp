@@ -55,11 +55,19 @@ others::Tracker    g_others;
 std::string        g_user;  // <save path>, the game's user folder
 std::string        g_base;  // <save path>\mxbcoach\
 
-// SPluginsBikeData_t: speedometer m/s, world x and z, and the crashed flag.
-constexpr size_t kDataSpeed   = 20;
-constexpr size_t kDataPosX    = 24;
-constexpr size_t kDataPosZ    = 32;
-constexpr size_t kDataCrashed = 136;
+// SPluginsBikeData_t: speedometer m/s, world x and z, the shocks' lengths, and the crashed
+// flag. Every field ahead of these is a 4-byte int or float in mxb_api.h's struct, so the
+// offsets are a straight walk of it - and the four that were already here landing exactly on
+// the fields they are named for is what says the walk is right.
+constexpr size_t kDataSpeed      = 20;
+constexpr size_t kDataPosX       = 24;
+constexpr size_t kDataPosZ       = 32;
+constexpr size_t kDataSuspLength = 120;  // f32[2] metres: 0 = front, 1 = rear
+constexpr size_t kDataCrashed    = 136;
+
+// SPluginsBikeEvent_t: m_afSuspMaxTravel, f32[2] metres, 0 = front and 1 = rear. It is what
+// the shocks' lengths are a proportion of, and it only arrives with the event.
+constexpr size_t kEventSuspMaxTravel = 332;
 
 // The HUD (coachhud.h).
 std::string          g_plugins;  // the folder this .dlo was loaded from
@@ -76,6 +84,12 @@ bool                 g_have_sample = false;
 float                g_time = 0, g_pos = 0;
 coachhud::Pt         g_rider;
 stance::Confidence   g_stance_conf = stance::CONF_NONE;
+// The suspension: what the event said each shock's travel is, how much of it is in use now,
+// and the deepest each has been this stint (the mark where it bottomed).
+float                g_susp_travel[2] = {0, 0};
+float                g_susp[2]        = {0, 0};
+float                g_susp_deep[2]   = {0, 0};
+bool                 g_have_susp      = false;
 // hud.ini as last read: whether it was there and when it was written.
 bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
@@ -196,14 +210,28 @@ void LoadCues() {
 // ---------------------------------------------------------------------------------------
 // Speaking the cues.
 //
-// One waveOut device, opened on the first cue spoken and kept. Two buffers, so a new clip
-// never touches one the device may still be reading. waveOutWrite returns at once; a buffer
-// is finished when the device sets WHDR_DONE, checked before it is reused.
+// One waveOut device, opened on the first cue spoken and kept. Two buffers, handed to the
+// device a clip at a time. Which buffers are ours and which the device still holds is
+// coachvoice::Queue's business (coachvoice.h), where the rule can be tested without Win32.
+//
+// The rule, and what went wrong with it: a buffer is ours again only when winmm has BOTH
+// finished with it (WHDR_DONE) AND accepted waveOutUnprepareHeader for it. v0.22 and v0.23
+// took the flag as enough and cleared their own "in use" bit whatever the unprepare returned,
+// so a buffer the driver still owned was refilled underneath it - its vector reallocated, its
+// header zeroed - and from then on the completion flag the driver wrote landed in memory that
+// had been reused. The slot never read as finished again. Two buffers means exactly two clips
+// and then silence, which is what the rider heard: "Stand up", "Gas", nothing after.
+//
+// Two things changed besides the ownership. Buffers are drained every telemetry sample instead
+// of only when the next cue turns up, so one comes back within 20 ms of its clip ending rather
+// than waiting on a cue that may be half a lap away. And every waveOut call's MMRESULT is
+// logged, because a voice that dies mid-session leaves no other trace: the device is open, the
+// clips are loaded, the cues fire, and nothing is heard.
 
 struct VoiceSlot {
     WAVEHDR              hdr{};
     std::vector<int16_t> pcm;
-    bool                 prepared = false;
+    bool                 prepared = false;  // prepared, and not yet accepted back by an unprepare
 };
 
 struct Voice {
@@ -215,13 +243,25 @@ struct Voice {
     bool                 read   = false;
     float                next_check = 0;
     int                  loaded_volume = -1;  // the volume the clips below were scaled to
+    int                  loaded_voice  = -1;  // and which voice's clips they are
     std::vector<int16_t> clips[coachvoice::kClipCount];
     HWAVEOUT             out    = nullptr;
     bool                 failed = false;  // the device wouldn't open; not retried until the next event
-    VoiceSlot            slots[2];
-    uint8_t              priority = 0;  // of the cue last spoken
+    VoiceSlot            slots[coachvoice::Queue::kSlots];
+    coachvoice::Queue    queue;
 };
 Voice g_voice;
+
+/// Which voice to speak in, never out of range whatever voice.ini said.
+uint8_t VoiceChoice() {
+    return g_voice.settings.voice < coachvoice::kVoiceCount ? g_voice.settings.voice : uint8_t(coachvoice::FEMALE);
+}
+
+/// Every waveOut call goes through here, so every one of them is in the log with its result.
+MMRESULT VoiceCall(const char* name, int slot, MMRESULT mr) {
+    Log("voice", coachlog::VoiceCallText(name, slot, uint32_t(mr)));
+    return mr;
+}
 
 HMODULE ThisModule() {
     HMODULE h = nullptr;
@@ -230,12 +270,14 @@ HMODULE ThisModule() {
     return h;
 }
 
-// The embedded clips, scaled to the rider's volume.
+// The embedded clips for the chosen voice, scaled to the rider's volume.
 void LoadClips() {
-    const HMODULE mod = ThisModule();
+    const HMODULE mod   = ThisModule();
+    const uint8_t voice = VoiceChoice();
     for (int i = 0; i < coachvoice::kClipCount; ++i) {
         g_voice.clips[i].clear();
-        HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(coachvoice::kResourceBase + i + 1), MAKEINTRESOURCEA(10));
+        const int id  = coachvoice::ResourceId(voice, uint8_t(i + 1));
+        HRSRC     res = FindResourceA(mod, MAKEINTRESOURCEA(id), MAKEINTRESOURCEA(10));
         HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
         const void* p = data ? LockResource(data) : nullptr;
         std::vector<int16_t> pcm;
@@ -243,34 +285,44 @@ void LoadClips() {
             g_voice.clips[i] = coachvoice::Scale(pcm, g_voice.settings.volume);
     }
     g_voice.loaded_volume = g_voice.settings.volume;
+    g_voice.loaded_voice  = int(voice);
 }
 
-bool VoiceBusy() {
-    for (const VoiceSlot& s : g_voice.slots)
-        if (s.prepared && !(s.hdr.dwFlags & WHDR_DONE)) return true;
-    return false;
-}
-
-// Hands back the buffers the device has finished with.
-void ReapSlots() {
-    for (VoiceSlot& s : g_voice.slots) {
+// Takes back every buffer the device has finished with. A slot becomes ours again only when
+// the unprepare is ACCEPTED: WAVERR_STILLPLAYING means the driver still holds that memory, and
+// refilling it then is the fault that silenced the voice. A slot it refuses is simply left
+// with the device and tried again on the next sample.
+void Drain() {
+    if (!g_voice.out) return;
+    for (int i = 0; i < coachvoice::Queue::kSlots; ++i) {
+        VoiceSlot& s = g_voice.slots[i];
         if (!s.prepared || !(s.hdr.dwFlags & WHDR_DONE)) continue;
-        waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
+        if (VoiceCall("waveOutUnprepareHeader", i,
+                      waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr))) != MMSYSERR_NOERROR)
+            continue;
         s.prepared = false;
+        g_voice.queue.release(i);
     }
 }
 
-// Silence now: on a crash, leaving practice, or the voice turned off.
+// Silence now: on a crash, leaving practice, or the voice turned off. waveOutReset makes the
+// device finish with everything it holds; the buffers still have to be taken back, which Drain
+// does here and again on the samples after, if the driver wasn't ready on this one.
 void StopVoice() {
     if (!g_voice.out) return;
-    waveOutReset(g_voice.out);  // marks every queued buffer done
-    ReapSlots();
+    VoiceCall("waveOutReset", -1, waveOutReset(g_voice.out));
+    Drain();
 }
 
 void CloseVoice() {
     StopVoice();
-    if (g_voice.out) waveOutClose(g_voice.out);
-    g_voice.out = nullptr;
+    if (g_voice.out) {
+        VoiceCall("waveOutClose", -1, waveOutClose(g_voice.out));
+        g_voice.out = nullptr;
+    }
+    // The device is gone, so it holds nothing, whatever it held a moment ago.
+    for (VoiceSlot& s : g_voice.slots) s.prepared = false;
+    g_voice.queue.clear();
 }
 
 // voice.ini, when it is new or has changed. Missing means off.
@@ -288,11 +340,14 @@ void ReadVoiceSettings(bool force) {
     g_voice.settings = seen ? coachvoice::ReadSettings(path) : coachvoice::Settings{};
     if (!g_voice.settings.enabled) {
         StopVoice();
-        Log("voice", coachlog::VoiceSettingsText(seen, false, g_voice.settings.volume, 0));
+        Log("voice", coachlog::VoiceSettingsText(seen, false, g_voice.settings.volume, 0,
+                                                 coachvoice::kVoices[VoiceChoice()].key));
         return;
     }
-    if (g_voice.loaded_volume != g_voice.settings.volume) {
-        StopVoice();  // the buffers hold copies, but keep what's heard in step with the setting
+    // A new volume or a new voice means the loaded clips are the wrong ones: stop, so nothing
+    // half-spoken carries over in the old voice, and load the set the rider asked for.
+    if (g_voice.loaded_volume != g_voice.settings.volume || g_voice.loaded_voice != int(VoiceChoice())) {
+        StopVoice();
         LoadClips();
     }
     // The clips are embedded, so zero of them with the voice on means the resources are not in
@@ -301,7 +356,8 @@ void ReadVoiceSettings(bool force) {
     for (const std::vector<int16_t>& c : g_voice.clips) {
         if (!c.empty()) ++ready;
     }
-    Log("voice", coachlog::VoiceSettingsText(seen, true, g_voice.settings.volume, ready));
+    Log("voice", coachlog::VoiceSettingsText(seen, true, g_voice.settings.volume, ready,
+                                             coachvoice::kVoices[VoiceChoice()].key));
 }
 
 bool OpenVoice() {
@@ -316,10 +372,15 @@ bool OpenVoice() {
     f.nAvgBytesPerSec = coachvoice::kRate * 2;
     // The one step here that depends on the rider's machine, and the one that used to fail in
     // silence: no sound and no reason. The device is not retried until the next event.
-    const MMRESULT mr = waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
+    const MMRESULT mr =
+        VoiceCall("waveOutOpen", -1, waveOutOpen(&g_voice.out, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL));
     if (mr != MMSYSERR_NOERROR) {
         g_voice.out    = nullptr;
         g_voice.failed = true;
+    } else {
+        // A device just opened holds nothing, whatever the last one was left holding.
+        for (VoiceSlot& s : g_voice.slots) s.prepared = false;
+        g_voice.queue.clear();
     }
     Log("voice", coachlog::VoiceDeviceText(g_voice.out != nullptr, uint32_t(mr)));
     return g_voice.out != nullptr;
@@ -330,27 +391,41 @@ void Speak(const coachcue::Cue& c) {
     if (!g_voice.settings.enabled || g_voice.settings.volume <= 0) return;
     const int clip = coachvoice::ClipFor(c.kind);
     if (clip < 0 || g_voice.clips[clip].empty() || !OpenVoice()) return;
-    switch (coachvoice::Choose(VoiceBusy(), g_voice.priority, c.priority)) {
+    Drain();  // whatever has finished is ours again before we go looking for a buffer
+    switch (coachvoice::Choose(g_voice.queue.playing(), g_voice.queue.priority(), c.priority)) {
         case coachvoice::SKIP: return;
-        case coachvoice::CUT_IN: waveOutReset(g_voice.out); break;
+        case coachvoice::CUT_IN:
+            VoiceCall("waveOutReset", -1, waveOutReset(g_voice.out));
+            Drain();
+            break;
         case coachvoice::SPEAK: break;
     }
-    ReapSlots();
-    for (VoiceSlot& s : g_voice.slots) {
-        if (s.prepared) continue;
-        s.pcm = g_voice.clips[clip];
-        s.hdr = WAVEHDR{};
-        s.hdr.lpData         = reinterpret_cast<LPSTR>(s.pcm.data());
-        s.hdr.dwBufferLength = DWORD(s.pcm.size() * sizeof(int16_t));
-        if (waveOutPrepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) return;
-        s.prepared = true;
-        if (waveOutWrite(g_voice.out, &s.hdr, sizeof(s.hdr)) != MMSYSERR_NOERROR) {
-            waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr));
-            s.prepared = false;
-            return;
-        }
-        g_voice.priority = c.priority;
+    const int slot = g_voice.queue.take(c.priority);
+    if (slot < 0) {
+        // Both buffers are still with the device. Say nothing rather than queue up behind
+        // them, and write down the counts: this line is what a voice running dry looks like.
+        Log("voice", coachlog::VoiceBuffersText(g_voice.queue.taken(), g_voice.queue.released(),
+                                                g_voice.queue.in_flight()));
         return;
+    }
+    VoiceSlot& s = g_voice.slots[slot];
+    s.pcm        = g_voice.clips[clip];
+    s.hdr        = WAVEHDR{};
+    s.hdr.lpData         = reinterpret_cast<LPSTR>(s.pcm.data());
+    s.hdr.dwBufferLength = DWORD(s.pcm.size() * sizeof(int16_t));
+    if (VoiceCall("waveOutPrepareHeader", slot, waveOutPrepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr))) !=
+        MMSYSERR_NOERROR) {
+        g_voice.queue.giveback(slot);  // the device never took it
+        return;
+    }
+    s.prepared = true;
+    if (VoiceCall("waveOutWrite", slot, waveOutWrite(g_voice.out, &s.hdr, sizeof(s.hdr))) != MMSYSERR_NOERROR) {
+        if (VoiceCall("waveOutUnprepareHeader", slot,
+                      waveOutUnprepareHeader(g_voice.out, &s.hdr, sizeof(s.hdr))) == MMSYSERR_NOERROR) {
+            s.prepared = false;
+            g_voice.queue.giveback(slot);
+        }
+        // If even the unprepare is refused the buffer stays out, and Drain picks it up later.
     }
 }
 
@@ -682,6 +757,7 @@ void BuildHud() {
         if (g_clock.valid()) v.has_ghost = g_ref.world_at(g_clock.elapsed(g_time), v.ghost.x, v.ghost.y);
         v.has_rider = true;
         v.rider     = g_rider;
+        v.pos       = g_pos;
         v.stopped   = g_stop.stopped();
         if (g_cues.active()) v.upcoming = coachhud::Upcoming(g_cues.sheet(), m, 5);
     }
@@ -690,6 +766,13 @@ void BuildHud() {
     v.track  = &g_track;
     v.setup  = g_setup;
     v.sag    = (g_hud_sheet.flags & coachhud::FLAG_SAG) != 0;
+    // Coach's own points for the line to take. Empty without a sheet, and then no trail.
+    v.ref       = &g_ref.points();
+    v.has_susp  = g_have_susp;
+    for (int i = 0; i < 2; ++i) {
+        v.susp[i]     = g_susp[i];
+        v.susp_max[i] = g_susp_deep[i];
+    }
     coachhud::Build(v, g_frame);
 }
 
@@ -746,6 +829,14 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
+    // How much travel each shock has. Without it there is nothing for the bars to be a
+    // proportion of, so they stay away rather than draw a scale nobody knows the size of.
+    g_susp_travel[0] = g_susp_travel[1] = 0;
+    if (_pData && _iDataSize >= int(kEventSuspMaxTravel + 8)) {
+        const auto* eb = static_cast<const uint8_t*>(_pData);
+        g_susp_travel[0] = coachcue::F32(eb + kEventSuspMaxTravel);
+        g_susp_travel[1] = coachcue::F32(eb + kEventSuspMaxTravel + 4);
+    }
     Log("event", coachlog::EventText(g_event.type, g_event.track, g_event.bike, g_event.track_len, g_event.server));
     LoadCues();
     LoadHud();
@@ -794,6 +885,9 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     g_clock.reset();
     g_stop.reset();
     g_have_sample = false;
+    // The bottomed marks belong to the stint, not to the session.
+    g_susp[0] = g_susp[1] = g_susp_deep[0] = g_susp_deep[1] = 0;
+    g_have_susp = false;
     ReadHudSettings(true);
 }
 
@@ -858,7 +952,16 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         g_time        = _fTime;
         g_pos         = _fPos;
         g_have_sample = true;
+        // How much of each shock's travel is in use, and the deepest it has been this stint.
+        g_have_susp = g_susp_travel[0] > 0 || g_susp_travel[1] > 0;
+        for (int i = 0; i < 2; ++i) {
+            g_susp[i] = coachhud::SuspUsed(coachcue::F32(b + kDataSuspLength + size_t(i) * 4), g_susp_travel[i]);
+            if (g_susp[i] > g_susp_deep[i]) g_susp_deep[i] = g_susp[i];
+        }
     }
+    // Every sample, take back any buffer the device has finished with, so the next cue always
+    // finds one free. Reaping only when a cue turned up is what let them run out.
+    Drain();
     // voice.ini changed while riding: MXB Coach can be switched to mid-stint.
     if (_fTime >= g_voice.next_check || _fTime + 2.0f < g_voice.next_check) {
         g_voice.next_check = _fTime + 2.0f;

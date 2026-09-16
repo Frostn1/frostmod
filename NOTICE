@@ -3,13 +3,27 @@ Copyright (C) FrostMod contributors. MIT Licensed (see LICENSE).
 
 This project includes third-party material:
 
-MXB Coach spoken cue clips (src/voice/*.wav, embedded in mxbcoach.dlo)
+MXB Coach spoken cue clips (src/voice/female/*.wav and src/voice/male/*.wav,
+embedded in mxbcoach.dlo)
   Generated offline by tools/voice/make_clips.py with Piper text-to-speech
-  (https://github.com/OHF-Voice/piper1-gpl), using the voice "en_US-ljspeech-high"
-  from https://huggingface.co/rhasspy/piper-voices (MIT License).
-  The voice was trained from scratch on the LJ Speech dataset by Keith Ito and
-  Linda Johnson (https://keithito.com/LJ-Speech-Dataset/), which is in the public
-  domain. Voice training by Bryce Beattie (https://brycebeattie.com/files/tts/).
+  (https://github.com/OHF-Voice/piper1-gpl), using two voices from
+  https://huggingface.co/rhasspy/piper-voices (model repository: MIT License).
+  Both were trained from scratch, by Bryce Beattie
+  (https://brycebeattie.com/files/tts/), on public-domain recordings:
+
+    female  "en_US-ljspeech-high"   trained from scratch on the LJ Speech
+            dataset by Keith Ito and Linda Johnson
+            (https://keithito.com/LJ-Speech-Dataset/), which is in the public
+            domain.
+
+    male    "en_US-norman-medium"   trained from scratch on recordings from
+            LibriVox (https://librivox.org), which are in the public domain.
+
+  Voices fine-tuned from "lessac" were deliberately avoided, because its
+  Blizzard 2013 data is licensed for research only and that restriction carries
+  into anything fine-tuned from it; "ryan" and "hfc_male" are CC BY-NC-SA, so
+  they were avoided too.
+
   Piper is only used to make the clips and isn't shipped; its licence doesn't
   cover the audio it outputs.
 

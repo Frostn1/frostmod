@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-09-15 — v0.24.0
+
+### Fixed
+- **The spoken cues keep talking for the whole session.** They used to stop after the first
+  couple of clips and stay silent until you restarted the game. The recorder was reusing a
+  sound buffer before your sound card had handed it back, and with only two buffers that meant
+  two cues and then nothing. It now waits for each one to come back properly, and tidies them
+  up every frame instead of only when the next cue is due.
+- **"Gas" sounds like "Gas".** The clips were trimmed so tightly that the first sound of a
+  short word was cut off, which is why it came out as "gss". Every clip has been regenerated
+  with a gentler trim and a short run-in, and they are all checked to start on silence.
+
+### Added
+- **Pick the voice for your cues.** MXB Coach now offers a male voice as well as the original
+  female one, and you can switch between them. Both are free, offline voices built into the
+  plugin (credits in `NOTICE`).
+- **Move the cue box.** The cues used to sit in the middle of the screen, right where you are
+  looking. You can now put the box wherever you want it, and the section line follows it.
+- **Suspension on the HUD.** A small bar for each end showing how much travel you are using
+  right now, with a mark where it bottomed out on this run. Off until you turn it on.
+- **See the line to take.** The track map can draw Coach's line as a blue trail ahead of you,
+  so you can see where the lap wants you to go. Your own dot and Coach's ghost stay as they
+  were. Off until you turn it on, and it only appears once Coach has sent a lap for the track.
+
 ## 2026-09-15 — v0.23.0
 
 ### Fixed

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-15 — v0.23.0
+
+### Fixed
+- **MXB Coach's live cues and HUD now appear on screen.** The recorder was asking the game to
+  draw its text with a font it had never registered, so every line it drew — the cue, the
+  section and its tip, the gap to Coach's lap, sit or stand, the setup card — was thrown away
+  without a word. It now brings its own font and registers it, and the text shows. If you have
+  never seen a cue in the game, this is why.
+
+### Added
+- **The recorder writes a log you can send us.** `mxbcoach.log`, next to your sessions, records
+  what the recorder decided and why: whether it could draw text, which cue and HUD sheets it
+  took or turned down, whether the session counts as practice, and whether the spoken cues
+  could open your sound device. Each of those used to fail silently. It holds no rider name,
+  no GUID and no server address.
+- **MXB Coach can tell you which recorder you are running.** The plugin writes its version to
+  `recorder.ini` when the game starts it, so the app can show the recorder that actually ran
+  instead of taking your word for it.
+
 ## 2026-09-15 — v0.22.0
 
 ### Added

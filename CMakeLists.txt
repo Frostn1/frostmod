@@ -193,6 +193,16 @@ if(WIN32)
     add_test(NAME coachvoice_res COMMAND coachvoice_res_test "$<TARGET_FILE:mxbcoach>")
 endif()
 
+# --- coach plugin exports test -------------------------------------------------
+# That the game can actually find every callback it looks for. A missing or mangled export is
+# silent - the game calls what it finds and says nothing about the rest - and for Draw/DrawInit
+# there is no other symptom, since a callback that is never called cannot log that it wasn't.
+if(WIN32)
+    add_executable(coachexports_test tests/coachexports_test.cpp)
+    add_dependencies(coachexports_test mxbcoach)
+    add_test(NAME coachexports COMMAND coachexports_test "$<TARGET_FILE:mxbcoach>")
+endif()
+
 # --- coach diagnostic log test -------------------------------------------------
 # The log is what a rider sends us when the HUD or the voice does not work, so what each line
 # SAYS is the thing that has to hold: a line that still reads plausibly but no longer records

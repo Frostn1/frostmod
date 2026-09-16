@@ -80,8 +80,11 @@ stance::Confidence   g_stance_conf = stance::CONF_NONE;
 bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
 ULONGLONG            g_ini_checked = 0;
-// Whether this stint has already written its one "the game called Draw" line.
+// Whether this stint has already written its one "the game called Draw" line, and how many
+// frames it has been asked to draw. Zero at the end of a stint means the game never called
+// Draw at all - which no line inside Draw could ever tell us.
 bool                 g_logged_draw = false;
+uint32_t             g_draw_calls  = 0;
 
 // PiBoSo draw items, as in mxb_example.c. The game reads them after Draw() returns, so they
 // live in these statics.
@@ -785,6 +788,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     g_cues.set_practice(g_practice);
     Log("run", coachlog::PracticeText(g_event.type, session, g_practice));
     g_logged_draw = false;
+    g_draw_calls  = 0;
     ReadVoiceSettings(false);
     g_setup = coachhud::SetupName(_pData, _iDataSize);
     g_clock.reset();
@@ -798,6 +802,12 @@ __declspec(dllexport) void RunDeinit() {
     g_rec.on_run_end();
     g_cues.set_practice(false);
     StopVoice();
+    // The whole stint in one line, and the one that separates the two worlds: frames=0 means
+    // the game never called Draw, so nothing we build could ever have appeared.
+    Log("draw", "stint ended: frames=" + std::to_string(g_draw_calls) +
+                    " practice=" + (g_practice ? "yes" : "no") +
+                    " cues fired=" + std::to_string(g_cues.fires()) +
+                    " hud=" + (g_hud_set.enabled ? "on" : "off") + " map=" + (g_hud_set.map ? "on" : "off"));
     g_practice    = false;
     g_have_sample = false;
 }
@@ -937,6 +947,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
     int quads = 0, strings = 0;
     try {
         std::lock_guard<std::mutex> lock(g_mu);
+        ++g_draw_calls;
         if (_iState == 0 && g_practice) {
             BuildHud();
             for (const coachhud::Quad& in : g_frame.quads) {

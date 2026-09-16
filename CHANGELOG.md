@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-09-16 — v0.25.0
+
+### Added
+- **Move anything on the HUD.** Hold the right mouse button on the track map, the suspension
+  bars or the cue box and drag it wherever you want it. Let go and it stays there. Right-click
+  anywhere else still does whatever it did before, and `move=0` in `hud.ini` turns it off.
+- **The map shows which way you are pointing.** Your marker was a square, which told you where
+  you were and nothing else. It is an arrow now, pointing the way the bike is going, so the map
+  reads at a glance.
+
+### Fixed
+- **Your own marker stops disappearing off the map.** With the blue trail turned on there was
+  not enough room left to draw it, and your dot and the ghost were the last things drawn — so
+  they were the first to go missing. The map's line and the trail are now drawn at a sensible
+  density for a map that size, and the last slots are held back for the markers that matter.
+
 ## 2026-09-15 — v0.24.0
 
 ### Fixed

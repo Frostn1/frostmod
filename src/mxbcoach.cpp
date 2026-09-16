@@ -59,6 +59,10 @@ std::string        g_base;  // <save path>\mxbcoach\
 // flag. Every field ahead of these is a 4-byte int or float in mxb_api.h's struct, so the
 // offsets are a straight walk of it - and the four that were already here landing exactly on
 // the fields they are named for is what says the walk is right.
+/// How far the bike must travel before its heading is worked out again. Short enough to turn
+/// with the track, long enough that a bike sitting still doesn't spin its own arrow.
+constexpr float  kDirStepM       = 1.5f;
+
 constexpr size_t kDataSpeed      = 20;
 constexpr size_t kDataPosX       = 24;
 constexpr size_t kDataPosZ       = 32;
@@ -83,6 +87,13 @@ bool                 g_practice = false;
 bool                 g_have_sample = false;
 float                g_time = 0, g_pos = 0;
 coachhud::Pt         g_rider;
+// Which way the bike is pointing, as a world x/z direction, and the point it was last worked
+// out from. The plugin API hands a heading only to the race-position callback, which a rider
+// practising alone never sees — so it comes from where the bike has travelled instead, which
+// is true whenever it is moving and holds its last value when it stops.
+coachhud::Pt         g_rider_dir{};
+coachhud::Pt         g_dir_from{};
+bool                 g_have_dir_from = false;
 stance::Confidence   g_stance_conf = stance::CONF_NONE;
 // The suspension: what the event said each shock's travel is, how much of it is in use now,
 // and the deepest each has been this stint (the mark where it bottomed).
@@ -93,6 +104,13 @@ bool                 g_have_susp      = false;
 // hud.ini as last read: whether it was there and when it was written.
 bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
+// A part being dragged with the right button, and where in it the rider took hold.
+struct DragState {
+    coachhud::Part held = coachhud::PART_NONE;
+    float          dx = 0, dy = 0;
+    bool           was_down = false;
+};
+DragState            g_drag;
 ULONGLONG            g_ini_checked = 0;
 // Whether this stint has already written its one "the game called Draw" line, and how many
 // frames it has been asked to draw. Zero at the end of a stint means the game never called
@@ -511,6 +529,9 @@ void LogHudSettings() {
 
 // At most once a second, from the telemetry callback rather than Draw.
 void MaybeReloadHudSettings() {
+    // Not while a part is being dragged: re-reading the file would snap it back to where it
+    // was before the rider picked it up.
+    if (g_drag.held != coachhud::PART_NONE) return;
     const ULONGLONG now = GetTickCount64();
     if (now - g_ini_checked < 1000) return;
     g_ini_checked = now;
@@ -581,6 +602,82 @@ bool GameFocused() {
     if (h) GetWindowThreadProcessId(h, &pid);
     return pid == GetCurrentProcessId();
 }
+
+// ---------------------------------------------------------------------------------------
+// Right-drag a part to move it
+//
+// The plugin API hands out no mouse at all, so this is read from Win32 the way the Sit bind
+// already is. Everything that can be decided without Windows — what is under the cursor, where
+// the part lands, how hud.ini is rewritten — is in coachhud.h, where it is tested.
+
+/// The cursor over the game's window, as screen fractions. False when the game isn't focused,
+/// has no window, or the cursor is outside it — a drag can't start from any of those.
+bool CursorOnGame(float& x, float& y) {
+    if (!GameFocused()) return false;
+    const HWND h = GameWindow();
+    if (!h) return false;
+    POINT p;
+    RECT  r;
+    if (!GetCursorPos(&p) || !ScreenToClient(h, &p) || !GetClientRect(h, &r)) return false;
+    if (r.right <= r.left || r.bottom <= r.top) return false;
+    x = float(p.x) / float(r.right - r.left);
+    y = float(p.y) / float(r.bottom - r.top);
+    return x >= 0.0f && x <= 1.0f && y >= 0.0f && y <= 1.0f;
+}
+
+/// hud.ini with a part's position written into it, everything else left alone. Written aside
+/// and moved in, so a read landing mid-write never sees half a file.
+void SavePartPosition(coachhud::Part part) {
+    const std::string path = g_base + "hud.ini";
+    const std::string text = coachhud::WithHudKeys(ReadText(path), coachhud::PartKeys(g_hud_set, part));
+    const std::string tmp  = path + ".tmp";
+    std::FILE*        f    = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    std::fclose(f);
+    if (!ok || !MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp.c_str());
+        return;
+    }
+    // Our own write, so don't let the next check read it back as someone else's change.
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) {
+        g_ini_seen = true;
+        g_ini_time = a.ftLastWriteTime;
+    }
+}
+
+/// Hold the right button over the map, the bars or the cue and it follows the cursor; let go
+/// and where it ended up is written to hud.ini. Off with `move=0`.
+void PollDrag() {
+    if (!g_hud_set.enabled || !g_hud_set.move) {
+        g_drag.held = coachhud::PART_NONE;
+        return;
+    }
+    const bool down = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    float      x = 0, y = 0;
+    const bool on = CursorOnGame(x, y);
+    if (down && !g_drag.was_down && on) {
+        // A press starts a drag only when it lands on a part, so right-clicking anywhere else
+        // goes on meaning whatever the game wants it to mean.
+        const coachhud::Part hit = coachhud::PartAt(g_hud_set, x, y);
+        coachhud::Box        b;
+        if (hit != coachhud::PART_NONE && coachhud::PartBox(g_hud_set, hit, b)) {
+            g_drag.held = hit;
+            g_drag.dx   = x - b.x0;
+            g_drag.dy   = y - b.y0;
+            Log("hud.move", std::string("picked up ") + coachhud::PartName(hit));
+        }
+    } else if (down && g_drag.held != coachhud::PART_NONE && on) {
+        coachhud::SetPartOrigin(g_hud_set, g_drag.held, x - g_drag.dx, y - g_drag.dy);
+    } else if (!down && g_drag.held != coachhud::PART_NONE) {
+        SavePartPosition(g_drag.held);
+        Log("hud.move", std::string("put down ") + coachhud::PartName(g_drag.held));
+        g_drag.held = coachhud::PART_NONE;
+    }
+    g_drag.was_down = down;
+}
+
 
 void ReleaseDevice() {
     if (!g_sit.dev) return;
@@ -757,6 +854,7 @@ void BuildHud() {
         if (g_clock.valid()) v.has_ghost = g_ref.world_at(g_clock.elapsed(g_time), v.ghost.x, v.ghost.y);
         v.has_rider = true;
         v.rider     = g_rider;
+        v.rider_dir = g_rider_dir;
         v.pos       = g_pos;
         v.stopped   = g_stop.stopped();
         if (g_cues.active()) v.upcoming = coachhud::Upcoming(g_cues.sheet(), m, 5);
@@ -948,7 +1046,20 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         }
         g_clock.on_sample(_fTime, _fPos);
         g_stop.on_sample(_fTime, speed);
-        g_rider       = {coachcue::F32(b + kDataPosX), coachcue::F32(b + kDataPosZ)};
+        const coachhud::Pt here = {coachcue::F32(b + kDataPosX), coachcue::F32(b + kDataPosZ)};
+        // Far enough apart to be travel rather than the bike shuffling on the spot: at racing
+        // speed that is a few samples, and standing still it simply never updates.
+        if (g_have_dir_from) {
+            const float dx = here.x - g_dir_from.x, dz = here.y - g_dir_from.y;
+            if (dx * dx + dz * dz >= kDirStepM * kDirStepM) {
+                g_rider_dir = {dx, dz};
+                g_dir_from  = here;
+            }
+        } else {
+            g_dir_from      = here;
+            g_have_dir_from = true;
+        }
+        g_rider       = here;
         g_time        = _fTime;
         g_pos         = _fPos;
         g_have_sample = true;
@@ -968,6 +1079,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         ReadVoiceSettings(false);
     }
     PollStance(_fTime, _fPos, crashed);
+    PollDrag();
     MaybeReloadHudSettings();
 }
 

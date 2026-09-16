@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-16 — v0.26.0
+
+### Added
+- **The gap line moves too.** The line showing your gap to Coach's lap and whether you're
+  sitting or standing was the one part still nailed to the middle of the screen — so if you
+  dragged the map or the cue box under it, there was no way to get it out of the way. Right-drag
+  it like the rest.
+
 ## 2026-09-16 — v0.25.0
 
 ### Added

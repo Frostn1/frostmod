@@ -170,6 +170,14 @@ constexpr float kMapW = 0.12f, kMapH = 0.21f;
 constexpr float kMapDefaultX = 0.01f, kMapDefaultY = 0.77f;
 constexpr float kSuspW = 0.13f, kSuspH = 0.085f;
 constexpr float kSuspDefaultX = 0.86f, kSuspDefaultY = 0.86f;
+// The gap to Coach's lap and sit/stand, on one line. Centred under the cue block by default.
+// It is sized to its text, so only where it starts is remembered; the width follows what it
+// has to say.
+constexpr float kRowH = 0.025f;
+constexpr float kRowDefaultX = 0.5f, kRowDefaultY = 0.365f;
+/// The width the row is taken hold of at. Its drawn width follows its text; this is near
+/// enough to grab, and keeps picking it up from depending on what it happens to say.
+constexpr float kRowHitW = 0.16f;
 
 struct Settings {
     bool enabled = true, cue = true, section = true, gap = true, stance = true, map = true, setup = true;
@@ -182,6 +190,8 @@ struct Settings {
     // corners they were first drawn in, which is the one thing every rider asked to change.
     float map_x  = kMapDefaultX, map_y = kMapDefaultY;
     float susp_x = kSuspDefaultX, susp_y = kSuspDefaultY;
+    // The gap-and-stance line: `row_x` is its centre across, `row_y` its top.
+    float row_x  = kRowDefaultX, row_y = kRowDefaultY;
     // Right-drag a part to move it. On by default - it is how the rider finds out they can.
     bool  move = true;
 };
@@ -223,6 +233,8 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.map_y   = fraction("map_y", kMapDefaultY);
     s.susp_x  = fraction("susp_x", kSuspDefaultX);
     s.susp_y  = fraction("susp_y", kSuspDefaultY);
+    s.row_x   = fraction("row_x", kRowDefaultX);
+    s.row_y   = fraction("row_y", kRowDefaultY);
     s.move    = flag("move", true);
     return s;
 }
@@ -556,7 +568,6 @@ constexpr Box   kCueBox     = {0.35f, 0.285f, 0.65f, 0.335f};
 constexpr float kCueSize    = 0.040f;
 constexpr Box   kSectionBox = {0.35f, 0.338f, 0.65f, 0.362f};
 constexpr float kSmallSize  = 0.022f;
-constexpr float kRowY0 = 0.365f, kRowY1 = 0.39f;  // gap and stance
 constexpr Box   kMapBox  = {kMapDefaultX, kMapDefaultY, kMapDefaultX + kMapW, kMapDefaultY + kMapH};
 constexpr Box   kCardBox = {0.35f, 0.60f, 0.65f, 0.72f};
 constexpr Box   kSuspBox = {kSuspDefaultX, kSuspDefaultY, kSuspDefaultX + kSuspW, kSuspDefaultY + kSuspH};
@@ -589,6 +600,13 @@ inline Box BoxAt(float x, float y, float w, float h) {
 }
 
 inline Box MapBoxAt(const Settings& s) { return BoxAt(s.map_x, s.map_y, kMapW, kMapH); }
+
+/// The gap-and-stance line, `text_w` wide, centred on `row_x` and kept on screen. Its width
+/// depends on what it says, so unlike the rest it is measured each frame rather than fixed.
+inline Box RowBoxAt(const Settings& s, float text_w) {
+    const float w = text_w + 0.02f;
+    return BoxAt(s.row_x - w * 0.5f, s.row_y, w, kRowH);
+}
 inline Box SuspBoxAt(const Settings& s) { return BoxAt(s.susp_x, s.susp_y, kSuspW, kSuspH); }
 
 // ---------------------------------------------------------------------------------------
@@ -599,7 +617,7 @@ inline Box SuspBoxAt(const Settings& s) { return BoxAt(s.susp_x, s.susp_y, kSusp
 // which part is under a point, where a part lands when it is dragged, and how hud.ini is
 // rewritten so Coach's own keys survive.
 
-enum Part { PART_NONE = 0, PART_CUE, PART_MAP, PART_SUSP };
+enum Part { PART_NONE = 0, PART_CUE, PART_MAP, PART_SUSP, PART_ROW };
 
 /// A part's name, for the log: a rider who can't move something wants to know whether the
 /// plugin ever saw the grab.
@@ -608,6 +626,7 @@ inline const char* PartName(Part p) {
         case PART_CUE: return "the cue";
         case PART_MAP: return "the map";
         case PART_SUSP: return "the suspension bars";
+        case PART_ROW: return "the gap line";
         default: return "nothing";
     }
 }
@@ -627,6 +646,12 @@ inline bool PartBox(const Settings& s, Part part, Box& out) {
             if (!s.susp) return false;
             out = SuspBoxAt(s);
             return true;
+        case PART_ROW:
+            // Grabbable whenever either half of it is on. Its real width follows its text, so
+            // a nominal one is used for the hit test — near enough to take hold of.
+            if (!s.gap && !s.stance) return false;
+            out = RowBoxAt(s, kRowHitW);
+            return true;
         default: return false;
     }
 }
@@ -634,7 +659,7 @@ inline bool PartBox(const Settings& s, Part part, Box& out) {
 /// Which drawn part is under (x, y), or `PART_NONE`. The cue is tested first: it is the
 /// smallest, and the one most likely to be sitting over something else.
 inline Part PartAt(const Settings& s, float x, float y) {
-    for (Part p : {PART_CUE, PART_SUSP, PART_MAP}) {
+    for (Part p : {PART_CUE, PART_ROW, PART_SUSP, PART_MAP}) {
         Box b;
         if (!PartBox(s, p, b)) continue;
         if (x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1) return p;
@@ -650,6 +675,9 @@ inline void SetPartOrigin(Settings& s, Part part, float x, float y) {
         case PART_CUE: s.cue_x = x + kCueWidth * 0.5f, s.cue_y = y; break;
         case PART_MAP: s.map_x = x, s.map_y = y; break;
         case PART_SUSP: s.susp_x = x, s.susp_y = y; break;
+        // Stored by its centre, like the cue box, and grabbed at the nominal width the hit
+        // test uses — its real width changes with the text.
+        case PART_ROW: s.row_x = x + (kRowHitW + 0.02f) * 0.5f, s.row_y = y; break;
         default: break;
     }
 }
@@ -665,6 +693,7 @@ inline std::vector<std::pair<std::string, std::string>> PartKeys(const Settings&
         case PART_CUE: return {{"cue_x", num(s.cue_x)}, {"cue_y", num(s.cue_y)}};
         case PART_MAP: return {{"map_x", num(s.map_x)}, {"map_y", num(s.map_y)}};
         case PART_SUSP: return {{"susp_x", num(s.susp_x)}, {"susp_y", num(s.susp_y)}};
+        case PART_ROW: return {{"row_x", num(s.row_x)}, {"row_y", num(s.row_y)}};
         default: return {};
     }
 }
@@ -912,9 +941,10 @@ inline void Build(const View& v, Frame& f) {
         const std::string s  = st ? (v.stance == stance::SIT ? "SIT" : "STAND") : "";
         const float       wg = TextWidth(g.size(), kSmallSize), ws = TextWidth(s.size(), kSmallSize);
         const float       sep = gap && st ? 0.015f : 0.0f;
-        const float       x0  = 0.5f - (wg + sep + ws) * 0.5f;
-        const float       y   = kRowY0 + (kRowY1 - kRowY0 - kSmallSize) * 0.5f;
-        Rect(f, x0 - 0.01f, kRowY0, x0 + wg + sep + ws + 0.01f, kRowY1, kBacking);
+        const Box         b   = RowBoxAt(v.set, wg + sep + ws);
+        const float       x0  = b.x0 + 0.01f;
+        const float       y   = b.y0 + (kRowH - kSmallSize) * 0.5f;
+        Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
         if (gap) Say(f, g, x0, y, kSmallSize, 0, v.gap > 0 ? kRed : kGreen);
         if (st) {
             uint32_t c = v.stance == stance::SIT ? kBlue : kWhite;

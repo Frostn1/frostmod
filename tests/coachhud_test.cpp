@@ -447,7 +447,10 @@ static void TheLayout() {
     CHECK(said[3] == "SIT", "stance");
     CHECK(f.texts[3].x > f.texts[2].x + TextWidth(said[2].size(), kSmallSize), "stance beside the gap");
     CHECK(said[4] == "Setup: sand fast.stp" && said[5] == "Stop 2 seconds in neutral to measure sag", "card");
-    CHECK(f.quads.size() > 300 && f.quads.size() <= kMaxQuads, "%zu quads", f.quads.size());
+    // The line and the trail are thinned to what a map this size can show, so the whole HUD
+    // now costs a fraction of the cap — and the reserve below is never touched by ordinary
+    // drawing.
+    CHECK(f.quads.size() > 40 && f.quads.size() <= kMaxQuads - kReserve, "%zu quads", f.quads.size());
 
     // Each part off in turn, and the map on its own stays in its box.
     v.set = ParseSettings("[hud]\ncue=0\nsection=0\ngap=0\nstance=0\nsetup=0\n", false);
@@ -572,6 +575,98 @@ static void FromAFile() {
     CHECK(n == b.size() && Parse(back.data(), n, s) && s.ref.size() == 101, "read back %zu bytes", n);
 }
 
+
+/// The rider's marker says which way they are pointing, and the parts sit where hud.ini puts
+/// them rather than in the corner they were first drawn in.
+static void TheRiderPointsAndThePartsMove() {
+    // An arrow is a triangle: two of its four corners are folded together onto the point.
+    Frame f;
+    Arrow(f, 0.5f, 0.5f, 1.0f, 0.0f, kWhite, 0.02f);
+    CHECK(f.quads.size() == 1, "one quad for the arrow: %zu", f.quads.size());
+    const Quad& q = f.quads[0];
+    CHECK(q.p[0][0] == q.p[3][0] && q.p[0][1] == q.p[3][1], "folded into a triangle");
+    CHECK(q.p[0][0] > q.p[1][0] && q.p[0][0] > q.p[2][0], "pointing the way it was given");
+    // Turned a quarter turn, it points that way instead.
+    f.clear();
+    Arrow(f, 0.5f, 0.5f, 0.0f, 1.0f, kWhite, 0.02f);
+    CHECK(f.quads[0].p[0][1] > f.quads[0].p[1][1], "pointing down the screen");
+    // Standing still is a dot, not an arrow with no direction.
+    f.clear();
+    Arrow(f, 0.5f, 0.5f, 0.0f, 0.0f, kWhite, 0.02f);
+    CHECK(f.quads.size() == 1 && f.quads[0].p[0][0] != f.quads[0].p[3][0], "a dot when stopped");
+
+    // hud.ini moves the map and the bars, and a part dragged off the edge stays on screen.
+    const Settings moved = ParseSettings("[hud]\nsusp=1\nmap_x=0.60\nmap_y=0.10\nsusp_x=0.02\nsusp_y=0.30\n", false);
+    CHECK(MapBoxAt(moved).x0 == 0.60f && MapBoxAt(moved).y0 == 0.10f, "the map where it was put");
+    CHECK(SuspBoxAt(moved).x0 == 0.02f && SuspBoxAt(moved).y0 == 0.30f, "the bars where they were put");
+    const Settings off = ParseSettings("[hud]\nmap_x=0.99\nmap_y=0.99\n", false);
+    CHECK(MapBoxAt(off).x1 <= 1.0f + 1e-6f && MapBoxAt(off).y1 <= 1.0f + 1e-6f, "kept on screen");
+    // Defaults are the corners it always used, so nobody's HUD moves on updating.
+    const Settings plain = Settings{};
+    CHECK(MapBoxAt(plain).x0 == kMapBox.x0 && MapBoxAt(plain).y0 == kMapBox.y0, "map unchanged by default");
+    CHECK(SuspBoxAt(plain).x0 == kSuspBox.x0 && SuspBoxAt(plain).y0 == kSuspBox.y0, "bars unchanged by default");
+    CHECK(plain.move, "right-drag is on unless turned off");
+    CHECK(!ParseSettings("[hud]\nmove=0\n", false).move, "and can be turned off");
+}
+
+/// Whatever else runs out of room, the rider can see themselves. The cap used to be spent by
+/// the centreline and the trail, and the rider's own marker is drawn last.
+static void TheRidersMarkerIsNeverDropped() {
+    Frame f;
+    while (f.room()) Rect(f, 0, 0, 0.01f, 0.01f, kWhite);
+    const size_t filled = f.quads.size();
+    CHECK(filled == kMaxQuads - kReserve, "ordinary drawing stops at the reserve: %zu", filled);
+    Rect(f, 0, 0, 0.01f, 0.01f, kWhite);
+    CHECK(f.quads.size() == filled, "and stays stopped");
+    {
+        Reserved hold(f);
+        Arrow(f, 0.5f, 0.5f, 1.0f, 0.0f, kWhite, 0.02f);
+        CHECK(f.quads.size() == filled + 1, "the reserve draws the rider anyway");
+    }
+    Rect(f, 0, 0, 0.01f, 0.01f, kWhite);
+    CHECK(f.quads.size() == filled + 1, "and the reserve closes again");
+}
+
+
+/// Right-drag a part to move it. Everything here is decided without Windows, so it is tested:
+/// what is under the cursor, where it lands, and that hud.ini keeps what Coach wrote in it.
+static void DraggingAPart() {
+    Settings s = ParseSettings("[hud]\nsusp=1\n", false);
+    // The cursor over each part finds that part, and empty screen finds none.
+    const Box map = MapBoxAt(s), susp = SuspBoxAt(s), cue = CueBoxAt(s.cue_x, s.cue_y);
+    CHECK(PartAt(s, (map.x0 + map.x1) * 0.5f, (map.y0 + map.y1) * 0.5f) == PART_MAP, "the map");
+    CHECK(PartAt(s, (susp.x0 + susp.x1) * 0.5f, (susp.y0 + susp.y1) * 0.5f) == PART_SUSP, "the bars");
+    CHECK(PartAt(s, (cue.x0 + cue.x1) * 0.5f, (cue.y0 + cue.y1) * 0.5f) == PART_CUE, "the cue");
+    CHECK(PartAt(s, 0.5f, 0.5f) == PART_NONE, "nothing in the middle of the screen");
+    // A part that isn't drawn can't be grabbed.
+    Settings off = ParseSettings("[hud]\nsusp=0\nmap=0\n", false);
+    CHECK(PartAt(off, (map.x0 + map.x1) * 0.5f, (map.y0 + map.y1) * 0.5f) == PART_NONE, "the map is off");
+
+    // Dragged to the middle, it is there — and the cue keeps being stored by its centre.
+    SetPartOrigin(s, PART_MAP, 0.40f, 0.20f);
+    CHECK(MapBoxAt(s).x0 == 0.40f && MapBoxAt(s).y0 == 0.20f, "the map moved");
+    SetPartOrigin(s, PART_CUE, 0.10f, 0.60f);
+    const Box moved = CueBoxAt(s.cue_x, s.cue_y);
+    CHECK(std::fabs(moved.x0 - 0.10f) < 1e-5f && std::fabs(moved.y0 - 0.60f) < 1e-5f, "the cue moved by its corner");
+
+    // hud.ini: the moved keys are written, and everything else survives untouched.
+    const std::string before = "[hud]\nenabled=1\ncue=1\nmap_x=0.010\ntrail=1\n\n[other]\nkeep=me\n";
+    const std::string after  = WithHudKeys(before, PartKeys(s, PART_MAP));
+    CHECK(after.find("map_x=0.400") != std::string::npos, "the key it had was rewritten: %s", after.c_str());
+    CHECK(after.find("map_y=0.200") != std::string::npos, "the key it lacked was added");
+    CHECK(after.find("trail=1") != std::string::npos && after.find("enabled=1") != std::string::npos, "Coach's keys kept");
+    CHECK(after.find("[other]") != std::string::npos && after.find("keep=me") != std::string::npos, "other sections kept");
+    CHECK(after.find("map_x=0.010") == std::string::npos, "the old value is gone, not left beside the new one");
+    // Read back, it is what was written.
+    const Settings round = ParseSettings(after, false);
+    CHECK(round.map_x == 0.400f && round.map_y == 0.200f, "what was written is what is read");
+    CHECK(round.trail, "and the rest of the file still means what it did");
+    // No [hud] section at all: one is made rather than the keys being dropped.
+    const std::string fresh = WithHudKeys("[other]\nkeep=me\n", PartKeys(s, PART_SUSP));
+    CHECK(ParseSettings(fresh, false).susp_x == s.susp_x, "a new [hud] section carries them");
+    CHECK(fresh.find("keep=me") != std::string::npos, "without losing what was there");
+}
+
 int main() {
     TheBytesAreExact();
     RefusesWhatTheAppDoesNotWrite();
@@ -590,6 +685,9 @@ int main() {
     TheLayout();
     TheSuspensionAndTheTrail();
     FromAFile();
+    TheRiderPointsAndThePartsMove();
+    TheRidersMarkerIsNeverDropped();
+    DraggingAPart();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

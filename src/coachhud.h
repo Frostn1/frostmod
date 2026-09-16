@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "coachcue.h"
@@ -162,6 +163,14 @@ inline const Section* SectionAt(const Sheet& s, float m) {
 constexpr float kCueDefaultX = 0.5f;
 constexpr float kCueDefaultY = 0.285f;
 
+// The map and the suspension bars, by their top-left corner and their size. Bottom left and
+// bottom right by default — opposite corners, so the two don't land on each other — but the
+// corner is only where they start now, not where they are stuck.
+constexpr float kMapW = 0.12f, kMapH = 0.21f;
+constexpr float kMapDefaultX = 0.01f, kMapDefaultY = 0.77f;
+constexpr float kSuspW = 0.13f, kSuspH = 0.085f;
+constexpr float kSuspDefaultX = 0.86f, kSuspDefaultY = 0.86f;
+
 struct Settings {
     bool enabled = true, cue = true, section = true, gap = true, stance = true, map = true, setup = true;
     // Off by default: they are additions, and a HUD that grows parts on its own after an
@@ -169,6 +178,12 @@ struct Settings {
     bool  susp = false, trail = false;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
+    // The map and the suspension bars by their top-left corner. They used to be nailed to the
+    // corners they were first drawn in, which is the one thing every rider asked to change.
+    float map_x  = kMapDefaultX, map_y = kMapDefaultY;
+    float susp_x = kSuspDefaultX, susp_y = kSuspDefaultY;
+    // Right-drag a part to move it. On by default - it is how the rider finds out they can.
+    bool  move = true;
 };
 
 /// `<save>\mxbcoach\hud.ini`, [hud] key=1|0. Anything missing is on, except the map when
@@ -204,6 +219,11 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.trail   = flag("trail", false);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
+    s.map_x   = fraction("map_x", kMapDefaultX);
+    s.map_y   = fraction("map_y", kMapDefaultY);
+    s.susp_x  = fraction("susp_x", kSuspDefaultX);
+    s.susp_y  = fraction("susp_y", kSuspDefaultY);
+    s.move    = flag("move", true);
     return s;
 }
 
@@ -488,20 +508,39 @@ struct Text {
     int         justify = 0;             // 0 left, 1 centre, 2 right
     uint32_t    color   = 0;
 };
-// Room for the map's 300 centreline segments plus the reference trail, the suspension bars and
-// every dot on top of them. The map is drawn last, so a cap reached early would cost the
-// rider's own dot before anything else.
+// Room for the map's centreline segments plus the reference trail, the suspension bars and
+// every marker on top of them.
+//
+// The cap used to be reachable: the centreline alone spent 301, a dense trail up to 240 more,
+// and the rider's arrow and the ghost are drawn last — so with the trail on, the first thing
+// to be dropped was the rider's own marker. Two things stop that now. The line and the trail
+// are thinned to what a map this size can show (`kLineOnMap`, `kTrailSegs`), and the last
+// slots are held back: `Frame::room` refuses ordinary drawing once the reserve is all that is
+// left, and `Frame::reserved` spends it for the markers that must never go missing.
 constexpr size_t kMaxQuads = 512;
+constexpr size_t kReserve  = 12;
 constexpr size_t kMaxTexts = 16;
 constexpr size_t kMaxChars = 99;  // SPluginString_t holds 100 bytes
 
 struct Frame {
     std::vector<Quad> quads;
     std::vector<Text> texts;
+    /// True while the reserve is being spent, for the handful of markers that must draw.
+    bool reserved = false;
+    /// Whether one more quad may be drawn.
+    bool room() const { return quads.size() < (reserved ? kMaxQuads : kMaxQuads - kReserve); }
     void clear() {
         quads.clear();
         texts.clear();
+        reserved = false;
     }
+};
+
+/// Spends the reserve for as long as it is in scope.
+struct Reserved {
+    Frame& f;
+    explicit Reserved(Frame& frame) : f(frame) { f.reserved = true; }
+    ~Reserved() { f.reserved = false; }
 };
 
 // Where everything goes, as screen fractions (16:9). Clear of MXBMRP3's Notices (y 0.099-0.165)
@@ -518,16 +557,17 @@ constexpr float kCueSize    = 0.040f;
 constexpr Box   kSectionBox = {0.35f, 0.338f, 0.65f, 0.362f};
 constexpr float kSmallSize  = 0.022f;
 constexpr float kRowY0 = 0.365f, kRowY1 = 0.39f;  // gap and stance
-constexpr Box   kMapBox  = {0.01f, 0.77f, 0.13f, 0.98f};
+constexpr Box   kMapBox  = {kMapDefaultX, kMapDefaultY, kMapDefaultX + kMapW, kMapDefaultY + kMapH};
 constexpr Box   kCardBox = {0.35f, 0.60f, 0.65f, 0.72f};
-// The suspension bars, bottom right - the opposite corner from the map, so the two additions
-// this release don't land on each other.
-constexpr Box   kSuspBox    = {0.86f, 0.86f, 0.99f, 0.945f};
+constexpr Box   kSuspBox = {kSuspDefaultX, kSuspDefaultY, kSuspDefaultX + kSuspW, kSuspDefaultY + kSuspH};
 constexpr float kSuspLabelW = 0.022f;  // room for the F / R label at the left of each bar
 constexpr float kSuspPad    = 0.006f;
 
 /// How far ahead of the rider Coach's line is drawn, as a fraction of the lap.
 constexpr float kTrailLap = 0.12f;
+/// How many segments the centreline and the trail are worth drawing on a map this small.
+constexpr size_t kLineOnMap = 120;
+constexpr size_t kTrailSegs = 40;
 
 /// The cue box for a `cue_x` (its centre) and `cue_y` (its top), kept wholly on screen along
 /// with the section line beneath it. A rider who drags it to the edge gets it at the edge, not
@@ -538,6 +578,158 @@ inline Box CueBoxAt(float cx, float cy) {
     const float tall = kCueHeight + kCueGap + kSectionHeight;
     const float y    = (std::max)(0.0f, (std::min)(cy, 1.0f - tall));
     return {x - half, y, x + half, y + kCueHeight};
+}
+
+/// A part of fixed size at the top-left the rider put it, kept wholly on screen. A part
+/// dragged past the edge sits against the edge rather than half out of sight.
+inline Box BoxAt(float x, float y, float w, float h) {
+    const float px = (std::max)(0.0f, (std::min)(x, 1.0f - w));
+    const float py = (std::max)(0.0f, (std::min)(y, 1.0f - h));
+    return {px, py, px + w, py + h};
+}
+
+inline Box MapBoxAt(const Settings& s) { return BoxAt(s.map_x, s.map_y, kMapW, kMapH); }
+inline Box SuspBoxAt(const Settings& s) { return BoxAt(s.susp_x, s.susp_y, kSuspW, kSuspH); }
+
+// ---------------------------------------------------------------------------------------
+// Moving a part with the mouse
+//
+// The plugin API has no input callback and no cursor, so the drag itself is read from Win32 in
+// mxbcoach.cpp. Everything that can be decided without Windows lives here, where it is tested:
+// which part is under a point, where a part lands when it is dragged, and how hud.ini is
+// rewritten so Coach's own keys survive.
+
+enum Part { PART_NONE = 0, PART_CUE, PART_MAP, PART_SUSP };
+
+/// A part's name, for the log: a rider who can't move something wants to know whether the
+/// plugin ever saw the grab.
+inline const char* PartName(Part p) {
+    switch (p) {
+        case PART_CUE: return "the cue";
+        case PART_MAP: return "the map";
+        case PART_SUSP: return "the suspension bars";
+        default: return "nothing";
+    }
+}
+
+/// The box a part occupies now. `PART_NONE`, or a part that isn't drawn, has none.
+inline bool PartBox(const Settings& s, Part part, Box& out) {
+    switch (part) {
+        case PART_CUE:
+            if (!s.cue) return false;
+            out = CueBoxAt(s.cue_x, s.cue_y);
+            return true;
+        case PART_MAP:
+            if (!s.map) return false;
+            out = MapBoxAt(s);
+            return true;
+        case PART_SUSP:
+            if (!s.susp) return false;
+            out = SuspBoxAt(s);
+            return true;
+        default: return false;
+    }
+}
+
+/// Which drawn part is under (x, y), or `PART_NONE`. The cue is tested first: it is the
+/// smallest, and the one most likely to be sitting over something else.
+inline Part PartAt(const Settings& s, float x, float y) {
+    for (Part p : {PART_CUE, PART_SUSP, PART_MAP}) {
+        Box b;
+        if (!PartBox(s, p, b)) continue;
+        if (x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1) return p;
+    }
+    return PART_NONE;
+}
+
+/// Put a part's top-left corner at (x, y). The cue is stored by the centre of its box, so it
+/// is converted; the clamping that keeps a part on screen belongs to the readers, so a value
+/// written here is the one the rider dragged to.
+inline void SetPartOrigin(Settings& s, Part part, float x, float y) {
+    switch (part) {
+        case PART_CUE: s.cue_x = x + kCueWidth * 0.5f, s.cue_y = y; break;
+        case PART_MAP: s.map_x = x, s.map_y = y; break;
+        case PART_SUSP: s.susp_x = x, s.susp_y = y; break;
+        default: break;
+    }
+}
+
+/// The `[hud]` keys a part's position is written under, and their values, to three decimals.
+inline std::vector<std::pair<std::string, std::string>> PartKeys(const Settings& s, Part part) {
+    char buf[32];
+    auto num = [&buf](float v) {
+        std::snprintf(buf, sizeof(buf), "%.3f", double(v));
+        return std::string(buf);
+    };
+    switch (part) {
+        case PART_CUE: return {{"cue_x", num(s.cue_x)}, {"cue_y", num(s.cue_y)}};
+        case PART_MAP: return {{"map_x", num(s.map_x)}, {"map_y", num(s.map_y)}};
+        case PART_SUSP: return {{"susp_x", num(s.susp_x)}, {"susp_y", num(s.susp_y)}};
+        default: return {};
+    }
+}
+
+/// `ini` with each key set in `[hud]`, every other line kept as it was. Coach writes this file
+/// too, so a key it owns must survive the rider dragging something across the screen.
+inline std::string WithHudKeys(const std::string& ini, const std::vector<std::pair<std::string, std::string>>& keys) {
+    if (keys.empty()) return ini;
+    std::vector<std::string> lines;
+    std::string              cur;
+    for (char c : ini) {
+        if (c == '\n') {
+            lines.push_back(cur);
+            cur.clear();
+        } else if (c != '\r') {
+            cur.push_back(c);
+        }
+    }
+    lines.push_back(cur);
+    auto trimmed = [](const std::string& l) {
+        size_t a = l.find_first_not_of(" \t");
+        if (a == std::string::npos) return std::string();
+        size_t b = l.find_last_not_of(" \t");
+        return l.substr(a, b - a + 1);
+    };
+    // Rewrite in place wherever the key is already there, inside [hud].
+    std::vector<bool> done(keys.size(), false);
+    bool              in_hud = false;
+    size_t            hud_end = std::string::npos;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string t = trimmed(lines[i]);
+        if (!t.empty() && t[0] == '[') {
+            if (in_hud) hud_end = i;
+            in_hud = t == "[hud]";
+            continue;
+        }
+        if (!in_hud) continue;
+        const size_t eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = trimmed(t.substr(0, eq));
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (done[k] || name != keys[k].first) continue;
+            lines[i] = keys[k].first + "=" + keys[k].second;
+            done[k]  = true;
+        }
+    }
+    if (in_hud) hud_end = lines.size();
+    // Anything that wasn't there goes in at the end of [hud], or in a new section.
+    std::vector<std::string> add;
+    for (size_t k = 0; k < keys.size(); ++k)
+        if (!done[k]) add.push_back(keys[k].first + "=" + keys[k].second);
+    if (!add.empty()) {
+        if (hud_end == std::string::npos) {
+            if (!lines.empty() && !trimmed(lines.back()).empty()) lines.push_back("");
+            lines.push_back("[hud]");
+            hud_end = lines.size();
+        }
+        lines.insert(lines.begin() + long(hud_end), add.begin(), add.end());
+    }
+    std::string out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size()) out += "\n";
+    }
+    return out;
 }
 
 /// The section line, directly under the cue box: it is the cue's second line, so it travels
@@ -573,7 +765,7 @@ inline std::string Fit(const std::string& s, float size, float width) {
 }
 
 inline void Rect(Frame& f, float x0, float y0, float x1, float y1, uint32_t color) {
-    if (f.quads.size() >= kMaxQuads) return;
+    if (!f.room()) return;
     Quad q;
     q.p[0][0] = x0, q.p[0][1] = y0;
     q.p[1][0] = x0, q.p[1][1] = y1;
@@ -589,10 +781,41 @@ inline void Dot(Frame& f, float x, float y, uint32_t color, float size) {
     Rect(f, x - hx, y - hy, x + hx, y + hy, color);
 }
 
+/// An arrow `size` long centred on (x, y), pointing along the screen direction (dx, dy).
+///
+/// The rider was a square, which says where they are and nothing else — on a map whose whole
+/// job is which way the next corner goes, that is half the information missing. A quad takes
+/// four free corners, so the head is one quad with its two back corners brought together into
+/// a triangle and the tail is a second: no sprite, no new API, two quads.
+///
+/// (dx, dy) is already in screen space, so a caller projecting a world heading must invert z
+/// the way `Project` does. A direction too short to normalise falls back to a dot, which is
+/// what a stationary bike should look like anyway.
+inline void Arrow(Frame& f, float x, float y, float dx, float dy, uint32_t color, float size) {
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (!(len > 1e-6f)) return Dot(f, x, y, color, size * 0.6f);
+    // Forward, and the perpendicular to it, both in screen units with the aspect taken out of
+    // x so the arrow stays the same shape rather than stretching with the screen.
+    const float fx = dx / len, fy = dy / len;
+    const float half = size * 0.5f;
+    const float tipx = x + fx * half / kAspect, tipy = y + fy * half;
+    const float bakx = x - fx * half / kAspect, baky = y - fy * half;
+    const float wx = -fy * size * 0.34f / kAspect, wy = fx * size * 0.34f;
+    if (f.room()) {
+        Quad q;
+        q.p[0][0] = tipx, q.p[0][1] = tipy;          // the point
+        q.p[1][0] = bakx + wx, q.p[1][1] = baky + wy;  // one back corner
+        q.p[2][0] = bakx - wx, q.p[2][1] = baky - wy;  // the other
+        q.p[3][0] = tipx, q.p[3][1] = tipy;            // folded onto the point: a triangle
+        q.color = color;
+        f.quads.push_back(q);
+    }
+}
+
 /// A line `thickness` thick. MXBMRP3's addLineSegment.
 inline void Line(Frame& f, float x1, float y1, float x2, float y2, uint32_t color, float thickness) {
     const float dx = x2 - x1, dy = y2 - y1, len = std::sqrt(dx * dx + dy * dy);
-    if (len < 0.0001f || f.quads.size() >= kMaxQuads) return;
+    if (len < 0.0001f || !f.room()) return;
     const float hx = dy / len * thickness * 0.5f / kAspect, hy = -dx / len * thickness * 0.5f;
     Quad q;
     q.p[0][0] = x1 + hx, q.p[0][1] = y1 + hy;
@@ -623,6 +846,9 @@ struct View {
     const Track*             track   = nullptr;
     bool                     has_rider = false, has_ghost = false;
     Pt                       rider, ghost;  // world x/z
+    // Which way the rider is pointing, as a world x/z direction. Zero until they have moved
+    // far enough to say, and then the arrow on the map points along it.
+    Pt                       rider_dir{};
     float                    pos = 0;       // the rider's lap position 0..1, for the trail
     std::vector<float>       upcoming;      // cue spots ahead, metres from the line
     bool                     stopped = false;
@@ -709,7 +935,7 @@ inline void Build(const View& v, Frame& f) {
     // 7. The suspension, bottom right: how much travel each end is using now, and a mark where
     //    it bottomed. Off unless hud.ini asks for it.
     if (v.set.susp && v.has_susp) {
-        const Box& b = kSuspBox;
+        const Box b = SuspBoxAt(v.set);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
         const float h  = (b.y1 - b.y0 - kSuspPad * 3) * 0.5f;
         const float x0 = b.x0 + kSuspPad + kSuspLabelW, x1 = b.x1 - kSuspPad;
@@ -733,15 +959,22 @@ inline void Build(const View& v, Frame& f) {
     //    ghost and the rider on top of it.
     if (v.set.map && v.track && v.track->ready()) {
         const Track& t = *v.track;
-        const Box&   b = kMapBox;
+        const Box    b = MapBoxAt(v.set);
         Rect(f, b.x0, b.y0, b.x1, b.y1, 0x80000000u);
+        // Every other segment, and every other one again if the line is long: a map this size
+        // cannot show 300 segments apart, and each one spent a quad the rider's own marker
+        // might have needed.
         const std::vector<Pt>& line = t.line();
+        const size_t step = (std::max)(size_t(1), (line.size() + kLineOnMap - 1) / kLineOnMap);
         Pt prev = Project(t, b, line[0].x, line[0].y);
-        for (size_t i = 1; i < line.size(); ++i) {
+        for (size_t i = step; i < line.size(); i += step) {
             const Pt p = Project(t, b, line[i].x, line[i].y);
             Line(f, prev.x, prev.y, p.x, p.y, kGrey, 0.003f);
             prev = p;
         }
+        // Back to the start, so the lap reads as a loop rather than stopping short.
+        const Pt last = Project(t, b, line[0].x, line[0].y);
+        Line(f, prev.x, prev.y, last.x, last.y, kGrey, 0.003f);
         for (float m : v.upcoming) {
             float x, z;
             if (!t.at(m, x, z)) continue;
@@ -757,26 +990,36 @@ inline void Build(const View& v, Frame& f) {
             const std::vector<RefPoint>& r = *v.ref;
             size_t first = 0;
             while (first < r.size() && r[first].pos < v.pos) ++first;
+            // The sheet carries up to 2000 points, so a twelfth of a lap of them is far more
+            // than this map can draw. Thinned to a fixed budget: the same line, a fraction of
+            // the quads, and no chance of crowding out what is drawn after it.
+            const size_t want = size_t(float(r.size()) * kTrailLap);
+            const size_t step = (std::max)(size_t(1), (want + kTrailSegs - 1) / kTrailSegs);
             bool started = false;
-            Pt   last{};
-            for (size_t k = 0; k < r.size(); ++k) {
+            Pt   prev_pt{};
+            for (size_t k = 0; k < r.size(); k += step) {
                 const RefPoint& p = r[(first + k) % r.size()];
                 float ahead = p.pos - v.pos;
                 if (ahead < 0) ahead += 1.0f;
                 if (ahead > kTrailLap) break;
-                const Pt s = Project(t, b, p.x, p.z);
-                if (started) Line(f, last.x, last.y, s.x, s.y, kBlue, 0.004f);
-                last    = s;
+                const Pt sp = Project(t, b, p.x, p.z);
+                if (started) Line(f, prev_pt.x, prev_pt.y, sp.x, sp.y, kBlue, 0.004f);
+                prev_pt = sp;
                 started = true;
             }
         }
+        // On the reserve: whatever else ran out of room, the rider has to be able to see
+        // themselves and the lap they are chasing.
+        Reserved hold(f);
         if (v.has_ghost) {
             const Pt p = Project(t, b, v.ghost.x, v.ghost.y);
             Dot(f, p.x, p.y, kBlue, 0.011f);
         }
         if (v.has_rider) {
             const Pt p = Project(t, b, v.rider.x, v.rider.y);
-            Dot(f, p.x, p.y, kWhite, 0.013f);
+            // The world heading through the same flip `Project` applies to z, so the arrow
+            // points where the bike is pointing on the map rather than mirrored.
+            Arrow(f, p.x, p.y, v.rider_dir.x, -v.rider_dir.y, kWhite, 0.019f);
         }
     }
 }

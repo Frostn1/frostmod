@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -155,16 +156,41 @@ inline const Section* SectionAt(const Sheet& s, float m) {
 // ---------------------------------------------------------------------------------------
 // hud.ini
 
+// Where the cue block sits by default: centred across, and low enough to clear MXBMRP3's
+// panels. The rider can move it, because on their screen the default lands in the middle of
+// where they are looking.
+constexpr float kCueDefaultX = 0.5f;
+constexpr float kCueDefaultY = 0.285f;
+
 struct Settings {
     bool enabled = true, cue = true, section = true, gap = true, stance = true, map = true, setup = true;
+    // Off by default: they are additions, and a HUD that grows parts on its own after an
+    // update is a worse surprise than one that waits to be asked.
+    bool  susp = false, trail = false;
+    float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
+    float cue_y = kCueDefaultY;  // its top edge
 };
 
 /// `<save>\mxbcoach\hud.ini`, [hud] key=1|0. Anything missing is on, except the map when
-/// MXBMRP3 is installed (it draws its own) unless map=1 says otherwise.
+/// MXBMRP3 is installed (it draws its own) unless map=1 says otherwise, and the suspension
+/// bars and the reference trail, which are off until asked for.
+///
+/// `cue_x` and `cue_y` are screen fractions, 0..1: the centre and the top of the cue box. The
+/// section line follows it down, since it is the cue's second line and would otherwise be left
+/// behind in the middle of the screen. A value that isn't a number, or one that would push the
+/// box off screen, keeps the default rather than hiding the cue somewhere it can't be found.
 inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     auto flag = [&](const char* key, bool def) {
         const std::string v = stance::IniValue(ini, "hud", key);
         return v == "1" ? true : v == "0" ? false : def;
+    };
+    auto fraction = [&](const char* key, float def) {
+        const std::string v = stance::IniValue(ini, "hud", key);
+        if (v.empty()) return def;
+        char*       end = nullptr;
+        const float f   = std::strtof(v.c_str(), &end);
+        if (end == v.c_str() || *end != '\0' || !std::isfinite(f) || f < 0.0f || f > 1.0f) return def;
+        return f;
     };
     Settings s;
     s.enabled = flag("enabled", true);
@@ -174,6 +200,10 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.stance  = flag("stance", true);
     s.map     = flag("map", !mxbmrp3);
     s.setup   = flag("setup", true);
+    s.susp    = flag("susp", false);
+    s.trail   = flag("trail", false);
+    s.cue_x   = fraction("cue_x", kCueDefaultX);
+    s.cue_y   = fraction("cue_y", kCueDefaultY);
     return s;
 }
 
@@ -201,6 +231,10 @@ public:
         }
     }
     bool ready() const { return !pts_.empty(); }
+
+    /// Coach's points as the sheet gave them, for drawing the line to take. Empty without a
+    /// sheet, which is what stops the trail being guessed from anything else.
+    const std::vector<RefPoint>& points() const { return pts_; }
 
     /// Coach's elapsed time at lap position `pos`, as MXBMRP3's calculateCurrentGap reads it.
     bool time_at(float pos, float& out) const {
@@ -454,7 +488,10 @@ struct Text {
     int         justify = 0;             // 0 left, 1 centre, 2 right
     uint32_t    color   = 0;
 };
-constexpr size_t kMaxQuads = 400;
+// Room for the map's 300 centreline segments plus the reference trail, the suspension bars and
+// every dot on top of them. The map is drawn last, so a cap reached early would cost the
+// rider's own dot before anything else.
+constexpr size_t kMaxQuads = 512;
 constexpr size_t kMaxTexts = 16;
 constexpr size_t kMaxChars = 99;  // SPluginString_t holds 100 bytes
 
@@ -469,6 +506,13 @@ struct Frame {
 
 // Where everything goes, as screen fractions (16:9). Clear of MXBMRP3's Notices (y 0.099-0.165)
 // and Timing (y 0.187-0.253) panels.
+// The cue block. kCueBox and kSectionBox are where it sits with the default cue_x / cue_y, and
+// what the rest of the layout was measured against; CueBoxAt and SectionBoxAt move it to
+// wherever hud.ini puts it.
+constexpr float kCueWidth      = 0.30f;
+constexpr float kCueHeight     = 0.05f;
+constexpr float kCueGap        = 0.003f;  // between the cue and the section line under it
+constexpr float kSectionHeight = 0.024f;
 constexpr Box   kCueBox     = {0.35f, 0.285f, 0.65f, 0.335f};
 constexpr float kCueSize    = 0.040f;
 constexpr Box   kSectionBox = {0.35f, 0.338f, 0.65f, 0.362f};
@@ -476,6 +520,31 @@ constexpr float kSmallSize  = 0.022f;
 constexpr float kRowY0 = 0.365f, kRowY1 = 0.39f;  // gap and stance
 constexpr Box   kMapBox  = {0.01f, 0.77f, 0.13f, 0.98f};
 constexpr Box   kCardBox = {0.35f, 0.60f, 0.65f, 0.72f};
+// The suspension bars, bottom right - the opposite corner from the map, so the two additions
+// this release don't land on each other.
+constexpr Box   kSuspBox    = {0.86f, 0.86f, 0.99f, 0.945f};
+constexpr float kSuspLabelW = 0.022f;  // room for the F / R label at the left of each bar
+constexpr float kSuspPad    = 0.006f;
+
+/// How far ahead of the rider Coach's line is drawn, as a fraction of the lap.
+constexpr float kTrailLap = 0.12f;
+
+/// The cue box for a `cue_x` (its centre) and `cue_y` (its top), kept wholly on screen along
+/// with the section line beneath it. A rider who drags it to the edge gets it at the edge, not
+/// half off the screen where the text can't be read.
+inline Box CueBoxAt(float cx, float cy) {
+    const float half = kCueWidth * 0.5f;
+    const float x    = (std::max)(half, (std::min)(cx, 1.0f - half));
+    const float tall = kCueHeight + kCueGap + kSectionHeight;
+    const float y    = (std::max)(0.0f, (std::min)(cy, 1.0f - tall));
+    return {x - half, y, x + half, y + kCueHeight};
+}
+
+/// The section line, directly under the cue box: it is the cue's second line, so it travels
+/// with it rather than staying behind in the middle of the screen.
+inline Box SectionBoxAt(const Box& cue) {
+    return {cue.x0, cue.y1 + kCueGap, cue.x1, cue.y1 + kCueGap + kSectionHeight};
+}
 
 constexpr uint32_t kBacking = 0xA0000000u;
 constexpr uint32_t kWhite   = 0xFFFFFFFFu;
@@ -554,11 +623,29 @@ struct View {
     const Track*             track   = nullptr;
     bool                     has_rider = false, has_ghost = false;
     Pt                       rider, ghost;  // world x/z
+    float                    pos = 0;       // the rider's lap position 0..1, for the trail
     std::vector<float>       upcoming;      // cue spots ahead, metres from the line
     bool                     stopped = false;
     std::string              setup;
     bool                     sag = false;
+    // Coach's lap, for the blue line ahead of the rider. Null, or empty, without a sheet - and
+    // then no trail is drawn at all, rather than one guessed from the centreline.
+    const std::vector<RefPoint>* ref = nullptr;
+    // How much suspension travel each end is using now, 0..1, and the deepest it has reached
+    // this stint. False when the bike hasn't said (the event carried no max travel).
+    bool                     has_susp    = false;
+    float                    susp[2]     = {0, 0};  // 0 = front, 1 = rear
+    float                    susp_max[2] = {0, 0};
 };
+
+/// How much of an end's travel is in use, given the shock's current length and its maximum
+/// travel: 0 fully extended, 1 fully compressed. From MXBMRP3's updateSuspensionLength
+/// (core/plugin_data_telemetry.cpp), which is where the direction of m_afSuspLength is
+/// settled - the published header only says "shocks length", which does not say which way.
+inline float SuspUsed(float length, float max_travel) {
+    if (!(max_travel > 0) || !std::isfinite(length) || !std::isfinite(max_travel)) return 0.0f;
+    return (std::max)(0.0f, (std::min)(1.0f, (max_travel - length) / max_travel));
+}
 
 /// "vs Coach +0.34"
 inline std::string GapText(float gap) {
@@ -571,22 +658,24 @@ inline void Build(const View& v, Frame& f) {
     f.clear();
     if (!v.set.enabled) return;
 
-    // 1. The cue, centred.
+    // 1. The cue, wherever the rider has put the block.
+    const Box cue_box = CueBoxAt(v.set.cue_x, v.set.cue_y);
+    const float cue_mid = (cue_box.x0 + cue_box.x1) * 0.5f;
     if (v.set.cue && v.cue) {
-        const Box& b = kCueBox;
+        const Box& b = cue_box;
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        Say(f, Fit(v.cue->text, kCueSize, b.x1 - b.x0), 0.5f, b.y0 + (b.y1 - b.y0 - kCueSize) * 0.5f, kCueSize, 1,
+        Say(f, Fit(v.cue->text, kCueSize, b.x1 - b.x0), cue_mid, b.y0 + (b.y1 - b.y0 - kCueSize) * 0.5f, kCueSize, 1,
             CueColour(v.cue->kind));
     }
 
     // 2. The section and its tip, below it.
     if (v.set.section && v.section) {
-        const Box& b = kSectionBox;
+        const Box b = SectionBoxAt(cue_box);
         std::string s = v.section->name;
         if (!v.section->tip.empty()) s += s.empty() ? v.section->tip : ": " + v.section->tip;
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        Say(f, Fit(s, kSmallSize, b.x1 - b.x0 - 0.01f), 0.5f, b.y0 + (b.y1 - b.y0 - kSmallSize) * 0.5f, kSmallSize, 1,
-            kWhite);
+        Say(f, Fit(s, kSmallSize, b.x1 - b.x0 - 0.01f), cue_mid, b.y0 + (b.y1 - b.y0 - kSmallSize) * 0.5f, kSmallSize,
+            1, kWhite);
     }
 
     // 3 and 4. The gap and the stance, side by side, centred together. Widths are estimates.
@@ -617,7 +706,31 @@ inline void Build(const View& v, Frame& f) {
         if (v.sag) Say(f, "Stop 2 seconds in neutral to measure sag", 0.5f, b.y0 + 0.065f, kSmallSize, 1, kAmber);
     }
 
-    // 5. The map, bottom left: the line, the cue spots ahead, Coach's ghost, then the rider.
+    // 7. The suspension, bottom right: how much travel each end is using now, and a mark where
+    //    it bottomed. Off unless hud.ini asks for it.
+    if (v.set.susp && v.has_susp) {
+        const Box& b = kSuspBox;
+        Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
+        const float h  = (b.y1 - b.y0 - kSuspPad * 3) * 0.5f;
+        const float x0 = b.x0 + kSuspPad + kSuspLabelW, x1 = b.x1 - kSuspPad;
+        for (int i = 0; i < 2; ++i) {
+            const float y0 = b.y0 + kSuspPad + float(i) * (h + kSuspPad), y1 = y0 + h;
+            Say(f, i == 0 ? "F" : "R", b.x0 + kSuspPad, y0 + (h - kSmallSize) * 0.5f, kSmallSize, 0, kGrey);
+            Rect(f, x0, y0, x1, y1, 0x50FFFFFFu);  // the travel there is
+            const float used = (std::max)(0.0f, (std::min)(1.0f, v.susp[i]));
+            if (used > 0) Rect(f, x0, y0, x0 + (x1 - x0) * used, y1, kBlue);
+            // Where it bottomed: a tick standing slightly proud of the bar, so it reads as a
+            // mark on the scale rather than as more fill.
+            const float deep = (std::max)(0.0f, (std::min)(1.0f, v.susp_max[i]));
+            if (deep > 0) {
+                const float mx = x0 + (x1 - x0) * deep;
+                Rect(f, mx - 0.0012f, y0 - 0.002f, mx + 0.0012f, y1 + 0.002f, kRed);
+            }
+        }
+    }
+
+    // 5. The map, bottom left: the line, the cue spots ahead, Coach's line to take, then the
+    //    ghost and the rider on top of it.
     if (v.set.map && v.track && v.track->ready()) {
         const Track& t = *v.track;
         const Box&   b = kMapBox;
@@ -634,6 +747,28 @@ inline void Build(const View& v, Frame& f) {
             if (!t.at(m, x, z)) continue;
             const Pt p = Project(t, b, x, z);
             Dot(f, p.x, p.y, kAmber, 0.008f);
+        }
+        // Coach's line for the stretch coming up, in blue: where to take it. Walked forward
+        // from the rider's position in lap order, so the piece that wraps past the line joins
+        // up properly instead of being drawn straight across the track. Drawn only from the
+        // sheet's own points - with no sheet there is nothing here, which is the whole rule:
+        // a line guessed from the centreline would be a wrong line confidently drawn.
+        if (v.set.trail && v.ref && v.ref->size() >= 2) {
+            const std::vector<RefPoint>& r = *v.ref;
+            size_t first = 0;
+            while (first < r.size() && r[first].pos < v.pos) ++first;
+            bool started = false;
+            Pt   last{};
+            for (size_t k = 0; k < r.size(); ++k) {
+                const RefPoint& p = r[(first + k) % r.size()];
+                float ahead = p.pos - v.pos;
+                if (ahead < 0) ahead += 1.0f;
+                if (ahead > kTrailLap) break;
+                const Pt s = Project(t, b, p.x, p.z);
+                if (started) Line(f, last.x, last.y, s.x, s.y, kBlue, 0.004f);
+                last    = s;
+                started = true;
+            }
         }
         if (v.has_ghost) {
             const Pt p = Project(t, b, v.ghost.x, v.ghost.y);

@@ -111,11 +111,31 @@ inline std::string VoiceDeviceText(bool opened, uint32_t mmresult) {
     return "waveOutOpen failed (" + std::to_string(mmresult) + ") - the cues cannot be spoken";
 }
 
-/// voice.ini as it was read, and how many clips are ready to play.
-inline std::string VoiceSettingsText(bool found, bool enabled, int volume, int clips) {
+/// The result of one `waveOut*` call, whichever way it went. Every call is written down,
+/// because the voice dying part way through a session - which is what v0.23 did - leaves no
+/// other trace: the device is open, the clips are loaded, the cues fire, and nothing is heard.
+/// The MMRESULT is the only thing that says which call started refusing, and when.
+inline std::string VoiceCallText(const char* call, int slot, uint32_t mmresult) {
+    std::string s = Safe(call);
+    if (slot >= 0) s += " slot=" + std::to_string(slot);
+    s += " mmresult=" + std::to_string(mmresult);
+    if (mmresult != 0) s += " FAILED";
+    return s;
+}
+
+/// How many buffers have gone out to the device and come back. They differ by what is playing,
+/// so a `given` that climbs while `returned` sits still is the voice running out of buffers -
+/// the exact shape of the fault that silenced it after two clips.
+inline std::string VoiceBuffersText(uint32_t given, uint32_t returned, int in_flight) {
+    return "buffers given=" + std::to_string(given) + " returned=" + std::to_string(returned) +
+           " in flight=" + std::to_string(in_flight);
+}
+
+/// voice.ini as it was read, which voice it asked for, and how many clips are ready to play.
+inline std::string VoiceSettingsText(bool found, bool enabled, int volume, int clips, const char* voice) {
     if (!found) return "no voice.ini - the cues are not spoken until MXB Coach turns them on";
     return std::string("enabled=") + (enabled ? "1" : "0") + " volume=" + std::to_string(volume) +
-           " clips=" + std::to_string(clips);
+           " voice=" + Safe(voice ? voice : "?") + " clips=" + std::to_string(clips);
 }
 
 /// Which sheet was taken, or why none was. A sheet made for another track is the common one:

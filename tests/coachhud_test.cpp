@@ -265,6 +265,60 @@ static void HudIni() {
     CHECK(s.cue, "another section's key");
     s = ParseSettings("[hud]\ncue=maybe\n", false);
     CHECK(s.cue, "a value that isn't 0 or 1 keeps the default");
+
+    // The two new parts are off until they are asked for: a HUD that grows things on its own
+    // after an update is a worse surprise than one that waits.
+    s = ParseSettings("", false);
+    CHECK(!s.susp && !s.trail, "suspension and trail are off by default");
+    CHECK(s.cue_x == kCueDefaultX && s.cue_y == kCueDefaultY, "the cue box starts where it always was");
+    s = ParseSettings("[hud]\nsusp=1\ntrail=1\ncue_x=0.2\ncue_y=0.75\n", false);
+    CHECK(s.susp && s.trail, "switched on");
+    CHECK(std::fabs(s.cue_x - 0.2f) < 1e-6f && std::fabs(s.cue_y - 0.75f) < 1e-6f, "cue at %f %f", s.cue_x, s.cue_y);
+    // A value that isn't a fraction keeps the default rather than putting the cue somewhere it
+    // can't be read.
+    s = ParseSettings("[hud]\ncue_x=middle\ncue_y=2.5\n", false);
+    CHECK(s.cue_x == kCueDefaultX && s.cue_y == kCueDefaultY, "junk and out of range keep the default");
+    s = ParseSettings("[hud]\ncue_x=-0.5\ncue_y=0.4x\n", false);
+    CHECK(s.cue_x == kCueDefaultX && s.cue_y == kCueDefaultY, "negative, and trailing rubbish");
+    s = ParseSettings("[hud]\ncue_x=0\ncue_y=1\n", false);
+    CHECK(s.cue_x == 0.0f && s.cue_y == 1.0f, "the ends of the range are values, not junk");
+}
+
+// Where the cue block goes, now the rider can move it off the middle of the screen.
+static void TheCueBoxMoves() {
+    const Box d = CueBoxAt(kCueDefaultX, kCueDefaultY);
+    CHECK(std::fabs(d.x0 - kCueBox.x0) < 1e-6f && std::fabs(d.y0 - kCueBox.y0) < 1e-6f &&
+              std::fabs(d.x1 - kCueBox.x1) < 1e-6f && std::fabs(d.y1 - kCueBox.y1) < 1e-6f,
+          "the default is exactly where it has always been: %f %f %f %f", d.x0, d.y0, d.x1, d.y1);
+    const Box ds = SectionBoxAt(d);
+    CHECK(std::fabs(ds.x0 - kSectionBox.x0) < 1e-6f && std::fabs(ds.y0 - kSectionBox.y0) < 1e-6f &&
+              std::fabs(ds.y1 - kSectionBox.y1) < 1e-6f,
+          "and so is the section line: %f %f", ds.y0, ds.y1);
+
+    // Moved: same size, and the section follows it rather than staying behind.
+    const Box m = CueBoxAt(0.25f, 0.70f);
+    CHECK(std::fabs((m.x1 - m.x0) - kCueWidth) < 1e-6f && std::fabs((m.y1 - m.y0) - kCueHeight) < 1e-6f, "same size");
+    CHECK(std::fabs(m.x0 - 0.10f) < 1e-6f && std::fabs(m.y0 - 0.70f) < 1e-6f, "at %f %f", m.x0, m.y0);
+    CHECK(SectionBoxAt(m).y0 > m.y1 && SectionBoxAt(m).x0 == m.x0, "the section follows it down");
+
+    // Pushed at the edges it stops at the edge, with the section still on screen under it.
+    const Box tl = CueBoxAt(0.0f, 0.0f);
+    CHECK(tl.x0 >= -1e-6f && tl.y0 >= -1e-6f, "top left: %f %f", tl.x0, tl.y0);
+    const Box br = CueBoxAt(1.0f, 1.0f);
+    CHECK(br.x1 <= 1.0f + 1e-6f, "right edge: %f", br.x1);
+    CHECK(SectionBoxAt(br).y1 <= 1.0f + 1e-6f, "the section stays on screen: %f", SectionBoxAt(br).y1);
+}
+
+// How much travel an end is using. The published header says only "shocks length", which does
+// not say which way it runs; this is MXBMRP3's reading of it.
+static void SuspensionTravel() {
+    CHECK(SuspUsed(0.30f, 0.30f) == 0.0f, "at full length, none of it is used");
+    CHECK(SuspUsed(0.0f, 0.30f) == 1.0f, "at no length, all of it");
+    CHECK(std::fabs(SuspUsed(0.15f, 0.30f) - 0.5f) < 1e-6f, "half way");
+    CHECK(SuspUsed(0.40f, 0.30f) == 0.0f, "longer than its travel is clamped");
+    CHECK(SuspUsed(-0.1f, 0.30f) == 1.0f, "past the stop is clamped");
+    CHECK(SuspUsed(0.15f, 0.0f) == 0.0f, "no travel means nothing to show a proportion of");
+    CHECK(SuspUsed(NAN, 0.3f) == 0.0f && SuspUsed(0.1f, NAN) == 0.0f, "not a number");
 }
 
 // A circle of radius 100 m in four quarter curves, anticlockwise from (0, -100) heading east.
@@ -418,6 +472,85 @@ static void TheLayout() {
     CHECK(f.texts.empty() && f.quads.empty(), "no confidence: no stance");
 }
 
+// The suspension bars and the blue line to take: both new, both off unless asked for.
+static void TheSuspensionAndTheTrail() {
+    const std::vector<uint8_t> segs = Circle(1);
+    Track t;
+    t.build(4, segs.data(), 28, nullptr);
+    Sheet sheet;
+    CHECK(Load(Write(SteadyLap()), sheet), "a reference lap to draw");
+
+    View v;
+    v.set         = ParseSettings("[hud]\ncue=0\nsection=0\ngap=0\nstance=0\nsetup=0\nsusp=1\ntrail=1\n", false);
+    v.track       = &t;
+    v.has_rider   = true;
+    v.rider       = {100, 0};
+    v.pos         = 0.0f;
+    v.ref         = &sheet.ref;
+    v.has_susp    = true;
+    v.susp[0]     = 0.5f;
+    v.susp[1]     = 0.25f;
+    v.susp_max[0] = 0.9f;
+    v.susp_max[1] = 0.4f;
+
+    Frame f;
+    Build(v, f);
+    CHECK(f.quads.size() <= kMaxQuads, "%zu quads fit", f.quads.size());
+    size_t in_susp = 0;
+    for (const Quad& q : f.quads) {
+        if (q.p[0][0] >= kSuspBox.x0 - 1e-3f && q.p[2][0] <= kSuspBox.x1 + 1e-3f &&
+            q.p[0][1] >= kSuspBox.y0 - 0.01f && q.p[2][1] <= kSuspBox.y1 + 0.01f)
+            ++in_susp;
+    }
+    CHECK(in_susp >= 7, "backing, two tracks, two fills, two bottomed marks: %zu", in_susp);
+    std::vector<std::string> said;
+    for (const Text& x : f.texts) said.push_back(x.s);
+    CHECK(said.size() == 2 && said[0] == "F" && said[1] == "R", "both ends are labelled");
+    const size_t with_trail = f.quads.size();
+
+    // No sheet, no trail. Nothing is guessed from the centreline, because a confidently drawn
+    // wrong line is worse than no line at all.
+    v.ref = nullptr;
+    Build(v, f);
+    CHECK(f.quads.size() < with_trail, "no reference, no trail: %zu vs %zu", f.quads.size(), with_trail);
+    const size_t without_trail = f.quads.size();
+    Sheet empty;
+    v.ref = &empty.ref;
+    Build(v, f);
+    CHECK(f.quads.size() == without_trail, "an empty reference draws no trail either");
+
+    // The trail goes with the rider round the lap, and is about as long wherever they are. Not
+    // exactly as long: the sheet's points sit 1% of a lap apart, so whether the one on the
+    // horizon falls just inside it or just outside is a rounding question, not a rule.
+    v.ref                      = &sheet.ref;
+    const size_t at_the_line   = with_trail - without_trail;
+    v.pos                      = 0.5f;
+    Build(v, f);
+    const size_t at_half = f.quads.size() - without_trail;
+    CHECK(at_half + 1 >= at_the_line && at_half <= at_the_line + 1, "%zu segments at half a lap, %zu at the line",
+          at_half, at_the_line);
+    CHECK(at_the_line > 5, "the trail is actually drawn: %zu segments", at_the_line);
+    // And it carries on across the line instead of stopping dead at it.
+    v.pos = 0.95f;
+    Build(v, f);
+    CHECK(f.quads.size() > without_trail, "the trail carries on past the line");
+
+    // The bike said nothing about its travel: no bars, rather than bars of unknown scale.
+    v.pos      = 0;
+    v.has_susp = false;
+    Build(v, f);
+    for (const Text& x : f.texts) CHECK(x.s != "F" && x.s != "R", "no bars without a travel to measure against");
+    // And they stay away unless hud.ini asks.
+    v.has_susp = true;
+    v.set.susp = false;
+    Build(v, f);
+    CHECK(f.texts.empty(), "susp=0 draws none of it");
+    v.set.susp  = true;  // back on, so this is a test of the trail key and nothing else
+    v.set.trail = false;
+    Build(v, f);
+    CHECK(f.quads.size() == without_trail, "trail=0 draws none of it");
+}
+
 // A sheet written to disk and read back, as the plugin does. TMPDIR, then TEMP, then /tmp.
 static void FromAFile() {
     const char* tmp = std::getenv("TMPDIR");
@@ -448,11 +581,14 @@ int main() {
     TheClockRestartsAtTheLine();
     TheGhost();
     HudIni();
+    TheCueBoxMoves();
+    SuspensionTravel();
     TheMap();
     UpcomingCues();
     Stopped();
     SetupNameFromTheSession();
     TheLayout();
+    TheSuspensionAndTheTrail();
     FromAFile();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);

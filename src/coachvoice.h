@@ -1,14 +1,16 @@
-// coachvoice.h - MXB Coach's spoken cues: the settings file, which clip a cue speaks, when a
-// new cue may cut off the one playing, and the clips' PCM.
+// coachvoice.h - MXB Coach's spoken cues: the settings file, which clip a cue speaks, which
+// voice says it, when a new cue may cut off the one playing, and who owns each sound buffer.
 //
-// Each cue kind has one short clip, generated offline (tools/voice/make_clips.py) and embedded
-// in mxbcoach.dlo as a resource. The plugin speaks a cue the moment it shows, in practice only,
-// through winmm's waveOut. No Win32 here, so tests/coachvoice_test.cpp runs anywhere.
+// Each cue kind has one short clip per voice, generated offline (tools/voice/make_clips.py) and
+// embedded in mxbcoach.dlo as a resource. The plugin speaks a cue the moment it shows, in
+// practice only, through winmm's waveOut. No Win32 here, so tests/coachvoice_test.cpp runs
+// anywhere.
 //
 // Settings, written by MXB Coach to <save path>\mxbcoach\cues\voice.ini:
 //   [voice]
 //   enabled=1     ; 1 to speak. Off when the file or the key is missing.
 //   volume=80     ; 0-100, applied to the samples
+//   voice=female  ; which voice says them: female (the default) or male
 #pragma once
 
 #include <algorithm>
@@ -29,11 +31,41 @@ namespace coachvoice {
 constexpr uint32_t kRate           = 22050;
 constexpr int      kDefaultVolume  = 80;
 constexpr size_t   kMaxClipSamples = kRate * 3;
-// A clip's resource id in the DLL is this plus its cue kind.
-constexpr int kResourceBase = 100;
 
-// One clip per cue kind, BRAKE (1) to SIT (10), in kind order: the file name under src/voice/
-// and what it says. The words match MXB Coach's cue texts (cues.rs).
+// Which voice speaks the cues. MXB Coach writes the key; the rider picks it there, because the
+// first thing the first rider to hear the cues asked for was a voice that wasn't a woman's.
+enum VoiceId : uint8_t {
+    FEMALE = 0,
+    MALE   = 1,
+};
+
+struct VoiceInfo {
+    const char* key;     // what voice.ini says
+    const char* folder;  // src/voice/<folder>/
+    const char* model;   // the Piper voice the clips were generated from
+};
+
+// The order here is the resource order and the order CMakeLists.txt walks, so adding a voice
+// means adding it at the END and nowhere else.
+constexpr VoiceInfo kVoices[] = {
+    {"female", "female", "en_US-ljspeech-high"},
+    {"male", "male", "en_US-norman-medium"},
+};
+constexpr int kVoiceCount = int(sizeof(kVoices) / sizeof(kVoices[0]));
+
+// A clip's resource id in the DLL: 100 + voice * 20 + cue kind. The stride leaves the female
+// set on the ids 101-110 it shipped with in v0.22, so the ids already in the wild keep meaning
+// what they meant. CMakeLists.txt generates the same numbers and
+// tests/coachvoice_res_test.cpp checks the built .dlo carries every one of them.
+constexpr int kResourceBase  = 100;
+constexpr int kVoiceIdStride = 20;
+
+inline int ResourceId(int voice, uint8_t kind) {
+    return kResourceBase + voice * kVoiceIdStride + int(kind);
+}
+
+// One clip per cue kind, BRAKE (1) to SIT (10), in kind order: the file name under
+// src/voice/<voice>/ and what it says. The words match MXB Coach's cue texts (cues.rs).
 struct ClipInfo {
     const char* name;
     const char* text;
@@ -52,9 +84,18 @@ inline int ClipFor(uint8_t kind) {
     return kind >= coachcue::BRAKE && kind <= coachcue::SIT ? int(kind) - 1 : -1;
 }
 
+/// The voice `key` names, or FEMALE when it names none. Case and spacing don't matter.
+inline uint8_t VoiceFor(std::string key) {
+    for (char& c : key) c = char(std::tolower(static_cast<unsigned char>(c)));
+    for (int i = 0; i < kVoiceCount; ++i)
+        if (key == kVoices[i].key) return uint8_t(i);
+    return FEMALE;
+}
+
 struct Settings {
-    bool enabled = false;
-    int  volume  = kDefaultVolume;
+    bool    enabled = false;
+    int     volume  = kDefaultVolume;
+    uint8_t voice   = FEMALE;
 };
 
 inline Settings ParseSettings(const std::string& text) {
@@ -68,6 +109,7 @@ inline Settings ParseSettings(const std::string& text) {
         const long n   = std::strtol(v.c_str(), &end, 10);
         if (end != v.c_str() && *end == '\0') s.volume = int((std::max)(0L, (std::min)(100L, n)));
     }
+    s.voice = VoiceFor(stance::IniValue(text, "voice", "voice"));
     return s;
 }
 
@@ -94,6 +136,100 @@ inline Action Choose(bool playing, uint8_t playing_priority, uint8_t priority) {
     if (!playing) return SPEAK;
     return priority > playing_priority ? CUT_IN : SKIP;
 }
+
+// ---------------------------------------------------------------------------------------
+// Who owns each sound buffer.
+//
+// waveOut plays out of buffers the device borrows and hands back, and the one rule that
+// matters is that a buffer must not be touched again until the device has BOTH finished with
+// it (winmm sets WHDR_DONE) AND given it back (waveOutUnprepareHeader accepted it).
+//
+// v0.22 and v0.23 marked a slot free on the strength of the flag alone and cleared its own
+// "in use" bit whether or not the unprepare succeeded. A slot the driver still owned was then
+// refilled underneath it - its vector reallocated, its header zeroed - and from that moment
+// the flags the driver wrote landed in memory that had been reused, so the slot never read as
+// finished again. With two slots that is two clips and then silence for the rest of the
+// session, which is exactly what the rider got: "Stand up", "Gas", and nothing after.
+//
+// So ownership lives here, in one place, with no Win32 in it. A slot leaves `free` only when
+// it is handed to the device, and returns only when the device has actually given it back.
+// tests/coachvoice_test.cpp plays a long session through it and checks the buffers come back.
+class Queue {
+public:
+    static constexpr int kSlots = 2;
+
+    /// A free slot to fill for a cue at `priority`, or -1 when the device holds them all.
+    int take(uint8_t priority) {
+        for (int i = 0; i < kSlots; ++i) {
+            if (!free_[i]) continue;
+            free_[i]  = false;
+            priority_ = priority;
+            ++taken_;
+            return i;
+        }
+        return -1;
+    }
+
+    /// Preparing or writing it failed, so the device never took it: ours again, and it was
+    /// never spoken, so it must not go on holding the priority either.
+    void giveback(int slot) {
+        if (!held(slot)) return;
+        free_[slot] = true;
+        idle_check();
+    }
+
+    /// The device finished with the slot and handed it back - only once the unprepare has
+    /// actually succeeded. A refused unprepare means the driver still owns the memory, so the
+    /// slot stays out and this is not called.
+    void release(int slot) {
+        if (!held(slot)) return;
+        free_[slot] = true;
+        ++released_;
+        idle_check();
+    }
+
+    /// The device is closed: it holds nothing any more, whatever it held before.
+    void clear() {
+        for (int i = 0; i < kSlots; ++i) free_[i] = true;
+        priority_ = 0;
+    }
+
+    /// Whether the device still holds a buffer, which is what "a cue is playing" means.
+    bool playing() const {
+        for (int i = 0; i < kSlots; ++i)
+            if (!free_[i]) return true;
+        return false;
+    }
+
+    /// The priority of the cue last handed over, or 0 when nothing is playing. Falling back to
+    /// 0 when idle is the point: a priority left standing from a finished clip would go on
+    /// shutting out every quieter cue for the rest of the session.
+    uint8_t priority() const { return priority_; }
+
+    int in_flight() const {
+        int n = 0;
+        for (int i = 0; i < kSlots; ++i)
+            if (!free_[i]) ++n;
+        return n;
+    }
+
+    /// How many buffers have been handed to the device, and how many it has given back. They
+    /// differ by exactly what is in flight, and if `released` stops climbing the voice has
+    /// stopped.
+    uint32_t taken() const { return taken_; }
+    uint32_t released() const { return released_; }
+
+private:
+    bool held(int slot) const { return slot >= 0 && slot < kSlots && !free_[slot]; }
+    void idle_check() {
+        if (!playing()) priority_ = 0;
+    }
+
+    bool     free_[kSlots] = {true, true};
+    uint8_t  priority_     = 0;
+    uint32_t taken_        = 0;
+    uint32_t released_     = 0;
+};
 
 /// A clip's samples at `volume` percent. Scaling down only, so nothing clips.
 inline std::vector<int16_t> Scale(const std::vector<int16_t>& in, int volume) {

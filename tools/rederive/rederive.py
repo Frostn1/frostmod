@@ -5,9 +5,11 @@
     ./rederive.py mxbikes.exe --json new.json          # machine-readable
     ./rederive.py mxbikes.exe --header                 # an offsets.h block to paste
     ./rederive.py mxbikes.exe --check baselines/mxb-beta21e.json   # regression test
-    ./rederive.py mxbikes.exe --unpack-to out.exe      # just decrypt the SteamStub
 
-Takes the shipping (SteamStub-packed) exe or an already-unpacked one; it detects which.
+Takes an exe whose code section is readable. A shipping copy straight from the store
+still has its wrapper on, so `.text` is encrypted and there is nothing here to read;
+point this at an unwrapped copy of a build you own. Unwrapping one is not part of this
+tool and never will be.
 
 The point is not that every offset comes out automatically — some are struct fields
 that no amount of analysis can name. The point is that nothing is ever emitted as if
@@ -23,7 +25,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import steamstub  # noqa: E402
 from analysis import Image  # noqa: E402
 from anchors import TITLES  # noqa: E402
 from pe import PE  # noqa: E402
@@ -49,17 +50,26 @@ class Row:
         return "-" if self.value is None else f"{self.value:#x}"
 
 
+def wrapped(pe: PE) -> bool:
+    """True if the store wrapper is still on the file. Section names and the entry
+    point, nothing else. Reads no wrapper and decrypts nothing."""
+    if pe.section(".bind") is not None:
+        return True
+    text = pe.section(".text")
+    return text is not None and not text.holds(pe.entry_rva)
+
+
 def load(path: Path) -> tuple[PE, dict]:
-    """Read an exe, unpacking it if it is still SteamStub-wrapped."""
+    """Read an exe whose code section is readable. A wrapped one is refused."""
     pe = PE(path.read_bytes(), str(path))
     meta = {"path": str(path), "timestamp": pe.timestamp, "image_base": pe.image_base}
-    try:
-        h = steamstub.read_header(pe)
-        meta["steamstub"] = steamstub.describe(h)
-        meta["steam_app_id"] = h.steam_app_id
-        pe = PE(steamstub.unpack(pe), str(path))
-    except steamstub.NotPacked as why:
-        meta["steamstub"] = f"already unpacked ({why})"
+    if wrapped(pe):
+        raise SystemExit(
+            f"{path.name} still has its store wrapper on, so .text is encrypted and "
+            f"there is nothing in it to read. Point this at an unwrapped copy of a "
+            f"build you own. This tool does not unwrap one."
+        )
+    meta["packing"] = "unwrapped"
     meta["entry"] = pe.entry_rva
     meta["functions"] = len(pe.functions)
     return pe, meta
@@ -121,7 +131,7 @@ STATUS_MARK = {"same": "  ", "moved": "->", "new": "+ ", "carried": "~ ", "UNRES
 def report(rows: list[Row], meta: dict) -> str:
     out = [f"image      {meta['path']}",
            f"build      TimeDateStamp {meta['timestamp']:#010x}",
-           f"packing    {meta['steamstub']}",
+           f"packing    {meta['packing']}",
            f"entry      {meta['entry']:#x}   ({meta['functions']} functions in .pdata)",
            ""]
     tally = {}
@@ -182,27 +192,16 @@ def emit_rust(rows: list[Row], meta: dict) -> str:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("exe", type=Path, help="mxbikes.exe, packed or unpacked")
+    ap.add_argument("exe", type=Path, help="an unwrapped mxbikes.exe")
     ap.add_argument("--title", default="mxb", choices=sorted(TITLES))
     ap.add_argument("--baseline", type=Path, default=None,
                     help="known-good values to diff against (default: baselines/<title>.json)")
     ap.add_argument("--json", type=Path, help="write the full result here")
     ap.add_argument("--header", action="store_true", help="print an offsets.h block")
     ap.add_argument("--rust", action="store_true", help="print mxb-app's constants")
-    ap.add_argument("--unpack-to", type=Path, help="write the decrypted image and stop")
     ap.add_argument("--check", action="store_true",
                     help="exit non-zero unless every baselined value is reproduced")
     args = ap.parse_args(argv)
-
-    if args.unpack_to:
-        pe = PE(args.exe.read_bytes(), str(args.exe))
-        try:
-            h = steamstub.read_header(pe)
-        except steamstub.NotPacked as why:
-            raise SystemExit(f"{args.exe}: nothing to unpack ({why})")
-        args.unpack_to.write_bytes(steamstub.unpack(pe))
-        print(f"{steamstub.describe(h)}\nwrote {args.unpack_to}")
-        return 0
 
     baseline_path = args.baseline or HERE / "baselines" / f"{args.title}.json"
     baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else {}

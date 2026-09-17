@@ -222,19 +222,41 @@ void WriteRecorderInfo() {
 }
 
 // The app's sheet for this track and bike, else for the track, if it was made for this track.
-void LoadCues() {
+/// The sheet Coach last wrote, and when. MXB Coach picks the calls again as the rider rides —
+/// that is the whole point of them moving on — so a sheet loaded once and kept for the event
+/// is the same cues at the same metres every lap, however hard the app works.
+std::string g_cue_file;
+FILETIME    g_cue_time = {};
+
+void LoadCues(bool quiet = false) {
     for (const std::string& name : coachcue::SheetNames(g_event)) {
-        std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
+        const std::string path = g_base + "cues\\" + name;
+        std::vector<uint8_t> b = ReadFile(path);
         coachcue::Sheet s;
         if (!b.empty() && coachcue::Parse(b.data(), b.size(), s) && coachcue::Fits(s, g_event)) {
             const int cues = int(s.cues.size());
             g_cues.load(std::move(s));
-            Log("cues", coachlog::SheetText("cue sheet", name, true, cues));
+            g_cue_file = path;
+            WIN32_FILE_ATTRIBUTE_DATA a;
+            if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) g_cue_time = a.ftLastWriteTime;
+            if (!quiet) Log("cues", coachlog::SheetText("cue sheet", name, true, cues));
+            else Log("cues", "picked up a newer sheet: " + std::to_string(cues) + " cues");
             return;
         }
     }
     g_cues.clear();
-    Log("cues", coachlog::SheetText("cue sheet", "", false, 0));
+    g_cue_file.clear();
+    if (!quiet) Log("cues", coachlog::SheetText("cue sheet", "", false, 0));
+}
+
+/// At the line, take a sheet the app has rewritten since the last one was read. The lap
+/// boundary is where every cue is re-armed anyway, so nothing is half-fired across the swap.
+void MaybeReloadCues() {
+    if (g_cue_file.empty()) return;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(g_cue_file.c_str(), GetFileExInfoStandard, &a)) return;
+    if (CompareFileTime(&a.ftLastWriteTime, &g_cue_time) == 0) return;
+    LoadCues(true);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1050,6 +1072,7 @@ __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_lap(_pData, _iDataSize);
     g_cues.on_lap();
+    MaybeReloadCues();
 }
 
 __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {

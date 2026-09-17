@@ -3,6 +3,10 @@
 ## 2026-09-16 — v0.27.0
 
 ### Fixed
+- **The cues change as you ride.** The recorder read your cue sheet once when the session
+  started and never looked at it again, so the same calls came at the same places every lap and
+  every session no matter what MXB Coach worked out in between. It now takes a newer sheet at
+  the start/finish line, where the calls are re-armed anyway.
 - **Right-drag actually moves things now.** It never could: the plugin only looked at your mouse
   while you were riding a lap, which is the one moment you are watching the track and not the
   HUD. It now watches every frame, so you can move a part in the pits, between sessions, or

@@ -3,6 +3,13 @@
 ## 2026-09-16 — v0.27.0
 
 ### Fixed
+- **Right-drag actually moves things now.** It never could: the plugin only looked at your mouse
+  while you were riding a lap, which is the one moment you are watching the track and not the
+  HUD. It now watches every frame, so you can move a part in the pits, between sessions, or
+  wherever you like.
+- **You can see what you are pointing at.** The game hides the mouse pointer on track, so moving
+  a part meant aiming something invisible. The recorder draws its own pointer; it appears when
+  you move the mouse and fades out again a couple of seconds after you stop.
 - **The male voice says the right words.** "Gas now" was coming out as a word nobody recognised,
   and "Stand up" ran on into half a sentence. The clips themselves were wrong: the voice that
   made them said the word and then kept talking, and the trimming that was supposed to cut that

@@ -4023,6 +4023,16 @@ static void InstallGhsGuard(intptr_t delta) {
         return;
     }
     uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_GHS_CLOSE + delta);
+    // Somebody hooked it before us - a second copy of FrostMod in this process, or another
+    // mod. Say so and leave it alone: the signature cannot match a patched prologue, and
+    // the scan below would then blame a game update for a detour sitting in front of us.
+    if (fn >= begin && fn < end && mxb::LooksDetoured(fn)) {
+        Log("[ghs] guard off: 0x%zx is already hooked (%02X %02X %02X %02X %02X). Another "
+            "copy of FrostMod is loaded, or another mod got there first. Leaving their hook "
+            "alone - two detours on one function is how you make this worse.",
+            (size_t)(fn - g_base), fn[0], fn[1], fn[2], fn[3], fn[4]);
+        return;
+    }
     if (fn < begin || fn >= end || !MatchAt(fn, mxb::SIG_GHS_CLOSE, mxb::SIG_GHS_CLOSE_MASK)) {
         uint8_t* found = PatternScan(begin, end, mxb::SIG_GHS_CLOSE, mxb::SIG_GHS_CLOSE_MASK);
         if (!found) {

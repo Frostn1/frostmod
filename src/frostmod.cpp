@@ -3973,6 +3973,22 @@ static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y
             Log("[terrain] refused a height query at (%f, %f) - not a position. This is the "
                 "crash at mxbikes.exe+0x%zx. Refused %u so far.",
                 (double)x, (double)y, (size_t)mxb::RVA_TERRAIN_FAULT, n);
+        // The one thing a crash dump of this fault can never contain.
+        //
+        // By the time the game faults, the position has been a NaN for a while and the
+        // code that made it has long since returned. Here it has not: we are standing in
+        // the call that was about to go wrong, with every frame above it still on the
+        // stack. So the first few catches record who asked, which is the only way the
+        // thing upstream - whatever produces the NaN - gets a name rather than a theory.
+        //
+        // First three only. This runs on the physics thread and the answer does not get
+        // truer the fourth time.
+        if (n <= 3) {
+            char frames[12][160];
+            const int got = frostmod::crash::CaptureStack(frames, 12);
+            Log("[terrain] who asked (nearest first, %d frame(s)):", got);
+            for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
+        }
         frostmod::crash::Note("refused a NaN height query (%u so far)", n);
         return 0;   // what the function itself returns for a query it cannot serve
     }

@@ -283,6 +283,60 @@ constexpr char SIG_GHS_CLOSE[] =
     "\x48\x89\x7C\x24\x20\x48\x8D\x3D\x00\x00\x00\x00";
 constexpr char SIG_GHS_CLOSE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxx????";
 
+// ---- the terrain sampler: the crash that ruins races (beta21e, 2026-09-17) ----
+// Reported from outside: `mxbikes.exe+0x1F1923`, said to be about a fifth of all crashes
+// and the one that takes a race down, hit "when crashing into a fence".
+//
+// 0x1F1923 is the first of four corner reads in a bilinear sample of the track's height
+// grid, inside the function at 0x1F1720:
+//
+//   0x1F1732  mov  r9, [rcx+0x750]     ; the grid: 16-bit heights
+//             test r9, r9 / jne        ; ...which IS null-checked, and returns 0
+//   0x1F174C  movss xmm1, [rcx+0x764]  ; origin X   \
+//             comiss xmm1, xmm3 / ja fail           |  four bounds checks against
+//             ... [rcx+0x758] size X                |  the query position
+//             ... [rcx+0x76C] origin Y              |
+//             ... [rcx+0x75C] size Y               /
+//   0x1F17BB  ecx  = [rcx+0x740] - 1   ; width  - 1
+//   0x1F1813  r15d = [rbx+0x744] - 1   ; height - 1
+//   0x1F1873  cvttss2si r11d, xmm3     ; x0 = (int)u
+//   0x1F1888  cvttss2si r10d, xmm8     ; y0 = (int)v
+//   0x1F1923  movsx ecx, word [r9 + rax*2]   ; heights[y0*stride + x0]  <-- faults
+//
+// Every bounds check is `comiss` + `ja`, and that pair is permissive of NaN: an unordered
+// compare leaves CF=ZF=PF=1, so `ja` is not taken and a NaN query passes all four. Then
+// `cvttss2si` of a NaN is 0x80000000, so x0 (or y0) becomes INT_MIN and the index walks
+// gigabytes off the grid. The upper edge IS clamped (`cmp r11d, ecx` / `cmp r10d, r15d`,
+// each only extending the +1 neighbour); nothing clamps the low side, because the float
+// checks above were supposed to have.
+//
+// So the crash is not the heightmap. It is a position that is already NaN by the time it
+// is asked about - which fits the report exactly: a violent collision produces a NaN, and
+// wherever that NaN lands first decides the symptom. Into this function it is a crash to
+// desktop; into a transform a moment earlier it is a black screen with the game still up.
+//
+// The guard is the function's own answer. It returns 1 having written three floats through
+// its out-pointer, or 0 having written nothing - which is what it already returns for a
+// grid that is null and for a position outside the map. A query that is not a position
+// gets the same 0.
+//
+//   int32 f(void* obj /*rcx*/, void* a2 /*rdx*/, float out[3] /*r8*/,
+//           float x /*xmm3*/, float y /*arg5, stack*/)
+//
+// arg3 is the out-pointer: the prologue homes r8 to [rsp+0x18] and the success path writes
+// [rax], [rax+4], [rax+8] through it. arg5 is read at [rsp+0x170], which is entry [rsp+0x28]
+// once the `push rbx` and `sub rsp,0x140` are accounted for.
+constexpr uintptr_t RVA_TERRAIN_SAMPLE = 0x1F1720;  // the bilinear height sample
+constexpr uintptr_t RVA_TERRAIN_FAULT  = 0x1F1923;  // the corner read that faults, for the log
+constexpr size_t    OFF_TERRAIN_GRID   = 0x750;     // qword: the 16-bit height grid, or null
+constexpr size_t    OFF_TERRAIN_WIDTH  = 0x740;     // dword
+constexpr size_t    OFF_TERRAIN_HEIGHT = 0x744;     // dword
+// The prologue, 31 fixed bytes, no RIP-relative operand in it. Unique in beta21e's .text.
+constexpr char SIG_TERRAIN_SAMPLE[] =
+    "\x4C\x89\x44\x24\x18\x48\x89\x54\x24\x10\x53\x48\x81\xEC\x40\x01\x00\x00"
+    "\x4C\x8B\x89\x50\x07\x00\x00\x48\x8B\xD9\x4D\x85\xC9";
+constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write
 // auto-extends the widget, there is no separate addRow. So to hide a row we must skip

@@ -295,6 +295,42 @@ constexpr char SIG_GHS_CLOSE[] =
     "\x48\x89\x7C\x24\x20\x48\x8D\x3D\x00\x00\x00\x00";
 constexpr char SIG_GHS_CLOSE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxx????";
 
+// ---- the trainer record: the biggest crash in the game (beta21e, 2026-09-17) ----
+// `msvcr90.dll+0x36EDE`, 39% of all crash reports in the largest public sample (17,231 of
+// 43,841) — a read AV in the CRT's bounded strnlen at track load, before you ride.
+//
+// TWO SAVERS THAT DISAGREE. The trainer-manager UI saver (0x1400E3BF0) copies three names into
+// the record — bike at +0x48, series at +0x68, tyre at +0x88. The saver that runs when a
+// session ends (0x140021010) copies the bike and jumps straight to +0xA8: the two `strcpy`
+// loops for the series and the tyre are not there. Its record is a raw stack local
+// (`sub rsp,0x7C8`, record at `rsp+0x40`) and the function has no `memset` anywhere, so
+// everything from the end of the bike name to +0xA7 goes to disk as whatever the stack held.
+//
+// AND A RETURN VALUE NOBODY CHECKS. On load, 0x14002083F compares the series field against ""
+// and calls the lookup at 0x140004350 when it isn't empty. That returns 1 WITHOUT writing its
+// out-parameter on a miss, and 0x14002086F never tests it: it sign-extends the uninitialised
+// `[rsp+0xB8]`, `imul`s by 0x234, adds the array base, and passes three pointers into that wild
+// address to sprintf as `%s`. Either defect alone is survivable. Together they are the crash.
+//
+// WHAT WE HOOK. The GHS file layer, which in this build carries nothing but trainers — the
+// loader has one caller and the saver has one, both reachable only from track load, session
+// teardown and the trainer UI. Neither writes a checksum and neither has a length that depends
+// on the bytes we touch, so a record can be corrected in flight.
+constexpr uintptr_t RVA_GHS_LOAD = 0x11DAB0;  // int(pool, path, tag, ver, dest, size) -> 0 ok
+constexpr uintptr_t RVA_GHS_SAVE = 0x11DE10;  // int(pool, path, tag, ver, buf,  size)
+// 16 bytes, stopping one short of the security cookie's RIP-relative displacement so nothing
+// in the signature moves between builds. `40 55 57 41 54 41 55 41 56` is the three-push
+// prologue the detour replaces.
+constexpr char SIG_GHS_LOAD[] =
+    "\x40\x55\x57\x41\x54\x41\x55\x41\x56\x48\x83\xEC\x50\x48\x8B\x05";
+constexpr char SIG_GHS_LOAD_MASK[] = "xxxxxxxxxxxxxxxx";
+// 31 bytes, ending on the 'GHS\0' the saver stamps into the header — self-identifying, and
+// with no RIP-relative displacement in it at all.
+constexpr char SIG_GHS_SAVE[] =
+    "\x48\x89\x5C\x24\x18\x44\x89\x4C\x24\x20\x56\x48\x83\xEC\x30\xFF\xC9"
+    "\x49\x8B\xD8\x4C\x8B\xCA\xC7\x44\x24\x40\x47\x48\x53\x00";
+constexpr char SIG_GHS_SAVE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
 // ---- the terrain sampler: the crash that ruins races (beta21e, 2026-09-17) ----
 // Reported from outside: `mxbikes.exe+0x1F1923`, said to be about a fifth of all crashes
 // and the one that takes a race down, hit "when crashing into a fence".

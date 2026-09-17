@@ -42,6 +42,7 @@
 
 #include "MinHook.h"
 #include "offsets.h"
+#include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
@@ -4073,6 +4074,119 @@ static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y
     return g_origTerrain(obj, a2, out, x, y);
 }
 
+// ===========================================================================
+// The trainer record: the biggest crash in the game
+//
+// 39% of all MX Bikes crash reports in the largest public sample — a read AV in the CRT at
+// track load, before the rider is even on track. The full chain is in offsets.h above
+// RVA_GHS_LOAD; the short version is that the saver which runs at session end never writes the
+// series and tyre names, its record is an uncleared stack local, and the loader then hands that
+// stack rubbish to sprintf as a `%s`.
+//
+// We cannot patch the game's two savers into agreement. We can make sure a record never reaches
+// that sprintf with something in it that is not a string — on the way in, which fixes every
+// damaged trainer already on disk, and on the way out, so no new one is written.
+//
+// Both hooks are pure buffer touch-ups: no globals, no locking, nothing that can throw. The
+// file layer is not re-entrant on a slot as it stands, and this does not make it worse.
+// ===========================================================================
+using GhsLoadFn = int32_t (*)(int32_t, const char*, const char*, int32_t, void*, int32_t);
+using GhsSaveFn = int32_t (*)(int32_t, const char*, const char*, int32_t, const void*, int32_t);
+static GhsLoadFn g_origGhsLoad = nullptr;
+static GhsSaveFn g_origGhsSave = nullptr;
+static std::atomic<unsigned> g_trainerFixedIn{0};
+static std::atomic<unsigned> g_trainerFixedOut{0};
+
+/// Whether this is the trainer record we know how to check, rather than some other GHS file.
+static bool IsTrainerRecord(const char* tag, int32_t ver, int32_t size) {
+    return ver == trainer::kVersion && size == (int32_t)trainer::kRecordSize && tag &&
+           _stricmp(tag, "mxbikes") == 0;
+}
+
+static int32_t hkGhsLoad(int32_t pool, const char* path, const char* tag, int32_t ver, void* dest,
+                         int32_t size) {
+    const int32_t rc = g_origGhsLoad(pool, path, tag, ver, dest, size);
+    // Only a record that loaded, and only the one we know. The legacy 0x53C layout reaches the
+    // same reader and the game zeroes these fields itself on that path.
+    if (rc == 0 && IsTrainerRecord(tag, ver, size)) {
+        const int fixed = trainer::Sanitise(dest, (size_t)size);
+        if (fixed > 0) {
+            const unsigned n = g_trainerFixedIn.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 10)
+                Log("[trainer] cleaned %d field(s) out of a trainer as it loaded: %s. Left as "
+                    "written it goes to sprintf as a string and takes the game with it "
+                    "(msvcr90+0x36EDE). Cleaned %u so far.",
+                    fixed, path ? path : "(no path)", n);
+            frostmod::crash::Note("cleaned a trainer record on load (%u so far)", n);
+        }
+    }
+    return rc;
+}
+
+static int32_t hkGhsSave(int32_t pool, const char* path, const char* tag, int32_t ver,
+                         const void* buf, int32_t size) {
+    if (buf && IsTrainerRecord(tag, ver, size)) {
+        // The record is the caller's stack temp and is dead after this returns, but it is not
+        // ours: corrected on a copy, so nothing the game does afterwards sees a changed buffer.
+        uint8_t copy[trainer::kRecordSize];
+        memcpy(copy, buf, sizeof(copy));
+        const int fixed = trainer::Sanitise(copy, sizeof(copy));
+        if (fixed > 0) {
+            const unsigned n = g_trainerFixedOut.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 10)
+                Log("[trainer] cleaned %d field(s) out of a trainer before it was written: %s. "
+                    "The saver that runs at session end never fills them, so what goes to disk "
+                    "is whatever was on the stack. Cleaned %u so far.",
+                    fixed, path ? path : "(no path)", n);
+            return g_origGhsSave(pool, path, tag, ver, copy, size);
+        }
+    }
+    return g_origGhsSave(pool, path, tag, ver, buf, size);
+}
+
+/// Place one of the two GHS hooks, by signature, refusing rather than guessing.
+static bool PlaceGhsHook(intptr_t delta, uintptr_t rva, const char* sig, const char* mask,
+                         void* detour, void** orig, const char* name) {
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) return false;
+    uint8_t* fn = (uint8_t*)(g_base + rva + delta);
+    if (fn < begin || fn >= end || !MatchAt(fn, sig, mask)) {
+        uint8_t* found = PatternScan(begin, end, sig, mask);
+        if (!found) {
+            Log("[trainer] %s not found by signature in this build's .text. If the game "
+                "updated, re-derive it before trusting the RVA.", name);
+            return false;
+        }
+        Log("[trainer] %s RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).", name,
+            (size_t)(found - g_base), (size_t)rva);
+        fn = found;
+    }
+    // Somebody else got here first. Two detours on one function is how you make this worse.
+    if (mxb::LooksDetoured(fn)) {
+        Log("[trainer] %s is already hooked (%02X %02X %02X %02X %02X). Leaving it alone.", name,
+            fn[0], fn[1], fn[2], fn[3], fn[4]);
+        return false;
+    }
+    return InstallHook(fn, detour, orig, name);
+}
+
+static void InstallTrainerGuard(intptr_t delta) {
+    if (!g_game->offsets_complete) {
+        Log("[trainer] guard off for %s - the trainer record is MX Bikes' and has no twin here.",
+            g_game->display);
+        return;
+    }
+    const bool in = PlaceGhsHook(delta, mxb::RVA_GHS_LOAD, mxb::SIG_GHS_LOAD, mxb::SIG_GHS_LOAD_MASK,
+                                 (void*)&hkGhsLoad, (void**)&g_origGhsLoad, "ghsLoad(0x11dab0)");
+    const bool out = PlaceGhsHook(delta, mxb::RVA_GHS_SAVE, mxb::SIG_GHS_SAVE, mxb::SIG_GHS_SAVE_MASK,
+                                  (void*)&hkGhsSave, (void**)&g_origGhsSave, "ghsSave(0x11de10)");
+    if (in)
+        Log("[trainer] load guard live. A trainer already damaged on disk now loads instead of "
+            "taking the game down.");
+    if (out)
+        Log("[trainer] save guard live. No new trainer is written with the stack in it.");
+}
+
 static void InstallTerrainGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
         Log("[terrain] guard off for %s - the sampler is MX Bikes' and has no twin here.",
@@ -4255,6 +4369,7 @@ DWORD WINAPI Init(LPVOID) {
             // the delta as a starting point rather than as a promise.
             InstallGhsGuard(delta);
             InstallTerrainGuard(delta);
+            InstallTrainerGuard(delta);
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);

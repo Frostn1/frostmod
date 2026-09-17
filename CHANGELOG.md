@@ -3,6 +3,13 @@
 ## 2026-09-17 — v0.34.0
 
 ### Fixed
+- **The server browser stops saying "connection timeout" until you restart.** Leave a server,
+  open Browse again, and the game would time out on a master server that is answering everyone
+  else — and keep timing out, whatever you did in the menus, for the rest of that run. When a
+  session ends the game leaves its connection to the master half-open, and its own browser will
+  not open a new one while the old one is still there. FrostMod watches for that and clears it
+  while you play, so the next time you open the list it works. MXB App's Servers tab has a
+  button for it as well, for the cases FrostMod deliberately leaves alone.
 - **The crash at track load is stopped.** This is the one that takes the game down while a track
   is loading, before you ride — the most common MX Bikes crash there is, about two in five of
   every crash reported. The game saves your trainer with two of its fields never filled in, so

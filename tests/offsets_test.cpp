@@ -314,8 +314,31 @@ static void detours_are_recognised_before_the_signature_check() {
           "the stored signature must not look like a detour");
 }
 
+// The server-browser reset writes to two `.data` addresses and calls the bus. Every one of
+// those is a wild write if a constant drifts, so pin them here: this test is the only thing
+// between a typo and a stray dword in the running game.
+static void world_session_constants_agree() {
+    CHECK(mxb::RVA_WORLD_STATE  == 0x3D7900, "world state moved");
+    CHECK(mxb::RVA_WORLD_REASON == 0x3D7E6C, "world reason moved");
+    CHECK(mxb::RVA_WORLD_PORT   == 0x3D78F0, "world port moved");
+    CHECK(mxb::CMD_WORLD_CLOSE  == 0x386,    "the teardown bus command moved");
+
+    // The three live in the same block the teardown zeroes — except the port, which is the
+    // whole reason the reset has to clear it separately.
+    CHECK(mxb::RVA_WORLD_REASON > mxb::RVA_WORLD_STATE &&
+          mxb::RVA_WORLD_REASON < mxb::RVA_WORLD_STATE + 0x5D8,
+          "reason must sit inside the 0x5D8 block the teardown zeroes");
+    CHECK(mxb::RVA_WORLD_PORT < mxb::RVA_WORLD_STATE,
+          "the port must sit outside that block, or clearing it separately is pointless");
+
+    // 4 is 'logged in', the state the teardown demands before it will send LOGOUT. If this
+    // ever stops being the top of the range, the reset stops sending one.
+    CHECK(mxb::WORLD_STATE_MAX == 4, "the highest world state moved");
+}
+
 int main() {
     terrain_guard_constants_agree();
+    world_session_constants_agree();
     ghs_guard_constants_agree();
     detours_are_recognised_before_the_signature_check();
     mx_table_is_unchanged();

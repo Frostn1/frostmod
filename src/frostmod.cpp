@@ -767,6 +767,199 @@ static void InstallOverjumpProbe() {
         g_overjumpForce ? ", FORCE ON - offline/testing only" : "");
 }
 
+// ===========================================================================
+// Server browser: unwedging the master login.
+//
+// The bug this exists for: join a server, leave it, open Browse again, and the game says
+// "connection timeout" for the rest of the session. The master is up; the main menu and the
+// local/online toggle don't clear it; only restarting the game does.
+//
+// See the RVA_WORLD_* block in offsets.h for the machine. The short version is that the
+// browser's master login lives in one global state, the opener refuses to send anything
+// while that state is above 1, and the only thing that ever tears the session down is bus
+// command 0x386 — which the game reaches only through the dialog's own cancel path. So a
+// session that ends any other way leaves the login half-open: the socket stays bound to the
+// same source port it has had since the first browse, and the master may still be holding a
+// session for the account. Either one produces silence, and five seconds of silence is
+// exactly what the dialog prints as "connection timeout".
+//
+// 0x386 fixes both, given two nudges first: it only sends LOGOUT at state >= 4, and the
+// port global sits outside the block it zeroes.
+// ===========================================================================
+
+/// Call the engine command bus. Split out so the SEH lives in a function holding nothing
+/// that needs unwinding, the same shape as SB_CallLoadEnter.
+static bool BusCall(BusFn bus, uint32_t cmd) {
+    __try {
+        bus(cmd, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+/// The bus as the game itself reaches it. Prefers the pointer captured before the overjump
+/// probe swapped the slot, so our own call goes straight to the engine rather than back
+/// through our hook; falls back to reading the slot and checking it lands in .text.
+static BusFn ResolveBus() {
+    if (g_origBus) return g_origBus;
+    uintptr_t slot = g_base + mxb::RVA_CMD_BUS_PTR + g_sigDelta;
+    void* cur = nullptr;
+    if (SafeReadBytes((const char*)slot, (char*)&cur, sizeof(cur)) != sizeof(cur) || !cur) return nullptr;
+    uint8_t *b = nullptr, *e = nullptr;
+    if (!GetExecRange(g_base, &b, &e)) return nullptr;
+    if ((uint8_t*)cur < b || (uint8_t*)cur >= e) return nullptr;
+    return (BusFn)cur;
+}
+
+/// Close the browser's master session so the next Browse starts from nothing.
+///
+/// `clearPort` decides how much is thrown away, and it is also the experiment. Two things can
+/// produce the silence, and they want different cures:
+///
+///   * the master still holds a session for this account, because LOGOUT never went out —
+///     the teardown alone fixes that;
+///   * the master is answering a source port nothing is listening on any more, the mapping
+///     having gone stale across the server session — only a new port fixes that.
+///
+/// Clearing both at once would work and teach us nothing. So the automatic path tries the
+/// cheaper one first and the log says which one the game came back from. The button clears
+/// both, because somebody pressing it wants it working, not measured.
+///
+/// Returns true when the block came back zeroed. Refuses outright if the state global reads
+/// something this build's state machine can't produce — a `.data` RVA that drifted is a wild
+/// write waiting to happen, and doing nothing is the correct answer to not knowing.
+static bool ResetServerBrowser(const char* why, bool clearPort) {
+    if (!g_game->offsets_complete) {
+        Log("[world] reset (%s) REFUSED: these offsets are MX Bikes' and this is %s.",
+            why, g_game->display);
+        return false;
+    }
+    int* state = (int*)(g_base + mxb::RVA_WORLD_STATE + g_sigDelta);
+    const int was = SafeReadInt(state);
+    if (was < 0 || was > mxb::WORLD_STATE_MAX) {
+        Log("[world] reset (%s) REFUSED: state @ RVA 0x%zx reads %d, which is not a state this "
+            "build has - the offset is wrong here, so nothing was touched.",
+            why, (size_t)mxb::RVA_WORLD_STATE, was);
+        return false;
+    }
+    if (was == 0) {
+        Log("[world] reset (%s): the browser is already closed (state 0), nothing to do.", why);
+        return true;
+    }
+    BusFn bus = ResolveBus();
+    if (!bus) {
+        Log("[world] reset (%s) REFUSED: the command bus fn-ptr @ RVA 0x%zx isn't a .text "
+            "address on this build.", why, (size_t)mxb::RVA_CMD_BUS_PTR);
+        return false;
+    }
+
+    // The port global sits outside the block the teardown zeroes, so it survives unless we
+    // say otherwise. 0 reaches bind() unchecked and means "any".
+    int* port = (int*)(g_base + mxb::RVA_WORLD_PORT + g_sigDelta);
+    const int wasPort = SafeReadInt(port);
+    const bool portCleared = clearPort && SafeWriteInt(port, 0);
+
+    // Say we're logged in so 0x386 actually emits LOGOUT. Safe to lie about: the next thing
+    // that function does is memset the whole block, so nothing reads this value again.
+    const bool armed = SafeWriteInt(state, mxb::WORLD_STATE_MAX);
+
+    const bool called = BusCall(bus, (uint32_t)mxb::CMD_WORLD_CLOSE);
+    const int after = SafeReadInt(state);
+    Log("[world] reset (%s): state %d -> %d, LOGOUT %s, port %d %s.",
+        why, was, after,
+        !called ? "FAULTED" : armed ? "sent" : "skipped (state write faulted)",
+        wasPort,
+        !clearPort  ? "kept"
+        : portCleared ? "-> any"
+                      : "UNCHANGED (write faulted)");
+    return called && after == 0;
+}
+
+/// How many times one run of the game will do this by itself, and how far apart. A master
+/// that is genuinely down looks identical from in here, and churning its socket every five
+/// seconds would help nobody.
+static const int      kWorldMaxAutoResets = 3;
+static const uint64_t kWorldResetGapMs    = 30000;
+
+/// Watch the login for the wedge, clear it without being asked, and record which half of it
+/// was actually to blame.
+///
+/// The signature is a 2 -> 1 transition carrying reason 0: the five-second timeout firing.
+/// What makes it the bug rather than an outage is having logged in successfully earlier in
+/// the same run — "it worked, then it stopped" is this and nothing else. Without that, hold
+/// off until a second one in a row, so a player who opens Browse during a real outage isn't
+/// quietly rebinding sockets on every attempt.
+///
+/// The first automatic reset keeps the port, the second takes it too. Whichever one the next
+/// successful login follows is the answer, and it gets written to the log in those words —
+/// so the question gets settled by everyone who hits this rather than by one repro.
+static void WorldWatch() {
+    if (!g_game->offsets_complete) return;
+
+    static int      prev       = -1;
+    static bool     everLogged = false;   // state reached 4 at some point this run
+    static int      timeouts   = 0;       // consecutive, since the last success
+    static int      resets     = 0;
+    static uint64_t nextResetOkMs = 0;
+    static bool     awaitingVerdict = false;  // a reset happened; the next login is the answer
+    static bool     verdictPortToo  = false;  // ...and whether that reset took the port as well
+
+    const int now = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_STATE + g_sigDelta));
+    if (now < 0 || now > mxb::WORLD_STATE_MAX) { prev = -1; return; }  // wrong offset: stay out
+
+    if (now == mxb::WORLD_STATE_MAX) {
+        if (awaitingVerdict) {
+            awaitingVerdict = false;
+            Log("[world] logged in again after the reset that %s. So on this machine the "
+                "browser was wedged by %s.",
+                verdictPortToo ? "also took the source port" : "only closed the session",
+                verdictPortToo ? "a stale source port, not the session"
+                               : "a half-open master session");
+        }
+        everLogged = true;
+        timeouts   = 0;
+    }
+
+    if (prev == 2 && now == 1) {
+        // Reason 0 is "nothing came back at all"; the master answering with a refusal takes a
+        // different path and leaves its own words here instead. The timeout writes this from a
+        // register that is zero on the path where no datagram arrived - which is the path this
+        // bug takes. A tick that happened to process some other traffic can leave it nonzero,
+        // and then we simply sit this timeout out and catch the next one five seconds later.
+        const int reason = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_REASON + g_sigDelta));
+        if (reason == 0) {
+            ++timeouts;
+            const uint64_t nowMs = GetTickCount64();
+            if (!everLogged && timeouts < 2) {
+                Log("[world] the master didn't answer the login (timeout %d). Leaving it alone "
+                    "for now - nothing has logged in yet this run, so this may just be the "
+                    "master.", timeouts);
+            } else if (resets >= kWorldMaxAutoResets) {
+                Log("[world] login timed out again, but %d automatic resets is the limit for one "
+                    "run. Whatever this is, it isn't the half-open session.", resets);
+            } else if (nowMs < nextResetOkMs) {
+                Log("[world] login timed out again, %llu ms too soon after the last reset; "
+                    "waiting.", (unsigned long long)(nextResetOkMs - nowMs));
+            } else {
+                // First attempt closes the session and keeps the port; anything after that
+                // takes the port too. If the first one was enough, the log says so.
+                const bool alsoPort = resets > 0;
+                ++resets;
+                nextResetOkMs = nowMs + kWorldResetGapMs;
+                everLogged = false;   // re-armed only by a fresh successful login
+                timeouts   = 0;
+                if (ResetServerBrowser("automatic", alsoPort)) {
+                    awaitingVerdict = true;
+                    verdictPortToo  = alsoPort;
+                }
+            }
+        }
+    }
+    prev = now;
+}
+
 // Read the game's track array (RVA_TRACK_LIST, stride TRACK_STRIDE, count at
 // RVA_TRACK_COUNT) and log each entry's fields. Confirms the array read and pins the
 // folder/name offsets the switcher relies on.
@@ -3177,6 +3370,11 @@ void Tick() {
     // ride past someone.
     SessionPublish();
 
+    // One int read per frame, watching for the server browser's login to wedge. Cheap enough
+    // to do here rather than on a timer, and the window it watches for is only five seconds
+    // wide.
+    WorldWatch();
+
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
     // plugin Draw() callback (g_drawCalls). On track both track the framerate. If frames/s
@@ -3917,6 +4115,13 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
         // below v0.9.11, so reaching here means an older app - answer it truthfully.
         NoteModelNeedsCategorySwitch(bikeId.c_str(), "MXB App model swap");
+    } else if (verb == "reset_server_browser") {
+        // The manual half of the server-browser fix: FrostMod clears this by itself when it
+        // recognises the wedge (see WorldWatch), and this is the button for when it declines
+        // to — a run that never logged in, or one that has used up its automatic resets.
+        // Enqueued rather than run here so the bus call lands on the render thread, which is
+        // the thread the game's own browser code runs on.
+        EnqueueGameThreadTask([] { ResetServerBrowser("MXB App", true); });
     } else if (verb == "swap_bike") {
         // Stage B (whole-bike in-garage switch) isn't built yet. Say so instead of
         // silently doing nothing - MXB App's garage_swap_bike sends this today.

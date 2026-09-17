@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-17 — v0.32.0
+
+### Changed
+- **The suspension is drawn on a bike.** It was two bars in a corner with an F and an R beside
+  them, which tells you the numbers and nothing else. It is a bike from the side now: the travel
+  fills down the fork leg and along the shock, where your eye already expects them, with a mark
+  at the deepest each end has been. Drag it wherever you want it like the rest.
+
 ## 2026-09-17 — v0.31.0
 
 ### Added
@@ -9,6 +17,7 @@
   there, which is something a crash dump could never have shown: by the time the game used to
   fall over, the code that produced the bad number had long since finished. If this has been
   happening to you, your log now carries the answer.
+
 
 ## 2026-09-17 — v0.30.0
 

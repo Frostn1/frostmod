@@ -505,10 +505,13 @@ static void TheSuspensionAndTheTrail() {
             q.p[0][1] >= kSuspBox.y0 - 0.01f && q.p[2][1] <= kSuspBox.y1 + 0.01f)
             ++in_susp;
     }
-    CHECK(in_susp >= 7, "backing, two tracks, two fills, two bottomed marks: %zu", in_susp);
+    // A bike: two wheels, the frame, the fork and shock with their travel and bottomed marks,
+    // and the swingarm. Far more quads than the two bars it replaced.
+    CHECK(in_susp >= 30, "a bike, not two bars: %zu quads in the box", in_susp);
     std::vector<std::string> said;
     for (const Text& x : f.texts) said.push_back(x.s);
-    CHECK(said.size() == 2 && said[0] == "F" && said[1] == "R", "both ends are labelled");
+    // The drawing says which end is which, so the F and R labels are gone with the bars.
+    CHECK(said.empty(), "the bike needs no labels: %zu still said", said.size());
     const size_t with_trail = f.quads.size();
 
     // No sheet, no trail. Nothing is guessed from the centreline, because a confidently drawn

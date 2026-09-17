@@ -111,6 +111,9 @@ struct DragState {
     bool           was_down = false;
 };
 DragState            g_drag;
+/// Whether the last telemetry sample said the rider was down, so the voice is stopped on the
+/// crash rather than on every sample of lying in the dirt.
+bool                 g_was_crashed = false;
 ULONGLONG            g_ini_checked = 0;
 // Whether this stint has already written its one "the game called Draw" line, and how many
 // frames it has been asked to draw. Zero at the end of a stint means the game never called
@@ -978,6 +981,9 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     Log("run", coachlog::PracticeText(g_event.type, session, g_practice));
     g_logged_draw = false;
     g_draw_calls  = 0;
+    // A new run starts on the bike, not in the dirt: left set, the first cue of the session
+    // would be swallowed.
+    g_was_crashed = false;
     ReadVoiceSettings(false);
     g_setup = coachhud::SetupName(_pData, _iDataSize);
     g_clock.reset();
@@ -1037,8 +1043,19 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         const uint32_t fired = g_cues.fires();
         g_cues.on_sample(_fPos, speed, _fTime, crashed);
         // Spoken the moment it shows. A cue the player skipped never fires, so is never said.
+        //
+        // Silenced once, when the crash happens, not for as long as the rider is down. This
+        // runs at 50 Hz: while `crashed` stayed true it called waveOutReset fifty times a
+        // second, which is a good way to leave the sound device unable to play anything for
+        // the rest of the run - and it logged each one, filling the log's 256 KB cap in about
+        // a minute and a half, taking with it every line that would have explained the silence.
         if (crashed) {
-            StopVoice();
+            if (!g_was_crashed) {
+                g_was_crashed = true;
+                StopVoice();
+            }
+        } else if (g_was_crashed) {
+            g_was_crashed = false;
         } else if (g_cues.fires() != fired && g_cues.showing()) {
             const coachcue::Cue& c = *g_cues.showing();
             Speak(c);

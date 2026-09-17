@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-16 — v0.27.0
+
+### Fixed
+- **The male voice says the right words.** "Gas now" was coming out as a word nobody recognised,
+  and "Stand up" ran on into half a sentence. The clips themselves were wrong: the voice that
+  made them said the word and then kept talking, and the trimming that was supposed to cut that
+  off needed a longer pause than the male voice leaves. Three clips carried a whole second
+  utterance, and because each clip is levelled over its full length, the real word was quiet and
+  the rubbish was loud. `brake`, `gas` and `stand_up` are re-cut; the rest were already fine.
+- **The voice keeps working after you crash.** Going down silenced it for the rest of the run.
+  It was stopping the sound device fifty times a second for as long as you were on the ground,
+  which is enough to leave it unable to play anything again. It now stops once, when you crash.
+
 ## 2026-09-16 — v0.26.0
 
 ### Added

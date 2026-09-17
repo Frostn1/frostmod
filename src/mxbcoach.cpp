@@ -63,6 +63,9 @@ std::string        g_base;  // <save path>\mxbcoach\
 /// with the track, long enough that a bike sitting still doesn't spin its own arrow.
 constexpr float  kDirStepM       = 1.5f;
 
+/// How long the pointer stays up after the mouse stops moving.
+constexpr ULONGLONG kPointerHoldMs = 2500;
+
 constexpr size_t kDataSpeed      = 20;
 constexpr size_t kDataPosX       = 24;
 constexpr size_t kDataPosZ       = 32;
@@ -109,6 +112,12 @@ struct DragState {
     coachhud::Part held = coachhud::PART_NONE;
     float          dx = 0, dy = 0;
     bool           was_down = false;
+    // Where the pointer was, and when it last moved. The pointer is only drawn for a moment
+    // after the rider moves the mouse: on screen the whole time it would be one more thing
+    // over the track, and never drawn they would be aiming something they cannot see.
+    float          at_x = 0, at_y = 0;
+    bool           has_at = false;
+    ULONGLONG      moved_ms = 0;
 };
 DragState            g_drag;
 /// Whether the last telemetry sample said the rider was down, so the voice is stopped on the
@@ -654,12 +663,23 @@ void SavePartPosition(coachhud::Part part) {
 /// and where it ended up is written to hud.ini. Off with `move=0`.
 void PollDrag() {
     if (!g_hud_set.enabled || !g_hud_set.move) {
-        g_drag.held = coachhud::PART_NONE;
+        g_drag.held   = coachhud::PART_NONE;
+        g_drag.has_at = false;
         return;
     }
     const bool down = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     float      x = 0, y = 0;
     const bool on = CursorOnGame(x, y);
+    // Moving the mouse is what asks for the pointer. Held, it stays up regardless, so it never
+    // fades out from under a part being dragged.
+    if (on) {
+        const bool moved = !g_drag.has_at || std::fabs(x - g_drag.at_x) > 0.0015f ||
+                           std::fabs(y - g_drag.at_y) > 0.0015f;
+        if (moved) g_drag.moved_ms = GetTickCount64();
+        g_drag.at_x = x, g_drag.at_y = y, g_drag.has_at = true;
+    } else {
+        g_drag.has_at = false;
+    }
     if (down && !g_drag.was_down && on) {
         // A press starts a drag only when it lands on a part, so right-clicking anywhere else
         // goes on meaning whatever the game wants it to mean.
@@ -861,6 +881,12 @@ void BuildHud() {
         v.pos       = g_pos;
         v.stopped   = g_stop.stopped();
         if (g_cues.active()) v.upcoming = coachhud::Upcoming(g_cues.sheet(), m, 5);
+    }
+    // The pointer, while the rider is moving the mouse or holding a part.
+    if (g_hud_set.move && g_drag.has_at &&
+        (g_drag.held != coachhud::PART_NONE || GetTickCount64() - g_drag.moved_ms < kPointerHoldMs)) {
+        v.has_pointer = true;
+        v.pointer     = {g_drag.at_x, g_drag.at_y};
     }
     v.stance = g_stance.state();
     v.conf   = g_stance_conf;
@@ -1096,7 +1122,6 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         ReadVoiceSettings(false);
     }
     PollStance(_fTime, _fPos, crashed);
-    PollDrag();
     MaybeReloadHudSettings();
 }
 
@@ -1181,6 +1206,14 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
         std::lock_guard<std::mutex> lock(g_mu);
         ++g_draw_calls;
         if (_iState == 0 && g_practice) {
+            // Before the frame is built, so a part picked up this frame is drawn where the
+            // rider has just dragged it to rather than a frame behind.
+            //
+            // Polled here, not from RunTelemetry where it started: that callback only fires
+            // during a live stint, which is the one state where the rider is looking at the
+            // track rather than at the HUD. MXBMRP3 polls the mouse from its own render path
+            // for the same reason, and their drag works.
+            PollDrag();
             BuildHud();
             for (const coachhud::Quad& in : g_frame.quads) {
                 if (quads >= int(coachhud::kMaxQuads)) break;

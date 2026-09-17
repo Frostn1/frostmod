@@ -611,6 +611,23 @@ static void TheRiderPointsAndThePartsMove() {
     const Settings row = ParseSettings("[hud]\nrow_x=0.20\nrow_y=0.70\n", false);
     CHECK(RowBoxAt(row, kRowHitW).y0 == 0.70f, "the gap line where it was put");
     CHECK(PartAt(row, 0.20f, 0.70f + kRowH * 0.5f) == PART_ROW, "and can be taken hold of there");
+    // The pointer: drawn only when asked for, over everything, and on the reserve so a busy
+    // frame can never be the reason a rider cannot see what they are aiming.
+    {
+        View pv;
+        pv.set = ParseSettings("[hud]\n", false);
+        Frame pf;
+        Build(pv, pf);
+        const size_t without = pf.quads.size();
+        pv.has_pointer = true;
+        pv.pointer     = {0.42f, 0.61f};
+        Build(pv, pf);
+        CHECK(pf.quads.size() == without + 2, "a pointer is two quads: %zu", pf.quads.size() - without);
+        const Quad& tip = pf.quads.back();
+        CHECK(tip.p[0][0] == 0.42f && tip.p[0][1] == 0.61f, "its point is where the mouse is");
+        CHECK(tip.p[0][0] == tip.p[3][0] && tip.p[0][1] == tip.p[3][1], "folded into a triangle");
+    }
+
     Settings put = Settings{};
     SetPartOrigin(put, PART_ROW, 0.30f, 0.55f);
     const Box moved_row = RowBoxAt(put, kRowHitW);

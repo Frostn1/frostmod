@@ -841,6 +841,29 @@ inline void Arrow(Frame& f, float x, float y, float dx, float dy, uint32_t color
     }
 }
 
+/// The rider's own pointer, as a triangle with a dark edge under it.
+///
+/// Drawn rather than relied upon: on track the game hides the system cursor, so a rider
+/// dragging a part would be aiming something they cannot see. MXBMRP3 draws its own pointer
+/// widget for the same reason. Two quads, no sprite.
+inline void Pointer(Frame& f, float x, float y) {
+    const float w = 0.011f / kAspect, h = 0.030f;
+    auto tri = [&f](float px, float py, float pw, float ph, uint32_t color) {
+        if (!f.room()) return;
+        Quad q;
+        q.p[0][0] = px, q.p[0][1] = py;                        // the point
+        q.p[1][0] = px, q.p[1][1] = py + ph;                   // straight down
+        q.p[2][0] = px + pw, q.p[2][1] = py + ph * 0.72f;      // and back up to the right
+        q.p[3][0] = px, q.p[3][1] = py;                        // folded onto the point
+        q.color = color;
+        f.quads.push_back(q);
+    };
+    // The shadow first and a shade larger, so the pointer reads over pale ground as well as
+    // dark. Over a track map it would otherwise vanish into the grey.
+    tri(x - 0.0015f / kAspect, y - 0.0015f, w * 1.28f, h * 1.18f, 0xC0000000u);
+    tri(x, y, w, h, kWhite);
+}
+
 /// A line `thickness` thick. MXBMRP3's addLineSegment.
 inline void Line(Frame& f, float x1, float y1, float x2, float y2, uint32_t color, float thickness) {
     const float dx = x2 - x1, dy = y2 - y1, len = std::sqrt(dx * dx + dy * dy);
@@ -878,6 +901,10 @@ struct View {
     // Which way the rider is pointing, as a world x/z direction. Zero until they have moved
     // far enough to say, and then the arrow on the map points along it.
     Pt                       rider_dir{};
+    // Where the rider's mouse is, while it is worth showing: they have moved it recently, or
+    // they are holding a part. Off, and nothing is drawn.
+    bool                     has_pointer = false;
+    Pt                       pointer{};
     float                    pos = 0;       // the rider's lap position 0..1, for the trail
     std::vector<float>       upcoming;      // cue spots ahead, metres from the line
     bool                     stopped = false;
@@ -1051,6 +1078,13 @@ inline void Build(const View& v, Frame& f) {
             // points where the bike is pointing on the map rather than mirrored.
             Arrow(f, p.x, p.y, v.rider_dir.x, -v.rider_dir.y, kWhite, 0.019f);
         }
+    }
+
+    // 8. The pointer, over everything, and on the reserve: a rider dragging a part must be able
+    //    to see where they are pointing even on a busy frame.
+    if (v.has_pointer) {
+        Reserved hold(f);
+        Pointer(f, v.pointer.x, v.pointer.y);
     }
 }
 

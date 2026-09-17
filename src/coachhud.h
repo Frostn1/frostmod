@@ -920,6 +920,71 @@ struct View {
     float                    susp_max[2] = {0, 0};
 };
 
+/// A motocrosser from its right-hand side, drawn small enough to sit in a corner of the screen:
+/// two wheels, the fork, the swingarm and the shock, on a flat line from the bars to the tail.
+///
+/// The travel used to be two bars in a box, which says the numbers and nothing else. On a bike
+/// the rider reads "the fork is using all of it" off the fork, without having to remember which
+/// bar was which — and F and R stop needing a label at all.
+///
+/// Everything is in fractions of `box`, so it moves and keeps its shape wherever the rider drags
+/// it. `used` and `deep` are 0..1 per end, front then rear.
+inline void SuspBike(Frame& f, const Box& box, const float used[2], const float deep[2]) {
+    const float w = box.x1 - box.x0, h = box.y1 - box.y0;
+    auto px = [&](float u) { return box.x0 + u * w; };
+    auto py = [&](float u) { return box.y0 + u * h; };
+    auto line = [&](float ax, float ay, float bx, float by, uint32_t c, float t) {
+        Line(f, px(ax), py(ay), px(bx), py(by), c, t * h);
+    };
+    // A wheel as a ring of short chords: a circle is not a primitive here, and eight of them
+    // reads round at this size.
+    // `r` is in the box's own y units. A step across the box is `w` of the screen and a step
+    // down it `h`, and the screen itself is 16:9 — so a round wheel needs its x radius scaled
+    // by both, or it comes out as an egg in whatever shape the box happens to be.
+    const float rx = h / (w * kAspect);
+    auto wheel = [&](float cx, float cy, float r, uint32_t c) {
+        const int n = 12;
+        float lx = 0, ly = 0;
+        for (int i = 0; i <= n; ++i) {
+            const float a = float(i) / float(n) * 6.2831853f;
+            const float x = cx + std::cos(a) * r * rx;
+            const float y = cy + std::sin(a) * r;
+            if (i > 0) line(lx, ly, x, y, c, 0.028f);
+            lx = x, ly = y;
+        }
+    };
+    // Rear wheel left, front wheel right, both on the ground line.
+    wheel(0.22f, 0.70f, 0.26f, kGrey);
+    wheel(0.80f, 0.70f, 0.28f, kGrey);
+    // Frame: the flat line from the tail to the bars, and the downtube.
+    line(0.26f, 0.34f, 0.70f, 0.28f, kGrey, 0.035f);
+    line(0.70f, 0.28f, 0.62f, 0.52f, kGrey, 0.03f);
+
+    // The fork, from the clamp down to the front axle, with the travel filled from the top.
+    const float fx0 = 0.72f, fy0 = 0.22f, fx1 = 0.80f, fy1 = 0.70f;
+    line(fx0, fy0, fx1, fy1, 0x50FFFFFFu, 0.075f);
+    const float fu = (std::max)(0.0f, (std::min)(1.0f, used[0]));
+    if (fu > 0) line(fx0, fy0, fx0 + (fx1 - fx0) * fu, fy0 + (fy1 - fy0) * fu, kBlue, 0.075f);
+    const float fd = (std::max)(0.0f, (std::min)(1.0f, deep[0]));
+    if (fd > 0) {
+        const float mx = fx0 + (fx1 - fx0) * fd, my = fy0 + (fy1 - fy0) * fd;
+        line(mx - 0.05f, my, mx + 0.05f, my, kRed, 0.022f);
+    }
+
+    // The shock, leaning forward under the seat, filled the same way.
+    const float sx0 = 0.44f, sy0 = 0.30f, sx1 = 0.36f, sy1 = 0.62f;
+    line(sx0, sy0, sx1, sy1, 0x50FFFFFFu, 0.075f);
+    const float su = (std::max)(0.0f, (std::min)(1.0f, used[1]));
+    if (su > 0) line(sx0, sy0, sx0 + (sx1 - sx0) * su, sy0 + (sy1 - sy0) * su, kBlue, 0.075f);
+    const float sd = (std::max)(0.0f, (std::min)(1.0f, deep[1]));
+    if (sd > 0) {
+        const float mx = sx0 + (sx1 - sx0) * sd, my = sy0 + (sy1 - sy0) * sd;
+        line(mx - 0.05f, my, mx + 0.05f, my, kRed, 0.022f);
+    }
+    // Swingarm, from the pivot back to the rear axle.
+    line(0.44f, 0.56f, 0.22f, 0.70f, kGrey, 0.035f);
+}
+
 /// How much of an end's travel is in use, given the shock's current length and its maximum
 /// travel: 0 fully extended, 1 fully compressed. From MXBMRP3's updateSuspensionLength
 /// (core/plugin_data_telemetry.cpp), which is where the direction of m_afSuspLength is
@@ -989,27 +1054,13 @@ inline void Build(const View& v, Frame& f) {
         if (v.sag) Say(f, "Stop 2 seconds in neutral to measure sag", 0.5f, b.y0 + 0.065f, kSmallSize, 1, kAmber);
     }
 
-    // 7. The suspension, bottom right: how much travel each end is using now, and a mark where
-    //    it bottomed. Off unless hud.ini asks for it.
+    // 7. The suspension, on a bike rather than as two bars in a corner: the travel fills down
+    //    the fork leg and along the shock, where the rider's eye already expects them, with a
+    //    mark at the deepest each end has been this stint. Off unless hud.ini asks for it.
     if (v.set.susp && v.has_susp) {
         const Box b = SuspBoxAt(v.set);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        const float h  = (b.y1 - b.y0 - kSuspPad * 3) * 0.5f;
-        const float x0 = b.x0 + kSuspPad + kSuspLabelW, x1 = b.x1 - kSuspPad;
-        for (int i = 0; i < 2; ++i) {
-            const float y0 = b.y0 + kSuspPad + float(i) * (h + kSuspPad), y1 = y0 + h;
-            Say(f, i == 0 ? "F" : "R", b.x0 + kSuspPad, y0 + (h - kSmallSize) * 0.5f, kSmallSize, 0, kGrey);
-            Rect(f, x0, y0, x1, y1, 0x50FFFFFFu);  // the travel there is
-            const float used = (std::max)(0.0f, (std::min)(1.0f, v.susp[i]));
-            if (used > 0) Rect(f, x0, y0, x0 + (x1 - x0) * used, y1, kBlue);
-            // Where it bottomed: a tick standing slightly proud of the bar, so it reads as a
-            // mark on the scale rather than as more fill.
-            const float deep = (std::max)(0.0f, (std::min)(1.0f, v.susp_max[i]));
-            if (deep > 0) {
-                const float mx = x0 + (x1 - x0) * deep;
-                Rect(f, mx - 0.0012f, y0 - 0.002f, mx + 0.0012f, y1 + 0.002f, kRed);
-            }
-        }
+        SuspBike(f, b, v.susp, v.susp_max);
     }
 
     // 5. The map, bottom left: the line, the cue spots ahead, Coach's line to take, then the

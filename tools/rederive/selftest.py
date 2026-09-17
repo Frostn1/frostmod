@@ -6,7 +6,8 @@ after touching any rule; a rule that gets cleverer at the cost of the known answ
 a rule that will be wrong on the next build too.
 
 Game binaries are not in the repo, so each check skips (loudly) when its input is
-missing. Point them elsewhere with MXB_EXE / MXB_UNPACKED / GPB_EXE.
+missing. Point them elsewhere with MXB_EXE / GPB_EXE. Both must be unwrapped copies;
+the tool refuses a file that still has its store wrapper on.
 """
 from __future__ import annotations
 
@@ -19,12 +20,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rederive  # noqa: E402
-import steamstub  # noqa: E402
-from pe import PE  # noqa: E402
 
 DL = Path.home() / "Downloads"
-MXB = Path(os.environ.get("MXB_EXE", DL / "mxbikes.exe"))
-MXB_REF = Path(os.environ.get("MXB_UNPACKED", DL / "mxbikes.exe.unpacked.exe"))
+MXB = Path(os.environ.get("MXB_EXE", DL / "mxbikes.exe.unpacked.exe"))
 GPB = Path(os.environ.get("GPB_EXE", DL / "gpbikes.exe.unpacked.exe"))
 
 results: list[tuple[str, str, str]] = []
@@ -44,21 +42,6 @@ def skip(name, why):
     results.append((name, "SKIP", why))
 
 
-def test_unpack_matches_steamless():
-    """Our SteamStub decrypt must equal what Steamless produced, byte for byte."""
-    if not (MXB.exists() and MXB_REF.exists()):
-        return skip("unpack == steamless", f"need {MXB.name} and {MXB_REF.name}")
-    pe = PE(MXB.read_bytes(), str(MXB))
-    ours = steamstub.unpack(pe)
-    ref = MXB_REF.read_bytes()
-    q = PE(ours)
-    t = q.section(".text")
-    a = ours[t.rawptr:t.rawptr + t.rawsize]
-    b = ref[t.rawptr:t.rawptr + t.rawsize]
-    record("unpack == steamless", a == b,
-           f"{sum(x != y for x, y in zip(a, b))} differing bytes of {len(a)}")
-
-
 def test_mxb_baseline():
     """Every baselined MX Bikes value must come back out of the anchors."""
     if not MXB.exists():
@@ -75,21 +58,8 @@ def test_gpb_known_values():
     record("gpb known values", code == 0, "see the MISMATCH/LOST lines above")
 
 
-def test_packed_and_unpacked_agree():
-    """Feeding the packed exe and the unpacked one must give the same answers."""
-    if not (MXB.exists() and MXB_REF.exists()):
-        return skip("packed == unpacked", "need both forms")
-    out = {}
-    for tag, p in (("packed", MXB), ("unpacked", MXB_REF)):
-        pe, _ = rederive.load(p)
-        out[tag] = {r.key: r.value for r in rederive.resolve(pe, "mxb", {})}
-    diff = [k for k in out["packed"] if out["packed"][k] != out["unpacked"][k]]
-    record("packed == unpacked", not diff, f"disagree on {diff}")
-
-
 if __name__ == "__main__":
-    for fn in (test_unpack_matches_steamless, test_mxb_baseline,
-               test_gpb_known_values, test_packed_and_unpacked_agree):
+    for fn in (test_mxb_baseline, test_gpb_known_values):
         try:
             fn()
         except Exception as exc:  # a crashing rule is a failing test, not a traceback

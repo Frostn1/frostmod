@@ -80,16 +80,18 @@ void DescribeAddress(const void* addr, char* out, size_t n) {
 char g_frames[kMaxFrames][160];
 int  g_frameCount = 0;
 
-void WriteStack(const CONTEXT& start) {
+// The walk itself, so the crash report and a live capture share one implementation. Fills
+// `out` with "module+0xRVA" per frame, nearest first, and returns how many it wrote.
+int Unwind(const CONTEXT& start, char (*out)[160], int max, int skip) {
     CONTEXT ctx = start;   // RtlVirtualUnwind mutates it; never touch the real one
-    char where[MAX_PATH + 64], line[MAX_PATH + 128];
-    g_frameCount = 0;
-    for (int frame = 0; frame < kMaxFrames; ++frame) {
+    char where[MAX_PATH + 64];
+    int written = 0;
+    for (int frame = 0; frame < kMaxFrames && written < max; ++frame) {
         if (!ctx.Rip) break;
-        DescribeAddress((const void*)ctx.Rip, where, sizeof(where));
-        _snprintf_s(g_frames[g_frameCount++], sizeof(g_frames[0]), _TRUNCATE, "%s", where);
-        _snprintf_s(line, sizeof(line), _TRUNCATE, "[crash]   #%-2d %s", frame, where);
-        Say(line);
+        if (frame >= skip) {
+            DescribeAddress((const void*)ctx.Rip, where, sizeof(where));
+            _snprintf_s(out[written++], sizeof(out[0]), _TRUNCATE, "%s", where);
+        }
 
         DWORD64 imageBase = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
@@ -104,6 +106,16 @@ void WriteStack(const CONTEXT& start) {
         DWORD64 establisher = 0;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx,
                          &handlerData, &establisher, nullptr);
+    }
+    return written;
+}
+
+void WriteStack(const CONTEXT& start) {
+    g_frameCount = Unwind(start, g_frames, kMaxFrames, 0);
+    char line[MAX_PATH + 128];
+    for (int i = 0; i < g_frameCount; ++i) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "[crash]   #%-2d %s", i, g_frames[i]);
+        Say(line);
     }
 }
 
@@ -367,6 +379,15 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
 }  // namespace
 
 unsigned long long ElapsedMs() { return NowMs(); }
+
+int CaptureStack(char (*out)[160], int max) {
+    if (!out || max <= 0) return 0;
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    // Skip this function and the caller's own frame: what is being asked for is who called
+    // the thing that is asking, and two frames of us at the top is noise in every line.
+    return Unwind(ctx, out, max, 2);
+}
 
 Trail& TheTrail() { static Trail t; return t; }
 Context& TheContext() { static Context c; return c; }

@@ -5,34 +5,36 @@ them and renumbered the message ids, and nothing about `base + 0xecd00` announce
 it is no longer the customization loader — it is simply whatever now lives there.
 
 This tool turns "re-do the RE" into "run a script and read a diff". It takes the new
-`mxbikes.exe`, decrypts the Steam DRM wrapper itself, and looks the offsets up again by
-what they *are* — the strings a function owns, the imports it calls, the array it
-multiplies an index through — rather than by where they used to be.
+`mxbikes.exe` and looks the offsets up again by what they *are* — the strings a function
+owns, the imports it calls, the array it multiplies an index through — rather than by
+where they used to be.
 
     ./rederive.py ~/Downloads/mxbikes.exe                  # the diff
     ./rederive.py mxbikes.exe --header                     # an offsets.h block
     ./rederive.py mxbikes.exe --rust                       # mxb-app's two constants
     ./rederive.py mxbikes.exe --json new.json              # machine-readable
     ./rederive.py mxbikes.exe --check                      # exit 1 on any mismatch
-    ./rederive.py mxbikes.exe --unpack-to unpacked.exe     # just the SteamStub decrypt
     ./selftest.py                                          # the regression test
 
-Needs Python 3.10+ and `cryptography`. No disassembler, no Windows, no IDA.
+Needs Python 3.10+. No disassembler, no Windows, no IDA.
+
+## The exe it wants
+
+An exe whose code section is readable. A copy straight from the store still has its
+wrapper on, `.text` is encrypted, and there is nothing in the file to analyse; the tool
+detects that from the section table and stops with a message rather than reading a
+megabyte of noise. Getting an unwrapped copy of a build you own is your business and is
+not part of this repo.
 
 ## What it does on a new build
 
-1. **Unpacks.** The shipping exe is SteamStub v3.x: `.text` is AES-encrypted in the
-   file. `steamstub.py` decodes the stub header (rolling XOR, signature `0xC0DEC0DF`),
-   ECB-decrypts the IV under the AES key, CBC-decrypts the section and restores the
-   original entry point. Verified byte-exact against Steamless's output for beta21e —
-   all `0x31F800` bytes of `.text`. This used to be the step that needed a Windows box.
-2. **Indexes.** `.pdata` gives an authoritative function table (8741 entries for
+1. **Indexes.** `.pdata` gives an authoritative function table (8741 entries for
    beta21e), so every reference can be attributed to the function that made it without
    disassembling anything. Chunked functions fold back together through their unwind
    chain info.
-3. **Resolves.** Each anchor in `anchors.py` is a rule, not an address. They run in
+2. **Resolves.** Each anchor in `anchors.py` is a rule, not an address. They run in
    dependency order; later ones build on what earlier ones found.
-4. **Reports.** Every row says how it was found and how far it moved:
+3. **Reports.** Every row says how it was found and how far it moved:
 
    ```
     -> RVA_MP_MSG_HANDLER            0x2a10e0  high    (was 0x29f880)
@@ -69,11 +71,9 @@ will, and the report tells you which entries were never checked.
 
 ## Why you can trust it on a build nobody has seen
 
-`selftest.py` is the argument, and it is four claims:
+`selftest.py` is the argument, and it is two claims:
 
-- our unpack equals Steamless's, byte for byte;
 - all 42 derived MX Bikes offsets come back out of the current build unchanged;
-- feeding the packed exe and the unpacked one gives identical answers;
 - run against **GP Bikes** — a different binary of the same engine — the same rules
   find `RVA_CONTENT_INIT = 0xfb650` and `RVA_SCAN_FOLDER = 0x18f150`, which are the
   values `offsets.h` reached by hand for that game, and correctly report its track
@@ -102,7 +102,6 @@ address is now something else.
 | | |
 |---|---|
 | `rederive.py` | CLI, resolver, report and emitters |
-| `steamstub.py` | SteamStub v3.x unpacker |
 | `pe.py` | PE64 reader: sections, `.pdata`, imports, strings, rip-relative xrefs, AOB |
 | `analysis.py` | function-scoped indices, stride discovery, count voting |
 | `rules.py` | the rule vocabulary |

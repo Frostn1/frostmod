@@ -405,6 +405,17 @@ Trail&   TheTrail();
 Context& TheContext();
 void Note(const char* fmt, ...);
 
+/// The call stack as it is right now, nearest caller first, each frame as "module+0xRVA".
+///
+/// The same unwinder the crash report uses, exposed because a fault is not the only moment
+/// worth a stack: a guard that turns a crash away has, at that instant, the one thing no
+/// crash dump can give - the stack of the call that was ABOUT to go wrong, with everything
+/// above it intact. That is how the thing upstream gets a name.
+///
+/// Costs a few dozen table lookups and no allocation, but it is not free: call it on the
+/// first few occurrences of something, never on every one.
+int CaptureStack(char (*out)[160], int max);
+
 /// Milliseconds since Install(). Every timestamp in a report is on this clock, so a
 /// caller stamping Context::lastDrawMs / lastReloadMs must use this and not
 /// GetTickCount64 - the report subtracts them.

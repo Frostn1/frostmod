@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.27.0")
+set(FROSTMOD_VERSION "0.28.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -86,7 +86,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
-add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp ${FROSTMOD_DLL_RC})
+add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp ${FROSTMOD_DLL_RC})
 target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
@@ -164,6 +164,11 @@ add_test(NAME command_channel COMMAND command_channel_test)
 # runs in CI rather than only on a machine with the game on it.
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
+
+# What a crash report says - the trail's ring and the report layout, both pure (the
+# Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.
+add_executable(crashreport_test tests/crashreport_test.cpp)
+add_test(NAME crashreport COMMAND crashreport_test)
 
 # --- coach recorder test -------------------------------------------------------
 # The .mxbc file is a wire contract with MXB Coach's Rust reader. src/coachrec.h keeps the

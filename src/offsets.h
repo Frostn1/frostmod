@@ -239,6 +239,50 @@ constexpr int    CMD_CFG_READ_INT      = 0x27;   // bus cmd: read an int out of 
 constexpr size_t SESSION_CFG_SIZE      = 0x21C;  // arg14 at every 0x310 dispatch
 constexpr size_t OFF_OVERJUMP_DISABLED = 0x190;  // dword; non-zero = crash disabled
 
+// ---- the GHS handle pool: a crash we can actually stop (beta21e, 2026-09-16) ----
+// From a player's own crash line, not from a hunt: `access violation (0xC0000005) at
+// mxbikes.exe+0x11D753, reading 0x0000000000000010`. That address is inside a small
+// function that closes one entry of a ten-slot handle pool:
+//
+//   0x11D730  sub rsp,0x28
+//             dec ecx                    ; handles are 1-based
+//             cmp ecx,9 / ja out         ; out-of-range -> return 1
+//             movsxd rbx,ecx
+//             lea rdi,[0x140E4B380]      ; the ten slots
+//             mov rcx,[rdi+rbx*8]        ; slot
+//   0x11D753  mov rcx,[rcx+0x10]         ; <-- faults: the slot is already NULL
+//             call 0x15B540              ; free the member
+//             mov rcx,[rdi+rbx*8] / call ; free the object
+//             mov qword [rdi+rbx*8],0    ; clear the slot
+//
+// So: closing a handle that was already closed (or never opened) is a null deref, and
+// the game goes to desktop. The pool is GHS files - the allocator at 0x11D660 takes a
+// free slot and fopen's "rb"/"wb", and 0x11DAB0 checks a three-byte "GHS" magic.
+//
+// It is an oversight rather than a design: its own siblings guard the identical read.
+// 0x11D790, one function along and reached from the same bus dispatch, does
+//   `mov rsi,[rsi+rax*8]; test rsi,rsi; je out` before touching the slot.
+// The guard FrostMod installs does exactly what that sibling does, and returns the 1
+// the function already returns for a handle that names no slot. Nothing else changes:
+// a real handle goes to the game's own code untouched.
+//
+// The table address is NOT taken from RVA_GHS_TABLE at runtime - a data RVA does not
+// move by the same delta as .text. It is decoded from the verified `lea` itself
+// (LEA_DISP_OFF/LEA_END_OFF below), so the guard can only ever point at the pool this
+// function really uses. RVA_GHS_TABLE is kept for the disassembler, and to check the
+// decode landed where beta21e has it.
+constexpr uintptr_t RVA_GHS_CLOSE      = 0x11D730;   // close(handle): the faulting fn
+constexpr uintptr_t RVA_GHS_TABLE      = 0xE4B380;   // the ten slots (beta21e)
+constexpr int       GHS_SLOTS          = 10;         // `cmp ecx,9` after the 1-based dec
+constexpr size_t    GHS_LEA_DISP_OFF   = 0x1B;       // disp32 of the `lea` into the fn
+constexpr size_t    GHS_LEA_END_OFF    = 0x1F;       // the byte after it: RIP for the disp
+// The 27 fixed bytes above the disp32, which is wildcarded (it is the only part that
+// moves when .data does). Unique in beta21e's .text.
+constexpr char SIG_GHS_CLOSE[] =
+    "\x48\x83\xEC\x28\xFF\xC9\x83\xF9\x09\x77\x43\x48\x89\x5C\x24\x30\x48\x63\xD9"
+    "\x48\x89\x7C\x24\x20\x48\x8D\x3D\x00\x00\x00\x00";
+constexpr char SIG_GHS_CLOSE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxx????";
+
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write
 // auto-extends the widget, there is no separate addRow. So to hide a row we must skip

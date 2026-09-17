@@ -606,6 +606,15 @@ static void TheRiderPointsAndThePartsMove() {
     CHECK(MapBoxAt(plain).x0 == kMapBox.x0 && MapBoxAt(plain).y0 == kMapBox.y0, "map unchanged by default");
     CHECK(SuspBoxAt(plain).x0 == kSuspBox.x0 && SuspBoxAt(plain).y0 == kSuspBox.y0, "bars unchanged by default");
     CHECK(plain.move, "right-drag is on unless turned off");
+    // The gap line moves too: it was the one part left nailed down, and a rider who drags the
+    // map under it had no way to get it out of the way.
+    const Settings row = ParseSettings("[hud]\nrow_x=0.20\nrow_y=0.70\n", false);
+    CHECK(RowBoxAt(row, kRowHitW).y0 == 0.70f, "the gap line where it was put");
+    CHECK(PartAt(row, 0.20f, 0.70f + kRowH * 0.5f) == PART_ROW, "and can be taken hold of there");
+    Settings put = Settings{};
+    SetPartOrigin(put, PART_ROW, 0.30f, 0.55f);
+    const Box moved_row = RowBoxAt(put, kRowHitW);
+    CHECK(std::fabs(moved_row.x0 - 0.30f) < 1e-5f && moved_row.y0 == 0.55f, "dragged by its corner");
     CHECK(!ParseSettings("[hud]\nmove=0\n", false).move, "and can be turned off");
 }
 

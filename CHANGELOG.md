@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-17 — v0.34.0
+
+### Fixed
+- **The crash at track load is stopped.** This is the one that takes the game down while a track
+  is loading, before you ride — the most common MX Bikes crash there is, about two in five of
+  every crash reported. The game saves your trainer with two of its fields never filled in, so
+  whatever happened to be in memory at that moment is written into the file as if it were text.
+  Next time that track loads, the game reads it back and tries to use it as a name, and walks
+  off the end of memory. FrostMod now corrects a trainer as it is read, so the ones already on
+  your disk load instead of crashing, and again as it is written, so no new one is spoiled.
+  Trainers saved from the trainer screen keep their real settings; only fields that are not
+  text are cleared.
+
 ## 2026-09-17 — v0.33.0
 
 ### Changed

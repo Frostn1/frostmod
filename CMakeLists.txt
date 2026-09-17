@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.33.0")
+set(FROSTMOD_VERSION "0.34.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -224,6 +224,14 @@ endif()
 # wording apart from Win32 so it is pinned here.
 add_executable(coachlog_test tests/coachlog_test.cpp)
 add_test(NAME coachlog COMMAND coachlog_test)
+
+# --- trainer record test ---------------------------------------------------------
+# The biggest crash in the game comes from two fields a saver never writes, and the guard that
+# corrects them decides what counts as a name. Get that judgement wrong in either direction and
+# you either leave the crash in place or blank a rider's real settings, so it is pinned here
+# rather than only reasoned about. src/trainer.h keeps it apart from Win32.
+add_executable(trainer_test tests/trainer_test.cpp)
+add_test(NAME trainer COMMAND trainer_test)
 
 # --- coach in-game HUD test ----------------------------------------------------
 # The .hud file is a wire contract with MXB Coach's Rust writer; src/coachhud.h holds it, hud.ini,

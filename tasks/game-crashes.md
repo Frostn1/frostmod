@@ -56,10 +56,11 @@ with a safe fix, not because it is *the* crash.
 
 - [ ] **Collect.** Every report from here carries a stack. The `+0x11D753` work took one
       address; ten stacks would take the other crashes the same way.
-- [ ] **Ship them somewhere.** `PUT /v1/diagnostics` in the control plane already takes
-      reports from this account and has an admin view. A crash record on the same pipe
-      (module+RVA, top frames, game build, where the player was) turns "two samples from
-      one bundle" into a ranked list. Reuse that endpoint, don't add one.
+- [x] **Ship them somewhere.** v0.29.0 writes `frostmod-crash-<stamp>.json` beside the log:
+      the same report as JSON, for MXB App to post to the diagnostics endpoint. A file
+      rather than a socket, because at that point the game has seconds and a crash that
+      happened while the app was closed still has to arrive. The app sends it and renames
+      it; the dump stays local until someone asks for it.
 - [ ] **`MSVCR90.dll+0x36EDE`.** Needs a stack before it needs a theory.
 - [ ] **"go to track".** No sample yet. The report's trail will say what the last thing
       before it was.

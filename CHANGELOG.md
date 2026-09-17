@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-17 — v0.31.0
+
+### Added
+- **The fence crash now says where it came from.** v0.30.0 stopped the game going down when a
+  contact leaves the bike's position as something that is not a number. It could not say what
+  made it. The first three times it happens in a session, the log now records the calls that led
+  there, which is something a crash dump could never have shown: by the time the game used to
+  fall over, the code that produced the bad number had long since finished. If this has been
+  happening to you, your log now carries the answer.
+
 ## 2026-09-17 — v0.30.0
 
 ### Fixed

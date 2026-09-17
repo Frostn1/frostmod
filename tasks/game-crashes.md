@@ -88,6 +88,24 @@ running. Same NaN, landing in a transform instead of in this function.
 **Unverified:** that the NaN comes from the collision, and the one-in-five figure. Both are
 somebody else's numbers. Every catch logs its coordinates, so the first logs back settle it.
 
+## Open: where the NaN comes from
+
+The guard turns the query away; it does not stop the position becoming a NaN in the first
+place. Static reading of the callers gives candidates and nothing better:
+
+- `0x1F23F0` (one of three callers) takes the query out of a local vec3 at `rsp+0x44`, filled
+  by `0x1F1060` a few lines earlier.
+- The same function calls `fmod` at `0x1F24BA`, guarded by `comiss xmm6, [rdi+0x1c]` / `jb`.
+  That guard admits a zero divisor: if `[rdi+0x1c]` is 0, `fmod(x, 0)` is a NaN. Whether that
+  field is ever 0 in practice is not established.
+- `0x1F25CD` is an unguarded `divss` by a table value in the same block. A zero divisor gives
+  an infinity, and `0 * inf` is a NaN.
+
+None of that is proof, and static analysis is not going to produce any. v0.31.0 takes the
+other route: the guard records the call stack the first three times it fires, which is the
+one moment the frames above the fault are still intact. A dump of the crash never had them -
+by then the code that made the NaN had returned.
+
 ## Next
 
 - [ ] **Collect.** Every report from here carries a stack. The `+0x11D753` work took one

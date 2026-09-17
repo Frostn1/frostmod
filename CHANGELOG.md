@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-09-16 — v0.28.0
+
+### Fixed
+- **One of the crashes to desktop is stopped.** MX Bikes closes a file handle it has already
+  closed, and the game goes down on the spot. FrostMod now catches that one case and lets the
+  game carry on, exactly as the game's own code does everywhere else it touches the same thing.
+
+### Added
+- **A crash to desktop now leaves a report.** When the game dies, the log gets the fault, the
+  call stack, and what was happening at the time: on track or in a menu, which track and
+  server, how many riders were in the session, and the last things that happened before it
+  went. A crash dump lands next to the log, and Settings > Send logs picks both up. Nothing is
+  sent anywhere on its own.
+
 ## 2026-09-16 — v0.27.0
 
 ### Fixed

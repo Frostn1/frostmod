@@ -45,6 +45,7 @@
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
+#include "crashreport.h"
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -177,88 +178,22 @@ void Log(const char* fmt, ...) {
 // adapter so serverfilter (which takes a plain void(*)(const char*)) logs here
 void SfLog(const char* msg) { Log("%s", msg); }
 
-// ---------------------------------------------------------------------------------
-// Last-chance crash reporting.
-//
-// Every FrostMod log written before this existed simply stopped mid-line when the game
-// died. The last entry was whatever happened to be flushed before the fault, which is
-// why a crash report could never say more than "it crashed" - the one question the log
-// exists to answer was the one thing it never recorded.
-//
-// Deliberately the *unhandled* filter rather than a vectored handler: this file, and the
-// game, both use SEH for control flow in places, and a first-chance hook would log every
-// one of those as though it were a crash.
-//
-// Two things it cannot promise, so neither is claimed anywhere in the log: a filter
-// installed after ours replaces it, and a stack overflow may leave too little stack to
-// run this at all. It costs nothing while the game is healthy and usually turns the last
-// moment into one line, which is a large improvement on nothing.
-static LPTOP_LEVEL_EXCEPTION_FILTER g_prevCrashFilter = nullptr;
+// Crash reports live in crashreport.h/.cpp: the trail of what happened, the session
+// context, the unwound stack and the minidump. This is the adapter that lets that
+// module write through our log, and the folder it puts dumps in (the log's own).
+void CrashLog(const char* msg) { Log("%s", msg); }
 
-static const char* ExceptionName(DWORD code) {
-    switch (code) {
-        case EXCEPTION_ACCESS_VIOLATION:         return "access violation";
-        case EXCEPTION_IN_PAGE_ERROR:            return "in-page error - a mapped file could not be read";
-        case EXCEPTION_STACK_OVERFLOW:           return "stack overflow";
-        case EXCEPTION_ILLEGAL_INSTRUCTION:      return "illegal instruction";
-        case EXCEPTION_PRIV_INSTRUCTION:         return "privileged instruction";
-        case EXCEPTION_INT_DIVIDE_BY_ZERO:       return "integer divide by zero";
-        case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "float divide by zero";
-        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return "array bounds exceeded";
-        case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "non-continuable exception";
-        case 0xC0000374:                         return "heap corruption";
-        case 0xC0000409:                         return "stack buffer overrun";
-        default:                                 return "unhandled exception";
+void InstallCrashReports() {
+    // Dumps only from the injected copy. Its folder is FrostMod's own, which is what
+    // MXB App's "Send logs" sweeps; the session plugin lives in the game's `plugins`
+    // folder, where a .dmp nobody collects is a file left on a player's disk for nothing.
+    // Its text report still goes to its own log.
+    char dir[MAX_PATH] = {0};
+    if (!g_sessionOnly && g_logPath[0]) {
+        strcpy_s(dir, g_logPath);
+        if (char* slash = strrchr(dir, '\\')) *slash = 0; else dir[0] = 0;
     }
-}
-
-// "module+0xRVA" for an address, so a faulting site is something that can be looked up in
-// a disassembler rather than a bare pointer that means nothing once ASLR has moved on.
-static void DescribeAddress(void* addr, char* out, size_t n) {
-    HMODULE mod = nullptr;
-    char name[MAX_PATH] = "";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)addr, &mod) &&
-        mod && GetModuleFileNameA(mod, name, sizeof(name))) {
-        const char* leaf = strrchr(name, '\\');
-        _snprintf_s(out, n, _TRUNCATE, "%s+0x%llX", leaf ? leaf + 1 : name,
-                    (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));
-    } else {
-        _snprintf_s(out, n, _TRUNCATE, "0x%016llX (no module)", (unsigned long long)(uintptr_t)addr);
-    }
-}
-
-static LONG WINAPI FrostCrashFilter(EXCEPTION_POINTERS* ep) {
-    if (ep && ep->ExceptionRecord) {
-        const EXCEPTION_RECORD* r = ep->ExceptionRecord;
-        char where[MAX_PATH + 64];
-        DescribeAddress(r->ExceptionAddress, where, sizeof(where));
-        Log("[crash] ***** %s (0x%08X) at %s *****",
-            ExceptionName(r->ExceptionCode), (unsigned)r->ExceptionCode, where);
-
-        // For these two the record carries what was being touched: parameter 0 is the
-        // kind of access, parameter 1 the address it was refused at.
-        if ((r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
-             r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && r->NumberParameters >= 2) {
-            const ULONG_PTR op = r->ExceptionInformation[0];
-            Log("[crash] while %s address 0x%016llX",
-                op == 0 ? "reading" : op == 1 ? "writing" : "executing",
-                (unsigned long long)r->ExceptionInformation[1]);
-            // An in-page error carries the filesystem's own status as a third parameter,
-            // and this is the shape a cloud-backed mods folder crashes in: the bytes were
-            // never on the disk and the fetch failed underneath a mapped read.
-            if (r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR && r->NumberParameters >= 3)
-                Log("[crash] the filesystem returned NTSTATUS 0x%08X for that page. If the mods "
-                    "folder is on OneDrive/Dropbox, the file is a placeholder rather than real "
-                    "bytes - right-click the folder and pick \"Always keep on this device\".",
-                    (unsigned)r->ExceptionInformation[2]);
-        }
-        Log("[crash] FrostMod v" FROSTMOD_VERSION " was loaded; the log ends here because the "
-            "game process is going down.");
-    }
-    // Chain rather than swallow: whatever reporting the game or Steam had set up still runs.
-    return g_prevCrashFilter ? g_prevCrashFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    frostmod::crash::Install(&CrashLog, dir[0] ? dir : nullptr, FROSTMOD_VERSION);
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,6 +1655,7 @@ void AdvanceReload() {
                 g_reloadStart + 1, g_game->reload_count, g_reloadStart);
         else
             Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
+        frostmod::crash::Note("content reload finished");
         SetStatus("reloaded - new mods listed", 4000);
     }
 }
@@ -1765,6 +1701,12 @@ void RequestReload() {
     // The thread id is still logged, but it is no longer the open question: a v0.12.0
     // reporter log has it matching the boot [capture] scan tid in all three sessions, so
     // we do replay on the thread that owns the content lists. The race theory is dead.
+    frostmod::crash::Note("content reload started (%d steps)", g_game->reload_count - first);
+    {
+        auto& ctx = frostmod::crash::TheContext();
+        ctx.reloads.fetch_add(1, std::memory_order_relaxed);
+        ctx.lastReloadMs.store(frostmod::crash::ElapsedMs(), std::memory_order_relaxed);
+    }
     Log("[reload] surgical content reload (%d step(s) from #%d, stepped over frames, tid=%lu)%s...",
         g_game->reload_count - first, first + 1, GetCurrentThreadId(),
         g_game->reload_verified ? "" : " [UNSAFE: unconfirmed table, armed by --unsafe-reload]");
@@ -1893,9 +1835,17 @@ static void RadAddEntry(const void* d, int size) {
     const auto* a = (const sdk::RaceAddEntry*)d;
     std::lock_guard<std::mutex> lk(g_radMutex);
     int i = RadFindEntry(a->m_iRaceNum);
+    // New to us, rather than the same rider's entry being restated: only the first is
+    // "someone joined", and the trail is 32 lines long - it cannot afford repeats.
+    const bool isNew = (i < 0);
     if (i < 0 && g_radNEntries < 64) { i = g_radNEntries++; g_radEntries[i].numLaps = 0; }
     if (i >= 0) { g_radEntries[i].raceNum = a->m_iRaceNum;
                   strncpy_s(g_radEntries[i].name, a->m_szName, _TRUNCATE); }
+    // The crashes this trail exists for are reported as worse on a full server, so how
+    // full it was getting is part of the report.
+    if (i >= 0 && isNew)
+        frostmod::crash::Note("rider #%d joined (%d in the session)",
+                              a->m_iRaceNum, g_radNEntries);
 }
 static void RadRemoveEntry(const void* d, int size) {
     if (!d || size < (int)sizeof(int)) return;
@@ -1903,6 +1853,8 @@ static void RadRemoveEntry(const void* d, int size) {
     std::lock_guard<std::mutex> lk(g_radMutex);
     int i = RadFindEntry(raceNum);
     if (i >= 0) g_radEntries[i] = g_radEntries[--g_radNEntries];
+    if (i >= 0) frostmod::crash::Note("rider #%d left (%d in the session)",
+                                      raceNum, g_radNEntries);
 }
 // GP Bikes and Kart Racing Pro carry an m_fBestSpeed that MX Bikes does not, so both the
 // element size and where m_iNumLaps sits inside it are per-title (see pluginsdk.h). Read
@@ -3080,11 +3032,66 @@ void MenuAction(int d) {
     //   DumpTrackList()                  - track list -> log   OpenDirectConnect() - direct connect
 }
 
+// Crash context for the INJECTED copy, out of the plugin copy's block.
+//
+// The two copies are separate modules with separate statics, and the split runs straight
+// through a crash report: the plugin copy is the one the game hands EventInit and Draw to,
+// so it knows the track, the server and who is on the grid - and the injected copy is the
+// one with the hooks, the guard and, for every fault inside them, the filter. Left alone,
+// the injected copy's report would say "in the menus" for a rider halfway round a lap.
+//
+// The plugin copy already publishes all of it for MXB App. This reads that same block, with
+// the same seqlock any other reader uses, and keeps the injected copy's report honest. A
+// failed read is ordinary and simply means the last good answer stands.
+static void MirrorPluginSession() {
+    static volatile frostmod::session::Block* live = nullptr;
+    static bool gaveUp = false;
+    if (gaveUp) return;
+    if (!live) {
+        HANDLE h = OpenFileMappingA(FILE_MAP_READ, FALSE, frostmod::session::kPluginMappingName);
+        if (!h) return;   // the plugin copy is not loaded yet, or not installed at all
+        void* view = MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(frostmod::session::Block));
+        CloseHandle(h);   // the view keeps the mapping alive
+        if (!view) { gaveUp = true; return; }
+        live = (volatile frostmod::session::Block*)view;
+        Log("[crash] session context is mirrored from the plugin copy - a crash report from "
+            "this copy can say where the rider was.");
+    }
+    frostmod::session::Block copy;
+    if (!frostmod::session::TryRead(*live, copy)) return;   // mid-write; next second will do
+    auto& ctx = frostmod::crash::TheContext();
+    ctx.SetTrack(copy.trackId);
+    ctx.SetServer(copy.serverName);
+    ctx.SetRider(copy.riderName);
+    ctx.riders.store(copy.riderCount > 0 ? copy.riderCount : -1, std::memory_order_relaxed);
+    ctx.inSession.store(copy.trackId[0] != 0, std::memory_order_relaxed);
+}
+
 void Tick() {
     // Heartbeat: proves the render hook fires. No [tick] line in the log => the game
     // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
     static bool firstFrame = true;
     if (firstFrame) { firstFrame = false; Log("[tick] render hook alive - first frame presented"); }
+
+    // Once a second: take the top of the exception-filter chain back if something
+    // installed over us (a crash after that point would otherwise go unreported), and
+    // refresh the rider count a crash report quotes. Both are a handful of instructions;
+    // neither belongs on every frame.
+    {
+        static uint64_t nextCrashPoll = 0;
+        const uint64_t nowMs = GetTickCount64();
+        if (nowMs >= nextCrashPoll) {
+            nextCrashPoll = nowMs + 1000;
+            frostmod::crash::Rearm();
+            int n;
+            { std::lock_guard<std::mutex> lk(g_radMutex); n = g_radN; }
+            if (n > 0)
+                frostmod::crash::TheContext().riders.store(n, std::memory_order_relaxed);
+            // This copy gets no plugin callbacks, so the grid, the track and the server
+            // come from the copy that does.
+            MirrorPluginSession();
+        }
+    }
 
     // MXB App polls the shared block; publishing here keeps it at frame rate rather than
     // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
@@ -3885,6 +3892,103 @@ bool InstallHook(void* target, void* detour, void** original, const char* name) 
     return true;
 }
 
+// ===========================================================================
+// GHS CLOSE GUARD  -  the one crash-to-desktop we can stop from in here
+//
+// A player's own crash line pinned it: closing an already-closed GHS handle is a
+// null deref in mxbikes.exe and the game goes to desktop. offsets.h carries the
+// derivation and, more to the point, the evidence that it is an oversight - the
+// sibling function one along guards the identical read and returns instead.
+//
+// So this does what the sibling does. A handle naming a slot that holds nothing
+// returns 1, the answer the function already gives for a handle out of range;
+// anything else goes straight to the game's own code, untouched. A working close
+// is unaffected and there is no state of ours to get wrong.
+//
+// Two conditions before a byte is written: the 27-byte signature must match, and
+// the table decoded from the function's own `lea` must land inside the module. If
+// either fails the guard stays off and says so - a detour at a wrong address is a
+// jmp spliced into whatever happens to live there, which is how you turn one
+// crash into a worse one.
+// ===========================================================================
+using GhsCloseFn = int (*)(unsigned);
+static GhsCloseFn g_origGhsClose = nullptr;
+static void**     g_ghsTable = nullptr;         // decoded from the lea, never from an RVA
+static std::atomic<unsigned> g_ghsGuarded{0};   // crashes prevented, for the log
+
+// SEH needs its own frame, and this one has no C++ objects in it on purpose.
+static bool GhsSlotEmpty(void** table, unsigned idx) {
+    __try { return table[idx] == nullptr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static int hkGhsClose(unsigned handle) {
+    const unsigned idx = handle - 1;            // the function's own `dec ecx`
+    if (g_ghsTable && idx < (unsigned)mxb::GHS_SLOTS && GhsSlotEmpty(g_ghsTable, idx)) {
+        const unsigned n = g_ghsGuarded.fetch_add(1, std::memory_order_relaxed) + 1;
+        // The first few only: if something closes handles in a loop, this must not
+        // become the thing that fills the disk.
+        if (n <= 5)
+            Log("[ghs] guarded a close of handle %u whose slot is already empty - this is "
+                "the crash at mxbikes.exe+0x11D753. Prevented %u so far.", handle, n);
+        frostmod::crash::Note("guarded a double close of GHS handle %u", handle);
+        return 1;   // the game's own answer for a handle that names no slot
+    }
+    return g_origGhsClose(handle);
+}
+
+// Verify, decode, hook. MX Bikes only: both the RVA and the signature are mxbikes.exe's.
+static void InstallGhsGuard(intptr_t delta) {
+    if (!g_game->offsets_complete) {
+        Log("[ghs] guard off for %s - the close function is MX Bikes' and has no twin here.",
+            g_game->display);
+        return;
+    }
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[ghs] guard off: can't read the module's sections to place it.");
+        return;
+    }
+    uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_GHS_CLOSE + delta);
+    if (fn < begin || fn >= end || !MatchAt(fn, mxb::SIG_GHS_CLOSE, mxb::SIG_GHS_CLOSE_MASK)) {
+        uint8_t* found = PatternScan(begin, end, mxb::SIG_GHS_CLOSE, mxb::SIG_GHS_CLOSE_MASK);
+        if (!found) {
+            Log("[ghs] guard off: the close signature is not in this build's .text. If the "
+                "game updated, re-derive RVA_GHS_CLOSE before trusting the old address.");
+            return;
+        }
+        Log("[ghs] close RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
+            (size_t)(found - g_base), (size_t)mxb::RVA_GHS_CLOSE);
+        fn = found;
+    }
+
+    // The slot table from the function's own RIP-relative lea: a .data RVA does not move
+    // by the .text delta, so decoding is the only way to still be right after an update.
+    const int32_t disp = *(const int32_t*)(fn + mxb::GHS_LEA_DISP_OFF);
+    uint8_t* table = fn + mxb::GHS_LEA_END_OFF + disp;
+    auto* dos = (IMAGE_DOS_HEADER*)g_base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
+    uint8_t* imageEnd = (uint8_t*)g_base + nt->OptionalHeader.SizeOfImage;
+    if (table < (uint8_t*)g_base || table + mxb::GHS_SLOTS * sizeof(void*) > imageEnd) {
+        Log("[ghs] guard off: the decoded slot table (RVA 0x%zx) is outside the module.",
+            (size_t)(table - g_base));
+        return;
+    }
+    if ((size_t)(table - g_base) != mxb::RVA_GHS_TABLE)
+        Log("[ghs] NOTE: the slot table decoded to RVA 0x%zx, not the 0x%zx beta21e had. "
+            "The decode wins - it came from the instruction we are guarding.",
+            (size_t)(table - g_base), (size_t)mxb::RVA_GHS_TABLE);
+
+    g_ghsTable = (void**)table;
+    if (!InstallHook(fn, (void*)&hkGhsClose, (void**)&g_origGhsClose, "ghsClose(0x11d730)")) {
+        g_ghsTable = nullptr;
+        return;
+    }
+    Log("[ghs] close guard live @ RVA 0x%zx, slots @ RVA 0x%zx. A double close now returns "
+        "instead of taking the game down.",
+        (size_t)(fn - g_base), (size_t)(table - g_base));
+}
+
 DWORD WINAPI Init(LPVOID) {
     // __DATE__/__TIME__ = when THIS dll was compiled. If this timestamp isn't
     // recent, you're running a stale frostmod.dll (rebuild failed to overwrite it,
@@ -3893,7 +3997,8 @@ DWORD WINAPI Init(LPVOID) {
 
     // Before anything else that could fault, so a crash during our own setup is reported
     // rather than being another log that simply stops.
-    g_prevCrashFilter = SetUnhandledExceptionFilter(FrostCrashFilter);
+    InstallCrashReports();
+    frostmod::crash::Note("FrostMod v" FROSTMOD_VERSION " loaded");
 
     LogHostGame();
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // the game exe
@@ -3969,6 +4074,9 @@ DWORD WINAPI Init(LPVOID) {
                     "(unverified - it has no signature).",
                     (long long)delta, (size_t)(resetAddr - g_base));
             InstallHook((void*)resetAddr, &hkReset, (void**)&g_origReset, "registryReset");
+            // Unlike registryReset this one verifies itself before it writes, so it takes
+            // the delta as a starting point rather than as a promise.
+            InstallGhsGuard(delta);
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);
@@ -4407,6 +4515,11 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         FROSTMOD_VERSION, g_sessionOnly ? " [session only: no hooks, no overlay]" : "",
         g_savePath[0] ? g_savePath : "<null>");
     if (g_sessionOnly) {
+        // This copy never runs Init, so it would otherwise have no crash filter at all -
+        // and it is the copy the game delivers the event callbacks to, which makes it the
+        // one that knows where the rider was. Its report goes to its own log.
+        InstallCrashReports();
+        frostmod::crash::Note("session plugin loaded");
         // Mapped here rather than in DllMain: it only has to exist before the first
         // `EventInit`, and the loader lock is not the place to be creating one.
         Log("[session] %s", SessionInit()
@@ -4439,6 +4552,13 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
         return;
     }
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    // The one signal that says where the player was when the game died: the game only
+    // calls Draw() on track, spectating or in a replay, and it hands us which.
+    {
+        auto& ctx = frostmod::crash::TheContext();
+        ctx.where.store(_iState, std::memory_order_relaxed);
+        ctx.lastDrawMs.store(frostmod::crash::ElapsedMs(), std::memory_order_relaxed);
+    }
     BuildOverlayDrawLists();
     if (_piNumQuads)  *_piNumQuads  = g_nDrawQuads;
     if (_ppQuad)      *_ppQuad      = g_drawQuads;
@@ -4532,9 +4652,26 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     Log("[session] rider='%s' server='%s' track='%s' guid=%s",
         rider, server[0] ? server : "<none in this title's event>", track,
         guid[0] ? "yes" : "no");
+    {
+        auto& ctx = frostmod::crash::TheContext();
+        ctx.SetTrack(track);
+        ctx.SetServer(server);
+        ctx.SetRider(rider);
+        ctx.inSession.store(true, std::memory_order_relaxed);
+    }
+    frostmod::crash::Note("event opened: track='%s' server='%s'", track,
+                          server[0] ? server : "<none>");
 }
 __declspec(dllexport) void EventDeinit() {
     Log("[session] event closed");
+    frostmod::crash::Note("event closed");
+    {
+        auto& ctx = frostmod::crash::TheContext();
+        ctx.SetTrack(""); ctx.SetServer("");
+        ctx.where.store((int)frostmod::crash::Where::Unknown, std::memory_order_relaxed);
+        ctx.riders.store(-1, std::memory_order_relaxed);
+        ctx.inSession.store(false, std::memory_order_relaxed);
+    }
     SessionClear();
 }
 // On MX Bikes this is kept for the track half only: a server on a rotation changes track
@@ -4561,8 +4698,15 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     }
     if (takeServerName) Log("[session] server='%s' (from RaceEvent), track now '%s'", name, track);
     else                Log("[session] track now '%s'", track);
+    frostmod::crash::TheContext().SetTrack(track);
+    if (takeServerName) frostmod::crash::TheContext().SetServer(name);
+    frostmod::crash::Note("track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { if (!g_sessionOnly) RadResetRace(); }
+__declspec(dllexport) void RaceSession(void*, int)  {
+    if (g_sessionOnly) return;
+    frostmod::crash::Note("session changed (practice/qualify/race)");
+    RadResetRace();
+}
 __declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly) RadResetRace(); }
 
 } // extern "C"

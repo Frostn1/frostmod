@@ -206,7 +206,50 @@ static void krp_is_plugin_only_until_its_offsets_are_derived() {
     CHECK(!GAME_KRP.offsets_complete, "Kart Racing Pro's offsets are not complete");
 }
 
+// The GHS close guard writes a detour into the game from constants in offsets.h, and it
+// decodes a pointer out of the bytes those constants describe. Everything about that has
+// to agree with itself or the guard points somewhere arbitrary - which is a worse crash
+// than the one it exists to stop. These are the invariants the code assumes and cannot
+// check for itself at runtime.
+static void ghs_guard_constants_agree() {
+    const size_t sigLen  = sizeof(mxb::SIG_GHS_CLOSE) - 1;       // minus the NUL
+    const size_t maskLen = sizeof(mxb::SIG_GHS_CLOSE_MASK) - 1;
+    CHECK(sigLen == maskLen,
+          "the signature is %zu bytes and its mask covers %zu", sigLen, maskLen);
+
+    // The wildcards are the lea's disp32 and nothing else: the fixed run must end exactly
+    // where the disp starts, and the disp must be the last four bytes of the pattern.
+    size_t fixed = 0;
+    while (fixed < maskLen && mxb::SIG_GHS_CLOSE_MASK[fixed] == 'x') ++fixed;
+    CHECK(fixed == mxb::GHS_LEA_DISP_OFF,
+          "the fixed bytes run to %zu but the disp32 is said to start at 0x%zx",
+          fixed, mxb::GHS_LEA_DISP_OFF);
+    for (size_t i = fixed; i < maskLen; ++i)
+        CHECK(mxb::SIG_GHS_CLOSE_MASK[i] == '?', "mask byte %zu after the fixed run is not a wildcard", i);
+    CHECK(maskLen - fixed == 4, "a disp32 is 4 bytes; the mask wildcards %zu", maskLen - fixed);
+
+    // RIP-relative: the displacement is added to the address of the NEXT instruction.
+    CHECK(mxb::GHS_LEA_END_OFF == mxb::GHS_LEA_DISP_OFF + 4,
+          "the lea ends at 0x%zx, which is not its disp32 (0x%zx) plus four",
+          mxb::GHS_LEA_END_OFF, mxb::GHS_LEA_DISP_OFF);
+
+    // `dec ecx; cmp ecx,9; ja` - ten slots, and the signature must carry that compare or
+    // the guard's own range check is asserting something the code doesn't do.
+    CHECK(mxb::GHS_SLOTS == 10, "the pool is ten slots, not %d", mxb::GHS_SLOTS);
+    CHECK((unsigned char)mxb::SIG_GHS_CLOSE[6] == 0x83 &&
+          (unsigned char)mxb::SIG_GHS_CLOSE[7] == 0xF9 &&
+          (unsigned char)mxb::SIG_GHS_CLOSE[8] == (unsigned char)(mxb::GHS_SLOTS - 1),
+          "the signature's `cmp ecx,%d` does not match GHS_SLOTS", mxb::GHS_SLOTS - 1);
+
+    // Both RVAs are MX Bikes': they must sit inside the module the guard is placed in,
+    // and the close must be in code while the table is not.
+    CHECK(mxb::RVA_GHS_CLOSE > 0 && mxb::RVA_GHS_CLOSE < mxb::RVA_GHS_TABLE,
+          "the close (0x%zx) should be in .text, well below the table (0x%zx)",
+          mxb::RVA_GHS_CLOSE, mxb::RVA_GHS_TABLE);
+}
+
 int main() {
+    ghs_guard_constants_agree();
     mx_table_is_unchanged();
     gp_table_is_all_self_contained();
     unconfirmed_tables_label_every_step();

@@ -169,6 +169,36 @@ constexpr uintptr_t RVA_MP_READ_INIT     = 0x2835A0; // reader: init
 constexpr uintptr_t RVA_MP_READ_U32      = 0x283490; // reader: read_u32
 constexpr uintptr_t RVA_MP_READ_STR      = 0x283800; // reader: read_str (inline NUL/\n-terminated)
 
+// ---- world session: the browser's own master login (RE'd 2026-09-16) ---------
+// What actually prints "connection timeout". One global state machine drives the in-game
+// browser's master connection; the idd_worldconnection dialog opens it through the command
+// bus, polls it, and labels itself from what the poll says:
+//
+//   0x2A66F0 (bus 0x380) open in BROWSE mode - NO call site anywhere in the exe. The
+//                        public master ignores a bare GETLIST, so the game never uses it.
+//   0x2A7860 (bus 0x381) open in LOGIN mode  - the Steam-ticket login; what the browser
+//                        actually calls, from 0x0ADDCD and 0x0EC03C.
+//   0x2A79A0 (bus 0x382) poll -> (state, reason, text) for the dialog at 0x0AEA70.
+//   0x2A7A10 (bus 0x386) LOGOUT + closesocket + free the record buffer + zero the block.
+//
+// Both openers begin `if (state > 1) return 1` (0x2A66FB, 0x2A789B) - while a session is
+// live they send nothing at all. The login timeout at 0x2A727A trips at 0x1388 ms and puts
+// the state back to 1 with reason 0; reason 0 with a finished state is exactly the
+// cc_timeout the dialog prints at 0x0AEB86. So "connection timeout" means one specific
+// thing: the master did not answer the LOGIN inside five seconds. A refusal takes the other
+// path (0x2A6A14, reason 1) and shows the master's own words instead.
+//
+// 0x386 is the ONLY teardown - nothing else closes that socket, and it only bothers to send
+// LOGOUT at state >= 4.
+constexpr uintptr_t RVA_WORLD_STATE  = 0x3D7900; // 0 closed /1 idle /2 login sent /3 browse /4 in
+constexpr uintptr_t RVA_WORLD_REASON = 0x3D7E6C; // 0 = nothing came back, 1 = the master spoke
+// The source port the master socket binds (read as a u16 at 0x2A6716 / 0x2A78AB, written as
+// a dword by the setter at 0x2A66E0). It lives OUTSIDE the 0x5D8 block 0x386 zeroes, so a
+// teardown alone rebinds the same port; 0 reaches bind() unchecked and means "any".
+constexpr uintptr_t RVA_WORLD_PORT   = 0x3D78F0;
+constexpr int       CMD_WORLD_CLOSE  = 0x386;    // bus cmd: LOGOUT, close, free, zero
+constexpr int       WORLD_STATE_MAX  = 4;        // a read above this means the offset is wrong
+
 // ---- server browser UI state (.data) ----
 constexpr uintptr_t RVA_SB_CONNECTED_FLAG = 0x4C8F20; // master/list ready (0/1)
 constexpr uintptr_t RVA_SB_FILTER_FLAGS   = 0x4C8F44; // bit0 hide-empty, bit1 hide-full

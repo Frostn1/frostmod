@@ -2045,6 +2045,29 @@ using glLoadMatrixf_t = void (WINAPI*)(const GLfloat*);
 static glMatrixMode_t  g_origGlMatrixMode  = nullptr;
 static glLoadMatrixf_t g_origGlLoadMatrixf = nullptr;
 
+// The rest of the fixed-function matrix surface, hooked for the diagnostic only.
+//
+// The capture below has never once seen a perspective projection: five sessions of reporter
+// logs across three GPUs hold 18,081 loadMatrix lines and not a single persp=1, so `g_vp` is
+// never composed and the outline has always fallen back to arrows. Two holes in the evidence
+// are worth closing before concluding the game keeps its camera somewhere we can't reach.
+//
+// The first is WHEN: the dump is armed from the first presented frame, which is the main menu.
+// A menu that draws in ortho says nothing about the pass that draws the track.
+//
+// The second is WHAT: only glLoadMatrixf was ever watched. An engine that sets its projection
+// with glFrustum, or builds it with glMultMatrixf, or uploads row-major with
+// glLoadTransposeMatrixf, is completely invisible to that one hook — and that is a far cheaper
+// explanation for a silent capture than "it is all shaders".
+using glMultMatrixf_t          = void (WINAPI*)(const GLfloat*);
+using glLoadTransposeMatrixf_t = void (WINAPI*)(const GLfloat*);
+using glFrustum_t              = void (WINAPI*)(double, double, double, double, double, double);
+using glGetFloatv_t            = void (WINAPI*)(GLenum, GLfloat*);
+static glMultMatrixf_t          g_origGlMultMatrixf          = nullptr;
+static glLoadTransposeMatrixf_t g_origGlLoadTransposeMatrixf = nullptr;
+static glFrustum_t              g_origGlFrustum              = nullptr;
+static glGetFloatv_t            g_pGlGetFloatv               = nullptr;
+
 static std::atomic<bool> g_inOverlay{false};
 static std::atomic<bool> g_vpValid{false};
 static std::atomic<int>  g_glDiag{0};          // >0 => log the next N matrix loads once
@@ -2063,16 +2086,48 @@ static void MatMul16(const float* a, const float* b, float* o) {   // o = a*b, c
         }
 }
 void WINAPI hkGlMatrixMode(GLenum mode) { g_glMode = mode; g_origGlMatrixMode(mode); }
+
+/// One line per matrix seen while the diagnostic is armed, whichever call carried it.
+static void DiagMatrix(const char* via, const GLfloat* m) {
+    const int left = g_glDiag.load(std::memory_order_relaxed);
+    if (left <= 0 || !m) return;
+    Log("[esp/diag] %s mode=0x%X persp=%d m11=%.3f m15=%.3f", via, g_glMode, (int)IsPerspectiveProj(m),
+        m[11], m[15]);
+    g_glDiag.store(left - 1, std::memory_order_relaxed);
+}
+
+void WINAPI hkGlMultMatrixf(const GLfloat* m) {
+    DiagMatrix("multMatrix", m);
+    g_origGlMultMatrixf(m);
+}
+void WINAPI hkGlLoadTransposeMatrixf(const GLfloat* m) {
+    // Row-major, so the perspective row sits where the test doesn't look; logged raw and read
+    // by eye rather than run through IsPerspectiveProj, which would always say no.
+    const int left = g_glDiag.load(std::memory_order_relaxed);
+    if (left > 0 && m) {
+        Log("[esp/diag] loadTranspose mode=0x%X m3=%.3f m7=%.3f m11=%.3f m15=%.3f", g_glMode, m[3], m[7],
+            m[11], m[15]);
+        g_glDiag.store(left - 1, std::memory_order_relaxed);
+    }
+    g_origGlLoadTransposeMatrixf(m);
+}
+void WINAPI hkGlFrustum(double l, double r, double b, double t, double n, double f) {
+    // A projection built here never passes through glLoadMatrixf at all, so the capture would
+    // never see it however long it watched.
+    const int left = g_glDiag.load(std::memory_order_relaxed);
+    if (left > 0) {
+        Log("[esp/diag] glFrustum mode=0x%X l=%.3f r=%.3f b=%.3f t=%.3f near=%.3f far=%.1f", g_glMode, l,
+            r, b, t, n, f);
+        g_glDiag.store(left - 1, std::memory_order_relaxed);
+    }
+    g_origGlFrustum(l, r, b, t, n, f);
+}
 void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
     // glLoadMatrixf is hot; only do capture work when the outline feature (or the
     // one-shot diagnostic) actually needs it. Otherwise this is a cheap passthrough.
     if (m && !g_inOverlay.load(std::memory_order_relaxed)
         && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed))) {
-        if (int d = g_glDiag.load(std::memory_order_relaxed)) {
-            Log("[esp/diag] loadMatrix mode=0x%X persp=%d m11=%.3f m15=%.3f",
-                g_glMode, (int)IsPerspectiveProj(m), m[11], m[15]);
-            g_glDiag.store(d - 1, std::memory_order_relaxed);
-        }
+        DiagMatrix("loadMatrix", m);
         if (g_glMode == GL_PROJECTION && IsPerspectiveProj(m)) {
             memcpy(g_capProj, m, sizeof(g_capProj)); g_projPrimed = true;
         } else if (g_glMode == GL_MODELVIEW && g_projPrimed) {
@@ -2081,6 +2136,29 @@ void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
         }
     }
     g_origGlLoadMatrixf(m);
+}
+
+/// What the matrix state is at the moment the plugin is asked to draw, and then a window on
+/// the calls around it.
+///
+/// Two answers in one: the projection read here settles whether a plugin could ever take the
+/// camera by reading current state (if it is ortho, it could not, and no amount of care with
+/// glGetFloatv changes that), and arming the dump from here puts the next few hundred matrix
+/// calls in the log with the track on screen rather than the menu.
+static void DiagOnTrackOnce() {
+    if (g_pGlGetFloatv) {
+        GLfloat proj[16] = {0}, view[16] = {0};
+        g_pGlGetFloatv(GL_PROJECTION_MATRIX, proj);
+        g_pGlGetFloatv(GL_MODELVIEW_MATRIX, view);
+        Log("[esp/diag] on track: Draw() projection persp=%d m11=%.3f m15=%.3f", (int)IsPerspectiveProj(proj),
+            proj[11], proj[15]);
+        Log("[esp/diag] on track: Draw() modelview m12=%.2f m13=%.2f m14=%.2f m15=%.3f", view[12], view[13],
+            view[14], view[15]);
+    } else {
+        Log("[esp/diag] on track: no glGetFloatv, so the state at Draw() can't be read");
+    }
+    g_glDiag.store(400, std::memory_order_relaxed);
+    Log("[esp/diag] on track: watching the next 400 matrix calls");
 }
 
 // Raw projection through the captured VP (no validity gate). *sx,*sy = normalized
@@ -4273,6 +4351,20 @@ DWORD WINAPI Init(LPVOID) {
             InstallHook((void*)p, &hkGlMatrixMode,  (void**)&g_origGlMatrixMode,  "opengl32!glMatrixMode");
         if (auto p = GetProcAddress(gl, "glLoadMatrixf"))
             InstallHook((void*)p, &hkGlLoadMatrixf, (void**)&g_origGlLoadMatrixf, "opengl32!glLoadMatrixf");
+        // The rest of the matrix surface, for the on-track diagnostic: a projection set with
+        // glFrustum, built with glMultMatrixf, or uploaded row-major never reaches the capture
+        // above, so its silence would prove nothing about the engine.
+        if (auto p = GetProcAddress(gl, "glMultMatrixf"))
+            InstallHook((void*)p, &hkGlMultMatrixf, (void**)&g_origGlMultMatrixf, "opengl32!glMultMatrixf");
+        if (auto p = GetProcAddress(gl, "glLoadTransposeMatrixf"))
+            InstallHook((void*)p, &hkGlLoadTransposeMatrixf, (void**)&g_origGlLoadTransposeMatrixf,
+                        "opengl32!glLoadTransposeMatrixf");
+        if (auto p = GetProcAddress(gl, "glFrustum"))
+            InstallHook((void*)p, &hkGlFrustum, (void**)&g_origGlFrustum, "opengl32!glFrustum");
+        // Read, never hooked: what the matrix state actually is when the plugin is asked to
+        // draw. If the projection there is ortho, reading it in Draw can never give a camera,
+        // which retires that idea with a measurement instead of an argument.
+        g_pGlGetFloatv = (glGetFloatv_t)GetProcAddress(gl, "glGetFloatv");
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
     }
@@ -4652,6 +4744,17 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
         return;
     }
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    // The diagnostic that matters, armed the first time the plugin is asked to draw ON TRACK.
+    // The existing one arms at the first presented frame, which is the main menu — and a menu
+    // drawing in ortho says nothing about the pass that draws the track. This is the gap that
+    // has kept the question open.
+    if (_iState == 0) {
+        static bool armed = false;
+        if (!armed) {
+            armed = true;
+            DiagOnTrackOnce();
+        }
+    }
     // The one signal that says where the player was when the game died: the game only
     // calls Draw() on track, spectating or in a replay, and it hands us which.
     {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-17 — v0.33.0
+
+### Changed
+- The log records what the game's drawing looks like from inside, the first time you go out on
+  track. This is groundwork for drawing a line on the ground ahead of you, which needs to know
+  where the camera is — something we have never been able to read, and until now had only
+  looked for while sitting in the menu. Nothing is drawn differently; it writes a few hundred
+  lines to the log once per run and stops.
+
 ## 2026-09-17 — v0.32.0
 
 ### Changed

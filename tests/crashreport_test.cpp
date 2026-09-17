@@ -190,7 +190,136 @@ static void ClockSkewDoesNotPrintNonsense() {
               "no underflowed duration in: %s", l.c_str());
 }
 
+// ---- the JSON sidecar -------------------------------------------------------
+// This one is read by a machine, not a person, so the bar is different: it has to stay
+// parseable whatever the game hands us. Rider names and server names come off a server and
+// are attacker-controlled text.
+
+static std::string Joined(const std::vector<std::string>& lines) {
+    std::string all;
+    for (const auto& l : lines) { all += l; all += "\n"; }
+    return all;
+}
+
+// A structural check, not a parser: quotes open and close, braces and brackets balance,
+// and nothing raw and unescaped is sitting inside a string.
+static bool LooksLikeJson(const std::string& text) {
+    int braces = 0, brackets = 0;
+    bool inString = false, escaped = false;
+    for (char c : text) {
+        if (inString) {
+            if (escaped) { escaped = false; continue; }
+            if (c == '\\') { escaped = true; continue; }
+            if (c == '"') { inString = false; continue; }
+            if ((unsigned char)c < 0x20) return false;   // raw control byte in a string
+            continue;
+        }
+        if (c == '"') inString = true;
+        else if (c == '{') ++braces;
+        else if (c == '}') --braces;
+        else if (c == '[') ++brackets;
+        else if (c == ']') --brackets;
+        if (braces < 0 || brackets < 0) return false;
+    }
+    return !inString && braces == 0 && brackets == 0;
+}
+
+static void EscapeKeepsItParseable() {
+    char out[128];
+    Escape("plain", out, sizeof(out));
+    CHECK(std::strcmp(out, "plain") == 0, "plain text is untouched, got '%s'", out);
+
+    Escape("say \"hi\"", out, sizeof(out));
+    CHECK(std::strcmp(out, "say \\\"hi\\\"") == 0, "quotes are escaped, got '%s'", out);
+
+    Escape("C:\\mods", out, sizeof(out));
+    CHECK(std::strcmp(out, "C:\\\\mods") == 0, "backslashes are escaped, got '%s'", out);
+
+    Escape("two\nlines", out, sizeof(out));
+    CHECK(std::strcmp(out, "two\\nlines") == 0, "newlines are escaped, got '%s'", out);
+
+    char bell[] = {'a', 0x07, 'b', 0};
+    Escape(bell, out, sizeof(out));
+    CHECK(std::strcmp(out, "a\\u0007b") == 0, "control bytes go out as \\u, got '%s'", out);
+
+    // Truncation must not cut an escape in half, which would leave a dangling backslash
+    // and take the rest of the document with it.
+    char tiny[6];
+    Escape("\"\"\"\"", tiny, sizeof(tiny));
+    CHECK(std::strlen(tiny) % 2 == 0, "a truncated escape is dropped whole, got '%s'", tiny);
+    CHECK(LooksLikeJson(std::string("\"") + tiny + "\""), "and what is left still parses");
+}
+
+static void SidecarCarriesTheFacts() {
+    Fault f;
+    f.kind = "access violation";
+    f.code = 0xC0000005;
+    f.site = "mxbikes.exe+0x11D753";
+    f.access = "reading";
+    f.target = 0x10;
+    f.haveTarget = true;
+    f.version = "0.29.0";
+    f.game = "mxbikes.exe";
+    f.whenUtc = "2026-09-16T13:59:29Z";
+    f.dumpFile = "frostmod-crash-20260916-145929.dmp";
+    f.uptimeMs = 2'400'000;
+
+    Context ctx;
+    ctx.where.store((int)Where::OnTrack);
+    ctx.inSession.store(true);
+    ctx.riders.store(17);
+    ctx.lastDrawMs.store(9'000);
+    ctx.SetTrack("Northgate Raceway");
+    // The name a server handed us, containing the two characters that end a JSON document.
+    ctx.SetServer("the \"best\" server\\");
+    ctx.SetRider("Frost");
+
+    Trail t;
+    t.Add(8'500, "rider #14 joined (17 in the session)");
+    const char* frames[] = { "mxbikes.exe+0x11D753", "mxbikes.exe+0x12782D", "frostmod.dll+0x9A1" };
+
+    std::vector<std::string> out;
+    WriteJson(f, ctx, t, frames, 3, /*nowMs=*/10'000, &Collect, &out);
+    const std::string all = Joined(out);
+
+    CHECK(LooksLikeJson(all), "the sidecar is structurally JSON");
+    CHECK(all.find("\"site\": \"mxbikes.exe+0x11D753\"") != std::string::npos,
+          "the crash site is the key everything groups by, and it is in there");
+    CHECK(all.find("\"code\": \"0xC0000005\"") != std::string::npos, "the exception code is there");
+    CHECK(all.find("\"target\": \"0x0000000000000010\"") != std::string::npos,
+          "and the address it was refused at");
+    CHECK(all.find("\"mxbikes.exe+0x12782D\"") != std::string::npos, "the caller is in the frames");
+    CHECK(all.find("\"riders\": 17") != std::string::npos, "the grid size travels with it");
+    CHECK(all.find("\"sinceFrameMs\": 1000") != std::string::npos, "so does the time since a frame");
+    CHECK(all.find("rider #14 joined") != std::string::npos, "and the trail");
+    CHECK(all.find("the \\\"best\\\" server\\\\") != std::string::npos,
+          "a hostile server name is escaped rather than dropped");
+}
+
+// Absent and zero are different answers, and a dashboard that cannot tell them apart will
+// draw conclusions from the wrong one.
+static void SidecarSaysNullWhenItDoesNotKnow() {
+    Fault f;
+    f.kind = "unhandled exception";
+    f.site = "mxbikes.exe+0x1";
+    Context ctx;    // nothing known
+    Trail t;
+    std::vector<std::string> out;
+    WriteJson(f, ctx, t, nullptr, 0, /*nowMs=*/1'000, &Collect, &out);
+    const std::string all = Joined(out);
+
+    CHECK(LooksLikeJson(all), "an empty report is still JSON");
+    CHECK(all.find("\"target\": null") != std::string::npos, "no faulting address means null");
+    CHECK(all.find("\"riders\": null") != std::string::npos, "no grid means null, not 0");
+    CHECK(all.find("\"sinceFrameMs\": null") != std::string::npos, "no frame drawn means null");
+    CHECK(all.find("\"sinceReloadMs\": null") != std::string::npos, "no reload means null");
+    CHECK(all.find("\"frames\": [") != std::string::npos, "an empty frame list is still a list");
+}
+
 int main() {
+    EscapeKeepsItParseable();
+    SidecarCarriesTheFacts();
+    SidecarSaysNullWhenItDoesNotKnow();
     TrailKeepsTheNewest();
     ReportSaysWhereTheyWere();
     ASessionWithoutFramesIsNotTheMenus();

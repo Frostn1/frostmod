@@ -225,6 +225,164 @@ inline void WriteContext(const Context& ctx, const Trail& trail,
 }
 
 // ---------------------------------------------------------------------------
+// The same report, as JSON, for the machine that reads it.
+//
+// The text report above is for whoever opens the log. This is the one MXB App picks up
+// and posts to the diagnostics endpoint, so crash sites can be counted across everyone
+// rather than read one bundle at a time. Same facts, no prose.
+//
+// Written by hand rather than with a library because it is nine fields and the alternative
+// is a dependency in a DLL that has to survive being loaded into somebody else's process.
+// Everything that goes in is escaped through Escape(), including the strings that came off
+// a server: a rider name is attacker-controlled text and a report that broke the parser
+// would be a report nobody reads.
+//
+// Pure, like the layout above, and tested the same way.
+// ---------------------------------------------------------------------------
+
+/// JSON string body (no quotes) for `in`, truncated to fit `n`. Control characters go out
+/// as \uXXXX, which keeps a name with a stray newline in it from ending the line.
+inline void Escape(const char* in, char* out, size_t n) {
+    if (!n) return;
+    size_t w = 0;
+    for (const unsigned char* p = (const unsigned char*)(in ? in : ""); *p; ++p) {
+        char buf[8];
+        int len;
+        switch (*p) {
+            case '"':  std::memcpy(buf, "\\\"", 2); len = 2; break;
+            case '\\': std::memcpy(buf, "\\\\", 2); len = 2; break;
+            case '\n': std::memcpy(buf, "\\n", 2);  len = 2; break;
+            case '\r': std::memcpy(buf, "\\r", 2);  len = 2; break;
+            case '\t': std::memcpy(buf, "\\t", 2);  len = 2; break;
+            default:
+                if (*p < 0x20) { len = std::snprintf(buf, sizeof(buf), "\\u%04x", *p); }
+                else           { buf[0] = (char)*p; len = 1; }
+                break;
+        }
+        if (w + (size_t)len >= n) break;   // truncate on a whole escape, never half of one
+        std::memcpy(out + w, buf, (size_t)len);
+        w += (size_t)len;
+    }
+    out[w] = 0;
+}
+
+/// What the fault itself was. The session half comes from Context, the history from Trail.
+struct Fault {
+    const char* kind = "";        // "access violation", and the rest of ExceptionName
+    unsigned code = 0;            // 0xC0000005
+    const char* site = "";        // "mxbikes.exe+0x11D753" - the key everything groups by
+    const char* access = "";      // "reading" | "writing" | "executing" | "" when not an AV
+    unsigned long long target = 0;
+    bool haveTarget = false;
+    const char* version = "";     // FrostMod's
+    const char* game = "";        // the exe we are inside
+    const char* whenUtc = "";     // ISO 8601, so two machines' reports sort together
+    const char* dumpFile = "";    // the .dmp beside this, or empty
+    unsigned long long uptimeMs = 0;
+};
+
+/// One JSON object, emitted as lines. `frames` is nearest-first.
+inline void WriteJson(const Fault& f, const Context& ctx, const Trail& trail,
+                      const char* const* frames, int frameCount,
+                      unsigned long long nowMs, Emit emit, void* user) {
+    char line[512], esc[256];
+    emit(user, "{");
+    std::snprintf(line, sizeof(line), "  \"schema\": 1,");
+    emit(user, line);
+    Escape(f.version, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "  \"frostmod\": \"%s\",", esc);
+    emit(user, line);
+    Escape(f.game, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "  \"game\": \"%s\",", esc);
+    emit(user, line);
+    Escape(f.whenUtc, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "  \"when\": \"%s\",", esc);
+    emit(user, line);
+    std::snprintf(line, sizeof(line), "  \"uptimeMs\": %llu,", f.uptimeMs);
+    emit(user, line);
+    Escape(f.dumpFile, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "  \"dump\": \"%s\",", esc);
+    emit(user, line);
+
+    emit(user, "  \"fault\": {");
+    Escape(f.kind, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"kind\": \"%s\",", esc);
+    emit(user, line);
+    std::snprintf(line, sizeof(line), "    \"code\": \"0x%08X\",", f.code);
+    emit(user, line);
+    Escape(f.site, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"site\": \"%s\",", esc);
+    emit(user, line);
+    Escape(f.access, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"access\": \"%s\",", esc);
+    emit(user, line);
+    if (f.haveTarget)
+        std::snprintf(line, sizeof(line), "    \"target\": \"0x%016llX\"", f.target);
+    else
+        std::snprintf(line, sizeof(line), "    \"target\": null");
+    emit(user, line);
+    emit(user, "  },");
+
+    emit(user, "  \"frames\": [");
+    for (int i = 0; i < frameCount; ++i) {
+        Escape(frames[i], esc, sizeof(esc));
+        std::snprintf(line, sizeof(line), "    \"%s\"%s", esc, i + 1 < frameCount ? "," : "");
+        emit(user, line);
+    }
+    emit(user, "  ],");
+
+    const Where w = (Where)ctx.where.load(std::memory_order_relaxed);
+    const int riders = ctx.riders.load(std::memory_order_relaxed);
+    const unsigned long long lastDraw = ctx.lastDrawMs.load(std::memory_order_relaxed);
+    const unsigned long long lastReload = ctx.lastReloadMs.load(std::memory_order_relaxed);
+    emit(user, "  \"session\": {");
+    Escape(WhereName(w), esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"where\": \"%s\",", esc);
+    emit(user, line);
+    std::snprintf(line, sizeof(line), "    \"inSession\": %s,",
+                  ctx.inSession.load(std::memory_order_relaxed) ? "true" : "false");
+    emit(user, line);
+    Escape(ctx.track, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"track\": \"%s\",", esc);
+    emit(user, line);
+    Escape(ctx.server, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"server\": \"%s\",", esc);
+    emit(user, line);
+    Escape(ctx.rider, esc, sizeof(esc));
+    std::snprintf(line, sizeof(line), "    \"rider\": \"%s\",", esc);
+    emit(user, line);
+    if (riders >= 0) std::snprintf(line, sizeof(line), "    \"riders\": %d,", riders);
+    else             std::snprintf(line, sizeof(line), "    \"riders\": null,");
+    emit(user, line);
+    std::snprintf(line, sizeof(line), "    \"reloads\": %u,",
+                  ctx.reloads.load(std::memory_order_relaxed));
+    emit(user, line);
+    // Null rather than zero when it never happened: "no frame has ever been drawn" and
+    // "a frame was drawn this instant" are opposite answers and must not share a value.
+    if (lastDraw) std::snprintf(line, sizeof(line), "    \"sinceFrameMs\": %llu,",
+                                nowMs >= lastDraw ? nowMs - lastDraw : 0);
+    else          std::snprintf(line, sizeof(line), "    \"sinceFrameMs\": null,");
+    emit(user, line);
+    if (lastReload) std::snprintf(line, sizeof(line), "    \"sinceReloadMs\": %llu",
+                                  nowMs >= lastReload ? nowMs - lastReload : 0);
+    else            std::snprintf(line, sizeof(line), "    \"sinceReloadMs\": null");
+    emit(user, line);
+    emit(user, "  },");
+
+    emit(user, "  \"trail\": [");
+    const int n = trail.Count();
+    for (int i = 0; i < n; ++i) {
+        const Crumb& c = trail.At(i);
+        Escape(c.text, esc, sizeof(esc));
+        std::snprintf(line, sizeof(line), "    { \"beforeMs\": %llu, \"text\": \"%s\" }%s",
+                      nowMs >= c.ms ? nowMs - c.ms : 0, esc, i + 1 < n ? "," : "");
+        emit(user, line);
+    }
+    emit(user, "  ]");
+    emit(user, "}");
+}
+
+// ---------------------------------------------------------------------------
 // The live half.
 // ---------------------------------------------------------------------------
 #ifdef _WIN32

@@ -12,6 +12,9 @@ void (*g_log)(const char*) = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER g_prev = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER g_ours = nullptr;
 char g_dumpDir[MAX_PATH] = {0};
+// One name per crash, shared by the dump and the report file beside it, so the pair is
+// obviously a pair in a folder listing and the report can name its own dump.
+char g_stem[64] = {0};
 char g_version[32] = {0};
 unsigned long long g_startTick = 0;
 // One report per process. A fault inside the filter, or a second thread faulting
@@ -71,12 +74,20 @@ void DescribeAddress(const void* addr, char* out, size_t n) {
 // x64 unwind, straight off the PE's own tables: no symbols, no allocation, no disk.
 // A frame with no function entry is a leaf (or hand-written assembly, which our own
 // hook trampolines are) - there the return address is simply at [rsp].
+// The frames, kept rather than only printed: the log wants them numbered and the sidecar
+// wants them as an array, and unwinding twice from a context we have already walked is
+// both slower and a second chance to fault.
+char g_frames[kMaxFrames][160];
+int  g_frameCount = 0;
+
 void WriteStack(const CONTEXT& start) {
     CONTEXT ctx = start;   // RtlVirtualUnwind mutates it; never touch the real one
     char where[MAX_PATH + 64], line[MAX_PATH + 128];
+    g_frameCount = 0;
     for (int frame = 0; frame < kMaxFrames; ++frame) {
         if (!ctx.Rip) break;
         DescribeAddress((const void*)ctx.Rip, where, sizeof(where));
+        _snprintf_s(g_frames[g_frameCount++], sizeof(g_frames[0]), _TRUNCATE, "%s", where);
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[crash]   #%-2d %s", frame, where);
         Say(line);
 
@@ -118,12 +129,12 @@ void WriteRegisters(const CONTEXT& c) {
 // Keep the newest kKeepDumps. A player who crashes nightly for a month should not
 // discover FrostMod filled their disk, and the newest dumps are the ones anyone asks
 // for. Deletes only files we name, never anything else in the folder.
-void PruneDumps() {
+void PruneOldest(const char* ext) {
     struct Found { char name[MAX_PATH]; FILETIME when; };
     Found found[64];
     int n = 0;
     char pattern[MAX_PATH];
-    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s\\frostmod-crash-*.dmp", g_dumpDir);
+    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s\\frostmod-crash-*.%s", g_dumpDir, ext);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -189,22 +200,18 @@ DWORD WINAPI DumpThread(LPVOID param) {
     return 0;
 }
 
-void WriteDump(EXCEPTION_POINTERS* ep) {
+bool WriteDump(EXCEPTION_POINTERS* ep) {
     if (!g_writeDump || !g_dumpDir[0]) {
         Say("[crash] no minidump: dbghelp.dll was unavailable when FrostMod started.");
-        return;
+        return false;
     }
-    SYSTEMTIME st;
-    GetLocalTime(&st);
     DumpJob job{};
     job.ep = ep;
     job.threadId = GetCurrentThreadId();
-    _snprintf_s(job.path, sizeof(job.path), _TRUNCATE,
-                "%s\\frostmod-crash-%04d%02d%02d-%02d%02d%02d.dmp", g_dumpDir,
-                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    _snprintf_s(job.path, sizeof(job.path), _TRUNCATE, "%s\\%s.dmp", g_dumpDir, g_stem);
 
     HANDLE t = CreateThread(nullptr, 0, DumpThread, &job, 0, nullptr);
-    if (!t) { Say("[crash] no minidump: could not start the writer thread."); return; }
+    if (!t) { Say("[crash] no minidump: could not start the writer thread."); return false; }
     // Bounded: a dump that hasn't landed in 30s is not worth holding the process
     // open for, and the report above it is already written.
     const DWORD waited = WaitForSingleObject(t, 30000);
@@ -213,20 +220,56 @@ void WriteDump(EXCEPTION_POINTERS* ep) {
     char line[MAX_PATH + 160];
     if (waited != WAIT_OBJECT_0) {
         Say("[crash] the minidump writer did not finish in 30s; carrying on without it.");
-        return;
+        return false;
     }
     if (!job.ok) {
         _snprintf_s(line, sizeof(line), _TRUNCATE,
                     "[crash] minidump FAILED (%lu) - the report above is all we have.",
                     GetLastError());
         Say(line);
-        return;
+        return false;
     }
     _snprintf_s(line, sizeof(line), _TRUNCATE,
                 "[crash] minidump written: %s  (send it with the log - Settings > Send logs "
                 "picks it up)", job.path);
     Say(line);
-    PruneDumps();
+    PruneOldest("dmp");
+    return true;
+}
+
+// The sidecar: the same report as JSON, beside the log, for MXB App to pick up and post.
+//
+// A file rather than a socket, and written by the dying process rather than sent by it: at
+// this point the game has seconds at best, the network stack is the last thing to trust,
+// and a crash that happened while the app was closed still has to arrive. The app finds it
+// on its next look, sends it, and renames it. See tasks/game-crashes.md.
+void WriteSidecar(const Fault& f) {
+    if (!g_dumpDir[0]) return;   // the session plugin: its folder is nobody's to collect
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s.json", g_dumpDir, g_stem);
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, path, "wb") != 0 || !fp) {
+        Say("[crash] could not write the report file next to the log; the text above is all "
+            "there is.");
+        return;
+    }
+    const char* frames[kMaxFrames];
+    for (int i = 0; i < g_frameCount; ++i) frames[i] = g_frames[i];
+    WriteJson(f, TheContext(), TheTrail(), frames, g_frameCount, NowMs(),
+              [](void* user, const char* line) {
+                  std::fputs(line, (FILE*)user);
+                  std::fputc('\n', (FILE*)user);
+              },
+              fp);
+    std::fclose(fp);
+
+    PruneOldest("json");
+
+    char line[MAX_PATH + 96];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[crash] report written: %s (MXB App sends this one; the dump stays here "
+                "until you say so)", path);
+    Say(line);
 }
 
 LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
@@ -239,6 +282,33 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
         const EXCEPTION_RECORD* r = ep->ExceptionRecord;
         char where[MAX_PATH + 64], line[MAX_PATH + 160];
         DescribeAddress(r->ExceptionAddress, where, sizeof(where));
+
+        // Name this crash once. Local time in the file name, because the player reading
+        // their own folder is the one who has to match it against when the game died; UTC
+        // inside the report, because everyone else's reports have to sort against it.
+        SYSTEMTIME local, utc;
+        GetLocalTime(&local);
+        GetSystemTime(&utc);
+        _snprintf_s(g_stem, sizeof(g_stem), _TRUNCATE,
+                    "frostmod-crash-%04d%02d%02d-%02d%02d%02d",
+                    local.wYear, local.wMonth, local.wDay,
+                    local.wHour, local.wMinute, local.wSecond);
+        char whenUtc[32];
+        _snprintf_s(whenUtc, sizeof(whenUtc), _TRUNCATE, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                    utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+
+        Fault fault;
+        fault.kind = ExceptionName(r->ExceptionCode);
+        fault.code = (unsigned)r->ExceptionCode;
+        fault.site = where;
+        fault.version = g_version;
+        fault.whenUtc = whenUtc;
+        fault.uptimeMs = NowMs();
+        char gameName[MAX_PATH] = "";
+        if (GetModuleFileNameA(nullptr, gameName, sizeof(gameName))) {
+            const char* leaf = strrchr(gameName, '\\');
+            fault.game = leaf ? leaf + 1 : gameName;
+        }
         _snprintf_s(line, sizeof(line), _TRUNCATE, "[crash] ***** %s (0x%08X) at %s *****",
                     ExceptionName(r->ExceptionCode), (unsigned)r->ExceptionCode, where);
         Say(line);
@@ -248,9 +318,11 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
         if ((r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
              r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && r->NumberParameters >= 2) {
             const ULONG_PTR op = r->ExceptionInformation[0];
+            fault.access = op == 0 ? "reading" : op == 1 ? "writing" : "executing";
+            fault.target = (unsigned long long)r->ExceptionInformation[1];
+            fault.haveTarget = true;
             _snprintf_s(line, sizeof(line), _TRUNCATE, "[crash] while %s address 0x%016llX",
-                        op == 0 ? "reading" : op == 1 ? "writing" : "executing",
-                        (unsigned long long)r->ExceptionInformation[1]);
+                        fault.access, (unsigned long long)r->ExceptionInformation[1]);
             Say(line);
             // An in-page error carries the filesystem's own status as a third parameter,
             // and this is the shape a cloud-backed mods folder crashes in: the bytes were
@@ -280,7 +352,10 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
         }
 
         WriteContext(TheContext(), TheTrail(), NowMs(), SaySink, nullptr);
-        WriteDump(ep);
+        char dumpName[80] = "";
+        if (WriteDump(ep)) _snprintf_s(dumpName, sizeof(dumpName), _TRUNCATE, "%s.dmp", g_stem);
+        fault.dumpFile = dumpName;
+        WriteSidecar(fault);
         Say("[crash] end of report - the game process is going down.");
     }
     // Chain rather than swallow: whatever reporting the game or Steam had set up

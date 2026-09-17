@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-16 — v0.29.0
+
+### Added
+- **A crash now leaves a report MXB App can send.** Alongside the crash log and the dump,
+  FrostMod writes a small file describing what happened: where the game faulted, the call
+  stack, the track and server, how many riders were in the session, and what happened just
+  before. MXB App picks that file up and sends it, so the same crash showing up for a lot of
+  people is something we can see rather than guess at. The dump stays on your machine.
+
 ## 2026-09-16 — v0.28.0
 
 ### Fixed

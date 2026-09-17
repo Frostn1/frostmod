@@ -48,9 +48,23 @@ Signature-verified before it writes, and the slot table is decoded from the func
 own `lea` rather than from a data RVA (a data RVA does not move by the `.text` delta).
 Off, loudly, if either check fails.
 
-**What it does not claim:** there is one sample, and it was not on track. It may have
-nothing to do with the three symptoms above. It is fixed because it is a real crash
-with a safe fix, not because it is *the* crash.
+**What the pool is (traced 2026-09-16, from the unpacked exe):** trainers. Every caller of
+the pool's open/read/close builds a trainer path (`%sprofiles\%s\trainers\%s_%s.trn`,
+`%strainers\%s.trn`), and one of them is the trainer screen (`ID_ADD`/`ID_REMOVE`/
+`ID_ENABLE`/`trainer_lead`). None of the six functions is called by address - the game
+reaches them through its single dispatch pointer at `0x120CC0` (971 jobs, ~11k call sites),
+where close is job 907 (`0x38B`). Search by job number, not by address.
+
+**Where a second close comes from:** the trainer loader at `0x2016E` closes the handle in
+the global `0x109E0A4` on two exit paths (`0x20734`, `0x20C39`) without zeroing the global,
+then sets the "trainers are up" flag at `0xF3DB54`. The tidy-up at `0x21500` (called from
+`0x71D50`) closes `0x109E0A4` again behind that flag, and `0xF3E244` + `0xF3DB4C` behind no
+check at all. A trainer that fails to load therefore leaves a stale handle for the tidy-up
+to close a second time. That matches what riders report as "old trainers crash the game",
+and it matches this sample: he was not on track.
+
+**What it still does not claim:** one sample, and the exact path above is inference from the
+code, not from a stack. It is fixed because it is a real crash with a safe fix.
 
 ## Fixed: the terrain query that is not a position (`+0x1F1923`)
 

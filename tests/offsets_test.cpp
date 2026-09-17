@@ -297,9 +297,27 @@ static void terrain_guard_constants_agree() {
     CHECK(mxb::OFF_TERRAIN_GRID > mxb::OFF_TERRAIN_HEIGHT, "the grid should sit past the dims");
 }
 
+// A patched prologue must never be mistaken for "the game moved this function".
+static void detours_are_recognised_before_the_signature_check() {
+    const uint8_t real[]   = {0x48,0x83,0xEC,0x28,0xFF,0xC9,0x83,0xF9,0x09,0x77,0x43,0x48};
+    const uint8_t rel32[]  = {0xE9,0x11,0x22,0x33,0x44,0xC9,0x83,0xF9,0x09,0x77,0x43,0x48};
+    const uint8_t indir[]  = {0xFF,0x25,0x00,0x00,0x00,0x00,0x11,0x22,0x33,0x44,0x55,0x66};
+    const uint8_t movjmp[] = {0x48,0xB8,1,2,3,4,5,6,7,8,0xFF,0xE0};
+
+    CHECK(!mxb::LooksDetoured(real), "the real close prologue is not a detour");
+    CHECK(mxb::LooksDetoured(rel32), "jmp rel32 is a detour");
+    CHECK(mxb::LooksDetoured(indir), "jmp [rip+disp32] is a detour");
+    CHECK(mxb::LooksDetoured(movjmp), "mov rax,imm64 + jmp rax is a detour");
+
+    // The signature's own first bytes are the real prologue, so the two can never disagree.
+    CHECK(!mxb::LooksDetoured((const uint8_t*)mxb::SIG_GHS_CLOSE),
+          "the stored signature must not look like a detour");
+}
+
 int main() {
     terrain_guard_constants_agree();
     ghs_guard_constants_agree();
+    detours_are_recognised_before_the_signature_check();
     mx_table_is_unchanged();
     gp_table_is_all_self_contained();
     unconfirmed_tables_label_every_step();

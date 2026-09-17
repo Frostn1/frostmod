@@ -240,6 +240,18 @@ constexpr size_t SESSION_CFG_SIZE      = 0x21C;  // arg14 at every 0x310 dispatc
 constexpr size_t OFF_OVERJUMP_DISABLED = 0x190;  // dword; non-zero = crash disabled
 
 // ---- the GHS handle pool: a crash we can actually stop (beta21e, 2026-09-16) ----
+// WHAT THE POOL HOLDS (traced 2026-09-16): trainers. Every caller of the pool's open/read/
+// close builds a trainer path - `%sprofiles\%s\trainers\%s_%s.trn`, `%strainers\%s.trn` -
+// and one of them is the trainer screen itself (ID_ADD / ID_REMOVE / ID_ENABLE). None of
+// the six are called by address: the game reaches them through its one dispatch pointer
+// (RVA 0x120CC0, 971 jobs, ~11k call sites), where closing a trainer is job 907 (0x38B).
+//
+// WHERE A SECOND CLOSE COMES FROM: the trainer loader at 0x2016E closes the handle held in
+// the global 0x109E0A4 on two exit paths (0x20734, 0x20C39) and never zeroes that global,
+// then sets the "trainers are up" flag at 0xF3DB54. The tidy-up at 0x21500 later closes
+// 0x109E0A4 again, plus 0xF3E244 and 0xF3DB4C with no check at all. So a trainer that
+// fails to load can leave a stale handle behind for the tidy-up to close a second time -
+// which is the shape of the "old trainers crash the game" reports.
 // From a player's own crash line, not from a hunt: `access violation (0xC0000005) at
 // mxbikes.exe+0x11D753, reading 0x0000000000000010`. That address is inside a small
 // function that closes one entry of a ten-slot handle pool:
@@ -336,6 +348,17 @@ constexpr char SIG_TERRAIN_SAMPLE[] =
     "\x4C\x89\x44\x24\x18\x48\x89\x54\x24\x10\x53\x48\x81\xEC\x40\x01\x00\x00"
     "\x4C\x8B\x89\x50\x07\x00\x00\x48\x8B\xD9\x4D\x85\xC9";
 constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// Does a function's first bytes look like somebody already detoured it? MinHook writes a
+// `jmp rel32`, or `jmp [rip+disp32]` when the trampoline is out of a 2 GB jump's reach;
+// other injectors use `mov rax, imm64; jmp rax`. Worth asking before the signature check
+// calls a patched prologue a game update: once a hook is on, the original bytes live in
+// that hook's trampoline, which is outside the module a pattern scan walks.
+inline bool LooksDetoured(const uint8_t* p) {
+    if (p[0] == 0xE9) return true;                                                  // jmp rel32
+    if (p[0] == 0xFF && p[1] == 0x25) return true;                                  // jmp [rip+disp32]
+    if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) return true; // mov rax,imm64; jmp rax
+    return false;
+}
 
 // ---- hook / patch points ----
 // THE row is created by the FIRST setCellText (msg 0x11B) at 0x0ABA03 - a cell-write

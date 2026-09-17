@@ -21,9 +21,13 @@
 ## 2026-09-16 — v0.28.0
 
 ### Fixed
-- **One of the crashes to desktop is stopped.** MX Bikes closes a file handle it has already
-  closed, and the game goes down on the spot. FrostMod now catches that one case and lets the
-  game carry on, exactly as the game's own code does everywhere else it touches the same thing.
+- **The old trainers crash is stopped.** MX Bikes closes a trainer file it has already closed,
+  and the game goes down on the spot. That is the crash riders have been putting down to old
+  trainers for years. FrostMod now catches it and lets the game carry on, exactly as the
+  game's own code does everywhere else it touches a trainer.
+- FrostMod says so when something has already hooked that close, instead of reporting it as a
+  game update. Two copies of FrostMod in one game is the usual reason, and the second one now
+  leaves the first one's hook alone.
 
 ### Added
 - **A crash to desktop now leaves a report.** When the game dies, the log gets the fault, the

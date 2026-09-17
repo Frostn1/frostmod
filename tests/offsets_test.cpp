@@ -248,7 +248,57 @@ static void ghs_guard_constants_agree() {
           mxb::RVA_GHS_CLOSE, mxb::RVA_GHS_TABLE);
 }
 
+// The terrain guard stands in front of a function whose signature we inferred from its
+// prologue, and the inference is load-bearing: `int32 f(obj, a2, float* out, float x, float y)`
+// puts `y` at [rsp+0x170] only because the frame is `push rbx` + `sub rsp,0x140`. If a future
+// build changes that, the argument we test for NaN is no longer the argument the function
+// reads, and the guard would be refusing queries at random. These tie the claim to the bytes,
+// so a build that moves the frame fails the signature and turns the guard off instead.
+static void terrain_guard_constants_agree() {
+    const size_t sigLen  = sizeof(mxb::SIG_TERRAIN_SAMPLE) - 1;
+    const size_t maskLen = sizeof(mxb::SIG_TERRAIN_SAMPLE_MASK) - 1;
+    CHECK(sigLen == maskLen,
+          "the signature is %zu bytes and its mask covers %zu", sigLen, maskLen);
+    for (size_t i = 0; i < maskLen; ++i)
+        CHECK(mxb::SIG_TERRAIN_SAMPLE_MASK[i] == 'x',
+              "byte %zu is wildcarded, but this prologue has no relocated operand in it", i);
+
+    // `mov [rsp+0x18], r8` - arg3 homed to its shadow slot, which is what makes the
+    // out-pointer the third argument rather than something read off the stack.
+    const unsigned char* sig = (const unsigned char*)mxb::SIG_TERRAIN_SAMPLE;
+    CHECK(sig[0] == 0x4C && sig[1] == 0x89 && sig[2] == 0x44 && sig[3] == 0x24 && sig[4] == 0x18,
+          "the signature does not start with `mov [rsp+0x18], r8`");
+
+    // `sub rsp, 0x140`. The whole argument mapping rests on this number: arg5 lands at
+    // [rsp+0x170] = entry [rsp+0x28] only for a frame of 0x140 plus the pushed rbx.
+    CHECK(sig[10] == 0x53, "no `push rbx` where the frame calculation assumes one");
+    CHECK(sig[11] == 0x48 && sig[12] == 0x81 && sig[13] == 0xEC &&
+          sig[14] == 0x40 && sig[15] == 0x01 && sig[16] == 0x00 && sig[17] == 0x00,
+          "the frame is not `sub rsp, 0x140`, so arg5 is not at [rsp+0x170]");
+
+    // `mov r9, [rcx+0x750]` - the grid pointer this function null-checks, which is also
+    // where OFF_TERRAIN_GRID says it is.
+    CHECK(sig[18] == 0x4C && sig[19] == 0x8B && sig[20] == 0x89,
+          "the signature does not load the grid into r9 where we said it does");
+    CHECK((size_t)(sig[21] | (sig[22] << 8) | (sig[23] << 16) | (sig[24] << 24)) ==
+              mxb::OFF_TERRAIN_GRID,
+          "the grid offset in the bytes is not OFF_TERRAIN_GRID (0x%zx)", mxb::OFF_TERRAIN_GRID);
+
+    // The reported faulting instruction has to be inside the function we are guarding, or
+    // we are guarding the wrong one. fcn.1401f1720 is 1515 bytes.
+    CHECK(mxb::RVA_TERRAIN_FAULT > mxb::RVA_TERRAIN_SAMPLE &&
+              mxb::RVA_TERRAIN_FAULT - mxb::RVA_TERRAIN_SAMPLE < 0x600,
+          "0x%zx is not inside the sampler at 0x%zx",
+          mxb::RVA_TERRAIN_FAULT, mxb::RVA_TERRAIN_SAMPLE);
+
+    // Width and height are adjacent dwords, and the grid pointer is past both.
+    CHECK(mxb::OFF_TERRAIN_HEIGHT == mxb::OFF_TERRAIN_WIDTH + 4,
+          "width and height are not adjacent dwords");
+    CHECK(mxb::OFF_TERRAIN_GRID > mxb::OFF_TERRAIN_HEIGHT, "the grid should sit past the dims");
+}
+
 int main() {
+    terrain_guard_constants_agree();
     ghs_guard_constants_agree();
     mx_table_is_unchanged();
     gp_table_is_all_self_contained();

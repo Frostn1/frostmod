@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-17 — v0.30.0
+
+### Fixed
+- **Going into a fence should not close the game.** A hard crash can leave the bike's position
+  as something that is not a number, and the game then asks the track how high the ground is
+  at that spot. The answer it reads is far outside the track, and the game goes down. FrostMod
+  now declines that question the same way the game itself declines a spot outside the map.
+  This is the crash a lot of people have been hitting mid-race.
+
 ## 2026-09-16 — v0.29.0
 
 ### Added

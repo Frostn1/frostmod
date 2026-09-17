@@ -3937,6 +3937,79 @@ static int hkGhsClose(unsigned handle) {
     return g_origGhsClose(handle);
 }
 
+// ===========================================================================
+// TERRAIN SAMPLE GUARD  -  the crash that ruins races
+//
+// Reported from outside as about a fifth of all crashes, and the one that takes a
+// race down with it: `mxbikes.exe+0x1F1923`, hit when a rider goes into a fence.
+//
+// offsets.h has the derivation. The short of it: that address is a corner read in
+// a bilinear sample of the track's height grid, and the four bounds checks above
+// it are `comiss` + `ja`, which a NaN passes - an unordered compare does not take
+// `ja`. `cvttss2si` then turns the NaN into INT_MIN and the index walks gigabytes
+// off the grid.
+//
+// So the fault is not the heightmap. It is a position that stopped being a number
+// somewhere upstream, and this is just where it gets used. We cannot fix where the
+// NaN comes from with a hook. We can decline to look up terrain for a query that is
+// not a position, which is what the function already does for a position outside
+// the map and for a grid that is not loaded: return 0, write nothing.
+//
+// Every catch is logged with the values, because that is the only way anyone learns
+// whether the NaN theory is right and what the query looked like. If the first
+// reports back show finite coordinates being refused, the theory is wrong and this
+// comes out again.
+// ===========================================================================
+using TerrainSampleFn = int32_t (*)(void*, void*, float*, float, float);
+static TerrainSampleFn g_origTerrain = nullptr;
+static std::atomic<unsigned> g_terrainGuarded{0};
+
+static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y) {
+    // isfinite, not isnan: an infinity survives the same comparisons and lands on the
+    // same cvttss2si.
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        const unsigned n = g_terrainGuarded.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 10)
+            Log("[terrain] refused a height query at (%f, %f) - not a position. This is the "
+                "crash at mxbikes.exe+0x%zx. Refused %u so far.",
+                (double)x, (double)y, (size_t)mxb::RVA_TERRAIN_FAULT, n);
+        frostmod::crash::Note("refused a NaN height query (%u so far)", n);
+        return 0;   // what the function itself returns for a query it cannot serve
+    }
+    return g_origTerrain(obj, a2, out, x, y);
+}
+
+static void InstallTerrainGuard(intptr_t delta) {
+    if (!g_game->offsets_complete) {
+        Log("[terrain] guard off for %s - the sampler is MX Bikes' and has no twin here.",
+            g_game->display);
+        return;
+    }
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[terrain] guard off: can't read the module's sections to place it.");
+        return;
+    }
+    uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_TERRAIN_SAMPLE + delta);
+    if (fn < begin || fn >= end ||
+        !MatchAt(fn, mxb::SIG_TERRAIN_SAMPLE, mxb::SIG_TERRAIN_SAMPLE_MASK)) {
+        uint8_t* found =
+            PatternScan(begin, end, mxb::SIG_TERRAIN_SAMPLE, mxb::SIG_TERRAIN_SAMPLE_MASK);
+        if (!found) {
+            Log("[terrain] guard off: the sampler's signature is not in this build's .text. "
+                "If the game updated, re-derive RVA_TERRAIN_SAMPLE before trusting it.");
+            return;
+        }
+        Log("[terrain] sampler RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
+            (size_t)(found - g_base), (size_t)mxb::RVA_TERRAIN_SAMPLE);
+        fn = found;
+    }
+    if (InstallHook(fn, (void*)&hkTerrainSample, (void**)&g_origTerrain,
+                    "terrainSample(0x1f1720)"))
+        Log("[terrain] height-query guard live @ RVA 0x%zx. A query that is not a position "
+            "now returns nothing instead of reading off the grid.", (size_t)(fn - g_base));
+}
+
 // Verify, decode, hook. MX Bikes only: both the RVA and the signature are mxbikes.exe's.
 static void InstallGhsGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
@@ -4077,6 +4150,7 @@ DWORD WINAPI Init(LPVOID) {
             // Unlike registryReset this one verifies itself before it writes, so it takes
             // the delta as a starting point rather than as a promise.
             InstallGhsGuard(delta);
+            InstallTerrainGuard(delta);
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);

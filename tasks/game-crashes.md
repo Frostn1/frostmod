@@ -52,6 +52,28 @@ Off, loudly, if either check fails.
 nothing to do with the three symptoms above. It is fixed because it is a real crash
 with a safe fix, not because it is *the* crash.
 
+## Fixed: the terrain query that is not a position (`+0x1F1923`)
+
+Reported from outside, not from our own corpus: about a fifth of all crashes, the one that
+takes a race with it, hit "when crashing into a fence".
+
+`0x1F1923` is a corner read in a bilinear sample of the track height grid
+(`0x1F1720`). The function is careful - it null-checks the grid, and it checks the query
+position against the map's origin and size on both axes. Every one of those checks is
+`comiss` + `ja`, and an unordered compare does not take `ja`, so **a NaN passes all four**.
+`cvttss2si` then makes it INT_MIN and the index walks off the grid. The upper edge is
+clamped; the low side never is, because the float checks were supposed to have covered it.
+
+So the fault is not the heightmap. It is a position that stopped being a number upstream,
+and this is where it gets used. The guard returns the 0 the function already returns for a
+grid that is not loaded and a position off the map.
+
+Which also explains the other half of the report - a black screen with the game still
+running. Same NaN, landing in a transform instead of in this function.
+
+**Unverified:** that the NaN comes from the collision, and the one-in-five figure. Both are
+somebody else's numbers. Every catch logs its coordinates, so the first logs back settle it.
+
 ## Next
 
 - [ ] **Collect.** Every report from here carries a stack. The `+0x11D753` work took one

@@ -87,12 +87,21 @@ FADE_S = 0.004
 
 # A silence longer than this ends the phrase, and everything after it is dropped.
 #
-# Asked for one short word, the male voice says it, pauses for the better part of a second and
-# then says something else entirely - "Brake!" came out 3.7 s long, as the word, a gap, and a
-# second utterance nobody asked for. Trimming on level alone keeps all of it, because the
-# hallucinated tail is as loud as the word. Cutting at the first real gap keeps the word. It is
-# well clear of the gaps inside a phrase: the closure in "Off the brakes" runs 50-80 ms.
-GAP_S = 0.25
+# Asked for one short word, the male voice says it and then says something else entirely -
+# "Brake!" came out 3.7 s long, as the word, a gap, and a second utterance nobody asked for.
+# Trimming on level alone keeps all of it, because the hallucinated tail is as loud as the word.
+#
+# 0.25 s was too generous and shipped the bug anyway: the male voice's pause before its tail is
+# 70-100 ms, and in `gas` and `brake` there was no measurable gap at all. 0.09 s still clears
+# the gaps inside a phrase - the closure in "Off the brakes" runs 50-80 ms - and catches the
+# pause the male voice actually leaves. `CAP_ON_REFERENCE` below is the backstop for the clips
+# that have no gap to cut on.
+GAP_S = 0.09
+
+# Nothing may run half again as long as the same word in a voice already committed. A tail that
+# runs straight out of the word leaves no silence to cut at, so length against another voice is
+# the only signal left; `tools/voice/retrim.py` applies the same rule to clips already on disk.
+CAP_ON_REFERENCE = 1.5
 
 
 def fetch_voice(cache: Path, voice: str, path: str, want_sha: str) -> Path:

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #ifndef COACHVOICE_CLIP_DIR
@@ -357,9 +358,12 @@ static void ASessionOfCuesIsAllSpoken() {
 // sensible level, and - the "gss" check - opening on silence rather than part way into a vowel.
 static void TheCommittedClips() {
     size_t total = 0;
+    // Each clip's length in every voice, so one voice can be held against another below.
+    std::vector<std::vector<double>> secs_of(coachvoice::kVoiceCount, std::vector<double>(coachvoice::kClipCount, 0.0));
     for (int v = 0; v < coachvoice::kVoiceCount; ++v) {
         const coachvoice::VoiceInfo& info = coachvoice::kVoices[v];
-        for (const coachvoice::ClipInfo& c : coachvoice::kClips) {
+        for (int ci = 0; ci < coachvoice::kClipCount; ++ci) {
+            const coachvoice::ClipInfo& c = coachvoice::kClips[ci];
             const std::string path = std::string(COACHVOICE_CLIP_DIR) + "/" + info.folder + "/" + c.name + ".wav";
             const std::vector<uint8_t> b = ReadAll(path);
             std::vector<int16_t> s;
@@ -371,6 +375,7 @@ static void TheCommittedClips() {
             // male voice will say it, pause, and then say something else entirely, and a clip
             // that runs long is that happening.
             CHECK(secs > 0.15 && secs < 1.6, "%s %s is %.2f s", info.key, c.name, secs);
+            secs_of[size_t(v)][size_t(ci)] = secs;
             int peak = 0;
             for (int16_t x : s) peak = (std::max)(peak, std::abs(int(x)));
             CHECK(peak > 16000 && peak < 32767, "%s %s peaks at %d", info.key, c.name, peak);
@@ -384,6 +389,25 @@ static void TheCommittedClips() {
             for (size_t i = 0; i < lead && i < s.size(); ++i) head = (std::max)(head, std::abs(int(s[i])));
             CHECK(head < 300, "%s %s opens at %d, so its first sound has been cut into", info.key, c.name, head);
         }
+    }
+    // One word, said by two voices, cannot differ by half again in length. The flat 1.6 s bound
+    // above was too loose to catch what actually shipped: `gas` ran 1.21 s against the female
+    // 0.51 s, `stand_up` 1.38 s against 0.68 s -- the word, then a second utterance nobody
+    // asked for, and because the clip is normalised over its whole length the real word was
+    // scaled down and the rubbish played at full volume. Holding the voices against each other
+    // catches that at any absolute length.
+    for (int ci = 0; ci < coachvoice::kClipCount; ++ci) {
+        double shortest = 1e9, longest = 0;
+        const char* long_voice = "";
+        for (int v = 0; v < coachvoice::kVoiceCount; ++v) {
+            const double t = secs_of[size_t(v)][size_t(ci)];
+            if (t <= 0) continue;
+            shortest = (std::min)(shortest, t);
+            if (t > longest) longest = t, long_voice = coachvoice::kVoices[v].key;
+        }
+        if (shortest >= 1e9 || longest <= 0) continue;
+        CHECK(longest <= shortest * 1.5, "%s runs %.2f s in %s against %.2f s elsewhere: a second utterance",
+              coachvoice::kClips[ci].name, longest, long_voice, shortest);
     }
     CHECK(total > 0 && total < 2000 * 1000, "clips total %zu bytes", total);
     std::printf("coachvoice: %d voices x %d clips, %zu bytes\n", coachvoice::kVoiceCount, coachvoice::kClipCount,

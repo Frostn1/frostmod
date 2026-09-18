@@ -44,6 +44,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
+#include "rejoin.h"
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
@@ -2193,6 +2194,133 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
+// ---- rejoin: freeing a rider's entity when they disconnect -------------------
+// What this is and why: rejoin.h. The disconnect path clears the roster entry and leaves the
+// rider's entity behind, so a rejoin writes the new session into the old record. We repoint
+// the memset at the end of that path to a thunk that also calls the game's own entity
+// removal for the same id.
+//
+// MX Bikes only, for the same reason antifreeze is: the RVA is that title's.
+static std::atomic<bool> g_rjOn{true};
+static uint8_t*          g_rjThunk   = nullptr;  // the 36 bytes we call instead of memset
+static uintptr_t         g_rjCall    = 0;        // VA of the call we rewrote
+static uint8_t           g_rjOrig[rejoin::kCallLen] = {0};
+static bool              g_rjPatched = false;
+
+// Executable bytes the call can actually name: rel32 reaches about 2 GB, so walk outward
+// from the site and take the first free granule, as AfAllocCellNear does for its cell.
+static uint8_t* RjAllocThunkNear(uintptr_t site) {
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    const uintptr_t limit = 0x70000000ull;
+    for (uintptr_t d = gran; d < limit; d += gran) {
+        for (int up = 0; up < 2; ++up) {
+            if (!up && site < d) continue;
+            uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
+            if (!a) continue;
+            void* p = VirtualAlloc((void*)a, rejoin::kThunkLen,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p) return (uint8_t*)p;
+        }
+    }
+    return nullptr;
+}
+
+static bool RjApply() {
+    if (g_rjPatched) return true;
+    if (g_game != &GAME_MXB) {
+        Log("[rejoin] not applied: this is %s, the offset is MX Bikes' only",
+            g_game && g_game->display ? g_game->display : "another title");
+        return false;
+    }
+    if (!g_base) { Log("[rejoin] not applied: no module base"); return false; }
+
+    const uintptr_t win  = g_base + rejoin::kRvaWindow;
+    const uintptr_t call = g_base + rejoin::kRvaCall;
+    const uint8_t*  w    = reinterpret_cast<const uint8_t*>(win);
+    if (!rejoin::WindowMatches(w)) {
+        Log("[rejoin] not applied: the bytes at +0x%llX are not the disconnect path we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)rejoin::kRvaWindow);
+        return false;
+    }
+    // The removal we are about to call has to be the function we think it is, too.
+    const uint8_t* rem = reinterpret_cast<const uint8_t*>(g_base + rejoin::kRvaEntityRemove);
+    if (memcmp(rem, rejoin::kEntityRemoveSig, rejoin::kEntityRemoveSigLen) != 0) {
+        Log("[rejoin] not applied: entity removal at +0x%llX does not match",
+            (unsigned long long)rejoin::kRvaEntityRemove);
+        return false;
+    }
+
+    // Call whatever the stock call called, decoded from its own bytes, rather than a second
+    // hardcoded address for memset.
+    const uintptr_t memsetVa =
+        rejoin::CurrentTarget(call, reinterpret_cast<const uint8_t*>(call));
+
+    g_rjThunk = RjAllocThunkNear(call);
+    if (!g_rjThunk) { Log("[rejoin] not applied: no free page within reach"); return false; }
+    if (!rejoin::BuildThunk(g_rjThunk, memsetVa, g_base + rejoin::kRvaEntityRemove)) {
+        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
+        Log("[rejoin] not applied: thunk could not be built");
+        return false;
+    }
+    DWORD tprot = 0;
+    if (!VirtualProtect(g_rjThunk, rejoin::kThunkLen, PAGE_EXECUTE_READ, &tprot)) {
+        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
+        Log("[rejoin] not applied: thunk could not be made executable (%lu)", GetLastError());
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), g_rjThunk, rejoin::kThunkLen);
+
+    int32_t disp = 0;
+    if (!rejoin::PlanDisp(call, reinterpret_cast<uintptr_t>(g_rjThunk), &disp)) {
+        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
+        Log("[rejoin] not applied: thunk out of rel32 reach");
+        return false;
+    }
+
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)call, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
+        Log("[rejoin] not applied: VirtualProtect failed (%lu)", GetLastError());
+        return false;
+    }
+    uint8_t* cw = reinterpret_cast<uint8_t*>(call);
+    memcpy(g_rjOrig, cw, rejoin::kCallLen);
+    for (int i = 0; i < 4; ++i)
+        cw[rejoin::kCallDispOff + i] = (uint8_t)((uint32_t)disp >> (8 * i));
+    VirtualProtect((void*)call, rejoin::kCallLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)call, rejoin::kCallLen);
+
+    if (rejoin::CurrentTarget(call, cw) != reinterpret_cast<uintptr_t>(g_rjThunk)) {
+        VirtualProtect((void*)call, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot);
+        memcpy(cw, g_rjOrig, rejoin::kCallLen);
+        VirtualProtect((void*)call, rejoin::kCallLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)call, rejoin::kCallLen);
+        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
+        Log("[rejoin] not applied: the patch did not verify, reverted");
+        return false;
+    }
+
+    g_rjCall = call; g_rjPatched = true;
+    Log("[rejoin] on: a rider's entity is freed when they disconnect, so a rejoin cannot "
+        "land on top of their last one (at +0x%llX)", (unsigned long long)rejoin::kRvaCall);
+    return true;
+}
+
+// Put the call back exactly as it shipped.
+static void RjRevert() {
+    if (!g_rjPatched) return;
+    DWORD prot = 0;
+    if (VirtualProtect((void*)g_rjCall, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        memcpy(reinterpret_cast<uint8_t*>(g_rjCall), g_rjOrig, rejoin::kCallLen);
+        VirtualProtect((void*)g_rjCall, rejoin::kCallLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)g_rjCall, rejoin::kCallLen);
+    }
+    if (g_rjThunk) { VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr; }
+    g_rjPatched = false;
+    Log("[rejoin] off: departed riders keep their entity, as the game ships");
+}
+
 // ---- server announcements: settings ----------------------------------------
 // The feature itself is below, next to the overlay it draws into. Only the settings live
 // up here, because the file they are saved in is written a few lines from now.
@@ -2218,6 +2346,7 @@ static void SaveOverlaySettings() {
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
+    fprintf(f, "rejoinfix=%d\n", g_rjOn.load() ? 1 : 0);
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -2237,12 +2366,14 @@ static void LoadOverlaySettings() {
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
+        else if (sscanf_s(line, "rejoinfix=%d", &v) == 1) g_rjOn.store(v != 0);
     }
     fclose(f);
     Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%% antifreeze=%d/%.2fs "
         "servermsg=%d y=%d port=%d",
         g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load(),
         g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load());
+    Log("[overlay] settings loaded: rejoinfix=%d", g_rjOn.load() ? 1 : 0);
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -5307,6 +5438,10 @@ DWORD WINAPI Init(LPVOID) {
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
+
+        // Same moment, same reason: the disconnect path is not running yet.
+        if (g_rjOn.load()) RjApply();
+        else Log("[rejoin] off by config; a rejoining rider may land on their old entity");
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row

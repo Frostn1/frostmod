@@ -2,6 +2,19 @@
 
 ## 2026-09-18 — unreleased
 
+### Fixed
+- **A rider who leaves and comes back no longer arrives on top of the rider they used to be.**
+  When someone drops out mid-session and rejoins, everyone else's game can end up drawing their
+  old bike and their new one in the same place, the two wound through each other. It has been
+  worse since the last game update: it used to take a bike change to show up, and now the same
+  bike does it. Underneath, your game files a departing rider away in two places and the
+  disconnect only empties one of them. The half holding their machine stays behind, and when
+  they come back your game finds that leftover first and pours the new session into it.
+  FrostMod empties both, using the game's own routine for it, so a returning rider arrives
+  clean the way a first-time joiner does. MX Bikes only, nothing goes over the network, and it
+  helps whoever has it installed whichever server they are on. Off by setting `rejoinfix=0` in
+  `frostmod_radar.cfg`.
+
 ### Added
 - **Servers can put a message on your screen in colour.** Anything a server says in chat comes
   out the same colour for everyone, because your game picks that colour and nothing the server

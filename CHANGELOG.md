@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-17 — unreleased
+## 2026-09-18 — v0.36.0
 
 ### Added
 - **Riders who used to be invisible are now drawn.** On a full gate there are riders you simply

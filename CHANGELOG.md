@@ -15,6 +15,19 @@
   room. Off by setting `antifreeze=0` in `frostmod_radar.cfg`, where `antifreezems` sets the
   window in milliseconds (default 2000). MX Bikes only. It does not help with a rider the
   server has stopped sending anything about at all; that one still freezes, as it always did.
+- **FrostServer stops the problem at the source, for everybody on the server.** The half above
+  is on the player's machine and helps whoever installed it. This one runs on the dedicated
+  server and helps every rider connected to it, including riders running no mod at all. On a
+  full gate the server cannot fit everyone into one update packet, so it sends each player the
+  riders nearest them and drops the rest. The riders furthest away get dropped over and over
+  until they vanish. FrostServer gives a rider who is close to vanishing a slot in the next
+  packet, ahead of somebody nearer who has updates to spare. No extra packets are sent and the
+  packets do not get bigger, so the same bytes go to the same riders at the same rate. A rider
+  kept on screen this way is in his real position rather than a smoothed one, which is why this
+  is the better half of the fix. Drop `frostserver.dlo` in the dedicated server's `plugins`
+  folder and it is on; `fair_send: false` in `frostserver.yaml` turns it off. Watch
+  `frostserver.log` for the line saying this server was starving riders, which is how an admin
+  knows it was happening here at all. MX Bikes only. Setup and limits in `docs/FROSTSERVER.md`.
 
 ## 2026-09-17 — v0.35.0
 

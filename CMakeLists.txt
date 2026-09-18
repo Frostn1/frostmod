@@ -201,6 +201,13 @@ add_test(NAME stance COMMAND stance_test)
 add_executable(lean_test tests/lean_test.cpp)
 add_test(NAME lean COMMAND lean_test)
 
+# --- rider-visibility patch test -----------------------------------------------
+# The displacement arithmetic behind the antifreeze patch. A wrong number there is a wild
+# read on every frame inside remote-rider playback, so it is proved rather than trusted.
+# Pure constants, so it runs on any host.
+add_executable(antifreeze_test tests/antifreeze_test.cpp)
+add_test(NAME antifreeze COMMAND antifreeze_test)
+
 # --- fair send test ------------------------------------------------------------
 # The promotion rule FrostServer runs on the game's own candidate list. Getting it wrong
 # does not crash anything, it just sends the wrong riders, so the ordering is proved here.

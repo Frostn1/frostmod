@@ -290,8 +290,12 @@ The plugin reads it on `EventInit`, checks it again on `RunInit` and every 2 s o
 re-reads it when its write time or size changes. Speech follows the cue player exactly: only
 in practice, only a cue that fires (a skipped cue is never said), and a crash stops it.
 
-Each cue kind has one clip, spoken whatever the cue's text says; a custom cue (kind 11) is
-shown but not spoken:
+Each spoken cue kind has one clip, spoken whatever the cue's text says. Two kinds have none
+and are drawn in white without a word: a custom cue (kind 11), and any kind from a newer MXB
+Coach than this plugin — `ClipFor` returns -1 and `Speak` bails before it indexes anything, so
+a sheet carrying an unknown kind is still accepted in full. That is why adding a kind needs no
+`.cue` version bump; bumping the version would make every plugin in the wild refuse the whole
+sheet instead. The kinds a clip exists for are therefore not contiguous:
 
 | Kind | Clip | Says |
 |---|---|---|
@@ -305,11 +309,15 @@ shown but not spoken:
 | 8 `SCRUB` | `scrub.wav` | "Scrub it" |
 | 9 `STAND` | `stand_up.wav` | "Stand up" |
 | 10 `SIT` | `sit_down.wav` | "Sit down" |
+| 12 `ROLL` | `roll_off.wav` | "Roll off" |
 
 The clips live in `src/voice/female/` and `src/voice/male/`: 22.05 kHz 16-bit mono PCM WAV,
 trimmed, normalised to -1 dBFS peak, each under 1.5 s, about 750 KB in all. CMake embeds them
 in `mxbcoach.dlo` as `RCDATA` resources numbered **100 + voice × 20 + kind**, so the female set
-keeps 101-110 (the ids it shipped with in v0.22) and the male set takes 121-130.
+keeps 101-110 (the ids it shipped with in v0.22) and the male set takes 121-130, with `ROLL`
+on 112 and 132. Kind 11 has no clip and so no id. The stride of 20 leaves room for kinds 1-19;
+a kind 20 would land on the next voice's base and needs the stride widened, which moves every
+id but the female set's.
 `coachvoice::ResourceId` computes the same numbers at runtime, and
 `tests/coachvoice_res_test.cpp` checks the built `.dlo` actually carries every one of them —
 a clip embedded under an id the plugin never asks for is silence in the game and nothing at

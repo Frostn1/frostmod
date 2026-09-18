@@ -24,13 +24,16 @@ int main(int argc, char** argv) {
     int failures = 0;
     for (int voice = 0; voice < coachvoice::kVoiceCount; ++voice) {
         const char* vname = coachvoice::kVoices[voice].key;
-        for (int kind = coachcue::BRAKE; kind <= coachcue::SIT; ++kind) {
-            const int id = coachvoice::ResourceId(voice, uint8_t(kind));
+        // Walk the clip table, not a range of kinds: the kinds a clip exists for are not
+        // contiguous, so BRAKE..SIT would ask for CUSTOM and miss ROLL.
+        for (int ci = 0; ci < coachvoice::kClipCount; ++ci) {
+            const int kind = int(coachvoice::kClips[ci].kind);
+            const int id = coachvoice::ResourceId(voice, coachvoice::kClips[ci].kind);
             HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(id), MAKEINTRESOURCEA(10));
             HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
             const void* p = data ? LockResource(data) : nullptr;
             std::vector<int16_t> pcm;
-            const char* name = coachvoice::kClips[coachvoice::ClipFor(uint8_t(kind))].name;
+            const char* name = coachvoice::kClips[ci].name;
             if (!p || !coachvoice::ParseWav(static_cast<const uint8_t*>(p), SizeofResource(mod, res), pcm)) {
                 std::printf("FAIL: %s clip for kind %d (%s), resource %d, missing or unreadable\n", vname, kind,
                             name, id);
@@ -44,6 +47,12 @@ int main(int argc, char** argv) {
     if (coachvoice::ResourceId(coachvoice::FEMALE, coachcue::BRAKE) != 101 ||
         coachvoice::ResourceId(coachvoice::FEMALE, coachcue::SIT) != 110) {
         std::printf("FAIL: the female clips have moved off the ids they shipped with\n");
+        ++failures;
+    }
+    // ROLL sits past the contiguous run, on the ids CMakeLists.txt embeds it under.
+    if (coachvoice::ResourceId(coachvoice::FEMALE, coachcue::ROLL) != 112 ||
+        coachvoice::ResourceId(coachvoice::MALE, coachcue::ROLL) != 132) {
+        std::printf("FAIL: roll off is not on the ids CMakeLists.txt embeds it under\n");
         ++failures;
     }
     // And the sets must not collide, or one voice would play over the other's ids.

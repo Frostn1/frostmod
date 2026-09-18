@@ -126,10 +126,15 @@ static void EachVoiceHasItsOwnResources() {
     CHECK(coachvoice::ResourceId(coachvoice::FEMALE, coachcue::SIT) == 110, "female sit is still 110");
     CHECK(coachvoice::ResourceId(coachvoice::MALE, coachcue::BRAKE) == 121, "male brake");
     CHECK(coachvoice::ResourceId(coachvoice::MALE, coachcue::SIT) == 130, "male sit");
+    // ROLL is kind 12, so it lands past the contiguous run and must not collide with the
+    // male base at 121 or the HUD font at 200.
+    CHECK(coachvoice::ResourceId(coachvoice::FEMALE, coachcue::ROLL) == 112, "female roll off");
+    CHECK(coachvoice::ResourceId(coachvoice::MALE, coachcue::ROLL) == 132, "male roll off");
     // No two clips may share an id, or one voice would be playing out of the other's set.
     std::vector<int> ids;
     for (int v = 0; v < coachvoice::kVoiceCount; ++v)
-        for (int k = coachcue::BRAKE; k <= coachcue::SIT; ++k) ids.push_back(coachvoice::ResourceId(v, uint8_t(k)));
+        for (int c = 0; c < coachvoice::kClipCount; ++c)
+            ids.push_back(coachvoice::ResourceId(v, coachvoice::kClips[c].kind));
     for (size_t i = 0; i < ids.size(); ++i)
         for (size_t j = i + 1; j < ids.size(); ++j) CHECK(ids[i] != ids[j], "resource %d used twice", ids[i]);
     // And none may land on the font's id, which is embedded the same way.
@@ -154,14 +159,19 @@ static void AMissingFileIsOff() {
 
 static void EachKindHasItsClip() {
     CHECK(coachvoice::ClipFor(coachcue::BRAKE) == 0, "brake");
-    CHECK(coachvoice::ClipFor(coachcue::SIT) == coachvoice::kClipCount - 1, "sit");
+    CHECK(coachvoice::ClipFor(coachcue::SIT) == 9, "sit");
+    CHECK(coachvoice::ClipFor(coachcue::ROLL) == coachvoice::kClipCount - 1, "roll off is last");
     CHECK(coachvoice::ClipFor(coachcue::CUSTOM) == -1, "a custom cue isn't spoken");
     CHECK(coachvoice::ClipFor(0) == -1, "nor kind 0");
     CHECK(coachvoice::ClipFor(200) == -1, "nor an unknown kind");
+    // The compatibility contract: a kind from a newer MXB Coach draws and stays silent
+    // rather than indexing off the end of the table.
+    CHECK(coachvoice::ClipFor(13) == -1, "nor the kind after the newest one");
     CHECK(std::strcmp(coachvoice::kClips[coachvoice::ClipFor(coachcue::OFF_BRAKES)].text, "Off the brakes") == 0,
           "off the brakes");
     CHECK(std::strcmp(coachvoice::kClips[coachvoice::ClipFor(coachcue::THROTTLE)].text, "Gas") == 0, "gas");
     CHECK(std::strcmp(coachvoice::kClips[coachvoice::ClipFor(coachcue::STAND)].text, "Stand up") == 0, "stand");
+    CHECK(std::strcmp(coachvoice::kClips[coachvoice::ClipFor(coachcue::ROLL)].text, "Roll off") == 0, "roll off");
 }
 
 static void AMoreImportantCueCutsIn() {

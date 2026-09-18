@@ -42,6 +42,7 @@
 
 #include "MinHook.h"
 #include "offsets.h"
+#include "antifreeze.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
@@ -2071,6 +2072,125 @@ static void RadResetRace() {
     g_radN = 0; g_radNEntries = 0; g_radHaveMe = false;
 }
 
+// ---- rider visibility: widening the remote-rider playback gap -----------------
+// What this is and why it is done this way: antifreeze.h. In short, the game stops drawing
+// a remote rider whose snapshots arrive more than 0.3 s apart, and on a full gate the server
+// starves the riders furthest from you until exactly that happens. We repoint one comparison
+// at a number we own so the window is wider.
+//
+// The game's own 0.3 is NOT overwritten: 37 unrelated sites read those same eight bytes.
+//
+// MX Bikes only. The RVA is from that title's image; GP Bikes and Kart Racing Pro have their
+// own layouts and the same address there is some other code entirely. Guarded on g_game
+// rather than hoped about, for the reason offsets_test.cpp exists.
+static std::atomic<bool> g_afOn{true};
+static double            g_afLimit   = antifreeze::kDefaultLimitSeconds;
+static double*           g_afCell    = nullptr;  // the value the patched instruction reads
+static uintptr_t         g_afSite    = 0;        // VA of the instruction we rewrote
+static uint8_t           g_afOrig[antifreeze::kSiteLen] = {0};
+static bool              g_afPatched = false;
+
+// An 8-byte cell the instruction can actually name. Its operand is a signed 32-bit offset
+// from itself, so a cell more than ~2 GB away cannot be addressed at all, and VirtualAlloc
+// left to choose will happily return a page far outside that. So walk outward from the site
+// one allocation granule at a time and take the first slot that is free.
+static double* AfAllocCellNear(uintptr_t site) {
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    const uintptr_t limit = 0x70000000ull;                 // stay well inside rel32 reach
+    for (uintptr_t d = gran; d < limit; d += gran) {
+        for (int up = 0; up < 2; ++up) {
+            if (!up && site < d) continue;                  // would underflow past zero
+            uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
+            if (!a) continue;
+            void* p = VirtualAlloc((void*)a, sizeof(double),
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p) return (double*)p;
+        }
+    }
+    return nullptr;
+}
+
+// Apply, or just retune if we are already applied. Retuning is a plain store to our own
+// cell - the instruction does not change again once it points at us.
+static bool AfApply(double seconds) {
+    g_afLimit = antifreeze::ClampLimit(seconds);
+    if (g_afPatched) { *g_afCell = g_afLimit; Log("[antifreeze] limit now %.2fs", g_afLimit); return true; }
+
+    if (g_game != &GAME_MXB) {
+        Log("[antifreeze] not applied: this is %s, the offset is MX Bikes' only",
+            g_game && g_game->display ? g_game->display : "another title");
+        return false;
+    }
+    if (!g_base) { Log("[antifreeze] not applied: no module base"); return false; }
+
+    const uintptr_t site = g_base + antifreeze::kRvaSite;
+    const uint8_t*  p    = reinterpret_cast<const uint8_t*>(site);
+    if (!antifreeze::SiteMatches(p)) {
+        // A game update, or somebody else got here first. Either way the four bytes we would
+        // write are no longer the middle of the instruction we think they are.
+        Log("[antifreeze] not applied: bytes at +0x%llX are not the comparison we expect "
+            "(game updated?). Nothing patched.", (unsigned long long)antifreeze::kRvaSite);
+        return false;
+    }
+
+    g_afCell = AfAllocCellNear(site);
+    if (!g_afCell) { Log("[antifreeze] not applied: no free page within reach"); return false; }
+    *g_afCell = g_afLimit;
+
+    int32_t disp = 0;
+    if (!antifreeze::PlanDisp(site, reinterpret_cast<uintptr_t>(g_afCell), &disp)) {
+        VirtualFree(g_afCell, 0, MEM_RELEASE); g_afCell = nullptr;
+        Log("[antifreeze] not applied: cell out of rel32 reach");
+        return false;
+    }
+
+    // Only the four displacement bytes are written; the opcode is left alone. Done at init,
+    // before a session exists, so the playback path this sits in is not running yet.
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)site, antifreeze::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        VirtualFree(g_afCell, 0, MEM_RELEASE); g_afCell = nullptr;
+        Log("[antifreeze] not applied: VirtualProtect failed (%lu)", GetLastError());
+        return false;
+    }
+    memcpy(g_afOrig, p, antifreeze::kSiteLen);
+    uint8_t* w = reinterpret_cast<uint8_t*>(site);
+    for (int i = 0; i < 4; ++i) w[antifreeze::kDispOffset + i] = (uint8_t)((uint32_t)disp >> (8 * i));
+    VirtualProtect((void*)site, antifreeze::kSiteLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)site, antifreeze::kSiteLen);
+
+    // Prove it landed by decoding the bytes back, rather than assuming the write took.
+    if (antifreeze::CurrentTarget(site, p) != reinterpret_cast<uintptr_t>(g_afCell)) {
+        VirtualProtect((void*)site, antifreeze::kSiteLen, PAGE_EXECUTE_READWRITE, &prot);
+        memcpy(w, g_afOrig, antifreeze::kSiteLen);
+        VirtualProtect((void*)site, antifreeze::kSiteLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)site, antifreeze::kSiteLen);
+        VirtualFree(g_afCell, 0, MEM_RELEASE); g_afCell = nullptr;
+        Log("[antifreeze] not applied: the patch did not verify, reverted");
+        return false;
+    }
+
+    g_afSite = site; g_afPatched = true;
+    Log("[antifreeze] on: distant riders kept drawn up to %.2fs between updates "
+        "(stock %.2fs), at +0x%llX", g_afLimit, antifreeze::kStockLimitSeconds,
+        (unsigned long long)antifreeze::kRvaSite);
+    return true;
+}
+
+// Put the instruction back exactly as it shipped. Called when the player turns it off.
+static void AfRevert() {
+    if (!g_afPatched) return;
+    DWORD prot = 0;
+    if (VirtualProtect((void*)g_afSite, antifreeze::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        memcpy(reinterpret_cast<uint8_t*>(g_afSite), g_afOrig, antifreeze::kSiteLen);
+        VirtualProtect((void*)g_afSite, antifreeze::kSiteLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)g_afSite, antifreeze::kSiteLen);
+    }
+    if (g_afCell) { VirtualFree(g_afCell, 0, MEM_RELEASE); g_afCell = nullptr; }
+    g_afPatched = false;
+    Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
+}
+
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
 // Radar/outline toggles and the overlay size. The filename stays as it was so an
 // existing install keeps its settings.
@@ -2084,9 +2204,9 @@ static void OverlaySettingsPath(char* out, size_t n) {
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
-    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\n",
+    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\nantifreeze=%d\nantifreezems=%d\n",
             g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
-            g_uiPct.load());
+            g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -2098,10 +2218,15 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
         else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
         else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
+        else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
+        // Stored in milliseconds so the file stays integers like every other key here.
+        else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
+            g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
     }
     fclose(f);
-    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%%",
-        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load());
+    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%% antifreeze=%d/%.2fs",
+        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load(),
+        g_afOn.load(), g_afLimit);
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -4864,6 +4989,10 @@ DWORD WINAPI Init(LPVOID) {
             Log("[session] block unavailable - MXB App cannot see this session");
         }
         LoadOverlaySettings();  // restore radar / outline toggles, range, overlay size
+        // Now that the saved limit is known, put the rider-visibility patch in. Before any
+        // session exists, so the playback path it sits in is not running while we write.
+        if (g_afOn.load()) AfApply(g_afLimit);
+        else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row

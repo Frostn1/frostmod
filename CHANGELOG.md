@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-09-17 — unreleased
+
+### Added
+- **Riders who used to be invisible are now drawn.** On a full gate there are riders you simply
+  cannot see. No bike, no rider, no name, and no warning that anyone is there. They are not
+  lagging and they have not crashed out: everyone else can see them perfectly well, and one of
+  them can still land on you. It is worst on whoever is furthest away, which in a race usually
+  means the leader, so you can be seconds off the lead and have no idea anybody is in front of
+  you. The game only draws a rider it has two recent enough positions for, and on a full gate
+  the updates for the riders furthest from you arrive too far apart to qualify. FrostMod widens
+  how far apart those updates may be, so those riders stay on screen. A rider drawn this way is
+  smoothed — they glide rather than track, because there is genuinely less information about
+  them — but you can see them, and you can leave room. Off by setting `antifreeze=0` in
+  `frostmod_radar.cfg`, where `antifreezems` sets the window in milliseconds (default 2000).
+  MX Bikes only. It does not help with a rider the server has stopped sending anything about
+  at all; that one still freezes, as it always did.
+
 ## 2026-09-17 — v0.34.0
 
 ### Fixed

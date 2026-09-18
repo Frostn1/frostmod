@@ -208,6 +208,13 @@ add_test(NAME lean COMMAND lean_test)
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
 
+# --- rejoin test ---------------------------------------------------------------
+# The 36-byte thunk the disconnect path is repointed at. It runs with a live stack frame
+# under it, so its encoding and stack balance are proved here rather than trusted.
+# Pure constants, so it runs on any host.
+add_executable(rejoin_test tests/rejoin_test.cpp)
+add_test(NAME rejoin COMMAND rejoin_test)
+
 # --- fair send test ------------------------------------------------------------
 # The promotion rule FrostServer runs on the game's own candidate list. Getting it wrong
 # does not crash anything, it just sends the wrong riders, so the ordering is proved here.

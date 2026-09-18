@@ -329,7 +329,7 @@ void LoadClips() {
     const uint8_t voice = VoiceChoice();
     for (int i = 0; i < coachvoice::kClipCount; ++i) {
         g_voice.clips[i].clear();
-        const int id  = coachvoice::ResourceId(voice, uint8_t(i + 1));
+        const int id  = coachvoice::ResourceId(voice, coachvoice::kClips[i].kind);
         HRSRC     res = FindResourceA(mod, MAKEINTRESOURCEA(id), MAKEINTRESOURCEA(10));
         HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
         const void* p = data ? LockResource(data) : nullptr;

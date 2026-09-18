@@ -64,24 +64,41 @@ inline int ResourceId(int voice, uint8_t kind) {
     return kResourceBase + voice * kVoiceIdStride + int(kind);
 }
 
-// One clip per cue kind, BRAKE (1) to SIT (10), in kind order: the file name under
-// src/voice/<voice>/ and what it says. The words match MXB Coach's cue texts (cues.rs).
+// One clip per spoken cue kind, in kind order: the cue kind it speaks, the file name
+// under src/voice/<voice>/ and what it says. The kind is carried explicitly because the
+// kinds a clip exists for are no longer contiguous - CUSTOM (11) is drawn and never
+// spoken, so ROLL (12) follows SIT (10) here. The words match MXB Coach's cue texts
+// (cues.rs), which the plugin never reads: it picks the clip by kind.
 struct ClipInfo {
+    uint8_t     kind;
     const char* name;
     const char* text;
 };
 constexpr ClipInfo kClips[] = {
-    {"brake", "Brake"},         {"off_brakes", "Off the brakes"}, {"gas", "Gas"},
-    {"shift_up", "Shift up"},   {"shift_down", "Shift down"},     {"go_wide", "Go wide"},
-    {"cut_inside", "Cut inside"}, {"scrub", "Scrub it"},          {"stand_up", "Stand up"},
-    {"sit_down", "Sit down"},
+    {coachcue::BRAKE, "brake", "Brake"},
+    {coachcue::OFF_BRAKES, "off_brakes", "Off the brakes"},
+    {coachcue::THROTTLE, "gas", "Gas"},
+    {coachcue::UPSHIFT, "shift_up", "Shift up"},
+    {coachcue::DOWNSHIFT, "shift_down", "Shift down"},
+    {coachcue::WIDE, "go_wide", "Go wide"},
+    {coachcue::INSIDE, "cut_inside", "Cut inside"},
+    {coachcue::SCRUB, "scrub", "Scrub it"},
+    {coachcue::STAND, "stand_up", "Stand up"},
+    {coachcue::SIT, "sit_down", "Sit down"},
+    {coachcue::ROLL, "roll_off", "Roll off"},
 };
 constexpr int kClipCount = int(sizeof(kClips) / sizeof(kClips[0]));
-static_assert(kClipCount == coachcue::SIT, "one clip per cue kind, BRAKE to SIT");
+// Every kind from BRAKE to the last one has a clip, except CUSTOM which is never spoken.
+static_assert(kClipCount == int(coachcue::ROLL) - 1, "a clip for every kind but CUSTOM");
+static_assert(kClips[0].kind == coachcue::BRAKE, "brake first");
+static_assert(kClips[kClipCount - 1].kind == coachcue::ROLL, "the newest kind last");
 
-/// The clip a cue speaks, by its kind whatever its text says, or -1 for none (a custom cue).
+/// The clip a cue speaks, by its kind whatever its text says, or -1 for none: a custom
+/// cue, or a kind from a newer MXB Coach than this plugin, which draws and stays silent.
 inline int ClipFor(uint8_t kind) {
-    return kind >= coachcue::BRAKE && kind <= coachcue::SIT ? int(kind) - 1 : -1;
+    for (int i = 0; i < kClipCount; ++i)
+        if (kClips[i].kind == kind) return i;
+    return -1;
 }
 
 /// The voice `key` names, or FEMALE when it names none. Case and spacing don't matter.

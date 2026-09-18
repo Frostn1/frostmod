@@ -31,6 +31,7 @@
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
 #include <GL/gl.h>    // immediate-mode GL overlay
+#include <winhttp.h>  // the announcement feed (the launcher already uses WinHTTP)
 
 // The Windows SDK ships an OpenGL 1.1 gl.h, so GL 2.0+ tokens aren't declared and
 // glext.h isn't available. We only need this one as a glGetString() key (the
@@ -42,7 +43,8 @@
 
 #include "MinHook.h"
 #include "offsets.h"
-#include "antifreeze.h" // rider-visibility patch: the numbers and the arithmetic
+#include "antifreeze.h"
+#include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
@@ -2191,6 +2193,13 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
+// ---- server announcements: settings ----------------------------------------
+// The feature itself is below, next to the overlay it draws into. Only the settings live
+// up here, because the file they are saved in is written a few lines from now.
+static std::atomic<bool> g_msgOn{true};        // a rider can mute a server's overlay
+static std::atomic<int>  g_msgAnchor{150};     // design px up from the bottom of the screen
+static std::atomic<int>  g_msgPort{54210};     // FrostServer's API port; its own default
+
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
 // Radar/outline toggles and the overlay size. The filename stays as it was so an
 // existing install keeps its settings.
@@ -2207,6 +2216,8 @@ static void SaveOverlaySettings() {
     fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\nantifreeze=%d\nantifreezems=%d\n",
             g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
+    fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
+            g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -2222,11 +2233,16 @@ static void LoadOverlaySettings() {
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
+        else if (sscanf_s(line, "servermsg=%d",  &v) == 1) g_msgOn.store(v != 0);
+        // Clamped so a hand-edited file cannot park the stack off the top or bottom.
+        else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
+        else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
     }
     fclose(f);
-    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%% antifreeze=%d/%.2fs",
+    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%% antifreeze=%d/%.2fs "
+        "servermsg=%d y=%d port=%d",
         g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load(),
-        g_afOn.load(), g_afLimit);
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load());
 }
 
 // ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
@@ -2541,6 +2557,7 @@ static const MenuItem kMenu[] = {
     { '5', "Rider outlines" },
     { '6', "Overlay size", true },
     { '7', "Hide overlay (recording)" },
+    { '8', "Server announcements" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -2573,6 +2590,11 @@ void SetStatus(const char* s, unsigned ms) {
 // the lists. g_fontPx is set before the attempt, so a failure isn't retried per frame.
 GLuint g_fontBase = 0;
 int    g_fontPx   = 0;            // pixel height the lists were built at (0 = none yet)
+// Advance width of each glyph, in device pixels, measured when the lists are built. Only
+// the per-character colouring in the announcement overlay needs them: the raster colour is
+// latched when the position is set, so a line in more than one colour has to position every
+// glyph itself rather than let glCallLists walk the string.
+int    g_charW[256] = {0};
 
 void EnsureFont(HDC hdc, int px) {
     px = px < 10 ? 10 : (px > 64 ? 64 : px);
@@ -2587,6 +2609,8 @@ void EnsureFont(HDC hdc, int px) {
     GLuint base = glGenLists(256);
     if (base && wglUseFontBitmaps(hdc, 0, 256, base)) g_fontBase = base;
     else if (base)                                    glDeleteLists(base, 256);
+    if (!GetCharWidth32A(hdc, 0, 255, g_charW))
+        for (int i = 0; i < 256; ++i) g_charW[i] = px / 2;   // a usable guess, not a failure
     SelectObject(hdc, old);
     DeleteObject(font);
     Log("[overlay] font %dpx %s", px, g_fontBase ? "ready" : "unavailable (hint text hidden)");
@@ -2859,6 +2883,266 @@ static void DrawEspGL(int w, int h) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// server announcements
+//
+// A dedicated server cannot choose the colour of anything it says: the receiving client
+// paints every server chat line from a constant of its own, and there is no field on the
+// wire that changes it. So these do not travel as chat. FrostServer publishes them over the
+// same small HTTP API it already serves the current map from, we fetch them, and we draw
+// them ourselves - which is the only place the colour, the animation and the glyphs are
+// ours to pick. A rider without FrostMod loses nothing: the server's ordinary chat line is
+// untouched and still arrives.
+//
+// The model, the feed format and every animation curve live in servermsg.h so that
+// tests/servermsg_test.cpp can drive them off Windows. What is here is the three things
+// that need this process: where the server is, fetching, and the drawing.
+//
+// On traffic: we talk only to the server the player has joined, only while they are on it,
+// and we stop asking after a few failures - a server with no FrostServer costs one probe.
+// ---------------------------------------------------------------------------
+static std::mutex        g_msgMutex;
+static servermsg::Queue  g_msgQueue;
+
+// The address the game is sending to, i.e. the server we are on. Latched in hkSendto, which
+// already sees every outbound datagram; only where it went is read, never what was in it.
+static std::atomic<uint32_t> g_msgServerIp{0};
+// When the game last sent to it. EventDeinit reaches the PLUGIN copy of this dll, and the
+// latch lives in the INJECTED one, so leaving a server is not an event we are told about -
+// we notice it by the traffic stopping.
+static std::atomic<uint64_t> g_msgServerSeenMs{0};
+static constexpr uint64_t    kMsgStaleMs = 15000;
+static std::atomic<bool>     g_msgQuit{false};
+static HANDLE                g_msgThread = nullptr;
+
+static constexpr int kMsgPollMs  = 5000;   // how often we ask
+static constexpr int kMsgMaxFail = 3;      // then stop asking this server
+
+static double MsgNowSec() { return (double)GetTickCount64() / 1000.0; }
+
+static bool MsgFeedLive() {
+    if (!g_msgOn.load()) return false;
+    std::lock_guard<std::mutex> lk(g_msgMutex);
+    return !g_msgQueue.Live().empty();
+}
+
+// A different server means a different sequence; keeping the old one would swallow the new
+// server's first announcements.
+static void MsgResetForNewServer() {
+    std::lock_guard<std::mutex> lk(g_msgMutex);
+    g_msgQueue.Reset();
+}
+
+// GET the feed from <ip>:<port>. "" on any failure, which the caller counts.
+static std::string MsgHttpGet(uint32_t ipNet, int port, uint32_t since) {
+    std::string out;
+    const unsigned char* b = (const unsigned char*)&ipNet;
+    wchar_t host[32], path[64];
+    _snwprintf_s(host, _countof(host), _TRUNCATE, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"/frostserver/messages?since=%u", (unsigned)since);
+
+    // NO_PROXY: this is a direct address on the player's own route to the game server, and
+    // a corporate proxy has no business in the middle of it.
+    HINTERNET hSes = WinHttpOpen(L"FrostMod", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSes) return out;
+    WinHttpSetTimeouts(hSes, 1500, 1500, 2500, 2500);   // never hold the poll thread long
+    if (HINTERNET hCon = WinHttpConnect(hSes, host, (INTERNET_PORT)port, 0)) {
+        if (HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path, nullptr,
+                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0)) {
+            if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hReq, nullptr)) {
+                DWORD code = 0, sz = sizeof(code);
+                WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
+                if (code == 200) {
+                    for (;;) {
+                        DWORD avail = 0;
+                        if (!WinHttpQueryDataAvailable(hReq, &avail) || avail == 0) break;
+                        if (out.size() + avail > 64 * 1024) break;   // a feed is never this big
+                        std::string chunk(avail, '\0');
+                        DWORD got = 0;
+                        if (!WinHttpReadData(hReq, &chunk[0], avail, &got) || got == 0) break;
+                        out.append(chunk.data(), got);
+                    }
+                }
+            }
+            WinHttpCloseHandle(hReq);
+        }
+        WinHttpCloseHandle(hCon);
+    }
+    WinHttpCloseHandle(hSes);
+    return out;
+}
+
+static DWORD WINAPI MsgFeedThread(LPVOID) {
+    uint32_t lastIp = 0;
+    int      fails  = 0;
+    bool     logged = false;
+    while (!g_msgQuit.load()) {
+        // Sliced so Shutdown does not wait a whole poll interval for us.
+        for (int slept = 0; slept < kMsgPollMs && !g_msgQuit.load(); slept += 250) Sleep(250);
+        if (g_msgQuit.load()) break;
+
+        // Nothing sent for a while means the player has left; drop the latch so an old
+        // server is not polled from the main menu.
+        const uint64_t seen = g_msgServerSeenMs.load(std::memory_order_relaxed);
+        if (seen && GetTickCount64() - seen > kMsgStaleMs) {
+            if (g_msgServerIp.exchange(0) != 0) Log("[servermsg] left the server.");
+            g_msgServerSeenMs.store(0, std::memory_order_relaxed);
+            MsgResetForNewServer();
+        }
+
+        const uint32_t ip = g_msgServerIp.load();
+        if (!ip) { lastIp = 0; fails = 0; logged = false; continue; }   // not on a server
+        if (ip != lastIp) {
+            lastIp = ip; fails = 0; logged = false;
+            MsgResetForNewServer();
+        }
+        if (!g_msgOn.load() || fails >= kMsgMaxFail) continue;
+
+        uint32_t since;
+        { std::lock_guard<std::mutex> lk(g_msgMutex); since = g_msgQueue.LastSeq(); }
+
+        const std::string body = MsgHttpGet(ip, g_msgPort.load(), since);
+        std::vector<servermsg::Message> msgs;
+        uint32_t head = 0;
+        if (body.empty() || !servermsg::ParseFeedJson(body, msgs, head)) {
+            if (++fails >= kMsgMaxFail)
+                Log("[servermsg] no FrostServer feed on this server - not asking again.");
+            continue;
+        }
+        fails = 0;
+        if (!logged) {
+            logged = true;
+            Log("[servermsg] feed found on this server (seq %u).", head);
+        }
+        if (msgs.empty()) continue;
+        {
+            std::lock_guard<std::mutex> lk(g_msgMutex);
+            g_msgQueue.Ingest(msgs, MsgNowSec());
+        }
+        Log("[servermsg] %zu new announcement(s), newest seq %u", msgs.size(), head);
+    }
+    return 0;
+}
+
+static void MsgFeedStart() {
+    if (g_msgThread) return;
+    g_msgThread = CreateThread(nullptr, 0, MsgFeedThread, nullptr, 0, nullptr);
+    Log("[servermsg] poll thread %s", g_msgThread ? "started" : "could NOT start");
+}
+
+static void MsgFeedStop() {
+    g_msgQuit.store(true);
+    if (g_msgThread) {
+        WaitForSingleObject(g_msgThread, 2000);
+        CloseHandle(g_msgThread);
+        g_msgThread = nullptr;
+    }
+}
+
+// One icon, as filled cells of an 8x8 grid, in whatever colour is current.
+static void DrawIconGL(int idx, float x, float y, float px) {
+    size_t n = 0;
+    const servermsg::Icon* all = servermsg::Icons(n);
+    if (idx < 0 || (size_t)idx >= n) return;
+    const float s = px / (float)servermsg::kIconSize;
+    glBegin(GL_QUADS);
+    for (int r = 0; r < servermsg::kIconSize; ++r) {
+        const unsigned char bits = all[idx].rows[r];
+        if (!bits) continue;
+        for (int c = 0; c < servermsg::kIconSize; ++c) {
+            if (!(bits & (0x80u >> c))) continue;
+            // Row 0 is the top of the icon and y runs up the screen, so rows invert.
+            const float cx = x + (float)c * s;
+            const float cy = y + (float)(servermsg::kIconSize - 1 - r) * s;
+            glVertex2f(cx, cy); glVertex2f(cx + s, cy);
+            glVertex2f(cx + s, cy + s); glVertex2f(cx, cy + s);
+        }
+    }
+    glEnd();
+}
+
+// The stack of live announcements, oldest at the top, newest nearest the chat - the order
+// a conversation reads in. `pxPerDesign` converts the font's device-pixel advances into the
+// design-pixel space everything else here is laid out in.
+static void DrawMessagesGL(int w, int lh, float pxPerDesign) {
+    if (!g_msgOn.load() || !g_fontBase) return;
+
+    std::vector<servermsg::Message> lines;
+    const double now = MsgNowSec();
+    {
+        std::lock_guard<std::mutex> lk(g_msgMutex);
+        g_msgQueue.Expire(now);
+        lines = g_msgQueue.Live();
+    }
+    if (lines.empty()) return;
+    if (pxPerDesign <= 0.0f) pxPerDesign = 1.0f;
+
+    const int   x0     = 14;
+    const int   baseY  = g_msgAnchor.load();
+    const float iconPx = (float)lh * 0.72f;
+    const int   count  = (int)lines.size();
+
+    for (int i = 0; i < count; ++i) {
+        const servermsg::Message& m = lines[i];
+        const int y = baseY + (count - 1 - i) * lh;
+
+        const std::vector<servermsg::Span> spans = servermsg::Tokenise(m.text);
+        const int cells = servermsg::CellCount(spans);
+        const servermsg::Rgba lead = servermsg::ColorAt(m, 0, cells, now);
+        if (lead.a <= 0.01f) continue;
+
+        // A backing strip, so a pale colour still reads over a pale track.
+        float wide = 0.0f;
+        for (const auto& sp : spans) {
+            if (sp.icon) { wide += iconPx + 3.0f; continue; }
+            for (unsigned char ch : sp.text) wide += (float)g_charW[ch] / pxPerDesign;
+        }
+        const float maxWide = (float)(w - x0 - 10);
+        if (wide > maxWide) wide = maxWide;
+        glColor4f(0.03f, 0.04f, 0.07f, 0.55f * lead.a);
+        FillRect(x0 - 6, y - 4, x0 + (int)wide + 8, y + lh - 4);
+
+        const bool perCell = (m.style == servermsg::Style::Rainbow);
+        float x = (float)x0;
+        int   cell = 0;
+        for (const auto& sp : spans) {
+            if (sp.icon) {
+                const servermsg::Rgba c = servermsg::ColorAt(m, cell, cells, now);
+                glColor4f(c.r, c.g, c.b, c.a);
+                DrawIconGL(sp.iconIndex, x, (float)y + 1.0f, iconPx);
+                x += iconPx + 3.0f;
+                ++cell;
+                continue;
+            }
+            if (!perCell) {
+                // One colour for the whole run: let glCallLists walk it, which is what the
+                // rest of the overlay does and costs one raster position instead of N.
+                const servermsg::Rgba c = servermsg::ColorAt(m, cell, cells, now);
+                glColor4f(c.r, c.g, c.b, c.a);
+                glRasterPos2f(x, (float)y);
+                glListBase(g_fontBase);
+                glCallLists((GLsizei)sp.text.size(), GL_UNSIGNED_BYTE, sp.text.data());
+                for (unsigned char ch : sp.text) x += (float)g_charW[ch] / pxPerDesign;
+                cell += (int)sp.text.size();
+                continue;
+            }
+            for (unsigned char ch : sp.text) {
+                const servermsg::Rgba c = servermsg::ColorAt(m, cell, cells, now);
+                glColor4f(c.r, c.g, c.b, c.a);
+                glRasterPos2f(x, (float)y);
+                glListBase(g_fontBase);
+                glCallLists(1, GL_UNSIGNED_BYTE, &ch);
+                x += (float)g_charW[ch] / pxPerDesign;
+                ++cell;
+            }
+        }
+    }
+}
+
 void DrawOverlay(HDC hdc) {
     // Clean view wins over everything, including an open panel: the point is a frame with
     // nothing of ours in it. Anything that opens a panel clears it first (see ClearClean).
@@ -2867,7 +3151,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -2955,6 +3239,10 @@ void DrawOverlay(HDC hdc) {
             FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
         }
     }
+
+    // Announcements sit low on the left, just above where the game stacks its own chat,
+    // so a styled line reads as part of the conversation rather than as a separate HUD.
+    DrawMessagesGL(w, lh, w > 0 ? (float)pw / (float)w : 1.0f);
 
     if (g_radarOn.load()) DrawRadarGL(w, h);     // HUD overlays draw on top of any panel
     if (g_espOn.load()) {
@@ -3341,7 +3629,23 @@ static void CapLog(const char* dir, const void* sa, const char* buf, int len) {
     if (n) { LogHexTag("[cap.hex]", buf, (size_t)n); LogPrintableRuns("[cap.str]", buf, (size_t)n); }
 }
 
+// Where the game is sending, which is the server the player joined. Only the destination
+// address is read - never the datagram - and only to know who to ask for announcements.
+static void MsgLatchServer(const sockaddr* to) {
+    if (!to) return;
+    const unsigned char* p = (const unsigned char*)to;
+    if ((uint16_t)(p[0] | (p[1] << 8)) != AF_INET) return;
+    if (CapIsMaster(to)) return;                 // the master server, not a game server
+    uint32_t ip = 0; memcpy(&ip, p + 4, 4);
+    if (!ip) return;
+    g_msgServerSeenMs.store(GetTickCount64(), std::memory_order_relaxed);
+    if (g_msgServerIp.exchange(ip) != ip)
+        Log("[servermsg] on %u.%u.%u.%u - will ask it for announcements",
+            p[4], p[5], p[6], p[7]);
+}
+
 int WSAAPI hkSendto(SOCKET s, const char* buf, int len, int flags, const sockaddr* to, int tolen) {
+    MsgLatchServer(to);
     if (CapIsMaster(to)) CapLog("SEND", to, buf, len);
     return g_origSendto(s, buf, len, flags, to, tolen);
 }
@@ -3422,6 +3726,9 @@ void MenuAction(int d) {
     case 7: g_menuOpen.store(false); g_cleanView.store(true);
             Log("[clean] overlay hidden - press F7 to bring it back");
             break;
+    case 8: { bool on = !g_msgOn.load(); g_msgOn.store(on); SaveOverlaySettings();
+              SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
+              Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -4853,6 +5160,14 @@ DWORD WINAPI Init(LPVOID) {
         }
     }
 
+    // Always on: ws2_32!sendto, for the one thing the announcement feed needs and cannot
+    // get any other way - the address of the server the player joined. The detour reads the
+    // destination and nothing else; the payload logging below stays opt-in.
+    if (HMODULE ws = LoadLibraryA("ws2_32.dll")) {
+        if (auto p = GetProcAddress(ws, "sendto"))
+            InstallHook((void*)p, &hkSendto, (void**)&g_origSendto, "ws2_32!sendto");
+    }
+
     // OPT-IN (frostmod.exe --capture-master): sniff the master protocol to RE the
     // login / GETLIST / REGISTER / HOSTED wire format before we build the mimic
     // master. Hooks the ws2_32 exports and logs only master (UDP 54200 / resolved
@@ -4865,8 +5180,7 @@ DWORD WINAPI Init(LPVOID) {
         }
         if (flag[0] && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
             if (HMODULE ws = LoadLibraryA("ws2_32.dll")) {
-                if (auto p = GetProcAddress(ws, "sendto"))
-                    InstallHook((void*)p, &hkSendto, (void**)&g_origSendto, "ws2_32!sendto");
+                // sendto is already hooked above, for the announcement feed.
                 if (auto p = GetProcAddress(ws, "recvfrom"))
                     InstallHook((void*)p, &hkRecvfrom, (void**)&g_origRecvfrom, "ws2_32!recvfrom");
                 if (auto p = GetProcAddress(ws, "getaddrinfo"))
@@ -5084,6 +5398,8 @@ DWORD WINAPI Init(LPVOID) {
                 "collect a step-level log.", g_game->display);
     }
 
+    MsgFeedStart();
+
     Log("[init] ready%s. If loaded as a plugin (or injected before launch) watch for a "
         "[capture] scan line with ext='pkz' - that's the mods scan we need.",
         g_savePath[0] ? " (plugin mode)" : "");
@@ -5176,6 +5492,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 
 __declspec(dllexport) void Shutdown() {
     Log("[plugin] Shutdown() requested by game.");
+    MsgFeedStop();   // no-op in the plugin copy, which never started one
     // MinHook hooks are torn down with the process; nothing required here.
 }
 

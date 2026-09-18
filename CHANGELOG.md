@@ -3,6 +3,18 @@
 ## 2026-09-18 — v0.36.0
 
 ### Added
+- **Servers can put a message on your screen in colour.** Anything a server says in chat comes
+  out the same colour for everyone, because your game picks that colour and nothing the server
+  sends changes it. So these do not come through chat. A server running FrostServer publishes
+  its announcements, FrostMod fetches them from the server you are already on, and draws them
+  itself just above the game's chat: any colour the admin picked, optionally pulsing, breathing
+  or running through a rainbow, with small icons for a flag, a warning, a clock, a trophy and a
+  few more. Ordinary server chat is untouched and still arrives, so riders without FrostMod
+  lose nothing and see exactly what they saw before. Admins write the lines in
+  `frostserver.yaml`, can have one go out whenever the track changes, and can send one live
+  over HTTP with a password they set. You can turn the whole thing off in the F8 menu under
+  "Server announcements", and that choice sticks. FrostMod only ever talks to the server you
+  have joined, only while you are on it, and stops asking a server that has no FrostServer.
 - **Riders who used to be invisible are now drawn.** On a full gate there are riders you simply
   cannot see, with no warning that anyone is there. They are not lagging and they have not
   crashed out. Everyone else can see them perfectly well, and one of them can still land on you.

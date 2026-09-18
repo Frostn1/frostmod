@@ -40,6 +40,9 @@ enum Kind : uint8_t {
     STAND      = 9,
     SIT        = 10,
     CUSTOM     = 11,
+    // Over-jumping: roll off before the lip. Spoken at the face, not the landing, because
+    // the face is the last place the rider can change where they come down.
+    ROLL       = 12,
 };
 
 struct Cue {

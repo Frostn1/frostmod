@@ -63,6 +63,10 @@ CLIPS = [
     ("scrub", "Scrub it!"),
     ("stand_up", "Stand up!"),
     ("sit_down", "Sit down!"),
+    # ROLL is kind 12, not 11: CUSTOM is drawn and never spoken, so the kinds a clip
+    # exists for are not contiguous. "Roll off", the throttle - never "roll it", which in
+    # the game's own words means not jumping the thing at all.
+    ("roll_off", "Roll off!"),
 ]
 
 RATE = 22050
@@ -161,7 +165,7 @@ def shape(audio: np.ndarray) -> np.ndarray:
     return np.clip(np.round(audio * 32767), -32768, 32767).astype("<i2")
 
 
-def generate(name: str, cache: Path, length_scale: float) -> int:
+def generate(name: str, cache: Path, length_scale: float, only=None) -> int:
     voice_id, path, want_sha, default_scale = VOICES[name]
     voice = PiperVoice.load(fetch_voice(cache, voice_id, path, want_sha), espeak_data_dir=espeak_dir(cache))
     if voice.config.sample_rate != RATE:
@@ -172,7 +176,8 @@ def generate(name: str, cache: Path, length_scale: float) -> int:
     out.mkdir(parents=True, exist_ok=True)
     print(f"\n{name}: {voice_id}")
     total = 0
-    for clip, text in CLIPS:
+    clips = [(c, t) for c, t in CLIPS if not only or c in only]
+    for clip, text in clips:
         audio = np.concatenate([c.audio_float_array for c in voice.synthesize(text, syn)]).astype(np.float64)
         pcm = shape(audio)
         f = out / f"{clip}.wav"
@@ -186,7 +191,7 @@ def generate(name: str, cache: Path, length_scale: float) -> int:
         # The head level is the "gss" check: the clip has to open on silence, not mid-vowel.
         head = int(np.max(np.abs(pcm[: int(RATE * 0.02)])))
         print(f"  {clip:12s} {len(pcm) / RATE:5.2f} s {size:7d} B  head {head:5d}  {text}")
-    print(f"  {len(CLIPS)} clips, {total} bytes")
+    print(f"  {len(clips)} clips, {total} bytes")
     return total
 
 
@@ -196,12 +201,16 @@ def main() -> None:
                     default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "frostmod-voice")
     ap.add_argument("--voice", choices=sorted(VOICES), action="append",
                     help="only this voice; repeatable. Default: all of them.")
+    # Synthesis is not reproducible run to run, and several committed clips were repaired
+    # by hand with retrim.py afterwards. Without this, adding one clip rewrites all of them.
+    ap.add_argument("--clip", choices=[c for c, _ in CLIPS], action="append",
+                    help="only this clip; repeatable. Default: all of them.")
     ap.add_argument("--length-scale", type=float, default=0.0, help="under 1 speaks faster; 0 = the voice's own")
     args = ap.parse_args()
 
     total = 0
     for name in args.voice or sorted(VOICES):
-        total += generate(name, args.cache, args.length_scale)
+        total += generate(name, args.cache, args.length_scale, args.clip)
     print(f"\n{total} bytes in all")
 
 

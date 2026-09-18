@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-17 — v0.35.0
+
+### Added
+- **"Roll off here."** MXB Coach can now tell you when you are going long over a jump, and the
+  recorder says it at the lip, where you can still do something about it. Spoken in both
+  voices, and gated to the faster rider levels: easing off before a lip is only advice once you
+  are clearing it every lap.
+
 ## 2026-09-17 — v0.34.0
 
 ### Fixed

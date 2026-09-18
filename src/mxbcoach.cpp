@@ -42,6 +42,7 @@
 #include "coachvoice.h"
 #include "offsets.h"
 #include "others.h"
+#include "lean.h"
 #include "stance.h"
 #include "version.h"
 
@@ -611,6 +612,22 @@ struct SitInput {
 SitInput        g_sit;
 stance::Tracker g_stance;
 
+// Rider lean: the two body-position binds. Its own device handle rather than the Sit one,
+// because lean and Sit need not be bound on the same pad; the IDirectInput8A is shared.
+struct LeanAxis {
+    stance::Source source  = stance::SRC_NONE;
+    int32_t        axis    = -1;  // the axis number the bind names
+    int32_t        sign    = -1;
+    int            vk_neg  = 0, vk_pos = 0;
+    int32_t        btn_neg = -1, btn_pos = -1;
+};
+struct LeanInput {
+    LeanAxis              lr, fb;
+    IDirectInputDevice8A* dev = nullptr;
+    stance::Guid          dev_guid;
+};
+LeanInput g_lean;
+
 // The game's own top-level window: DirectInput wants one for its cooperative level.
 HWND GameWindow() {
     struct Find {
@@ -793,12 +810,18 @@ XInputGetStateFn LoadXInput() {
 
 // Reads the rider's setup from their profile and gets ready to poll the bind. Writes the
 // stint's STANCE_BIND record.
+void SetupLean(const lean::Setup& s);
+
 void SetupStance() {
     stance::Setup s;
+    // Both readers want the same two files, so they are read once and shared.
+    std::string profile_ini, controls;
     const std::string profile = stance::IniValue(ReadText(g_user + "global.ini"), "", "lastprofile");
     if (!profile.empty()) {
         const std::string dir = g_user + "profiles\\" + profile + "\\";
-        s = stance::ReadSetup(ReadText(dir + "profile.ini"), ReadText(dir + "controls.txt"));
+        profile_ini = ReadText(dir + "profile.ini");
+        controls    = ReadText(dir + "controls.txt");
+        s = stance::ReadSetup(profile_ini, controls);
     }
     g_sit.source = stance::SRC_NONE;
     g_sit.button = s.bind.index;
@@ -835,6 +858,7 @@ void SetupStance() {
     g_rec.record(coachrec::STANCE_BIND, p.data(), uint32_t(p.size()));
     g_stance.configure(s.mode, c != stance::CONF_NONE);
     g_stance_conf = c;
+    SetupLean(lean::ReadSetup(profile_ini, controls));
 }
 
 // Whether the bind is down now. False when it can't be read.
@@ -870,6 +894,150 @@ bool ReadSit(bool& down) {
         }
         default: return false;
     }
+}
+
+// Which member of the joystick state an axis number means.
+//
+// ASSUMED, NOT PROVEN. The game's axis number indexes its own per-device table, and this is
+// the natural DirectInput ordering. It has to be confirmed against a real pad - bind
+// CTRL_LRLEAN to a known stick and see which of these moves - before any reading from it is
+// worth trusting. Until then the records carry the axis number too, so a wrong mapping can be
+// spotted and corrected without re-recording.
+LONG AxisValue(const DIJOYSTATE2& js, int32_t n) {
+    switch (n) {
+        case 0: return js.lX;
+        case 1: return js.lY;
+        case 2: return js.lZ;
+        case 3: return js.lRx;
+        case 4: return js.lRy;
+        case 5: return js.lRz;
+        case 6: return js.rglSlider[0];
+        case 7: return js.rglSlider[1];
+        default: return 0;
+    }
+}
+
+constexpr LONG kAxisLo = -32768;
+constexpr LONG kAxisHi = 32767;
+
+void ReleaseLeanDevice() {
+    if (!g_lean.dev) return;
+    g_lean.dev->Unacquire();
+    g_lean.dev->Release();
+    g_lean.dev = nullptr;
+}
+
+/// Opens the lean pad and puts every axis on one known range, so two devices give comparable
+/// numbers. Buttons need no range, which is why nothing set one before.
+bool OpenLeanDevice(const stance::Guid& want) {
+    if (g_lean.dev && std::memcmp(&g_lean.dev_guid, &want, sizeof(want)) == 0) return true;
+    ReleaseLeanDevice();
+    if (OpenDevice(want) != Open::OK || !g_sit.dev) return false;
+    // The Sit path just opened it; take our own reference so releasing one doesn't kill the
+    // other, and leave the Sit handle exactly as it was.
+    g_lean.dev = g_sit.dev;
+    g_lean.dev->AddRef();
+    g_lean.dev_guid = want;
+    DIPROPRANGE r;
+    r.diph.dwSize       = sizeof(r);
+    r.diph.dwHeaderSize = sizeof(r.diph);
+    r.diph.dwObj        = 0;
+    r.diph.dwHow        = DIPH_DEVICE;
+    r.lMin              = kAxisLo;
+    r.lMax              = kAxisHi;
+    g_lean.dev->SetProperty(DIPROP_RANGE, &r.diph);
+    return true;
+}
+
+/// One axis of the rider's lean setup, from its bind.
+void SetupLeanAxis(LeanAxis& out, const lean::Axis& a) {
+    out = LeanAxis{};
+    if (a.aid == stance::FLAG_ON) return;
+    out.sign = a.bind.sign;
+    if (a.bind.input == stance::IN_KEY) {
+        const auto vk = [](int32_t dik) {
+            int v = stance::FixedVk(dik);
+            if (!v) v = int(MapVirtualKeyA(UINT(dik), MAPVK_VSC_TO_VK_EX));
+            return v;
+        };
+        out.vk_neg = vk(a.bind.index);
+        out.vk_pos = a.bind.index2 >= 0 ? vk(a.bind.index2) : 0;
+        if (out.vk_neg || out.vk_pos) out.source = stance::SRC_KEYBOARD;
+    } else if (a.bind.input == stance::IN_PAD_AXIS || a.bind.input == stance::IN_PAD_BUTTON) {
+        stance::Guid g;
+        if (!stance::ParseGuid(a.bind.device, g) || !OpenLeanDevice(g)) return;
+        if (a.bind.input == stance::IN_PAD_AXIS) {
+            out.axis = a.bind.index;
+        } else {
+            out.btn_neg = a.bind.index;
+            out.btn_pos = a.bind.index2;
+        }
+        out.source = stance::SRC_DIRECTINPUT;
+    }
+}
+
+/// Reads both lean binds and writes the stint's LEAN_BIND record.
+void SetupLean(const lean::Setup& s) {
+    SetupLeanAxis(g_lean.lr, s.lr);
+    SetupLeanAxis(g_lean.fb, s.fb);
+    if (g_lean.lr.source != stance::SRC_DIRECTINPUT && g_lean.fb.source != stance::SRC_DIRECTINPUT)
+        ReleaseLeanDevice();
+    // Both axes are read through whichever source actually opened, so rate each on its own.
+    uint8_t buf[lean::kBindSize];
+    std::memset(buf, 0, sizeof(buf));
+    buf[0] = lean::kBindLayout;
+    lean::WriteAxis(buf + 4, s.lr, lean::Rate(s.lr, g_lean.lr.source), g_lean.lr.source);
+    lean::WriteAxis(buf + 4 + lean::kAxisSize, s.fb, lean::Rate(s.fb, g_lean.fb.source), g_lean.fb.source);
+    g_rec.record(coachrec::LEAN_BIND, buf, uint32_t(sizeof(buf)));
+}
+
+/// Where one axis is now, -1..+1, or unknown when it can't be read.
+float ReadLeanAxis(const LeanAxis& a, const DIJOYSTATE2& js, bool have_js) {
+    switch (a.source) {
+        case stance::SRC_KEYBOARD: {
+            if (!GameFocused()) return lean::Unknown();
+            const bool neg = a.vk_neg && (GetAsyncKeyState(a.vk_neg) & 0x8000) != 0;
+            const bool pos = a.vk_pos && (GetAsyncKeyState(a.vk_pos) & 0x8000) != 0;
+            return lean::FromPair(neg, pos);
+        }
+        case stance::SRC_DIRECTINPUT: {
+            if (!have_js) return lean::Unknown();
+            if (a.axis >= 0 && a.axis < 8) return lean::FromAxis(int32_t(AxisValue(js, a.axis)), kAxisLo, kAxisHi, a.sign);
+            if (a.btn_neg >= 0 && a.btn_neg < 128) {
+                const bool neg = (js.rgbButtons[a.btn_neg] & 0x80) != 0;
+                const bool pos = a.btn_pos >= 0 && a.btn_pos < 128 && (js.rgbButtons[a.btn_pos] & 0x80) != 0;
+                return lean::FromPair(neg, pos);
+            }
+            return lean::Unknown();
+        }
+        default: return lean::Unknown();
+    }
+}
+
+void PollLean(float time, float pos) {
+    if (!g_rec.recording()) return;
+    if (g_lean.lr.source == stance::SRC_NONE && g_lean.fb.source == stance::SRC_NONE) return;
+    DIJOYSTATE2 js;
+    std::memset(&js, 0, sizeof(js));
+    bool have_js = false;
+    if (g_lean.dev) {
+        if (FAILED(g_lean.dev->Poll())) {
+            g_lean.dev->Acquire();
+            g_lean.dev->Poll();
+        }
+        HRESULT hr = g_lean.dev->GetDeviceState(sizeof(js), &js);
+        if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+            g_lean.dev->Acquire();
+            hr = g_lean.dev->GetDeviceState(sizeof(js), &js);
+        }
+        have_js = SUCCEEDED(hr);
+    }
+    const float lr = ReadLeanAxis(g_lean.lr, js, have_js);
+    const float fb = ReadLeanAxis(g_lean.fb, js, have_js);
+    if (!lean::IsKnown(lr) && !lean::IsKnown(fb)) return;
+    uint8_t buf[lean::kEventSize];
+    lean::WriteEvent(buf, time, pos, lr, fb);
+    g_rec.record(coachrec::LEAN, buf, uint32_t(sizeof(buf)));
 }
 
 void PollStance(float time, float pos, bool crashed) {
@@ -1145,6 +1313,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         ReadVoiceSettings(false);
     }
     PollStance(_fTime, _fPos, crashed);
+    PollLean(_fTime, _fPos);
     MaybeReloadHudSettings();
 }
 

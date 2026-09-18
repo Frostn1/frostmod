@@ -11,9 +11,15 @@ download + extract, and live-reload the mods folder — so you go from "missing
 track" to "on the server" without leaving the game. FrostServer is the first
 piece of that flow; it defines the contract the client and MXB App consume.
 
-FrostServer is **read-only** and serves nothing but the map names and links you
-put in its config. It opens no game memory, changes no gameplay, and never
-touches files outside its own folder.
+The HTTP API is **read-only** and serves nothing but the map names and links you
+put in its config. It never touches files outside its own folder.
+
+FrostServer does one thing beyond that API, and it is on by default: it keeps
+riders on the far side of the track from going invisible on each other's screens.
+That part **does** read and hook game memory, and it **does** change what goes out
+on the wire. See [Keeping distant riders visible](#keeping-distant-riders-visible)
+for exactly what it changes and how to turn it off. Nothing else in FrostServer
+touches the game.
 
 ## How it loads
 
@@ -43,6 +49,9 @@ restart the server (or the `.exe`) to pick up changes.
 port: 54210          # TCP port for the HTTP API; clients reach <server-ip>:<port>
 name: 'My MX Server' # optional friendly name reported in /frostserver/info
 
+fair_send: true      # keep distant riders from going invisible; see below
+fair_send_ticks: 9   # how far into a rider's silence to act, in 30ms ticks
+
 # For each track this server runs, its mxb-mods.com download page.
 # The KEY is the track name EXACTLY as FrostServer logs it — watch frostserver.log
 # for a line like:  [race] current track: '<name>'  — and copy that name here.
@@ -55,10 +64,81 @@ maps:
 - **`port`** — the API port. Clients reach the server at `http://<server-ip>:<port>`.
   Make sure it's open in the server's firewall / forwarded, like the game port.
 - **`name`** — cosmetic; echoed back in `/frostserver/info`.
+- **`fair_send`** / **`fair_send_ticks`** — see
+  [Keeping distant riders visible](#keeping-distant-riders-visible). On by default.
 - **`maps`** — the track-name → link table. The key must match the track name the
   server reports; FrostServer logs that exact string every time a race starts, so
   the reliable way to fill this in is to run the track once and copy the name from
   `frostserver.log`.
+
+## Keeping distant riders visible
+
+On a full gate, riders cannot see some of the people they are racing. No bike, no
+rider, no name. Those riders are still solid and can still land on someone who
+cannot see them, and everyone else on the server sees them perfectly well. It is
+worst on whoever is furthest away, which in a race usually means the leader.
+
+The cause is on the server, not on the players' machines. A full gate does not fit
+in one update packet, so the server sends each player the riders nearest them first
+and drops the rest off the end. The riders furthest away get dropped over and over.
+After about a third of a second of that, a player's game stops drawing them.
+
+FrostServer gives a rider who is close to vanishing a slot in the next packet, ahead
+of somebody nearer who has updates to spare. **No extra packets are sent and the
+packets do not get bigger.** The same bytes go to the same riders at the same rate,
+and only the choice of who is in them changes.
+
+### Using it
+
+Nothing to do. Drop `frostserver.dlo` in the `plugins` folder as above and it is on.
+
+**Only the server needs it.** Players install nothing, change nothing, and do not
+need FrostMod for this to help them. The packets reaching them are simply better.
+
+Watch `frostserver.log` for the two lines that matter:
+
+```
+[fairsend] on: a rider silent for 9 ticks goes to the front of the next packet (their game gives up at 10)
+[fairsend] this server is starving riders on a full gate; keeping them drawn from here on
+```
+
+The first says the hook is installed. The second appears the first time it actually
+rescues somebody, and it is the useful one: it tells you this server *was* dropping
+riders off people's screens. A server that never prints it never had the problem,
+which on a small grid is normal.
+
+If it cannot install, it says why and leaves the game alone. The usual reason is a
+game update moving the code it hooks.
+
+### Settings
+
+| key | default | what it does |
+|---|---|---|
+| `fair_send` | `true` | `false` leaves the server exactly as PiBoSo ships it |
+| `fair_send_ticks` | `9` | how many 30 ms ticks into a rider's silence to act |
+
+`fair_send_ticks` is clamped to 1–9. A player's game gives up at 10 ticks, so 9 is
+the last moment that still works, and lower values act earlier at the cost of
+bumping nearby riders more often. There is no reason to change it.
+
+Existing configs keep working without these keys and get the defaults. The config
+version was deliberately **not** bumped, because a bump rewrites the file and would
+put your `maps` list in a `.bak`.
+
+### Limits, so nobody is surprised
+
+- On a grid big enough that one packet cannot hold even the starving riders, this
+  rotates who is starved rather than ending it. Still better than the stock order,
+  which never rotates.
+- A promoted rider takes a slot a nearer rider would have had, so that rider waits
+  one tick. Riders close to you are sent every tick and have ticks to spare, so
+  nothing shows on screen.
+- **MX Bikes only.** The addresses are that title's. On GP Bikes or Kart Racing Pro
+  it refuses to install and says so.
+- There is a client-side half in FrostMod for players on servers that do not run
+  FrostServer. It widens how long their game will wait before giving up on a rider.
+  That one makes a distant rider visible but smoothed. This one is the better fix,
+  because the rider's position stays accurate.
 
 ## HTTP API (the contract)
 

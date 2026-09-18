@@ -188,6 +188,9 @@ add_test(NAME coachcue COMMAND coachcue_test)
 add_executable(stance_test tests/stance_test.cpp)
 add_test(NAME stance COMMAND stance_test)
 
+add_executable(lean_test tests/lean_test.cpp)
+add_test(NAME lean COMMAND lean_test)
+
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder
 # writes them. src/others.h keeps that apart from Win32.

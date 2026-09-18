@@ -69,6 +69,8 @@ enum Tag : uint8_t {
     POSITIONS   = 13,
     RACE_LAP    = 14,
     RACE_SPLIT  = 15,
+    LEAN_BIND   = 16,
+    LEAN        = 17,
 };
 
 /// Appends records to one file.

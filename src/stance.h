@@ -72,8 +72,18 @@ constexpr const char* kToggleControl = "CTRL_SIT";
 
 struct Bind {
     Input       input = IN_NONE;
-    std::string device;      // controller GUID, as written
-    int32_t     index = -1;  // scan code or button number
+    std::string device;       // controller GUID, as written
+    int32_t     index  = -1;  // scan code or button number
+    /// The second code of a two-sided control: the other direction's key, or the other
+    /// button. Sit has one side and leaves this -1; the lean controls have two.
+    int32_t     index2 = -1;
+    /// An AXIS line's trailing direction flag, 0 or 1; -1 when there isn't one.
+    int32_t     sign   = -1;
+    /// The ten tuning values every line ends with: deadzone, linearity, gain and the
+    /// smoothing either side, in the game's own order. Recorded rather than applied, so the
+    /// curve can be worked out later without the recording having baked one in.
+    float       tuning[10] = {};
+    bool        has_tuning = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -125,6 +135,15 @@ inline bool ToInt(const std::string& s, int32_t& out) {
     const long long v = std::strtoll(s.c_str(), &end, 10);
     if (!end || *end || v < INT32_MIN || v > INT32_MAX) return false;
     out = int32_t(v);
+    return true;
+}
+
+inline bool ToFloat(const std::string& s, float& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    const double v = std::strtod(s.c_str(), &end);
+    if (!end || *end) return false;
+    out = float(v);
     return true;
 }
 
@@ -195,22 +214,41 @@ inline bool ParseLine(const std::string& line, std::string& name, Bind& out) {
     int32_t    n   = -1;
     const bool dev = t.size() >= 3 && ParseGuid(t[2], g);
     const bool num = dev && t.size() >= 4 && ToInt(t[3], n);
+    // The ten tuning values close every line. Reading them from the end is what keeps the
+    // binding tokens unambiguous: a tuning value is written as a float, so `ToInt` refuses
+    // it and a missing optional token can never be mistaken for the first of the ten.
+    if (t.size() >= 10) {
+        float  tune[10];
+        size_t at = t.size() - 10;
+        bool   all = true;
+        for (size_t i = 0; i < 10 && all; ++i) all = ToFloat(t[at + i], tune[i]);
+        if (all) {
+            std::memcpy(out.tuning, tune, sizeof(tune));
+            out.has_tuning = true;
+        }
+    }
+    int32_t second = -1;
     if (type == "KEY") {
-        // A second code (two-sided controls) is left alone: Sit has one.
+        // A two-sided control binds one code per direction; Sit has one and leaves it -1.
         if (t.size() >= 3 && ToInt(t[2], n) && n > 0 && n < 256) {
             out.input = IN_KEY;
             out.index = n;
+            if (t.size() >= 4 && ToInt(t[3], second) && second > 0 && second < 256) out.index2 = second;
         }
     } else if (type == "BUTTON") {
         if (num && n >= 0 && n < 128) {
             out.input  = IN_PAD_BUTTON;
             out.device = t[2];
             out.index  = n;
+            if (t.size() >= 5 && ToInt(t[4], second) && second >= 0 && second < 128) out.index2 = second;
         }
     } else if (type == "AXIS" || type == "POV") {
         out.input = type == "AXIS" ? IN_PAD_AXIS : IN_PAD_POV;
         if (dev) out.device = t[2];
         if (num) out.index = n;
+        // An axis line ends its binding with the direction flag the game applies to it.
+        if (type == "AXIS" && num && t.size() >= 5 && ToInt(t[4], second) && (second == 0 || second == 1))
+            out.sign = second;
     } else if (type == "C_BUTTON" || type == "C_AXIS" || type == "C_SLIDER" || type == "C_POV" ||
                type == "C_DIAL") {
         out.input = IN_OTHER;  // a .dli plugin controller: DirectInput can't see it

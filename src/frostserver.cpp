@@ -38,6 +38,12 @@
 #include <cctype>
 #include <cstdlib>
 
+#ifndef FROSTSERVER_EXE
+#include <intrin.h>     // _ReturnAddress: which call site reached our writer_init detour
+#include "MinHook.h"
+#endif
+
+#include "fairsend.h"   // the promotion rule, and the game's candidate-list layout
 #include "version.h"
 
 #pragma comment(lib, "ws2_32.lib")   // harmless duplicate of the CMake link
@@ -153,6 +159,11 @@ struct Config {
     int         port = 54210;
     std::string name;                                       // friendly server name (optional)
     std::vector<std::pair<std::string, std::string>> maps;  // {track name, link} in file order
+    // Keep a starved rider in the packet so he does not go invisible on other people's
+    // screens. See fairsend.h. On by default, because the bug it fixes is silent and the
+    // cost of the fix is one tick of delay for a rider who has ticks to spare.
+    bool        fairSend      = true;
+    int         fairSendTicks = fairsend::kPromoteAtTicks;
 };
 std::mutex g_cfgMutex;
 Config     g_cfg;
@@ -167,6 +178,16 @@ const char* kDefaultConfig =
     "\n"
     "port: 54210          # TCP port for the HTTP API; clients reach <server-ip>:<port>\n"
     "name: ''             # optional friendly server name reported in /frostserver/info\n"
+    "\n"
+    "# On a full gate this server cannot fit every rider into one update packet, so it\n"
+    "# sends the riders nearest each player first and drops the rest. The riders furthest\n"
+    "# away get dropped over and over, and after about a third of a second their game\n"
+    "# stops drawing them. They stay solid and can still land on somebody who cannot see\n"
+    "# them. fair_send gives a rider who is close to vanishing a slot in the next packet,\n"
+    "# ahead of somebody nearer who has updates to spare. No extra packets are sent.\n"
+    "fair_send: true      # set false to leave the server exactly as PiBoSo ships it\n"
+    "fair_send_ticks: 9   # act this many 30ms ticks into a rider's silence (their game\n"
+    "                     # gives up at 10, so 9 leaves one tick of margin)\n"
     "\n"
     "# For each track this server runs, the mxb-mods.com page to download it.\n"
     "# The KEY must be the track name EXACTLY as FrostServer logs it - watch\n"
@@ -259,6 +280,15 @@ void LoadConfig() {
         if      (key == "maps") inMaps = true;
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
+        else if (key == "fair_send") { std::string v = lower(stripComment(val)); c.fairSend = !(v == "false" || v == "0" || v == "no"); }
+        else if (key == "fair_send_ticks") {
+            // Clamped, not trusted. Above the cliff the promotion would arrive too late to
+            // help, and at zero every rider is "starving" and the order stops meaning anything.
+            int t = atoi(stripComment(val).c_str());
+            if (t >= 1 && t < fairsend::kCliffTicks) c.fairSendTicks = t;
+            else Log("[config] fair_send_ticks must be 1..%d, keeping %d",
+                     fairsend::kCliffTicks - 1, c.fairSendTicks);
+        }
         else Log("[config] ignoring unknown key: %s", key.c_str());
     }
     fclose(f);
@@ -478,12 +508,106 @@ void LogAsciiRuns(const char* tag, const void* data, int size) {
 }
 
 // Shared init used by both the plugin Startup() and the standalone main().
+// ---- fair send: keeping a starved rider in the packet ------------------------
+// The rule and the reasoning are in fairsend.h. This is the part that needs a process.
+//
+// WHERE WE STEP IN. The builder at `0x29C760` populates the candidate list, sorts it by
+// distance, drops riders whose send interval has not elapsed, and only then starts writing
+// the packet. The first thing it writes with is `writer_init` at `0x283590`, so a hook on
+// that helper lands exactly between "the list is final" and "the packet is filled".
+//
+// `writer_init` is shared by every message builder in the game, so the detour has to know
+// whether THIS call is the one we want. It checks the return address against the instruction
+// after the builder's own call site. That is exact, costs one compare, and needs nothing from
+// the game's registers.
+//
+// Everything else comes out of static memory: the candidate array is at a fixed address and
+// each record already carries its own staleness. Nothing here reads a register or walks a
+// stack frame, which is why this needs no trampoline and no hand-written assembly.
+#ifndef FROSTSERVER_EXE
+
+constexpr uintptr_t kRvaWriterInit = 0x283590;   // writer_init(w, buf, cap)
+constexpr uintptr_t kRvaBuilderCallRet = 0x29D490;  // the instruction after the builder's call
+
+using WriterInitFn = void* (*)(void*, void*, int);
+static WriterInitFn g_writerInitOrig = nullptr;
+static uintptr_t    g_gameBase       = 0;
+static std::atomic<bool> g_fairOn{false};
+static std::atomic<int>  g_fairTicks{fairsend::kPromoteAtTicks};
+// Promotions are counted rather than logged. This runs about thirty times a second for every
+// rider on the server, and a line per promotion would bury the log it shares with the map API.
+static std::atomic<unsigned long long> g_fairPromoted{0};
+static std::atomic<unsigned long long> g_fairPasses{0};
+
+static void* FairWriterInit(void* w, void* buf, int cap) {
+    if (g_fairOn.load(std::memory_order_relaxed) &&
+        (uintptr_t)_ReturnAddress() == g_gameBase + kRvaBuilderCallRet) {
+        auto* recs = reinterpret_cast<fairsend::Record*>(g_gameBase + fairsend::kRvaCandidates);
+        const int n = fairsend::CountFilled(recs, (int)fairsend::kMaxRecords);
+        const int moved = fairsend::Promote(recs, n, g_fairTicks.load(std::memory_order_relaxed));
+        g_fairPasses.fetch_add(1, std::memory_order_relaxed);
+        if (moved) {
+            const unsigned long long total =
+                g_fairPromoted.fetch_add((unsigned)moved, std::memory_order_relaxed);
+            // Say it once. A promotion means this server was about to drop a rider off
+            // somebody's screen, which an operator wants to know happens here at all. Saying
+            // it again thirty times a second would tell them nothing more and bury the log.
+            if (total == 0)
+                Log("[fairsend] this server is starving riders on a full gate; "
+                    "keeping them drawn from here on");
+        }
+    }
+    return g_writerInitOrig(w, buf, cap);
+}
+
+static void StartFairSend() {
+    bool on; int ticks;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); on = g_cfg.fairSend; ticks = g_cfg.fairSendTicks; }
+    if (!on) { Log("[fairsend] off by config; distant riders will vanish as the game ships"); return; }
+
+    // MX Bikes only. The addresses are that title's, and the same offsets inside GP Bikes or
+    // Kart Racing Pro are unrelated code. GetModID() already limits the plugin to MX Bikes,
+    // so this is the second lock on the same door rather than the only one.
+    char exe[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, exe, sizeof(exe));
+    const char* leaf = strrchr(exe, '\\');
+    leaf = leaf ? leaf + 1 : exe;
+    if (_stricmp(leaf, "mxbikes.exe") != 0) {
+        Log("[fairsend] not applied: host is '%s', the offsets are MX Bikes'", leaf);
+        return;
+    }
+
+    g_gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (!g_gameBase) { Log("[fairsend] not applied: no module base"); return; }
+
+    if (MH_Initialize() != MH_OK) { Log("[fairsend] not applied: MinHook init failed"); return; }
+    void* target = reinterpret_cast<void*>(g_gameBase + kRvaWriterInit);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&FairWriterInit),
+                      reinterpret_cast<void**>(&g_writerInitOrig)) != MH_OK) {
+        Log("[fairsend] not applied: could not hook +0x%llX", (unsigned long long)kRvaWriterInit);
+        return;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        Log("[fairsend] not applied: could not enable the hook");
+        return;
+    }
+    g_fairTicks.store(ticks);
+    g_fairOn.store(true);
+    Log("[fairsend] on: a rider silent for %d ticks goes to the front of the next packet "
+        "(their game gives up at %d)", ticks, fairsend::kCliffTicks);
+}
+
+#else
+static void StartFairSend() {}   // the standalone exe is not inside a game
+#endif
+
 void FrostServerInit() {
     InitPaths();
     Log("=============== FrostServer %s starting ===============", FROSTMOD_VERSION);
     ensureConfig();
     LoadConfig();
     StartHttpServer();
+    StartFairSend();
 }
 
 } // namespace

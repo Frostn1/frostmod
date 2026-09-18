@@ -116,7 +116,11 @@ set_target_properties(frostmod_app PROPERTIES OUTPUT_NAME "frostmod")
 # The same source also builds a standalone frostserver.exe (FROSTSERVER_EXE) that
 # serves the API with no game attached, for testing the client / MXB App flow.
 add_library(frostserver SHARED src/frostserver.cpp ${FROSTSERVER_DLL_RC})
-target_link_libraries(frostserver PRIVATE ws2_32)
+# MinHook for the fair-send hook (fairsend.h). The plugin is loaded INTO the dedicated
+# server, so it can hook the game's own code without an injector. The standalone exe below
+# links neither, because it has no game to hook.
+target_link_libraries(frostserver PRIVATE ws2_32 minhook)
+target_include_directories(frostserver PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostserver PROPERTIES OUTPUT_NAME "frostserver" PREFIX "")
 
 add_executable(frostserver_app src/frostserver.cpp ${FROSTSERVER_EXE_RC})
@@ -203,6 +207,13 @@ add_test(NAME lean COMMAND lean_test)
 # Pure constants, so it runs on any host.
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
+
+# --- fair send test ------------------------------------------------------------
+# The promotion rule FrostServer runs on the game's own candidate list. Getting it wrong
+# does not crash anything, it just sends the wrong riders, so the ordering is proved here.
+# Pure logic, so it runs on any host.
+add_executable(fairsend_test tests/fairsend_test.cpp)
+add_test(NAME fairsend COMMAND fairsend_test)
 
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder

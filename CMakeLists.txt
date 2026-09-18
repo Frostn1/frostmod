@@ -93,7 +93,7 @@ FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
 add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp ${FROSTMOD_DLL_RC})
-target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32)
+target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32 winhttp)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")
@@ -214,6 +214,11 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 # Pure logic, so it runs on any host.
 add_executable(fairsend_test tests/fairsend_test.cpp)
 add_test(NAME fairsend COMMAND fairsend_test)
+
+# servermsg.h is spoken by BOTH halves - FrostServer publishes the feed and FrostMod parses
+# it - in two processes that never compile together, so the round trip is proved here.
+add_executable(servermsg_test tests/servermsg_test.cpp)
+add_test(NAME servermsg COMMAND servermsg_test)
 
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder

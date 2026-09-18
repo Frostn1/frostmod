@@ -140,10 +140,90 @@ put your `maps` list in a `.bak`.
   That one makes a distant rider visible but smoothed. This one is the better fix,
   because the rider's position stays accurate.
 
+## Styled announcements
+
+Every message a dedicated server sends in chat arrives in the same colour on every
+player's screen, in the game's own font. That is decided by the receiving game, not by
+the server, so there is nothing a server can put in a chat message that changes it.
+
+So FrostServer does not send these as chat. It publishes them, FrostMod fetches them from
+the server the player is already on, and FrostMod draws them itself — just above where the
+game stacks its chat, in the colour you picked, with the animation you picked.
+
+**What each kind of player sees.** A player running FrostMod sees your styled line. A
+player without it sees nothing extra and loses nothing: ordinary server chat is untouched
+and still arrives as it always did. So use ordinary chat for anything everyone must read,
+and announcements for the things that are nicer in colour — the welcome, the rules, the
+Discord, a warning before a session change.
+
+### Writing them
+
+Add an `announce:` list to `frostserver.yaml`:
+
+```yaml
+announce:
+  - text: ':flag: Welcome to Frost MX - clean racing, no cutting'
+    color: FF3B00
+    style: pulse
+    seconds: 8
+    every: 300
+
+  - text: ':clock: Qualifying starts on the hour'
+    color: 7FD4FF
+    style: rainbow
+    seconds: 6
+
+announce_session: true    # also say a line whenever the track changes
+announce_token: ''        # see "Live announcements" below
+```
+
+| key | what it does |
+|---|---|
+| `text` | what to say. Cut at 160 characters. |
+| `color` | `RRGGBB` hex. Default white. |
+| `style` | `none`, `pulse` (brightness breathes), `fade` (alpha breathes) or `rainbow` (the colour runs along the line). Default `none`. |
+| `seconds` | how long it stays on screen, 1–30. Default 8. |
+| `every` | repeat every N seconds. Leave it out to say it once, when the server starts. |
+
+Every line fades in and out whatever its style, so nothing pops on or off.
+
+### Icons
+
+These names draw a small symbol in the message's colour:
+
+`:flag:` `:warn:` `:star:` `:clock:` `:trophy:` `:check:` `:cross:` `:bolt:` `:skull:`
+`:heart:`
+
+They are single-colour symbols, tinted to match the message — not colour emoji. A name
+that is not on the list is left exactly as you typed it, so `2:30` stays `2:30`.
+
+### Live announcements
+
+Set `announce_token` to a password and you can send one right now, from anywhere that can
+reach the server:
+
+```
+curl -X POST http://<server-ip>:54210/frostserver/announce \
+  -H "Authorization: Bearer <your token>" \
+  -H "Content-Type: application/json" \
+  -d '{"text":":warn: Red flag - stop on track","color":"FF0000","style":"pulse","seconds":10}'
+```
+
+Left empty, the endpoint does not exist and returns `404` — which is also what it returns
+to anyone probing for it. **It is a password on an open port; treat it like one.** Anyone
+who has it can put words on your riders' screens.
+
+### What players control
+
+A rider can turn the overlay off entirely (FrostMod's F8 menu, "Server announcements"), and
+that choice sticks. The position and FrostServer's API port are `servermsgy` and
+`servermsgport` in `frostmod_radar.cfg`. If you change `port:` in `frostserver.yaml`, riders
+must set `servermsgport` to match — which is a good reason to leave the port alone.
+
 ## HTTP API (the contract)
 
 All responses are JSON (except `/health`), `Access-Control-Allow-Origin: *`,
-`Connection: close`. Only `GET` is supported.
+`Connection: close`. Everything is `GET` except the one authenticated `POST` below.
 
 ### `GET /frostserver/info`
 
@@ -180,6 +260,34 @@ not just the current one (e.g. to pre-download the rotation).
     { "name": "Some MX Track", "link": "https://mxb-mods.com/some-mx-track/" }
   ]
 }
+```
+
+### `GET /frostserver/messages?since=<seq>`
+
+Announcements newer than `since` (omit it for everything the ring holds). `seq` at the top
+level is the newest sequence the server has, so a client that has fallen behind can tell by
+how much. The ring keeps the last 64; a client away longer than that misses the difference,
+which is intended — an announcement is news, not a mailbox.
+
+```json
+{
+  "seq": 12,
+  "messages": [
+    { "seq": 11, "text": ":flag: Welcome", "color": "FF3B00", "style": "pulse", "seconds": 8.00 },
+    { "seq": 12, "text": "Qualifying in 5", "color": "7FD4FF", "style": "none", "seconds": 6.00 }
+  ]
+}
+```
+
+### `POST /frostserver/announce`
+
+Publish one announcement now. Requires `Authorization: Bearer <announce_token>`; returns
+`404` when no token is configured, `401` on a wrong one. The body is one message object —
+`text` required, `color`, `style` and `seconds` optional and clamped the same way a
+configured line is. Body cap 4 KB.
+
+```json
+{ "seq": 13 }
 ```
 
 ### `GET /health`

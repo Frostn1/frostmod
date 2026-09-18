@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <deque>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -44,6 +46,7 @@
 #endif
 
 #include "fairsend.h"   // the promotion rule, and the game's candidate-list layout
+#include "servermsg.h"  // the announcement model + feed JSON, shared with FrostMod
 #include "version.h"
 
 #pragma comment(lib, "ws2_32.lib")   // harmless duplicate of the CMake link
@@ -155,6 +158,16 @@ std::string jsonEscape(const std::string& s) {
 // ---------------------------------------------------------------------------
 // config: port, server name, and the map-name -> mxb-mods link table
 // ---------------------------------------------------------------------------
+// One announcement an admin configured. `every` is the repeat interval in seconds; 0 means
+// the line goes out once, when the server starts.
+struct Announce {
+    std::string      text;
+    uint32_t         rgb     = 0xFFFFFFu;
+    servermsg::Style style   = servermsg::Style::None;
+    float            seconds = servermsg::kDefaultSeconds;
+    int              every   = 0;
+};
+
 struct Config {
     int         port = 54210;
     std::string name;                                       // friendly server name (optional)
@@ -164,6 +177,11 @@ struct Config {
     // cost of the fix is one tick of delay for a rider who has ticks to spare.
     bool        fairSend      = true;
     int         fairSendTicks = fairsend::kPromoteAtTicks;
+    // Styled announcements. These do not travel as chat - FrostMod fetches them and draws
+    // them itself, so a rider without it is unaffected and still sees ordinary server chat.
+    std::vector<Announce> announce;              // timed lines from this file
+    std::string           announceToken;         // bearer token for POST; empty = endpoint off
+    bool                  announceSession = false;  // a line when the track changes
 };
 std::mutex g_cfgMutex;
 Config     g_cfg;
@@ -195,7 +213,33 @@ const char* kDefaultConfig =
     "# and copy that name here. Quote names that contain spaces or ':'.\n"
     "maps:\n"
     "  # 'Red Bud 2024': https://mxb-mods.com/red-bud-2024/\n"
-    "  # 'Some MX Track': https://mxb-mods.com/some-mx-track/\n";
+    "  # 'Some MX Track': https://mxb-mods.com/some-mx-track/\n"
+    "\n"
+    "# Styled announcements. The game paints every server chat line the same colour and\n"
+    "# nothing changes that, so these are not sent as chat: FrostServer publishes them and\n"
+    "# FrostMod draws them in its own overlay, in the colour you pick. Riders who do not run\n"
+    "# FrostMod see nothing extra and lose nothing - use ordinary server chat for anything\n"
+    "# everybody must read.\n"
+    "#\n"
+    "#   text     what to say. :flag: :warn: :star: :clock: :trophy: :check: :cross:\n"
+    "#            :bolt: :skull: :heart: draw a small icon in the message's colour.\n"
+    "#   color    RRGGBB hex. Default white.\n"
+    "#   style    none | pulse | fade | rainbow. Default none.\n"
+    "#   seconds  how long it stays on screen, 1-30. Default 8.\n"
+    "#   every    repeat every N seconds. Omit to say it once, when the server starts.\n"
+    "announce:\n"
+    "  # - text: ':flag: Welcome - clean racing, no cutting'\n"
+    "  #   color: FF3B00\n"
+    "  #   style: pulse\n"
+    "  #   seconds: 8\n"
+    "  #   every: 300\n"
+    "\n"
+    "announce_session: false   # also say a line whenever the track changes\n"
+    "announce_token: ''        # set a password here to allow live announcements over HTTP:\n"
+    "                          #   POST /frostserver/announce  with header\n"
+    "                          #   Authorization: Bearer <this>  and a JSON body\n"
+    "                          #   {\"text\":\"...\",\"color\":\"FF3B00\",\"style\":\"pulse\"}\n"
+    "                          # Left empty the endpoint is off and returns 404.\n";
 
 bool configIsCurrent() {
     FILE* f = nullptr;
@@ -257,7 +301,7 @@ void LoadConfig() {
         g_cfg = std::move(c);
         return;
     }
-    bool inMaps = false;
+    bool inMaps = false, inAnnounce = false;
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
         bool indented = (line[0] == ' ' || line[0] == '\t');
@@ -271,13 +315,43 @@ void LoadConfig() {
             continue;
         }
 
+        // announce entries: "- text: ..." opens one, the indented keys under it fill it in.
+        if (indented && inAnnounce) {
+            std::string e = s;
+            if (e[0] == '-') { e = trim(e.substr(1)); c.announce.emplace_back(); }
+            if (c.announce.empty()) {
+                Log("[config] announce key before any '- text:' entry, ignored: %s", s.c_str());
+                continue;
+            }
+            size_t colon = e.find(':');
+            if (colon == std::string::npos) { Log("[config] ignoring announce line: %s", s.c_str()); continue; }
+            // Split on the FIRST colon only, so ':flag: hi' survives as a value unquoted.
+            std::string k = lower(trim(e.substr(0, colon)));
+            std::string v = trim(e.substr(colon + 1));
+            Announce& a = c.announce.back();
+            if      (k == "text")    a.text = unquote(stripComment(v));
+            else if (k == "style")   a.style = servermsg::StyleFromName(lower(unquote(stripComment(v))));
+            else if (k == "seconds") a.seconds = servermsg::ClampSeconds((float)atof(stripComment(v).c_str()));
+            else if (k == "every")   { int n = atoi(stripComment(v).c_str()); a.every = n > 0 ? n : 0; }
+            else if (k == "color" || k == "colour") {
+                uint32_t rgb = 0;
+                if (servermsg::ParseHexRgb(unquote(stripComment(v)), rgb)) a.rgb = rgb;
+                else Log("[config] announce color must be RRGGBB hex, keeping white: %s", v.c_str());
+            }
+            else Log("[config] ignoring unknown announce key: %s", k.c_str());
+            continue;
+        }
+
         // top-level key: value
         size_t colon = s.find(':');
         if (colon == std::string::npos) { Log("[config] ignoring line: %s", s.c_str()); continue; }
         std::string key = lower(trim(s.substr(0, colon)));
         std::string val = trim(s.substr(colon + 1));
-        inMaps = false;
+        inMaps = false; inAnnounce = false;
         if      (key == "maps") inMaps = true;
+        else if (key == "announce") inAnnounce = true;
+        else if (key == "announce_token") c.announceToken = unquote(stripComment(val));
+        else if (key == "announce_session") { std::string v = lower(stripComment(val)); c.announceSession = (v == "true" || v == "1" || v == "yes"); }
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
         else if (key == "fair_send") { std::string v = lower(stripComment(val)); c.fairSend = !(v == "false" || v == "0" || v == "no"); }
@@ -293,10 +367,23 @@ void LoadConfig() {
     }
     fclose(f);
 
-    Log("[config] loaded: port=%d name='%s' maps=%zu", c.port, c.name.c_str(), c.maps.size());
+    // An entry with no text would publish an empty line; drop it here rather than on every tick.
+    for (size_t i = c.announce.size(); i-- > 0; )
+        if (c.announce[i].text.empty()) {
+            Log("[config] dropped an announce entry with no text");
+            c.announce.erase(c.announce.begin() + (long)i);
+        }
+
+    Log("[config] loaded: port=%d name='%s' maps=%zu announce=%zu session=%d push=%s",
+        c.port, c.name.c_str(), c.maps.size(), c.announce.size(), (int)c.announceSession,
+        c.announceToken.empty() ? "off" : "on");
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     g_cfg = std::move(c);
 }
+
+// A line when the track changes, if the admin asked for one. Declared here and defined
+// below the ring, since that is where publishing lives.
+void AnnounceSession(const std::string& track);
 
 // Look up the mxb-mods link for a track name (case-insensitive). "" if none.
 std::string LinkForTrack(const std::string& track) {
@@ -330,7 +417,71 @@ bool GetCurrentTrack(std::string& out) {
 }
 
 // ---------------------------------------------------------------------------
-// tiny HTTP/1.1 server (read-only GET; one connection at a time)
+// the announcement ring
+//
+// Everything this server has published, oldest first, each with a sequence number. A client
+// asks for what is newer than the last one it saw. The ring is bounded and a client that has
+// been away longer than it simply misses the difference, which is the right behaviour: an
+// announcement is news, not a mailbox.
+// ---------------------------------------------------------------------------
+constexpr size_t kRingMax = 64;
+
+std::mutex                     g_msgMutex;
+std::deque<servermsg::Message> g_ring;
+uint32_t                       g_msgSeq = 0;
+
+// Returns the sequence given, or 0 when there was nothing to say.
+uint32_t PublishMessage(const std::string& text, uint32_t rgb, servermsg::Style st, float secs) {
+    servermsg::Message m;
+    m.text = servermsg::Truncate(text);
+    if (m.text.empty()) return 0;
+    m.rgb     = rgb & 0xFFFFFFu;
+    m.style   = st;
+    m.seconds = servermsg::ClampSeconds(secs);
+
+    std::lock_guard<std::mutex> lk(g_msgMutex);
+    m.seq = ++g_msgSeq;
+    g_ring.push_back(m);
+    while (g_ring.size() > kRingMax) g_ring.pop_front();
+    return m.seq;
+}
+
+void AnnounceSession(const std::string& track) {
+    bool on = false;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); on = g_cfg.announceSession; }
+    if (!on || track.empty()) return;
+    PublishMessage(":flag: Now on " + track, 0x7FD4FFu, servermsg::Style::None, 8.0f);
+}
+
+// Seconds since this process started. The scheduler works in these rather than wall time so
+// that a clock correction cannot make an announcement fire a thousand times or never again.
+double NowSeconds() {
+    using namespace std::chrono;
+    static const steady_clock::time_point start = steady_clock::now();
+    return duration<double>(steady_clock::now() - start).count();
+}
+
+// When each configured entry is next due. Touched only by the server thread.
+std::vector<double> g_nextDue;
+
+void ScheduleTick() {
+    std::vector<Announce> list;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); list = g_cfg.announce; }
+    // A reloaded config can change the list; start its schedule over rather than line up
+    // due times against entries that may no longer be the same ones.
+    if (g_nextDue.size() != list.size()) g_nextDue.assign(list.size(), 0.0);
+
+    const double now = NowSeconds();
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (now < g_nextDue[i]) continue;
+        PublishMessage(list[i].text, list[i].rgb, list[i].style, list[i].seconds);
+        // A one-shot is pushed far enough out that it cannot come round again.
+        g_nextDue[i] = list[i].every > 0 ? now + (double)list[i].every : 1e18;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tiny HTTP/1.1 server (GET, plus one authenticated POST; one connection at a time)
 // ---------------------------------------------------------------------------
 std::atomic<bool> g_httpRunning{false};
 // Shared between the server thread and Stop* only at shutdown; on Win64 an
@@ -368,6 +519,18 @@ std::string BuildMapsJson() {
     return j;
 }
 
+std::string BuildMessagesJson(uint32_t since) {
+    std::vector<servermsg::Message> newer;
+    uint32_t head = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_msgMutex);
+        head = g_msgSeq;
+        for (const auto& m : g_ring)
+            if (m.seq > since) newer.push_back(m);
+    }
+    return servermsg::BuildFeedJson(newer, head);
+}
+
 void SendResponse(SOCKET c, const char* status, const char* contentType, const std::string& body) {
     char header[256];
     int n = _snprintf_s(header, sizeof(header), _TRUNCATE,
@@ -394,23 +557,115 @@ std::string ParsePath(const char* req, int len) {
     return std::string(p, q - p);
 }
 
+// One query parameter of the request line, as a non-negative integer. ParsePath stops at
+// '?' on purpose - the other routes take no parameters - so the query is read here instead.
+uint32_t ParseQueryUInt(const std::string& req, const char* key, uint32_t def) {
+    std::string line = req.substr(0, req.find('\r'));
+    size_t q = line.find('?');
+    if (q == std::string::npos) return def;
+    size_t sp = line.find(' ', q);
+    std::string query = line.substr(q + 1, sp == std::string::npos ? std::string::npos : sp - q - 1);
+    const std::string needle = std::string(key) + "=";
+    for (size_t k = query.find(needle); k != std::string::npos; k = query.find(needle, k + 1)) {
+        if (k != 0 && query[k - 1] != '&') continue;      // "since=" not "notsince="
+        const char* p = query.c_str() + k + needle.size();
+        if (*p < '0' || *p > '9') return def;
+        return (uint32_t)strtoul(p, nullptr, 10);
+    }
+    return def;
+}
+
+// The trimmed value of a header, matched case-insensitively. "" when absent.
+std::string HeaderValue(const std::string& req, const char* name) {
+    const std::string lower_req = lower(req);
+    const std::string needle = "\r\n" + lower(name) + ":";
+    size_t k = lower_req.find(needle);
+    if (k == std::string::npos) return "";
+    size_t start = k + needle.size();
+    size_t eol = req.find('\r', start);
+    if (eol == std::string::npos) return "";
+    return trim(req.substr(start, eol - start));
+}
+
+// A live announcement pushed over HTTP. The only write this server accepts, so everything
+// about it is bounded: the body has a cap, the token must match, and the message goes
+// through exactly the same clamps as a line configured in the file.
+constexpr size_t kMaxBody = 4096;
+
+void HandleAnnounce(SOCKET c, std::string& req) {
+    std::string token;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); token = g_cfg.announceToken; }
+    if (token.empty()) {
+        // Indistinguishable from a server that has no such route, which is the point.
+        SendResponse(c, "404 Not Found", "text/plain", "not found");
+        return;
+    }
+    if (HeaderValue(req, "authorization") != ("Bearer " + token)) {
+        SendResponse(c, "401 Unauthorized", "text/plain", "bad or missing bearer token");
+        Log("[announce] rejected a push: wrong token");
+        return;
+    }
+
+    size_t hend = req.find("\r\n\r\n");
+    if (hend == std::string::npos) {
+        SendResponse(c, "400 Bad Request", "text/plain", "malformed request");
+        return;
+    }
+    const size_t declared = (size_t)atoi(HeaderValue(req, "content-length").c_str());
+    if (declared > kMaxBody) {
+        SendResponse(c, "413 Payload Too Large", "text/plain", "body too large");
+        return;
+    }
+    // The body may not have arrived with the headers; read on until we have what was
+    // declared, and stop at the cap whatever the sender claims.
+    std::string body = req.substr(hend + 4);
+    char more[1024];
+    while (body.size() < declared && body.size() < kMaxBody) {
+        int n = recv(c, more, sizeof(more), 0);
+        if (n <= 0) break;
+        body.append(more, (size_t)n);
+    }
+
+    servermsg::Message m;
+    if (!servermsg::ParseMessageObject(body, m)) {
+        SendResponse(c, "400 Bad Request", "application/json",
+                     "{\"error\":\"expected {\\\"text\\\":\\\"...\\\"} with optional color, style, seconds\"}");
+        return;
+    }
+    const uint32_t seq = PublishMessage(m.text, m.rgb, m.style, m.seconds);
+    Log("[announce] published seq=%u style=%s color=%06X '%s'",
+        seq, servermsg::StyleName(m.style), m.rgb, m.text.c_str());
+    SendResponse(c, "200 OK", "application/json", "{\"seq\":" + std::to_string(seq) + "}");
+}
+
 void HandleConnection(SOCKET c) {
     char buf[4096];
     int len = recv(c, buf, sizeof(buf) - 1, 0);
     if (len <= 0) return;
     buf[len] = 0;
+    std::string req(buf, (size_t)len);
 
-    // only GET is supported
-    if (_strnicmp(buf, "GET ", 4) != 0) {
+    const bool isGet  = _strnicmp(buf, "GET ",  4) == 0;
+    const bool isPost = _strnicmp(buf, "POST ", 5) == 0;
+    if (!isGet && !isPost) {
         SendResponse(c, "405 Method Not Allowed", "text/plain", "method not allowed");
         return;
     }
     std::string path = ParsePath(buf, len);
 
+    if (isPost) {
+        if (path == "/frostserver/announce") HandleAnnounce(c, req);
+        else SendResponse(c, "404 Not Found", "text/plain", "not found");
+        return;
+    }
+
     if (path == "/frostserver/info")
         SendResponse(c, "200 OK", "application/json", BuildInfoJson());
     else if (path == "/frostserver/maps")
         SendResponse(c, "200 OK", "application/json", BuildMapsJson());
+    else if (path == "/frostserver/messages")
+        SendResponse(c, "200 OK", "application/json",
+                     BuildMessagesJson(ParseQueryUInt(req, "since", 0)));
     else if (path == "/health" || path == "/frostserver/health")
         SendResponse(c, "200 OK", "text/plain", "ok");
     else
@@ -447,8 +702,20 @@ void HttpServerLoop(int port) {
         return;
     }
 
-    Log("[http] listening on 0.0.0.0:%d  (GET /frostserver/info, /frostserver/maps, /health)", port);
+    Log("[http] listening on 0.0.0.0:%d  (GET /frostserver/info, /frostserver/maps, "
+        "/frostserver/messages, /health; POST /frostserver/announce)", port);
     while (g_httpRunning.load()) {
+        // A timeout rather than a blocking accept, so due announcements go out whether or
+        // not anybody happens to call. One thread still, as before.
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(g_listenSock, &rfds);
+        timeval tv{1, 0};
+        const int ready = select(0, &rfds, nullptr, nullptr, &tv);
+        if (!g_httpRunning.load()) break;
+        ScheduleTick();
+        if (ready <= 0) continue;
+
         SOCKET c = accept(g_listenSock, nullptr, nullptr);
         if (c == INVALID_SOCKET) {
             if (!g_httpRunning.load()) break;    // closed by StopHttpServer
@@ -656,6 +923,7 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     e.m_szName[sizeof(e.m_szName) - 1]           = 0;   // ensure NUL-terminated
     e.m_szTrackName[sizeof(e.m_szTrackName) - 1] = 0;
     SetCurrentTrack(e.m_szTrackName);
+    AnnounceSession(e.m_szTrackName);
     Log("[race] RaceEvent size=%d type=%d  track='%s'  event='%s'",
         _iDataSize, e.m_iType, e.m_szTrackName, e.m_szName);
     LogAsciiRuns("[race.raw]", _pData, _iDataSize);   // probe: verify field layout

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-18 — v0.36.0
+## 2026-09-18 — unreleased
 
 ### Added
 - **Servers can put a message on your screen in colour.** Anything a server says in chat comes
@@ -15,6 +15,10 @@
   over HTTP with a password they set. You can turn the whole thing off in the F8 menu under
   "Server announcements", and that choice sticks. FrostMod only ever talks to the server you
   have joined, only while you are on it, and stops asking a server that has no FrostServer.
+
+## 2026-09-18 — v0.36.0
+
+### Added
 - **Riders who used to be invisible are now drawn.** On a full gate there are riders you simply
   cannot see, with no warning that anyone is there. They are not lagging and they have not
   crashed out. Everyone else can see them perfectly well, and one of them can still land on you.

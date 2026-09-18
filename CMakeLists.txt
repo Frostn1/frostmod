@@ -197,6 +197,13 @@ add_test(NAME stance COMMAND stance_test)
 add_executable(lean_test tests/lean_test.cpp)
 add_test(NAME lean COMMAND lean_test)
 
+# --- rider-visibility patch test -----------------------------------------------
+# The displacement arithmetic behind the antifreeze patch. A wrong number there is a wild
+# read on every frame inside remote-rider playback, so it is proved rather than trusted.
+# Pure constants, so it runs on any host.
+add_executable(antifreeze_test tests/antifreeze_test.cpp)
+add_test(NAME antifreeze COMMAND antifreeze_test)
+
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder
 # writes them. src/others.h keeps that apart from Win32.

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 
 static int g_failures = 0;
 
@@ -109,7 +110,9 @@ int main() {
     CHECK(ClampLimit(0.0)  == kMinLimitSeconds, "below the floor clamps up");
     CHECK(ClampLimit(99.0) == kMaxLimitSeconds, "above the ceiling clamps down");
     CHECK(ClampLimit(1.25) == 1.25,             "a value in range is kept");
-    CHECK(ClampLimit(0.0 / 0.0) == kDefaultLimitSeconds, "NaN falls back to the default");
+    // MSVC rejects a compile-time 0.0/0.0 outright (C2124), so the NaN comes from <limits>.
+    CHECK(ClampLimit(std::numeric_limits<double>::quiet_NaN()) == kDefaultLimitSeconds,
+          "NaN falls back to the default");
 
     if (g_failures == 0) std::printf("antifreeze_test: all checks passed\n");
     else                 std::printf("antifreeze_test: %d FAILURE(S)\n", g_failures);

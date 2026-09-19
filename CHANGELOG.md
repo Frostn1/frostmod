@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-18 — unreleased
+## 2026-09-19 — v0.37.0
 
 ### Fixed
 - **The in-game server browser is unstuck as often as it sticks.** Come out of a server, open

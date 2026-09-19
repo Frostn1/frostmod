@@ -3,6 +3,12 @@
 ## 2026-09-18 — unreleased
 
 ### Fixed
+- **The in-game server browser is unstuck as often as it sticks.** Come out of a server, open
+  Browse, and the game can sit there saying "connection timeout" at a master server that is
+  answering everybody else. FrostMod spots that and clears it for you, every time it happens,
+  so an evening of hopping between servers keeps a working list the whole way through. When
+  the master server itself is out it stands back and says so in the log instead, because
+  nothing on your machine fixes that one.
 - **A rider who leaves and comes back no longer arrives on top of the rider they used to be.**
   When someone drops out mid-session and rejoins, everyone else's game can end up drawing their
   old bike and their new one in the same place, the two wound through each other. It has been

@@ -215,6 +215,14 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 add_executable(rejoin_test tests/rejoin_test.cpp)
 add_test(NAME rejoin COMMAND rejoin_test)
 
+# --- world watch test ----------------------------------------------------------
+# When a timed-out master login is the half-open session we can clear and when it is an
+# outage we must not churn at. Neither state is reproducible on demand - it wants a licensed
+# copy and an already-stuck browser - so src/worldwatch.h keeps the deciding out of the
+# process and it is proved here. Pure arithmetic, so it runs on any host.
+add_executable(worldwatch_test tests/worldwatch_test.cpp)
+add_test(NAME worldwatch COMMAND worldwatch_test)
+
 # --- fair send test ------------------------------------------------------------
 # The promotion rule FrostServer runs on the game's own candidate list. Getting it wrong
 # does not crash anything, it just sends the wrong riders, so the ordering is proved here.

@@ -51,6 +51,7 @@
 #include "serverfilter.h"
 #include "session.h"
 #include "crashreport.h"
+#include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -881,34 +882,30 @@ static bool ResetServerBrowser(const char* why, bool clearPort) {
     return called && after == 0;
 }
 
-/// How many times one run of the game will do this by itself, and how far apart. A master
-/// that is genuinely down looks identical from in here, and churning its socket every five
-/// seconds would help nobody.
-static const int      kWorldMaxAutoResets = 3;
-static const uint64_t kWorldResetGapMs    = 30000;
-
 /// Watch the login for the wedge, clear it without being asked, and record which half of it
 /// was actually to blame.
 ///
 /// The signature is a 2 -> 1 transition carrying reason 0: the five-second timeout firing.
-/// What makes it the bug rather than an outage is having logged in successfully earlier in
-/// the same run — "it worked, then it stopped" is this and nothing else. Without that, hold
-/// off until a second one in a row, so a player who opens Browse during a real outage isn't
-/// quietly rebinding sockets on every attempt.
+/// What makes it the bug rather than an outage is having logged in successfully earlier —
+/// "it worked, then it stopped" is this and nothing else. Without that, hold off until a
+/// second one in a row, so a player who opens Browse during a real outage isn't quietly
+/// rebinding sockets on every attempt.
 ///
-/// The first automatic reset keeps the port, the second takes it too. Whichever one the next
-/// successful login follows is the answer, and it gets written to the log in those words —
-/// so the question gets settled by everyone who hits this rather than by one repro.
+/// The first automatic reset of an episode keeps the port, the second takes it too. Whichever
+/// one the next successful login follows is the answer, and it gets written to the log in
+/// those words — so the question gets settled by everyone who hits this rather than by one
+/// repro.
+///
+/// The counters are `worldwatch::State`, in a header with no Win32 in it, because this is the
+/// half of the fix that can be proved without a wedged browser and a licensed copy of the
+/// game. Everything below reads the process or writes the log; the judgement is over there.
 static void WorldWatch() {
     if (!g_game->offsets_complete) return;
 
-    static int      prev       = -1;
-    static bool     everLogged = false;   // state reached 4 at some point this run
-    static int      timeouts   = 0;       // consecutive, since the last success
-    static int      resets     = 0;
-    static uint64_t nextResetOkMs = 0;
-    static bool     awaitingVerdict = false;  // a reset happened; the next login is the answer
-    static bool     verdictPortToo  = false;  // ...and whether that reset took the port as well
+    static int  prev = -1;
+    static worldwatch::State w;
+    static bool awaitingVerdict = false;  // a reset happened; the next login is the answer
+    static bool verdictPortToo  = false;  // ...and whether that reset took the port as well
 
     const int now = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_STATE + g_sigDelta));
     if (now < 0 || now > mxb::WORLD_STATE_MAX) { prev = -1; return; }  // wrong offset: stay out
@@ -922,8 +919,7 @@ static void WorldWatch() {
                 verdictPortToo ? "a stale source port, not the session"
                                : "a half-open master session");
         }
-        everLogged = true;
-        timeouts   = 0;
+        worldwatch::OnLogin(w);
     }
 
     if (prev == 2 && now == 1) {
@@ -934,30 +930,33 @@ static void WorldWatch() {
         // and then we simply sit this timeout out and catch the next one five seconds later.
         const int reason = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_REASON + g_sigDelta));
         if (reason == 0) {
-            ++timeouts;
-            const uint64_t nowMs = GetTickCount64();
-            if (!everLogged && timeouts < 2) {
+            const worldwatch::Decision d = worldwatch::OnTimeout(w, GetTickCount64());
+            switch (d.action) {
+            case worldwatch::Action::HoldForOutage:
                 Log("[world] the master didn't answer the login (timeout %d). Leaving it alone "
-                    "for now - nothing has logged in yet this run, so this may just be the "
-                    "master.", timeouts);
-            } else if (resets >= kWorldMaxAutoResets) {
-                Log("[world] login timed out again, but %d automatic resets is the limit for one "
-                    "run. Whatever this is, it isn't the half-open session.", resets);
-            } else if (nowMs < nextResetOkMs) {
+                    "for now - nothing has logged in yet, so this may just be the master.",
+                    w.timeouts);
+                break;
+            case worldwatch::Action::OverBudget:
+                Log("[world] login timed out again, but %d resets with no login in between is "
+                    "the limit (%d this run). Whatever this is, it isn't the half-open session.",
+                    w.resets, w.totalResets);
+                break;
+            case worldwatch::Action::TooSoon:
                 Log("[world] login timed out again, %llu ms too soon after the last reset; "
-                    "waiting.", (unsigned long long)(nextResetOkMs - nowMs));
-            } else {
-                // First attempt closes the session and keeps the port; anything after that
-                // takes the port too. If the first one was enough, the log says so.
-                const bool alsoPort = resets > 0;
-                ++resets;
-                nextResetOkMs = nowMs + kWorldResetGapMs;
-                everLogged = false;   // re-armed only by a fresh successful login
-                timeouts   = 0;
-                if (ResetServerBrowser("automatic", alsoPort)) {
+                    "waiting.", (unsigned long long)d.waitMs);
+                break;
+            case worldwatch::Action::Reset: {
+                // Numbered across the whole run, so a log shows an evening of ordinary
+                // one-per-session wedges apart from something resetting over and over.
+                char why[32];
+                snprintf(why, sizeof(why), "automatic #%d", w.totalResets);
+                if (ResetServerBrowser(why, d.alsoPort)) {
                     awaitingVerdict = true;
-                    verdictPortToo  = alsoPort;
+                    verdictPortToo  = d.alsoPort;
                 }
+                break;
+            }
             }
         }
     }

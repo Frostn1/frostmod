@@ -52,13 +52,26 @@ constexpr int32_t kNegativePulseDelta = -0x00040000;
 
 enum class PulseState : uint8_t {
     Waiting,
-    Claimed,
+    Selecting,
+    Armed,
+    Injecting,
     Fired,
 };
 
-inline bool TryClaimPulse(std::atomic<PulseState>& state) {
+inline bool TryBeginPulseSelection(std::atomic<PulseState>& state) {
     PulseState expected = PulseState::Waiting;
-    return state.compare_exchange_strong(expected, PulseState::Claimed,
+    return state.compare_exchange_strong(expected, PulseState::Selecting,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire);
+}
+
+inline void ArmPulse(std::atomic<PulseState>& state) {
+    state.store(PulseState::Armed, std::memory_order_release);
+}
+
+inline bool TryClaimPulseInjection(std::atomic<PulseState>& state) {
+    PulseState expected = PulseState::Armed;
+    return state.compare_exchange_strong(expected, PulseState::Injecting,
                                          std::memory_order_acq_rel,
                                          std::memory_order_acquire);
 }
@@ -79,6 +92,26 @@ struct PulseCandidate {
     int block = 0;
 };
 
+enum class SerializationDecision : uint8_t {
+    NotTarget,
+    Inject,
+    RefuseInvalid,
+    RefuseDirty,
+    RefuseNonzero,
+};
+
+enum class ApplyResult : uint8_t {
+    Exact,
+    Mismatch,
+    Missing,
+};
+
+inline ApplyResult ClassifyApplyResult(int32_t delta) {
+    if (delta == kNegativePulseDelta) return ApplyResult::Exact;
+    if (delta == 0) return ApplyResult::Missing;
+    return ApplyResult::Mismatch;
+}
+
 inline BlockShape MapBlock(const Geometry& g, int blockIndex) {
     BlockShape out;
     if (g.width <= 0 || g.height <= 0 || g.blockWidth <= 0 || g.blockHeight <= 0 ||
@@ -96,6 +129,55 @@ inline BlockShape MapBlock(const Geometry& g, int blockIndex) {
     out.height = g.height - out.y < g.blockHeight ? g.height - out.y : g.blockHeight;
     out.valid = out.width > 0 && out.height > 0;
     return out;
+}
+
+inline bool SpanContainsCell(const void* nextIn, size_t available, const int32_t* cell) {
+    if (!nextIn || !cell || available < sizeof(*cell)) return false;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(nextIn);
+    const uintptr_t target = reinterpret_cast<uintptr_t>(cell);
+    if (first > UINTPTR_MAX - available || target > UINTPTR_MAX - sizeof(*cell)) return false;
+    return target >= first && target + sizeof(*cell) <= first + available;
+}
+
+// Called only after the serializer hook has established that this is the target row. The
+// selected block must still be the clean block we armed: its dirty byte is set only to make
+// the stock sender visit it, while every cell remains zero until this exact boundary.
+inline SerializationDecision ClassifySerializationInjection(
+    const Geometry& g, const PulseCandidate& candidate,
+    const int32_t* outgoing, size_t outgoingCount,
+    const uint8_t* dirty, size_t dirtyCount,
+    const void* nextIn, size_t available) {
+    if (!candidate.valid || !outgoing || !dirty || candidate.cell >= outgoingCount ||
+        candidate.block < 0 || static_cast<size_t>(candidate.block) >= dirtyCount)
+        return SerializationDecision::RefuseInvalid;
+    if (!SpanContainsCell(nextIn, available, outgoing + candidate.cell))
+        return SerializationDecision::NotTarget;
+    const BlockShape shape = MapBlock(g, candidate.block);
+    if (!shape.valid || candidate.x < shape.x || candidate.x >= shape.x + shape.width ||
+        candidate.y < shape.y || candidate.y >= shape.y + shape.height ||
+        candidate.cell != static_cast<uint64_t>(candidate.y) * g.width + candidate.x)
+        return SerializationDecision::RefuseInvalid;
+    if (dirty[candidate.block] != 1) return SerializationDecision::RefuseDirty;
+    for (int row = 0; row < shape.height; ++row) {
+        const uint64_t start = static_cast<uint64_t>(shape.y + row) * g.width + shape.x;
+        if (start + static_cast<uint64_t>(shape.width) > outgoingCount)
+            return SerializationDecision::RefuseInvalid;
+        for (int col = 0; col < shape.width; ++col)
+            if (outgoing[start + col] != 0) return SerializationDecision::RefuseNonzero;
+    }
+    return SerializationDecision::Inject;
+}
+
+inline SerializationDecision InjectAtSerialization(
+    const Geometry& g, const PulseCandidate& candidate,
+    int32_t* outgoing, size_t outgoingCount,
+    const uint8_t* dirty, size_t dirtyCount,
+    const void* nextIn, size_t available) {
+    const SerializationDecision decision = ClassifySerializationInjection(
+        g, candidate, outgoing, outgoingCount, dirty, dirtyCount, nextIn, available);
+    if (decision == SerializationDecision::Inject)
+        outgoing[candidate.cell] = kNegativePulseDelta;
+    return decision;
 }
 
 // Mirror only the writer's coordinate-to-four-cells arithmetic. This does not decide

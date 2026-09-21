@@ -103,17 +103,78 @@ static void negative_pulse_requires_an_adjacent_zero_cell_in_a_clean_zero_block(
           "invalid block geometry was accepted");
 }
 
-static void negative_pulse_latch_fires_once_and_can_release_a_refused_claim() {
+static void negative_pulse_latch_separates_selection_from_one_shot_injection() {
     using frostmod::rutdiag::PulseState;
     std::atomic<PulseState> state{PulseState::Waiting};
-    CHECK(frostmod::rutdiag::TryClaimPulse(state), "waiting pulse could not be claimed");
-    CHECK(!frostmod::rutdiag::TryClaimPulse(state), "claimed pulse was claimed twice");
+    CHECK(frostmod::rutdiag::TryBeginPulseSelection(state), "waiting pulse could not select");
+    CHECK(!frostmod::rutdiag::TryClaimPulseInjection(state),
+          "selection wrote before it was armed");
+    frostmod::rutdiag::ArmPulse(state);
+    CHECK(frostmod::rutdiag::TryClaimPulseInjection(state), "armed pulse could not inject");
+    CHECK(!frostmod::rutdiag::TryClaimPulseInjection(state), "injection was claimed twice");
     frostmod::rutdiag::ReleasePulse(state);
-    CHECK(frostmod::rutdiag::TryClaimPulse(state), "refused claim did not return to waiting");
+    CHECK(frostmod::rutdiag::TryBeginPulseSelection(state),
+          "refused injection did not return to waiting");
+    frostmod::rutdiag::ArmPulse(state);
+    CHECK(frostmod::rutdiag::TryClaimPulseInjection(state), "re-armed pulse could not inject");
     frostmod::rutdiag::CompletePulse(state);
-    CHECK(!frostmod::rutdiag::TryClaimPulse(state), "completed pulse fired twice");
+    CHECK(!frostmod::rutdiag::TryBeginPulseSelection(state), "completed pulse selected twice");
+    CHECK(!frostmod::rutdiag::TryClaimPulseInjection(state), "completed pulse injected twice");
     CHECK(state.load() == PulseState::Fired, "completed pulse did not stay fired");
     CHECK(frostmod::rutdiag::kNegativePulseDelta == -262144, "pulse magnitude changed");
+}
+
+static void serialization_injection_requires_the_exact_clean_target_row() {
+    using namespace frostmod::rutdiag;
+    Geometry g{130, 130, 64, 64, 3, 9, 0, 0, 129, 129};
+    PulseCandidate candidate{true, 64, 10, 10u * 130u + 64u, 1};
+    std::vector<int32_t> outgoing(static_cast<size_t>(g.width) * g.height, 0);
+    std::vector<uint8_t> dirty(g.blockCount, 0);
+    dirty[candidate.block] = 1;
+    int32_t* target = outgoing.data() + candidate.cell;
+
+    CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
+              dirty.data(), dirty.size(), outgoing.data(), 64 * sizeof(int32_t)) ==
+              SerializationDecision::NotTarget,
+          "a different serialized block injected the pulse");
+    CHECK(outgoing[candidate.cell] == 0, "arming changed the target before serialization");
+
+    int32_t* targetRow = outgoing.data() + 10u * g.width + 64u;
+    CHECK(InjectAtSerialization(g, candidate, outgoing.data(), outgoing.size(),
+              dirty.data(), dirty.size(), targetRow, 64 * sizeof(int32_t)) ==
+              SerializationDecision::Inject,
+          "the exact clean target row was refused");
+    CHECK(*target == kNegativePulseDelta, "exact serializer injection value changed");
+
+    outgoing[candidate.cell] = 7;
+    CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
+              dirty.data(), dirty.size(), targetRow, 64 * sizeof(int32_t)) ==
+              SerializationDecision::RefuseNonzero,
+          "a raced nonzero target was accepted");
+    outgoing[candidate.cell] = 0;
+    outgoing[12u * g.width + 65u] = 1;
+    CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
+              dirty.data(), dirty.size(), targetRow, 64 * sizeof(int32_t)) ==
+              SerializationDecision::RefuseNonzero,
+          "a raced nonzero peer in the target block was accepted");
+    outgoing[12u * g.width + 65u] = 0;
+    dirty[candidate.block] = 0;
+    CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
+              dirty.data(), dirty.size(), targetRow, 64 * sizeof(int32_t)) ==
+              SerializationDecision::RefuseDirty,
+          "a target block no longer queued for serialization was accepted");
+}
+
+static void source_apply_results_are_never_silent() {
+    using namespace frostmod::rutdiag;
+    CHECK(ClassifyApplyResult(kNegativePulseDelta) == ApplyResult::Exact,
+          "exact pulse was not classified as a match");
+    CHECK(ClassifyApplyResult(0) == ApplyResult::Missing,
+          "zero pulse result was not classified as missing");
+    CHECK(ClassifyApplyResult(17) == ApplyResult::Mismatch,
+          "positive overwrite was not classified as mismatch");
+    CHECK(ClassifyApplyResult(kNegativePulseDelta + 1) == ApplyResult::Mismatch,
+          "wrong negative pulse was not classified as mismatch");
 }
 
 int main() {
@@ -122,7 +183,9 @@ int main() {
     footprint_rejects_bad_inputs_and_clamps_the_upper_edge();
     block_shape_clamps_track_edges();
     negative_pulse_requires_an_adjacent_zero_cell_in_a_clean_zero_block();
-    negative_pulse_latch_fires_once_and_can_release_a_refused_claim();
+    negative_pulse_latch_separates_selection_from_one_shot_injection();
+    serialization_injection_requires_the_exact_clean_target_row();
+    source_apply_results_are_never_silent();
     if (failures) return 1;
     std::puts("rutdiag tests passed");
     return 0;

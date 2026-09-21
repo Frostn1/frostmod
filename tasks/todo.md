@@ -70,3 +70,41 @@ Database impact: none. This phase changes no schema, migration, backfill, or ind
 - `git diff --check` and the added-line public leakage scan pass. No private map, toolkit,
   binary, or local path is included.
 - No database changes. No commit, push, PR update, or changelog edit was made for Phase 1.
+
+## Phase 1b — inject at outbound serialization
+
+- [x] Correlate the failed solo log with the private beta21e sender map and identify the
+  exact pre-deflate row boundary already used by the outbound world-data serializer.
+- [x] Separate safe candidate selection/arming from the actual negative-cell write.
+- [x] Inject exactly once only when the selected target row reaches the mapped serializer.
+- [x] Log an explicit source exact/mismatch/missing result whenever the target block returns.
+- [x] Add focused pure tests for arm/inject separation, wrong-block no-op, race refusal,
+  one-shot behavior, and source-result classification.
+- [x] Keep the solo test guide compact and align it with the delayed injection lifecycle.
+- [x] Run the portable, sanitizer, Windows syntax/cross-build, diff, leakage, and stock-path
+  invariant checks; document manual-review results without committing or publishing.
+
+Database impact: none. This phase changes no schema, migration, backfill, or index.
+
+### Phase 1b review / results
+
+- The accepted-stock-writer hook now only selects a still-zero cell in a clean neighboring
+  block, records the target, and queues that block. It does not write the negative value.
+- A separately signature-gated hook on the stock serializer's raw-deflate function accepts
+  only the mapped terrain-row call. Wrong rows call stock unchanged. On the target row it
+  atomically claims the armed pulse, revalidates the saved geometry, cell, dirty byte, and
+  complete zero block, then assigns exactly `-262144` immediately before the original
+  deflate call consumes the row. A dirty/nonzero/invalid race writes nothing and permits a
+  later safe selection; a guarded access fault closes the one-shot.
+- The apply observer explicitly samples the saved target whenever its block returns, even
+  when the value is positive or zero. It emits `source-match`, `source-mismatch`,
+  `source-missing`, or `source-unavailable`, with requested/input/authoritative/height values.
+- Disabled behavior is unchanged: observation-only mode never installs the serializer hook,
+  and pulse mode remains off unless the beta21e timestamp plus writer, apply, deflate, and
+  mapped serializer-call validations all pass. Each detour calls its stock original exactly
+  once; authoritative/rendered terrain and compressed packet bytes are never edited.
+- All 20 portable CTest targets pass. Warning-as-error ASan/UBSan `rutdiag_test`, strict
+  `offsets_test`, MinGW DLL syntax checking, and the PE32+ x64 launcher cross-build pass.
+  `git diff --check` and the public added-line leakage scan pass.
+- No private map file was changed because the sender, deflate boundary, and post-send clear
+  behavior were already decoded. No database, changelog, commit, push, or PR change was made.

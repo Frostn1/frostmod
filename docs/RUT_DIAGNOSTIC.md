@@ -93,11 +93,6 @@ gameplay behavior.
 
 ## Phase 1: one-shot negative transport test
 
-These Phase-1 edits are currently **uncommitted manual-review changes**. A checkout of the
-already-published branch does not contain them. After manual review, they need a follow-up
-commit/push or an explicitly supplied patch/artifact before another Windows machine can build
-this mode.
-
 The pulse answers one question only: can one small signed negative terrain cell survive the
 stock sender/server/receiver path and produce the opposite height sign on both clients? It is
 not a rut-shaping kernel. `--rut-negative-pulse` implies the diagnostic hooks but writes a
@@ -108,12 +103,14 @@ Safety rules are fail-closed:
 - MX Bikes beta21e and both exact writer/apply signatures must match.
 - The stock writer runs once with its original arguments before any pulse decision.
 - The stock call must have increased all four expected footprint cells.
-- The target must be a terrain-interior cell cardinally adjacent to that footprint, outside
-  every stock-touched block, with an outgoing value of zero, a clear dirty byte, and an
-  entirely zero 64x64 outbound block.
-- The source writes exactly one signed value, `-0x00040000` (`-262144`), then marks only that
-  block. It assigns zero to the fixed value rather than adding, so local integer wrap and
-  same-cell overlap cannot occur.
+- The target must initially be a terrain-interior cell cardinally adjacent to that footprint,
+  outside every stock-touched block, with an outgoing value of zero, a clear dirty byte, and
+  an entirely zero 64x64 outbound block. Selection queues that block but does not change the
+  target cell.
+- Immediately before the stock outbound serializer compresses the target row, the source
+  revalidates the saved cell, dirty byte, and block. Only then does it assign exactly
+  `-0x00040000` (`-262144`) to the still-zero cell. A raced/nonzero block is refused and can
+  be selected again; there is no add, integer wrap, or same-cell overlap.
 - The authoritative/rendered terrain grid and packet payloads are never edited directly.
 - The one-shot stays closed for the rest of the process, including content reloads and
   session changes. If no candidate is safe, bounded `REFUSED candidate` lines are logged and
@@ -143,7 +140,8 @@ Set-Location .\tmp
 
 1. Start one rider in a private local-host session on flat, deformable dirt. Ride one slow lap,
    return to the menu, rejoin without restarting the game, and ride briefly again.
-2. Success is exactly one `[rutpulse] FIRED`, followed by one `role=source-match` with
+2. Success is one `[rutpulse] SELECTED`, exactly one `[rutpulse] FIRED stage=pre-deflate`,
+   followed by one `role=source-match` with
    `delta=-262144`, `observed=-262144`, an authoritative difference of `-262144`, and a
    positive `height_delta`; there must be no second `FIRED`, crash, or repeatable hitch.
 3. Send back the complete `frostmod.log`. If no pulse fires after one lap, send the log anyway;
@@ -156,10 +154,11 @@ exact log shapes, stop conditions, and the optional later watcher test.
 
 1. Start a private local-host session with one rider on an initially flat, deformable area.
    Close other FrostMod/game processes so the log belongs to this run.
-2. Ride slowly and steadily until the log contains exactly one line matching:
+2. Ride slowly and steadily until the log contains one selection and exactly one fire:
 
    ```text
-   [rutpulse] FIRED id=... source_writer_call=... target=(x,y)#cell block=... outbound=0>-262144 dirty=0>1 delta=-262144 one_shot=complete
+   [rutpulse] SELECTED id=... target=(x,y)#cell block=... outbound=0 unchanged ...
+   [rutpulse] FIRED id=<same id> ... target=(same x,y)#same-cell block=same-block stage=pre-deflate outbound=0>-262144 ...
    ```
 
    If it never fires after a lap, the test is inconclusive: save the log and stop rather than
@@ -168,7 +167,7 @@ exact log shapes, stop conditions, and the optional later watcher test.
    followed by:
 
    ```text
-   [rutpulse/apply] id=<same id> role=source-match ... target=(same x,y)#same-cell block=same-block delta=-262144 authoritative=A>B observed=-262144 height16=H0>H1 height_delta=positive
+   [rutpulse/apply] id=<same id> role=source-match ... target=(same x,y)#same-cell block=same-block requested=-262144 delta=-262144 authoritative=A>B observed=-262144 height16=H0>H1 height_delta=positive
    ```
 
    Verify numerically that `B - A == -262144`; the exact `observed=-262144` shows the signed

@@ -2,6 +2,13 @@
 
 ## 2026-09-20
 
+### Fixed
+- **The one-shot negative rut pulse now enters the exact terrain row being sent.** FrostMod
+  selects and queues a safe empty deformation block after stock rut activity, then performs the
+  diagnostic write immediately before that row is compressed for transmission. It refuses the
+  pulse if the game build, sender call, row, block state, or saved target no longer matches, and
+  reports whether the same signed value returns through the authoritative apply path.
+
 ### Added
 - **A one-shot negative rut pulse can now verify the deformation path on a private local host.**
   `--rut-negative-pulse` separately gates a bounded `-262144` test write after stock rut activity,

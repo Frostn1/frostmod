@@ -301,6 +301,9 @@ static void rut_diagnostic_constants_agree() {
     CHECK(mxb::MXB_BETA21E_TIMESTAMP == 0x6A21833D, "rut diagnostic build stamp changed");
     CHECK(mxb::RVA_TERRAIN_DEFORM_POINT == 0x1F5AC0, "rut writer RVA changed");
     CHECK(mxb::RVA_TERRAIN_APPLY_BLOCK == 0x1F60C0, "rut apply RVA changed");
+    CHECK(mxb::RVA_ZLIB_DEFLATE == 0x147E80, "rut serializer deflate RVA changed");
+    CHECK(mxb::RVA_TERRAIN_DEFLATE_ROW_RET == 0x2A30FF,
+          "rut serializer row return site changed");
     const size_t sigLen = sizeof(mxb::SIG_TERRAIN_DEFORM_POINT) - 1;
     const size_t maskLen = sizeof(mxb::SIG_TERRAIN_DEFORM_POINT_MASK) - 1;
     CHECK(sigLen == 32 && sigLen == maskLen, "rut signature/mask lengths disagree");
@@ -321,6 +324,13 @@ static void rut_diagnostic_constants_agree() {
           "rut apply signature/mask lengths disagree");
     CHECK(!mxb::LooksDetoured(reinterpret_cast<const uint8_t*>(mxb::SIG_TERRAIN_APPLY_BLOCK)),
           "stored rut apply signature looks like a detour");
+    CHECK(sizeof(mxb::SIG_ZLIB_DEFLATE) - 1 == 31 &&
+          sizeof(mxb::SIG_ZLIB_DEFLATE_MASK) - 1 == 31,
+          "rut serializer signature/mask lengths disagree");
+    CHECK(!mxb::LooksDetoured(reinterpret_cast<const uint8_t*>(mxb::SIG_ZLIB_DEFLATE)),
+          "stored rut serializer signature looks like a detour");
+    CHECK(mxb::RVA_TERRAIN_DEFLATE_ROW_RET > mxb::RVA_ZLIB_DEFLATE,
+          "serializer row call cannot return before deflate");
 }
 
 // A patched prologue must never be mistaken for "the game moved this function".

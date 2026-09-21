@@ -422,6 +422,12 @@ constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 constexpr uint32_t  MXB_BETA21E_TIMESTAMP       = 0x6A21833D;
 constexpr uintptr_t RVA_TERRAIN_DEFORM_POINT    = 0x1F5AC0;
 constexpr uintptr_t RVA_TERRAIN_APPLY_BLOCK     = 0x1F60C0;
+// Raw-deflate entry used by the outbound world-data serializer. Phase 1b hooks the normal
+// function ABI, then accepts only the row-input call whose return address is the mapped
+// serializer site. This is later than the dirty-block scan and immediately before zlib
+// consumes that row; no post-compression packet byte is touched.
+constexpr uintptr_t RVA_ZLIB_DEFLATE             = 0x147E80;
+constexpr uintptr_t RVA_TERRAIN_DEFLATE_ROW_RET  = 0x2A30FF;
 constexpr size_t    OFF_TERRAIN_SIZE_X          = 0x758;
 constexpr size_t    OFF_TERRAIN_SIZE_Y          = 0x75C;
 constexpr size_t    OFF_TERRAIN_ORIGIN_X        = 0x764;
@@ -446,6 +452,11 @@ constexpr char SIG_TERRAIN_APPLY_BLOCK[] =
     "\x44\x89\x44\x24\x18\x48\x89\x4C\x24\x08\x57\x41\x54\x48\x83\xEC"
     "\x28\x41\x8B\xC0\x4C\x8B\xE2\x48\x8B\xF9\x48\x85\xD2\x75\x0B\x8D";
 constexpr char SIG_TERRAIN_APPLY_BLOCK_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// 31 fixed prologue bytes, unique in beta21e. The final complete instruction is `test eax,eax`.
+constexpr char SIG_ZLIB_DEFLATE[] =
+    "\x89\x54\x24\x10\x48\x89\x4C\x24\x08\x48\x81\xEC\x98\x00\x00\x00"
+    "\x48\x8B\x8C\x24\xA0\x00\x00\x00\xE8\x93\xFC\xFF\xFF\x85\xC0";
+constexpr char SIG_ZLIB_DEFLATE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // Does a function's first bytes look like somebody already detoured it? MinHook writes a
 // `jmp rel32`, or `jmp [rip+disp32]` when the trampoline is out of a 2 GB jump's reach;
 // other injectors use `mov rax, imm64; jmp rax`. Worth asking before the signature check

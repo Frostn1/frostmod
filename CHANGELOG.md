@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-20
+
+### Added
+- **An opt-in diagnostic can now measure the game's stock rut deformation safely.** On MX
+  Bikes beta21e, `--rut-diag` observes the native terrain writer and received network blocks,
+  recording the caller, thread, affected cells, dirty blocks, signed deltas, and height changes
+  needed to design realistic wider ruts. It is rate-limited, defaults off, refuses unknown game
+  builds, and does not alter terrain or packets. The accompanying guide covers the solo and
+  private two-client validation runs and detects a stale launcher before testing begins.
+
 ## 2026-09-19 — v0.37.0
 
 ### Fixed

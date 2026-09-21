@@ -52,6 +52,7 @@
 #include "session.h"
 #include "crashreport.h"
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
+#include "rutdiag.h"    // pure default-off/rate/map rules for the native rut-event probe
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -4954,6 +4955,369 @@ static void InstallTrainerGuard(intptr_t delta) {
         Log("[trainer] save guard live. No new trainer is written with the stack in it.");
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in Phase-0 rut diagnostic. Observation only: the original writer receives the exact
+// object/coordinates/magnitude and runs exactly once. We snapshot the four candidate cells
+// and dirty bytes around it so a controlled ride can establish caller ownership, sign,
+// scale and block behaviour without changing terrain or packets.
+using TerrainDeformPoint_t = int(__fastcall*)(void*, float, float, double);
+TerrainDeformPoint_t g_origTerrainDeformPoint = nullptr;
+using TerrainApplyBlock_t = int(__fastcall*)(void*, int32_t*, int);
+TerrainApplyBlock_t g_origTerrainApplyBlock = nullptr;
+std::atomic<uint64_t> g_rutDiagCalls{0};
+std::atomic<uint64_t> g_rutApplyCalls{0};
+
+struct RutLiveSnapshot {
+    bool ok = false;
+    frostmod::rutdiag::Geometry geometry{};
+    frostmod::rutdiag::Footprint footprint{};
+    int32_t cell[4]{};
+    int16_t baseHeight[4]{};
+    int16_t height[4]{};
+    uint8_t dirty[4]{};
+};
+
+static bool CaptureRutSnapshot(void* object, float worldX, float worldY, RutLiveSnapshot* out) {
+    if (!object || !out) return false;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        frostmod::rutdiag::Geometry g;
+        g.width = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_WIDTH);
+        g.height = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_HEIGHT);
+        g.blockWidth = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_WIDTH);
+        g.blockHeight = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_HEIGHT);
+        g.blocksPerRow = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCKS_PER_ROW);
+        g.blockCount = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_COUNT);
+        g.sizeX = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_SIZE_X);
+        g.sizeY = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_SIZE_Y);
+        g.originX = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_ORIGIN_X);
+        g.originY = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_ORIGIN_Y);
+        // Refuse implausible metadata before multiplying/indexing pointers read from game
+        // memory. A diagnostic must never turn a stale layout into a second crash site.
+        if (g.width <= 0 || g.height <= 0 || g.width > 32768 || g.height > 32768 ||
+            g.blockWidth <= 0 || g.blockHeight <= 0 || g.blockWidth > 1024 ||
+            g.blockHeight > 1024 || g.blocksPerRow <= 0 || g.blocksPerRow > 32768 ||
+            g.blockCount <= 0 || g.blockCount > 1073741824)
+            return false;
+        auto footprint = frostmod::rutdiag::MapFootprint(g, worldX, worldY);
+        if (!footprint.valid) return false;
+        auto cells = *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_OUTGOING_DELTA);
+        auto baseHeights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_BASE_HEIGHTS);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        auto dirty = *reinterpret_cast<uint8_t* const*>(base + mxb::OFF_TERRAIN_DIRTY_OUTGOING);
+        if (!cells || !baseHeights || !heights || !dirty) return false;
+        out->geometry = g;
+        out->footprint = footprint;
+        for (int i = 0; i < 4; ++i) {
+            out->cell[i] = cells[footprint.cell[i]];
+            out->baseHeight[i] = baseHeights[footprint.cell[i]];
+            out->height[i] = heights[footprint.cell[i]];
+            out->dirty[i] = dirty[footprint.block[i]];
+        }
+        out->ok = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->ok = false;
+        return false;
+    }
+}
+
+struct RutApplySample {
+    int x = 0;
+    int y = 0;
+    uint64_t cell = 0;
+    int32_t delta = 0;
+    int32_t before = 0;
+    int32_t after = 0;
+    int16_t heightBefore = 0;
+    int16_t heightAfter = 0;
+};
+
+struct RutApplySnapshot {
+    bool ok = false;
+    frostmod::rutdiag::Geometry geometry{};
+    frostmod::rutdiag::BlockShape shape{};
+    int nonzero = 0;
+    int positive = 0;
+    int negative = 0;
+    int32_t minimum = 0;
+    int32_t maximum = 0;
+    int64_t sum = 0;
+    int sampleCount = 0;
+    RutApplySample sample[4]{};
+};
+
+static bool CaptureRutApplyBefore(void* object, int32_t* blockDelta, int blockIndex,
+                                  RutApplySnapshot* out) {
+    if (!object || !blockDelta || !out) return false;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        frostmod::rutdiag::Geometry g;
+        g.width = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_WIDTH);
+        g.height = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_HEIGHT);
+        g.blockWidth = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_WIDTH);
+        g.blockHeight = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_HEIGHT);
+        g.blocksPerRow = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCKS_PER_ROW);
+        g.blockCount = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_COUNT);
+        if (g.width <= 0 || g.height <= 0 || g.width > 32768 || g.height > 32768 ||
+            g.blockWidth <= 0 || g.blockHeight <= 0 || g.blockWidth > 1024 ||
+            g.blockHeight > 1024 || g.blocksPerRow <= 0 || g.blocksPerRow > 32768 ||
+            g.blockCount <= 0 || g.blockCount > 1073741824)
+            return false;
+        auto shape = frostmod::rutdiag::MapBlock(g, blockIndex);
+        if (!shape.valid) return false;
+        auto authoritative =
+            *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_AUTHORITATIVE);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        if (!authoritative || !heights) return false;
+        int32_t minimum = 0x7fffffff;
+        int32_t maximum = (-2147483647 - 1);
+        for (int row = 0; row < shape.height; ++row) {
+            for (int col = 0; col < shape.width; ++col) {
+                const int local = row * shape.width + col;
+                const int32_t delta = blockDelta[local];
+                if (!delta) continue;
+                ++out->nonzero;
+                if (delta > 0) ++out->positive; else ++out->negative;
+                if (delta < minimum) minimum = delta;
+                if (delta > maximum) maximum = delta;
+                out->sum += delta;
+                if (out->sampleCount < 4) {
+                    auto& sample = out->sample[out->sampleCount++];
+                    sample.x = shape.x + col;
+                    sample.y = shape.y + row;
+                    sample.cell = static_cast<uint64_t>(sample.y) * g.width + sample.x;
+                    sample.delta = delta;
+                    sample.before = authoritative[sample.cell];
+                    sample.heightBefore = heights[sample.cell];
+                }
+            }
+        }
+        out->geometry = g;
+        out->shape = shape;
+        out->minimum = out->nonzero ? minimum : 0;
+        out->maximum = out->nonzero ? maximum : 0;
+        out->ok = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->ok = false;
+        return false;
+    }
+}
+
+static void CaptureRutApplyAfter(void* object, RutApplySnapshot* snapshot) {
+    if (!object || !snapshot || !snapshot->ok) return;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        auto authoritative =
+            *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_AUTHORITATIVE);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        if (!authoritative || !heights) { snapshot->ok = false; return; }
+        for (int i = 0; i < snapshot->sampleCount; ++i) {
+            snapshot->sample[i].after = authoritative[snapshot->sample[i].cell];
+            snapshot->sample[i].heightAfter = heights[snapshot->sample[i].cell];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        snapshot->ok = false;
+    }
+}
+
+int __fastcall hkTerrainDeformPoint(void* object, float worldX, float worldY, double magnitude) {
+    const uint64_t call = g_rutDiagCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const frostmod::rutdiag::Config cfg{true, 48, 256};
+    if (!frostmod::rutdiag::ShouldLog(call, cfg))
+        return g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
+
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const DWORD thread = GetCurrentThreadId();
+    RutLiveSnapshot before, after;
+    CaptureRutSnapshot(object, worldX, worldY, &before);
+    const int result = g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
+    CaptureRutSnapshot(object, worldX, worldY, &after);
+
+    const uint64_t suppressed = call > cfg.burst && cfg.sampleEvery
+        ? cfg.sampleEvery - 1 : 0;
+    Log("[rutdiag] call=%llu tid=%lu caller=mxbikes.exe+0x%zx pos=(%.6f,%.6f) "
+        "magnitude=%.12g result=%d suppressed_since_sample=%llu",
+        (unsigned long long)call, (unsigned long)thread,
+        caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+        worldX, worldY, magnitude, result, (unsigned long long)suppressed);
+    if (!before.ok || !after.ok) {
+        Log("[rutdiag] call=%llu snapshot unavailable before=%d after=%d; original call still ran unchanged",
+            (unsigned long long)call, before.ok ? 1 : 0, after.ok ? 1 : 0);
+        return result;
+    }
+
+    int64_t total = 0;
+    int changed = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int64_t delta = static_cast<int64_t>(after.cell[i]) - before.cell[i];
+        total += delta;
+        if (delta) ++changed;
+    }
+    Log("[rutdiag] call=%llu grid=%dx%d block=%dx%d changed=%d total_delta=%lld "
+        "c0=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u "
+        "c1=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u",
+        (unsigned long long)call, before.geometry.width, before.geometry.height,
+        before.geometry.blockWidth, before.geometry.blockHeight, changed, (long long)total,
+        before.footprint.x[0], before.footprint.y[0],
+        (unsigned long long)before.footprint.cell[0], before.cell[0], after.cell[0],
+        (long long)(static_cast<int64_t>(after.cell[0]) - before.cell[0]),
+        before.footprint.block[0], before.dirty[0], after.dirty[0],
+        before.footprint.x[1], before.footprint.y[1],
+        (unsigned long long)before.footprint.cell[1], before.cell[1], after.cell[1],
+        (long long)(static_cast<int64_t>(after.cell[1]) - before.cell[1]),
+        before.footprint.block[1], before.dirty[1], after.dirty[1]);
+    Log("[rutdiag] call=%llu c2=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u "
+        "c3=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u",
+        (unsigned long long)call,
+        before.footprint.x[2], before.footprint.y[2],
+        (unsigned long long)before.footprint.cell[2], before.cell[2], after.cell[2],
+        (long long)(static_cast<int64_t>(after.cell[2]) - before.cell[2]),
+        before.footprint.block[2], before.dirty[2], after.dirty[2],
+        before.footprint.x[3], before.footprint.y[3],
+        (unsigned long long)before.footprint.cell[3], before.cell[3], after.cell[3],
+        (long long)(static_cast<int64_t>(after.cell[3]) - before.cell[3]),
+        before.footprint.block[3], before.dirty[3], after.dirty[3]);
+    Log("[rutdiag] call=%llu heights base/current c0=%d/%d>%d c1=%d/%d>%d "
+        "c2=%d/%d>%d c3=%d/%d>%d",
+        (unsigned long long)call,
+        before.baseHeight[0], before.height[0], after.height[0],
+        before.baseHeight[1], before.height[1], after.height[1],
+        before.baseHeight[2], before.height[2], after.height[2],
+        before.baseHeight[3], before.height[3], after.height[3]);
+    return result;
+}
+
+int __fastcall hkTerrainApplyBlock(void* object, int32_t* blockDelta, int blockIndex) {
+    const uint64_t call = g_rutApplyCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Join reconstruction can apply roughly a thousand blocks before the rider moves. Keep
+    // sampling frequent enough that a short two-client pass still lands in the log afterward.
+    const frostmod::rutdiag::Config cfg{true, 24, 16};
+    if (!frostmod::rutdiag::ShouldLog(call, cfg))
+        return g_origTerrainApplyBlock(object, blockDelta, blockIndex);
+
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const DWORD thread = GetCurrentThreadId();
+    RutApplySnapshot snapshot;
+    CaptureRutApplyBefore(object, blockDelta, blockIndex, &snapshot);
+    const int result = g_origTerrainApplyBlock(object, blockDelta, blockIndex);
+    CaptureRutApplyAfter(object, &snapshot);
+    if (!snapshot.ok) {
+        Log("[rutdiag/apply] call=%llu tid=%lu caller=mxbikes.exe+0x%zx block=%d result=%d "
+            "snapshot unavailable; original call still ran unchanged",
+            (unsigned long long)call, (unsigned long)thread,
+            caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+            blockIndex, result);
+        return result;
+    }
+    Log("[rutdiag/apply] call=%llu tid=%lu caller=mxbikes.exe+0x%zx block=%d "
+        "region=(%d,%d %dx%d) nonzero=%d pos=%d neg=%d min=%d max=%d sum=%lld result=%d",
+        (unsigned long long)call, (unsigned long)thread,
+        caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+        blockIndex, snapshot.shape.x, snapshot.shape.y, snapshot.shape.width,
+        snapshot.shape.height, snapshot.nonzero, snapshot.positive, snapshot.negative,
+        snapshot.minimum, snapshot.maximum, (long long)snapshot.sum, result);
+    for (int i = 0; i < snapshot.sampleCount; ++i) {
+        const auto& sample = snapshot.sample[i];
+        Log("[rutdiag/apply] call=%llu sample%d=(%d,%d)#%llu delta=%d authoritative=%d>%d "
+            "observed=%lld height16=%d>%d height_delta=%d",
+            (unsigned long long)call, i, sample.x, sample.y,
+            (unsigned long long)sample.cell, sample.delta, sample.before, sample.after,
+            (long long)(static_cast<int64_t>(sample.after) - sample.before),
+            (int)sample.heightBefore, (int)sample.heightAfter,
+            (int)sample.heightAfter - (int)sample.heightBefore);
+    }
+    return result;
+}
+
+static bool RutDiagnosticFlagPresent() {
+    char flag[MAX_PATH] = {0};
+    if (!g_logPath[0]) return false;
+    strcpy_s(flag, g_logPath);
+    if (char* slash = strrchr(flag, '\\')) {
+        *(slash + 1) = 0;
+        strcat_s(flag, "frostmod_rutdiag.flag");
+    } else {
+        return false;
+    }
+    return GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool HostTimestampIsBeta21e() {
+    __try {
+        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_base + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->FileHeader.TimeDateStamp == mxb::MXB_BETA21E_TIMESTAMP;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static uint8_t* ResolveRutDiagnosticTarget(uintptr_t rva, const char* signature,
+                                           const char* mask, const char* label) {
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[rutdiag] %s REFUSED: cannot read the executable range.", label);
+        return nullptr;
+    }
+    const size_t length = strlen(mask);
+    uint8_t* expected = reinterpret_cast<uint8_t*>(g_base + rva);
+    if (expected >= begin && expected + length <= end && mxb::LooksDetoured(expected)) {
+        Log("[rutdiag] %s REFUSED: expected RVA 0x%zx is already hooked.", label, (size_t)rva);
+        return nullptr;
+    }
+    if (expected >= begin && expected + length <= end && MatchAt(expected, signature, mask))
+        return expected;
+    uint8_t* found = PatternScan(begin, end, signature, mask);
+    if (!found) {
+        Log("[rutdiag] %s REFUSED: signature not found; stock deformation remains untouched.", label);
+        return nullptr;
+    }
+    // A signature that is no longer unique is not a relocation rule; it is a guess.
+    uint8_t* duplicate = found + 1 < end ? PatternScan(found + 1, end, signature, mask) : nullptr;
+    if (duplicate) {
+        Log("[rutdiag] %s REFUSED: signature is ambiguous at RVAs 0x%zx and 0x%zx.", label,
+            (size_t)(found - g_base), (size_t)(duplicate - g_base));
+        return nullptr;
+    }
+    Log("[rutdiag] %s RELOCATED by signature: RVA 0x%zx (offsets.h says 0x%zx).", label,
+        (size_t)(found - g_base), (size_t)rva);
+    return found;
+}
+
+static void InstallRutDiagnostic() {
+    if (!RutDiagnosticFlagPresent()) return;
+    if (ResolveHostGame() != &GAME_MXB || !g_game->offsets_complete) {
+        Log("[rutdiag] flag present but ignored: this diagnostic is derived only for MX Bikes beta21e.");
+        return;
+    }
+    if (!HostTimestampIsBeta21e()) {
+        Log("[rutdiag] REFUSED: host TimeDateStamp is not beta21e 0x%08X; stock deformation remains untouched.",
+            mxb::MXB_BETA21E_TIMESTAMP);
+        return;
+    }
+    uint8_t* writer = ResolveRutDiagnosticTarget(
+        mxb::RVA_TERRAIN_DEFORM_POINT, mxb::SIG_TERRAIN_DEFORM_POINT,
+        mxb::SIG_TERRAIN_DEFORM_POINT_MASK, "writer");
+    if (writer && InstallHook(writer, reinterpret_cast<void*>(&hkTerrainDeformPoint),
+                    reinterpret_cast<void**>(&g_origTerrainDeformPoint),
+                    "terrainDeformPoint(0x1f5ac0)"))
+        Log("[rutdiag] writer ARMED observation-only @ RVA 0x%zx: first 48 calls then every 256th.",
+            (size_t)(writer - g_base));
+    uint8_t* apply = ResolveRutDiagnosticTarget(
+        mxb::RVA_TERRAIN_APPLY_BLOCK, mxb::SIG_TERRAIN_APPLY_BLOCK,
+        mxb::SIG_TERRAIN_APPLY_BLOCK_MASK, "received-block apply");
+    if (apply && InstallHook(apply, reinterpret_cast<void*>(&hkTerrainApplyBlock),
+                    reinterpret_cast<void**>(&g_origTerrainApplyBlock),
+                    "terrainApplyBlock(0x1f60c0)"))
+        Log("[rutdiag] received-block apply ARMED observation-only @ RVA 0x%zx: first 24 blocks "
+            "then every 16th; no values, dirty flags or packets are modified.",
+            (size_t)(apply - g_base));
+}
+
 static void InstallTerrainGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
         Log("[terrain] guard off for %s - the sampler is MX Bikes' and has no twin here.",
@@ -5137,6 +5501,7 @@ DWORD WINAPI Init(LPVOID) {
             InstallGhsGuard(delta);
             InstallTerrainGuard(delta);
             InstallTrainerGuard(delta);
+            InstallRutDiagnostic();
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
 
@@ -44,6 +46,37 @@ struct BlockShape {
     int y = 0;
     int width = 0;
     int height = 0;
+};
+
+constexpr int32_t kNegativePulseDelta = -0x00040000;
+
+enum class PulseState : uint8_t {
+    Waiting,
+    Claimed,
+    Fired,
+};
+
+inline bool TryClaimPulse(std::atomic<PulseState>& state) {
+    PulseState expected = PulseState::Waiting;
+    return state.compare_exchange_strong(expected, PulseState::Claimed,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire);
+}
+
+inline void ReleasePulse(std::atomic<PulseState>& state) {
+    state.store(PulseState::Waiting, std::memory_order_release);
+}
+
+inline void CompletePulse(std::atomic<PulseState>& state) {
+    state.store(PulseState::Fired, std::memory_order_release);
+}
+
+struct PulseCandidate {
+    bool valid = false;
+    int x = 0;
+    int y = 0;
+    uint64_t cell = 0;
+    int block = 0;
 };
 
 inline BlockShape MapBlock(const Geometry& g, int blockIndex) {
@@ -98,6 +131,71 @@ inline Footprint MapFootprint(const Geometry& g, float worldX, float worldY) {
     }
     out.valid = true;
     return out;
+}
+
+// Select one cardinally adjacent terrain cell outside the stock four-cell footprint. The
+// accepted stock writer has already dirtied its own block, so a pulse candidate must live in
+// a different block which is still clear and entirely zero. This stronger whole-block check
+// prevents the manual signed test from sharing a byte-wise network merge with pending data.
+inline PulseCandidate SelectNegativePulseCandidate(const Geometry& g, const Footprint& f,
+                                                    const int32_t* outgoing,
+                                                    size_t outgoingCount,
+                                                    const uint8_t* dirty,
+                                                    size_t dirtyCount) {
+    PulseCandidate none;
+    if (!f.valid || !outgoing || !dirty || g.width <= 2 || g.height <= 2 ||
+        g.blockWidth <= 0 || g.blockHeight <= 0 || g.blocksPerRow <= 0 ||
+        g.blockCount <= 0 || outgoingCount < static_cast<size_t>(g.width) * g.height ||
+        dirtyCount < static_cast<size_t>(g.blockCount))
+        return none;
+
+    static constexpr int kDirection[4][2] = {
+        {-1, 0}, {1, 0}, {0, -1}, {0, 1},
+    };
+    uint64_t considered[16]{};
+    int consideredCount = 0;
+    for (int source = 0; source < 4; ++source) {
+        for (const auto& direction : kDirection) {
+            const int x = f.x[source] + direction[0];
+            const int y = f.y[source] + direction[1];
+            if (x <= 0 || y <= 0 || x >= g.width - 1 || y >= g.height - 1) continue;
+            const uint64_t cell = static_cast<uint64_t>(y) * g.width + x;
+            bool duplicate = false;
+            for (int i = 0; i < consideredCount; ++i)
+                if (considered[i] == cell) duplicate = true;
+            if (duplicate) continue;
+            considered[consideredCount++] = cell;
+
+            bool inFootprint = false;
+            for (int i = 0; i < 4; ++i)
+                if (f.cell[i] == cell) inFootprint = true;
+            if (inFootprint) continue;
+
+            const int block = (y / g.blockHeight) * g.blocksPerRow + (x / g.blockWidth);
+            if (block < 0 || block >= g.blockCount || dirty[block] != 0 || outgoing[cell] != 0)
+                continue;
+            bool stockBlock = false;
+            for (int i = 0; i < 4; ++i)
+                if (f.block[i] == block) stockBlock = true;
+            if (stockBlock) continue;
+
+            const BlockShape shape = MapBlock(g, block);
+            if (!shape.valid) continue;
+            bool blockIsZero = true;
+            for (int row = 0; row < shape.height && blockIsZero; ++row) {
+                const uint64_t start = static_cast<uint64_t>(shape.y + row) * g.width + shape.x;
+                for (int col = 0; col < shape.width; ++col) {
+                    if (outgoing[start + col] != 0) {
+                        blockIsZero = false;
+                        break;
+                    }
+                }
+            }
+            if (!blockIsZero) continue;
+            return {true, x, y, cell, block};
+        }
+    }
+    return none;
 }
 
 } // namespace frostmod::rutdiag

@@ -26,3 +26,47 @@ Database impact: none. This phase changes no schema, migration, backfill, or ind
   valid substitute for a launcher that does not implement the diagnostic flag.
 - Public changed-file scan found no private repo path, private toolkit, unpacker, or game binary.
 - No database changes. No commit, push, PR, or changelog edit was made.
+
+## Phase 1 — bounded negative pulse
+
+- [x] Add a separate `--rut-negative-pulse` launcher marker; `--rut-diag` alone must remain observation-only.
+- [x] Add pure candidate selection and one-shot state rules with refusal-path tests.
+- [x] After an accepted stock writer call, inject one `-0x00040000` cell only when an adjacent terrain cell belongs to an entirely zero, clean block.
+- [x] Preserve the stock writer exactly once and never touch authoritative/rendered terrain or packet buffers.
+- [x] Force apply-side evidence for the source rider and an optional later watcher, including source-pulse correlation when available.
+- [x] Document rebuild, required solo success/failure, optional fanout confirmation, rollback, and the fact that these changes remain uncommitted until manual approval.
+- [x] Run portable CTest, strict-warning focused tests, Windows launcher/DLL syntax checks, diff checks, and a public leakage review.
+
+Database impact: none. This phase changes no schema, migration, backfill, or index.
+
+### Phase 1 review / results
+
+- `--rut-diag` alone never creates the pulse marker. `--rut-negative-pulse` creates a
+  separate marker and implies observation so the timestamp, writer signature, apply signature,
+  and apply evidence are all prerequisites.
+- The stock writer is called exactly once before the pulse decision. The one-shot waits for
+  four positive stock-cell changes, then selects only a cardinally adjacent terrain-interior
+  cell outside the stock blocks whose complete outbound block is zero and whose dirty byte is
+  clear. It assigns `-262144` to the zero cell and marks that one block.
+- The process-wide atomic latch prevents a second fire across calls, reloads, and later
+  sessions. Failed/revalidated candidates release the claim without writing; a guarded memory
+  fault closes the latch rather than risking a retry.
+- Every received block is inspected while the manual diagnostic hook is active so a negative
+  cell forces evidence even between ordinary rate-limited samples. The required solo
+  local-host test proves one-shot firing, the local client/server round trip, exact
+  authoritative delta, positive height response, stability, and no repeat after rejoin/reload.
+  A later watcher can expose the same cell/index/block and height result for optional remote
+  fanout confirmation; that limitation is recorded but is not a blocker for the next bounded
+  shape experiment after solo success.
+- The future continuous-rut acceptance criteria are documented but intentionally not built:
+  reasonably smooth starting tracks; rider-generated believable roughness; shallow centers;
+  rounded multi-cell shoulders; smoothing; conservative accumulation; hard depth/slope caps;
+  natural behavior across dirt types; and no one-cell cliffs, exaggerated trenches, or janky
+  low-speed catches.
+- All 20 portable CTest targets pass. Warning-enabled `offsets_test` and warning-as-error
+  `rutdiag_test` pass. MinGW validates the Windows DLL source with the existing SEH parsing
+  substitution, and the launcher cross-build is a PE32+ x64 executable containing both rut
+  flags and the separate pulse marker.
+- `git diff --check` and the added-line public leakage scan pass. No private map, toolkit,
+  binary, or local path is included.
+- No database changes. No commit, push, PR update, or changelog edit was made for Phase 1.

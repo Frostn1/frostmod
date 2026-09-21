@@ -10,3 +10,10 @@
 - Treat an option being consumed as a positional path as evidence of an artifact/version
   mismatch until the actual executable's parser is inspected. Do not propose argument-order
   workarounds without testing them against that exact parser generation.
+
+## Keep manual-test handoffs executable
+
+- Default to the minimum instructions the tester needs: the exact command, the action to
+  perform, the success signal to look for, and the artifact to send back.
+- Put interpretation, safety rationale, edge cases, and optional follow-up tests in a linked
+  detailed reference. Do not make the tester read the engineering background to begin.

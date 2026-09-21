@@ -1,5 +1,6 @@
 #include "../src/rutdiag.h"
 #include <cstdio>
+#include <vector>
 
 static int failures = 0;
 #define CHECK(c, ...) do { if (!(c)) { std::fprintf(stderr, __VA_ARGS__); std::fputc('\n', stderr); ++failures; } } while (0)
@@ -58,11 +59,70 @@ static void block_shape_clamps_track_edges() {
     CHECK(!frostmod::rutdiag::MapBlock(g, 100).valid, "stored block-count limit was ignored");
 }
 
+static void negative_pulse_requires_an_adjacent_zero_cell_in_a_clean_zero_block() {
+    frostmod::rutdiag::Geometry g{130, 130, 64, 64, 3, 9, 0, 0, 129, 129};
+    frostmod::rutdiag::Footprint f;
+    f.valid = true;
+    const int x[4] = {62, 63, 62, 63};
+    const int y[4] = {10, 10, 11, 11};
+    for (int i = 0; i < 4; ++i) {
+        f.x[i] = x[i];
+        f.y[i] = y[i];
+        f.cell[i] = static_cast<uint64_t>(y[i]) * g.width + x[i];
+        f.block[i] = 0;
+    }
+    std::vector<int32_t> outgoing(static_cast<size_t>(g.width) * g.height, 0);
+    std::vector<uint8_t> dirty(g.blockCount, 0);
+    dirty[0] = 1; // the accepted stock footprint's block
+
+    auto candidate = frostmod::rutdiag::SelectNegativePulseCandidate(
+        g, f, outgoing.data(), outgoing.size(), dirty.data(), dirty.size());
+    CHECK(candidate.valid && candidate.x == 64 && candidate.y == 10 &&
+          candidate.block == 1 && candidate.cell == 10u * 130u + 64u,
+          "wrong clean adjacent pulse candidate: valid=%d cell=%llu block=%d",
+          candidate.valid ? 1 : 0, (unsigned long long)candidate.cell, candidate.block);
+
+    dirty[candidate.block] = 1;
+    CHECK(!frostmod::rutdiag::SelectNegativePulseCandidate(
+              g, f, outgoing.data(), outgoing.size(), dirty.data(), dirty.size()).valid,
+          "dirty target block was accepted");
+    dirty[candidate.block] = 0;
+    outgoing[12u * 130u + 65u] = 7;
+    CHECK(!frostmod::rutdiag::SelectNegativePulseCandidate(
+              g, f, outgoing.data(), outgoing.size(), dirty.data(), dirty.size()).valid,
+          "nonzero peer in the target block was accepted");
+    outgoing[12u * 130u + 65u] = 0;
+    outgoing[candidate.cell] = 1;
+    CHECK(!frostmod::rutdiag::SelectNegativePulseCandidate(
+              g, f, outgoing.data(), outgoing.size(), dirty.data(), dirty.size()).valid,
+          "nonzero target cell was accepted");
+    outgoing[candidate.cell] = 0;
+    g.blockWidth = 0;
+    CHECK(!frostmod::rutdiag::SelectNegativePulseCandidate(
+              g, f, outgoing.data(), outgoing.size(), dirty.data(), dirty.size()).valid,
+          "invalid block geometry was accepted");
+}
+
+static void negative_pulse_latch_fires_once_and_can_release_a_refused_claim() {
+    using frostmod::rutdiag::PulseState;
+    std::atomic<PulseState> state{PulseState::Waiting};
+    CHECK(frostmod::rutdiag::TryClaimPulse(state), "waiting pulse could not be claimed");
+    CHECK(!frostmod::rutdiag::TryClaimPulse(state), "claimed pulse was claimed twice");
+    frostmod::rutdiag::ReleasePulse(state);
+    CHECK(frostmod::rutdiag::TryClaimPulse(state), "refused claim did not return to waiting");
+    frostmod::rutdiag::CompletePulse(state);
+    CHECK(!frostmod::rutdiag::TryClaimPulse(state), "completed pulse fired twice");
+    CHECK(state.load() == PulseState::Fired, "completed pulse did not stay fired");
+    CHECK(frostmod::rutdiag::kNegativePulseDelta == -262144, "pulse magnitude changed");
+}
+
 int main() {
     defaults_are_off_and_logging_is_bounded();
     footprint_maps_four_cells_and_blocks();
     footprint_rejects_bad_inputs_and_clamps_the_upper_edge();
     block_shape_clamps_track_edges();
+    negative_pulse_requires_an_adjacent_zero_cell_in_a_clean_zero_block();
+    negative_pulse_latch_fires_once_and_can_release_a_refused_claim();
     if (failures) return 1;
     std::puts("rutdiag tests passed");
     return 0;

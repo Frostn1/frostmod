@@ -4966,6 +4966,14 @@ using TerrainApplyBlock_t = int(__fastcall*)(void*, int32_t*, int);
 TerrainApplyBlock_t g_origTerrainApplyBlock = nullptr;
 std::atomic<uint64_t> g_rutDiagCalls{0};
 std::atomic<uint64_t> g_rutApplyCalls{0};
+std::atomic<bool> g_rutNegativePulseEnabled{false};
+std::atomic<frostmod::rutdiag::PulseState> g_rutNegativePulseState{
+    frostmod::rutdiag::PulseState::Waiting};
+std::atomic<uint64_t> g_rutNegativePulseRefusals{0};
+std::atomic<uint64_t> g_rutNegativePulseId{0};
+std::atomic<uint64_t> g_rutNegativePulseCell{UINT64_MAX};
+std::atomic<int> g_rutNegativePulseBlock{-1};
+std::atomic<uint64_t> g_rutNegativePulseWriterCall{0};
 
 struct RutLiveSnapshot {
     bool ok = false;
@@ -5045,6 +5053,8 @@ struct RutApplySnapshot {
     int64_t sum = 0;
     int sampleCount = 0;
     RutApplySample sample[4]{};
+    int negativeSampleCount = 0;
+    RutApplySample negativeSample[4]{};
 };
 
 static bool CaptureRutApplyBefore(void* object, int32_t* blockDelta, int blockIndex,
@@ -5091,6 +5101,15 @@ static bool CaptureRutApplyBefore(void* object, int32_t* blockDelta, int blockIn
                     sample.before = authoritative[sample.cell];
                     sample.heightBefore = heights[sample.cell];
                 }
+                if (delta < 0 && out->negativeSampleCount < 4) {
+                    auto& sample = out->negativeSample[out->negativeSampleCount++];
+                    sample.x = shape.x + col;
+                    sample.y = shape.y + row;
+                    sample.cell = static_cast<uint64_t>(sample.y) * g.width + sample.x;
+                    sample.delta = delta;
+                    sample.before = authoritative[sample.cell];
+                    sample.heightBefore = heights[sample.cell];
+                }
             }
         }
         out->geometry = g;
@@ -5117,15 +5136,103 @@ static void CaptureRutApplyAfter(void* object, RutApplySnapshot* snapshot) {
             snapshot->sample[i].after = authoritative[snapshot->sample[i].cell];
             snapshot->sample[i].heightAfter = heights[snapshot->sample[i].cell];
         }
+        for (int i = 0; i < snapshot->negativeSampleCount; ++i) {
+            snapshot->negativeSample[i].after = authoritative[snapshot->negativeSample[i].cell];
+            snapshot->negativeSample[i].heightAfter = heights[snapshot->negativeSample[i].cell];
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         snapshot->ok = false;
+    }
+}
+
+static bool StockRutWriteAccepted(const RutLiveSnapshot& before, const RutLiveSnapshot& after) {
+    if (!before.ok || !after.ok || !before.footprint.valid || !after.footprint.valid)
+        return false;
+    for (int i = 0; i < 4; ++i) {
+        for (int prior = 0; prior < i; ++prior)
+            if (before.footprint.cell[i] == before.footprint.cell[prior]) return false;
+        if (before.footprint.cell[i] != after.footprint.cell[i] ||
+            after.cell[i] <= before.cell[i])
+            return false;
+    }
+    return true;
+}
+
+static void TryFireRutNegativePulse(void* object, const RutLiveSnapshot& before,
+                                    const RutLiveSnapshot& after, uint64_t writerCall) {
+    using namespace frostmod::rutdiag;
+    if (!g_rutNegativePulseEnabled.load(std::memory_order_acquire) ||
+        g_rutNegativePulseState.load(std::memory_order_acquire) != PulseState::Waiting ||
+        !StockRutWriteAccepted(before, after))
+        return;
+
+    __try {
+        const auto base = reinterpret_cast<uint8_t*>(object);
+        auto outgoing = *reinterpret_cast<int32_t**>(base + mxb::OFF_TERRAIN_OUTGOING_DELTA);
+        auto dirty = *reinterpret_cast<uint8_t**>(base + mxb::OFF_TERRAIN_DIRTY_OUTGOING);
+        if (!outgoing || !dirty) return;
+        const size_t cellCount = static_cast<size_t>(after.geometry.width) * after.geometry.height;
+        const size_t dirtyCount = static_cast<size_t>(after.geometry.blockCount);
+        PulseCandidate candidate = SelectNegativePulseCandidate(
+            after.geometry, after.footprint, outgoing, cellCount, dirty, dirtyCount);
+        if (!candidate.valid) {
+            const uint64_t refusal =
+                g_rutNegativePulseRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (refusal <= 4 || refusal % 1024 == 0)
+                Log("[rutpulse] REFUSED candidate=%llu source_writer_call=%llu: no adjacent "
+                    "cell in a different clean, entirely-zero block; pulse remains armed.",
+                    (unsigned long long)refusal, (unsigned long long)writerCall);
+            return;
+        }
+        if (!TryClaimPulse(g_rutNegativePulseState)) return;
+
+        // Re-run every precondition after claiming. There is no add here: zero becomes the
+        // exact signed test value, so no local integer wrap or same-cell overlap is possible.
+        candidate = SelectNegativePulseCandidate(
+            after.geometry, after.footprint, outgoing, cellCount, dirty, dirtyCount);
+        if (!candidate.valid) {
+            ReleasePulse(g_rutNegativePulseState);
+            Log("[rutpulse] REFUSED source_writer_call=%llu: candidate changed before write; "
+                "nothing was modified and the pulse remains armed.",
+                (unsigned long long)writerCall);
+            return;
+        }
+
+        const int32_t beforeCell = outgoing[candidate.cell];
+        const uint8_t beforeDirty = dirty[candidate.block];
+        const uint64_t pulseId = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ writerCall;
+        outgoing[candidate.cell] = kNegativePulseDelta;
+        dirty[candidate.block] = 1;
+        const int32_t afterCell = outgoing[candidate.cell];
+        const uint8_t afterDirty = dirty[candidate.block];
+
+        g_rutNegativePulseId.store(pulseId, std::memory_order_release);
+        g_rutNegativePulseCell.store(candidate.cell, std::memory_order_release);
+        g_rutNegativePulseBlock.store(candidate.block, std::memory_order_release);
+        g_rutNegativePulseWriterCall.store(writerCall, std::memory_order_release);
+        CompletePulse(g_rutNegativePulseState);
+        Log("[rutpulse] FIRED id=%016llx source_writer_call=%llu target=(%d,%d)#%llu "
+            "block=%d outbound=%d>%d dirty=%u>%u delta=%d one_shot=complete",
+            (unsigned long long)pulseId, (unsigned long long)writerCall,
+            candidate.x, candidate.y, (unsigned long long)candidate.cell, candidate.block,
+            beforeCell, afterCell, beforeDirty, afterDirty, kNegativePulseDelta);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // An exception after a game-memory write cannot be proven harmless. Permanently close
+        // the one-shot rather than risk a second mutation in this process.
+        CompletePulse(g_rutNegativePulseState);
+        Log("[rutpulse] REFUSED source_writer_call=%llu: guarded access fault; one-shot is "
+            "closed for this process and no retry will occur.", (unsigned long long)writerCall);
     }
 }
 
 int __fastcall hkTerrainDeformPoint(void* object, float worldX, float worldY, double magnitude) {
     const uint64_t call = g_rutDiagCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     const frostmod::rutdiag::Config cfg{true, 48, 256};
-    if (!frostmod::rutdiag::ShouldLog(call, cfg))
+    const bool shouldLog = frostmod::rutdiag::ShouldLog(call, cfg);
+    const bool pulseWaiting = g_rutNegativePulseEnabled.load(std::memory_order_acquire) &&
+        g_rutNegativePulseState.load(std::memory_order_acquire) ==
+            frostmod::rutdiag::PulseState::Waiting;
+    if (!shouldLog && !pulseWaiting)
         return g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
 
     const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -5134,6 +5241,8 @@ int __fastcall hkTerrainDeformPoint(void* object, float worldX, float worldY, do
     CaptureRutSnapshot(object, worldX, worldY, &before);
     const int result = g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
     CaptureRutSnapshot(object, worldX, worldY, &after);
+    if (pulseWaiting) TryFireRutNegativePulse(object, before, after, call);
+    if (!shouldLog) return result;
 
     const uint64_t suppressed = call > cfg.burst && cfg.sampleEvery
         ? cfg.sampleEvery - 1 : 0;
@@ -5194,8 +5303,7 @@ int __fastcall hkTerrainApplyBlock(void* object, int32_t* blockDelta, int blockI
     // Join reconstruction can apply roughly a thousand blocks before the rider moves. Keep
     // sampling frequent enough that a short two-client pass still lands in the log afterward.
     const frostmod::rutdiag::Config cfg{true, 24, 16};
-    if (!frostmod::rutdiag::ShouldLog(call, cfg))
-        return g_origTerrainApplyBlock(object, blockDelta, blockIndex);
+    const bool shouldLog = frostmod::rutdiag::ShouldLog(call, cfg);
 
     const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     const DWORD thread = GetCurrentThreadId();
@@ -5203,6 +5311,8 @@ int __fastcall hkTerrainApplyBlock(void* object, int32_t* blockDelta, int blockI
     CaptureRutApplyBefore(object, blockDelta, blockIndex, &snapshot);
     const int result = g_origTerrainApplyBlock(object, blockDelta, blockIndex);
     CaptureRutApplyAfter(object, &snapshot);
+    const bool forceNegativeEvidence = snapshot.ok && snapshot.negative > 0;
+    if (!shouldLog && !forceNegativeEvidence) return result;
     if (!snapshot.ok) {
         Log("[rutdiag/apply] call=%llu tid=%lu caller=mxbikes.exe+0x%zx block=%d result=%d "
             "snapshot unavailable; original call still ran unchanged",
@@ -5228,6 +5338,37 @@ int __fastcall hkTerrainApplyBlock(void* object, int32_t* blockDelta, int blockI
             (int)sample.heightBefore, (int)sample.heightAfter,
             (int)sample.heightAfter - (int)sample.heightBefore);
     }
+    for (int i = 0; i < snapshot.negativeSampleCount; ++i) {
+        const auto& sample = snapshot.negativeSample[i];
+        const bool localTarget = sample.cell ==
+                g_rutNegativePulseCell.load(std::memory_order_acquire) &&
+            blockIndex == g_rutNegativePulseBlock.load(std::memory_order_acquire);
+        if (localTarget) {
+            const bool exact = sample.delta == frostmod::rutdiag::kNegativePulseDelta;
+            Log("[rutpulse/apply] id=%016llx role=%s apply_call=%llu "
+                "source_writer_call=%llu target=(%d,%d)#%llu block=%d delta=%d "
+                "authoritative=%d>%d observed=%lld height16=%d>%d height_delta=%d",
+                (unsigned long long)g_rutNegativePulseId.load(std::memory_order_acquire),
+                exact ? "source-match" : "source-mismatch",
+                (unsigned long long)call,
+                (unsigned long long)g_rutNegativePulseWriterCall.load(std::memory_order_acquire),
+                sample.x, sample.y, (unsigned long long)sample.cell, blockIndex, sample.delta,
+                sample.before, sample.after,
+                (long long)(static_cast<int64_t>(sample.after) - sample.before),
+                (int)sample.heightBefore, (int)sample.heightAfter,
+                (int)sample.heightAfter - (int)sample.heightBefore);
+        } else {
+            Log("[rutpulse/apply] id=remote-match role=watcher apply_call=%llu "
+                "target=(%d,%d)#%llu block=%d delta=%d authoritative=%d>%d observed=%lld "
+                "height16=%d>%d height_delta=%d",
+                (unsigned long long)call, sample.x, sample.y,
+                (unsigned long long)sample.cell, blockIndex, sample.delta,
+                sample.before, sample.after,
+                (long long)(static_cast<int64_t>(sample.after) - sample.before),
+                (int)sample.heightBefore, (int)sample.heightAfter,
+                (int)sample.heightAfter - (int)sample.heightBefore);
+        }
+    }
     return result;
 }
 
@@ -5238,6 +5379,19 @@ static bool RutDiagnosticFlagPresent() {
     if (char* slash = strrchr(flag, '\\')) {
         *(slash + 1) = 0;
         strcat_s(flag, "frostmod_rutdiag.flag");
+    } else {
+        return false;
+    }
+    return GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool RutNegativePulseFlagPresent() {
+    char flag[MAX_PATH] = {0};
+    if (!g_logPath[0]) return false;
+    strcpy_s(flag, g_logPath);
+    if (char* slash = strrchr(flag, '\\')) {
+        *(slash + 1) = 0;
+        strcat_s(flag, "frostmod_rut_negative_pulse.flag");
     } else {
         return false;
     }
@@ -5289,7 +5443,14 @@ static uint8_t* ResolveRutDiagnosticTarget(uintptr_t rva, const char* signature,
 }
 
 static void InstallRutDiagnostic() {
-    if (!RutDiagnosticFlagPresent()) return;
+    const bool diagnosticRequested = RutDiagnosticFlagPresent();
+    const bool pulseRequested = RutNegativePulseFlagPresent();
+    if (!diagnosticRequested && !pulseRequested) return;
+    if (pulseRequested && !diagnosticRequested) {
+        Log("[rutpulse] REFUSED: pulse marker requires the separate rut diagnostic marker; "
+            "stock deformation remains untouched.");
+        return;
+    }
     if (ResolveHostGame() != &GAME_MXB || !g_game->offsets_complete) {
         Log("[rutdiag] flag present but ignored: this diagnostic is derived only for MX Bikes beta21e.");
         return;
@@ -5302,20 +5463,38 @@ static void InstallRutDiagnostic() {
     uint8_t* writer = ResolveRutDiagnosticTarget(
         mxb::RVA_TERRAIN_DEFORM_POINT, mxb::SIG_TERRAIN_DEFORM_POINT,
         mxb::SIG_TERRAIN_DEFORM_POINT_MASK, "writer");
-    if (writer && InstallHook(writer, reinterpret_cast<void*>(&hkTerrainDeformPoint),
+    const bool writerArmed = writer &&
+        InstallHook(writer, reinterpret_cast<void*>(&hkTerrainDeformPoint),
                     reinterpret_cast<void**>(&g_origTerrainDeformPoint),
-                    "terrainDeformPoint(0x1f5ac0)"))
-        Log("[rutdiag] writer ARMED observation-only @ RVA 0x%zx: first 48 calls then every 256th.",
-            (size_t)(writer - g_base));
+                    "terrainDeformPoint(0x1f5ac0)");
+    if (writerArmed) {
+        if (pulseRequested)
+            Log("[rutdiag] writer ARMED @ RVA 0x%zx: observation plus separately gated "
+                "one-shot pulse; first 48 calls then every 256th.", (size_t)(writer - g_base));
+        else
+            Log("[rutdiag] writer ARMED observation-only @ RVA 0x%zx: first 48 calls then "
+                "every 256th.", (size_t)(writer - g_base));
+    }
     uint8_t* apply = ResolveRutDiagnosticTarget(
         mxb::RVA_TERRAIN_APPLY_BLOCK, mxb::SIG_TERRAIN_APPLY_BLOCK,
         mxb::SIG_TERRAIN_APPLY_BLOCK_MASK, "received-block apply");
-    if (apply && InstallHook(apply, reinterpret_cast<void*>(&hkTerrainApplyBlock),
+    const bool applyArmed = apply &&
+        InstallHook(apply, reinterpret_cast<void*>(&hkTerrainApplyBlock),
                     reinterpret_cast<void**>(&g_origTerrainApplyBlock),
-                    "terrainApplyBlock(0x1f60c0)"))
+                    "terrainApplyBlock(0x1f60c0)");
+    if (applyArmed)
         Log("[rutdiag] received-block apply ARMED observation-only @ RVA 0x%zx: first 24 blocks "
             "then every 16th; no values, dirty flags or packets are modified.",
             (size_t)(apply - g_base));
+    if (pulseRequested && writerArmed && applyArmed) {
+        g_rutNegativePulseEnabled.store(true, std::memory_order_release);
+        Log("[rutpulse] ARMED PRIVATE TEST ONLY: waits for an accepted stock footprint and "
+            "one adjacent cell in a different clean, entirely-zero block; writes exactly "
+            "-262144 once in this process. Authoritative terrain and packets are untouched.");
+    } else if (pulseRequested) {
+        Log("[rutpulse] REFUSED: both exact-signature diagnostic hooks must arm before the "
+            "one-shot can write; stock deformation remains untouched.");
+    }
 }
 
 static void InstallTerrainGuard(intptr_t delta) {

@@ -3,6 +3,11 @@
 ## 2026-09-20
 
 ### Added
+- **A one-shot negative rut pulse can now verify the deformation path on a private local host.**
+  `--rut-negative-pulse` separately gates a bounded `-262144` test write after stock rut activity,
+  records whether the game applies that exact source delta, and fails closed if its build, hooks,
+  candidate cell, or one-shot state is unsafe. The diagnostic guide now leads with the solo test
+  command and documents the visual acceptance target for future natural, smooth multi-cell ruts.
 - **An opt-in diagnostic can now measure the game's stock rut deformation safely.** On MX
   Bikes beta21e, `--rut-diag` observes the native terrain writer and received network blocks,
   recording the caller, thread, affected cells, dirty blocks, signed deltas, and height changes

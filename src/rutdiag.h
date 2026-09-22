@@ -140,8 +140,9 @@ inline bool SpanContainsCell(const void* nextIn, size_t available, const int32_t
 }
 
 // Called only after the serializer hook has established that this is the target row. The
-// selected block must still be the clean block we armed: its dirty byte is set only to make
-// the stock sender visit it, while every cell remains zero until this exact boundary.
+// selected block must still be the clean block we armed. The stock sender consumes and clears
+// its live dirty byte before reaching raw deflate, so zero is the expected serializer-time
+// state; every cell must remain zero until this exact boundary.
 inline SerializationDecision ClassifySerializationInjection(
     const Geometry& g, const PulseCandidate& candidate,
     const int32_t* outgoing, size_t outgoingCount,
@@ -157,7 +158,7 @@ inline SerializationDecision ClassifySerializationInjection(
         candidate.y < shape.y || candidate.y >= shape.y + shape.height ||
         candidate.cell != static_cast<uint64_t>(candidate.y) * g.width + candidate.x)
         return SerializationDecision::RefuseInvalid;
-    if (dirty[candidate.block] != 1) return SerializationDecision::RefuseDirty;
+    if (dirty[candidate.block] != 0) return SerializationDecision::RefuseDirty;
     for (int row = 0; row < shape.height; ++row) {
         const uint64_t start = static_cast<uint64_t>(shape.y + row) * g.width + shape.x;
         if (start + static_cast<uint64_t>(shape.width) > outgoingCount)

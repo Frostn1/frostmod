@@ -5282,7 +5282,8 @@ static void SelectRutNegativePulse(void* object, const RutLiveSnapshot& before,
 static const char* SerializationRefusal(frostmod::rutdiag::SerializationDecision decision) {
     using frostmod::rutdiag::SerializationDecision;
     switch (decision) {
-        case SerializationDecision::RefuseDirty: return "target block is no longer queued";
+        case SerializationDecision::RefuseDirty:
+            return "target dirty marker was not consumed before serialization";
         case SerializationDecision::RefuseNonzero: return "target block changed before serialization";
         default: return "saved target metadata is invalid";
     }

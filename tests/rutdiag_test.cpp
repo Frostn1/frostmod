@@ -130,8 +130,12 @@ static void serialization_injection_requires_the_exact_clean_target_row() {
     PulseCandidate candidate{true, 64, 10, 10u * 130u + 64u, 1};
     std::vector<int32_t> outgoing(static_cast<size_t>(g.width) * g.height, 0);
     std::vector<uint8_t> dirty(g.blockCount, 0);
+    // Selection queues the clean block. The sender then consumes this marker before it calls
+    // raw deflate for the first row, which is the ordering observed in frostmod-6.log.
     dirty[candidate.block] = 1;
     int32_t* target = outgoing.data() + candidate.cell;
+    CHECK(dirty[candidate.block] == 1, "selection did not queue the target block");
+    dirty[candidate.block] = 0;
 
     CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
               dirty.data(), dirty.size(), outgoing.data(), 64 * sizeof(int32_t)) ==
@@ -158,11 +162,11 @@ static void serialization_injection_requires_the_exact_clean_target_row() {
               SerializationDecision::RefuseNonzero,
           "a raced nonzero peer in the target block was accepted");
     outgoing[12u * g.width + 65u] = 0;
-    dirty[candidate.block] = 0;
+    dirty[candidate.block] = 1;
     CHECK(ClassifySerializationInjection(g, candidate, outgoing.data(), outgoing.size(),
               dirty.data(), dirty.size(), targetRow, 64 * sizeof(int32_t)) ==
               SerializationDecision::RefuseDirty,
-          "a target block no longer queued for serialization was accepted");
+          "an unexpected uncleared dirty marker was accepted at serialization");
 }
 
 static void source_apply_results_are_never_silent() {

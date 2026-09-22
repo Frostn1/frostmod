@@ -108,3 +108,34 @@ Database impact: none. This phase changes no schema, migration, backfill, or ind
   `git diff --check` and the public added-line leakage scan pass.
 - No private map file was changed because the sender, deflate boundary, and post-send clear
   behavior were already decoded. No database, changelog, commit, push, or PR change was made.
+
+## Phase 1c — accept the sender-consumed queue marker
+
+- [x] Correlate `frostmod-6.log` with the mapped sender ordering: all 37 completed selections
+  reached the target serializer row after the live dirty byte had been consumed to zero.
+- [x] Require the expected cleared dirty state at the pre-deflate boundary instead of the
+  stale queued value, while refusing any unexpected nonzero dirty state.
+- [x] Preserve exact caller/row, saved identity/geometry, complete-zero-block, one-shot, and
+  signed-value safety gates.
+- [x] Add the reproduced `1 -> 0` queue-marker lifecycle and unexpected-dirty refusal to the
+  focused serializer tests.
+- [x] Update the compact operator guidance and rerun the full verification matrix.
+
+Database impact: none. This phase changes no schema, migration, backfill, or index.
+
+### Phase 1c review / results
+
+- Candidate selection still requires a clean, entirely-zero neighboring block and sets its
+  dirty byte to one only to queue it. At raw deflate, zero is now the sole accepted dirty
+  value because the stock sender has already consumed the queue marker into its block scan.
+- An unexpected nonzero dirty byte, wrong row, invalid saved identity/geometry, or any nonzero
+  cell in the target block refuses without writing and permits a later safe selection.
+- All other Phase 1b gates and invariants remain unchanged: explicit opt-in, beta21e and exact
+  signatures/callsite, atomic one-shot claim, exact `-262144`, original deflate once, and no
+  direct authoritative-grid or compressed-packet mutation.
+- All 20 CTest targets pass. Warning-as-error ASan/UBSan `rutdiag_test`, strict
+  `offsets_test`, and MinGW DLL syntax checking pass. The launcher was not touched; its
+  existing PE32+ x64 artifact remains valid. `git diff --check`, the public leakage scan,
+  and manual stock-original call review pass.
+- No changelog, commit, push, or PR change was made. Manual review remains required before
+  publication.

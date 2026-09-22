@@ -108,9 +108,11 @@ Safety rules are fail-closed:
   an entirely zero 64x64 outbound block. Selection queues that block but does not change the
   target cell.
 - Immediately before the stock outbound serializer compresses the target row, the source
-  revalidates the saved cell, dirty byte, and block. Only then does it assign exactly
-  `-0x00040000` (`-262144`) to the still-zero cell. A raced/nonzero block is refused and can
-  be selected again; there is no add, integer wrap, or same-cell overlap.
+  requires the dirty byte to be back at zero, because the stock sender consumes that queue
+  marker before raw deflate. It then revalidates the saved cell and entire block before
+  assigning exactly `-0x00040000` (`-262144`) to the still-zero cell. An unexpected dirty
+  state or raced/nonzero block is refused and can be selected again; there is no add, integer
+  wrap, or same-cell overlap.
 - The authoritative/rendered terrain grid and packet payloads are never edited directly.
 - The one-shot stays closed for the rest of the process, including content reloads and
   session changes. If no candidate is safe, bounded `REFUSED candidate` lines are logged and

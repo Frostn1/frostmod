@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-21
+
+### Fixed
+- **The one-shot negative rut pulse now recognizes the sender's consumed queue marker.** The
+  stock sender clears a block's dirty byte before compressing its rows, so the pre-compression
+  safety check now requires that expected cleared state while continuing to refuse unexpected
+  dirty values, changed cells, wrong rows, and invalid saved targets.
+
 ## 2026-09-20
 
 ### Fixed

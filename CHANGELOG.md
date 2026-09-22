@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-09-21
+
+### Fixed
+- **The one-shot negative rut pulse now recognizes the sender's consumed queue marker.** The
+  stock sender clears a block's dirty byte before compressing its rows, so the pre-compression
+  safety check now requires that expected cleared state while continuing to refuse unexpected
+  dirty values, changed cells, wrong rows, and invalid saved targets.
+
+## 2026-09-20
+
+### Fixed
+- **The one-shot negative rut pulse now enters the exact terrain row being sent.** FrostMod
+  selects and queues a safe empty deformation block after stock rut activity, then performs the
+  diagnostic write immediately before that row is compressed for transmission. It refuses the
+  pulse if the game build, sender call, row, block state, or saved target no longer matches, and
+  reports whether the same signed value returns through the authoritative apply path.
+
+### Added
+- **A one-shot negative rut pulse can now verify the deformation path on a private local host.**
+  `--rut-negative-pulse` separately gates a bounded `-262144` test write after stock rut activity,
+  records whether the game applies that exact source delta, and fails closed if its build, hooks,
+  candidate cell, or one-shot state is unsafe. The diagnostic guide now leads with the solo test
+  command and documents the visual acceptance target for future natural, smooth multi-cell ruts.
+- **An opt-in diagnostic can now measure the game's stock rut deformation safely.** On MX
+  Bikes beta21e, `--rut-diag` observes the native terrain writer and received network blocks,
+  recording the caller, thread, affected cells, dirty blocks, signed deltas, and height changes
+  needed to design realistic wider ruts. It is rate-limited, defaults off, refuses unknown game
+  builds, and does not alter terrain or packets. The accompanying guide covers the solo and
+  private two-client validation runs and detects a stale launcher before testing begins.
+
 ## 2026-09-19 — v0.37.0
 
 ### Fixed

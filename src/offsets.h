@@ -414,6 +414,49 @@ constexpr char SIG_TERRAIN_SAMPLE[] =
     "\x4C\x89\x44\x24\x18\x48\x89\x54\x24\x10\x53\x48\x81\xEC\x40\x01\x00\x00"
     "\x4C\x8B\x89\x50\x07\x00\x00\x48\x8B\xD9\x4D\x85\xC9";
 constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+// ---- native terrain-deformation point writer (beta21e) -----------------------
+// Observation-only Phase-0 diagnostic. The writer keeps the game's material/load decision,
+// bilinearly adds one positive scalar to four cells in the outgoing grid at obj+0x7C8, then
+// marks their blocks in obj+0x7D0. FrostMod never changes its arguments or result here.
+constexpr uint32_t  MXB_BETA21E_TIMESTAMP       = 0x6A21833D;
+constexpr uintptr_t RVA_TERRAIN_DEFORM_POINT    = 0x1F5AC0;
+constexpr uintptr_t RVA_TERRAIN_APPLY_BLOCK     = 0x1F60C0;
+// Raw-deflate entry used by the outbound world-data serializer. Phase 1b hooks the normal
+// function ABI, then accepts only the row-input call whose return address is the mapped
+// serializer site. This is later than the dirty-block scan and immediately before zlib
+// consumes that row; no post-compression packet byte is touched.
+constexpr uintptr_t RVA_ZLIB_DEFLATE             = 0x147E80;
+constexpr uintptr_t RVA_TERRAIN_DEFLATE_ROW_RET  = 0x2A30FF;
+constexpr size_t    OFF_TERRAIN_SIZE_X          = 0x758;
+constexpr size_t    OFF_TERRAIN_SIZE_Y          = 0x75C;
+constexpr size_t    OFF_TERRAIN_ORIGIN_X        = 0x764;
+constexpr size_t    OFF_TERRAIN_ORIGIN_Y        = 0x76C;
+constexpr size_t    OFF_TERRAIN_BLOCK_WIDTH     = 0x790;
+constexpr size_t    OFF_TERRAIN_BLOCK_HEIGHT    = 0x794;
+constexpr size_t    OFF_TERRAIN_BLOCKS_PER_ROW  = 0x798;
+constexpr size_t    OFF_TERRAIN_AUTHORITATIVE   = 0x7A8;
+constexpr size_t    OFF_TERRAIN_BLOCK_COUNT     = 0x7A0;
+constexpr size_t    OFF_TERRAIN_BASE_HEIGHTS    = 0x748;
+constexpr size_t    OFF_TERRAIN_OUTGOING_DELTA  = 0x7C8;
+constexpr size_t    OFF_TERRAIN_DIRTY_OUTGOING  = 0x7D0;
+// 32 fixed prologue bytes, unique in beta21e's executable section. It includes the load of
+// obj+0x7C8, tying the signature to the outgoing deformation writer rather than any function
+// with a similar frame.
+constexpr char SIG_TERRAIN_DEFORM_POINT[] =
+    "\x40\x56\x41\x57\x48\x81\xEC\x98\x00\x00\x00\x4C\x8B\xB9\xC8\x07"
+    "\x00\x00\x0F\x29\x74\x24\x70\x0F\x29\x7C\x24\x60\x48\x8B\xF1\x44";
+constexpr char SIG_TERRAIN_DEFORM_POINT_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// Received channel-4 block application. Also 32 fixed bytes and unique in beta21e.
+constexpr char SIG_TERRAIN_APPLY_BLOCK[] =
+    "\x44\x89\x44\x24\x18\x48\x89\x4C\x24\x08\x57\x41\x54\x48\x83\xEC"
+    "\x28\x41\x8B\xC0\x4C\x8B\xE2\x48\x8B\xF9\x48\x85\xD2\x75\x0B\x8D";
+constexpr char SIG_TERRAIN_APPLY_BLOCK_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// 31 fixed prologue bytes, unique in beta21e. The final complete instruction is `test eax,eax`.
+constexpr char SIG_ZLIB_DEFLATE[] =
+    "\x89\x54\x24\x10\x48\x89\x4C\x24\x08\x48\x81\xEC\x98\x00\x00\x00"
+    "\x48\x8B\x8C\x24\xA0\x00\x00\x00\xE8\x93\xFC\xFF\xFF\x85\xC0";
+constexpr char SIG_ZLIB_DEFLATE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // Does a function's first bytes look like somebody already detoured it? MinHook writes a
 // `jmp rel32`, or `jmp [rip+disp32]` when the trampoline is out of a 2 GB jump's reach;
 // other injectors use `mov rax, imm64; jmp rax`. Worth asking before the signature check
@@ -731,4 +774,3 @@ inline constexpr GameOffsets GAME_KRP = {
 };
 
 inline constexpr const GameOffsets* ALL_GAMES[] = { &GAME_MXB, &GAME_GPB, &GAME_KRP };
-

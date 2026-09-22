@@ -148,6 +148,12 @@ enable_testing()
 add_executable(offsets_test tests/offsets_test.cpp)
 add_test(NAME offsets COMMAND offsets_test)
 
+# --- native rut-event diagnostic test -----------------------------------------
+# The live hook is Windows-only, but its default-off gate, bounded sampling, and exact
+# four-cell/block mapping are pure arithmetic and run on every CI host.
+add_executable(rutdiag_test tests/rutdiag_test.cpp)
+add_test(NAME rutdiag COMMAND rutdiag_test)
+
 # --- plugin ABI test -----------------------------------------------------------
 # The three titles hand the same callbacks different structs (KRP's track position has no
 # crashed flag, its classification header an extra field, its event a different shape).

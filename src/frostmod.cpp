@@ -52,6 +52,7 @@
 #include "session.h"
 #include "crashreport.h"
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
+#include "rutdiag.h"    // pure default-off/rate/map rules for the native rut-event probe
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -4954,6 +4955,729 @@ static void InstallTrainerGuard(intptr_t delta) {
         Log("[trainer] save guard live. No new trainer is written with the stack in it.");
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in Phase-0 rut diagnostic. Observation only: the original writer receives the exact
+// object/coordinates/magnitude and runs exactly once. We snapshot the four candidate cells
+// and dirty bytes around it so a controlled ride can establish caller ownership, sign,
+// scale and block behaviour without changing terrain or packets.
+using TerrainDeformPoint_t = int(__fastcall*)(void*, float, float, double);
+TerrainDeformPoint_t g_origTerrainDeformPoint = nullptr;
+using TerrainApplyBlock_t = int(__fastcall*)(void*, int32_t*, int);
+TerrainApplyBlock_t g_origTerrainApplyBlock = nullptr;
+using ZlibDeflate_t = int(__fastcall*)(void*, int);
+ZlibDeflate_t g_origZlibDeflate = nullptr;
+std::atomic<uint64_t> g_rutDiagCalls{0};
+std::atomic<uint64_t> g_rutApplyCalls{0};
+std::atomic<bool> g_rutNegativePulseEnabled{false};
+std::atomic<frostmod::rutdiag::PulseState> g_rutNegativePulseState{
+    frostmod::rutdiag::PulseState::Waiting};
+std::atomic<uint64_t> g_rutNegativePulseRefusals{0};
+std::atomic<uint64_t> g_rutNegativePulseId{0};
+std::atomic<uint64_t> g_rutNegativePulseCell{UINT64_MAX};
+std::atomic<int> g_rutNegativePulseBlock{-1};
+std::atomic<uint64_t> g_rutNegativePulseWriterCall{0};
+
+struct RutPulsePending {
+    frostmod::rutdiag::Geometry geometry{};
+    frostmod::rutdiag::PulseCandidate candidate{};
+    int32_t* outgoing = nullptr;
+    uint8_t* dirty = nullptr;
+    size_t outgoingCount = 0;
+    size_t dirtyCount = 0;
+    uint64_t id = 0;
+    uint64_t writerCall = 0;
+};
+
+// Published by Selecting -> Armed and consumed only by Armed -> Injecting. The atomic state
+// is the ownership handoff; these fields are deliberately not read while another phase can
+// write them.
+RutPulsePending g_rutPulsePending{};
+
+struct RutZStreamPrefix {
+    uint8_t* nextIn = nullptr;
+    uint32_t availableIn = 0;
+};
+
+struct RutLiveSnapshot {
+    bool ok = false;
+    frostmod::rutdiag::Geometry geometry{};
+    frostmod::rutdiag::Footprint footprint{};
+    int32_t cell[4]{};
+    int16_t baseHeight[4]{};
+    int16_t height[4]{};
+    uint8_t dirty[4]{};
+};
+
+static bool CaptureRutSnapshot(void* object, float worldX, float worldY, RutLiveSnapshot* out) {
+    if (!object || !out) return false;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        frostmod::rutdiag::Geometry g;
+        g.width = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_WIDTH);
+        g.height = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_HEIGHT);
+        g.blockWidth = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_WIDTH);
+        g.blockHeight = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_HEIGHT);
+        g.blocksPerRow = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCKS_PER_ROW);
+        g.blockCount = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_COUNT);
+        g.sizeX = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_SIZE_X);
+        g.sizeY = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_SIZE_Y);
+        g.originX = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_ORIGIN_X);
+        g.originY = *reinterpret_cast<const float*>(base + mxb::OFF_TERRAIN_ORIGIN_Y);
+        // Refuse implausible metadata before multiplying/indexing pointers read from game
+        // memory. A diagnostic must never turn a stale layout into a second crash site.
+        if (g.width <= 0 || g.height <= 0 || g.width > 32768 || g.height > 32768 ||
+            g.blockWidth <= 0 || g.blockHeight <= 0 || g.blockWidth > 1024 ||
+            g.blockHeight > 1024 || g.blocksPerRow <= 0 || g.blocksPerRow > 32768 ||
+            g.blockCount <= 0 || g.blockCount > 1073741824)
+            return false;
+        auto footprint = frostmod::rutdiag::MapFootprint(g, worldX, worldY);
+        if (!footprint.valid) return false;
+        auto cells = *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_OUTGOING_DELTA);
+        auto baseHeights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_BASE_HEIGHTS);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        auto dirty = *reinterpret_cast<uint8_t* const*>(base + mxb::OFF_TERRAIN_DIRTY_OUTGOING);
+        if (!cells || !baseHeights || !heights || !dirty) return false;
+        out->geometry = g;
+        out->footprint = footprint;
+        for (int i = 0; i < 4; ++i) {
+            out->cell[i] = cells[footprint.cell[i]];
+            out->baseHeight[i] = baseHeights[footprint.cell[i]];
+            out->height[i] = heights[footprint.cell[i]];
+            out->dirty[i] = dirty[footprint.block[i]];
+        }
+        out->ok = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->ok = false;
+        return false;
+    }
+}
+
+struct RutApplySample {
+    int x = 0;
+    int y = 0;
+    uint64_t cell = 0;
+    int32_t delta = 0;
+    int32_t before = 0;
+    int32_t after = 0;
+    int16_t heightBefore = 0;
+    int16_t heightAfter = 0;
+};
+
+struct RutApplySnapshot {
+    bool ok = false;
+    frostmod::rutdiag::Geometry geometry{};
+    frostmod::rutdiag::BlockShape shape{};
+    int nonzero = 0;
+    int positive = 0;
+    int negative = 0;
+    int32_t minimum = 0;
+    int32_t maximum = 0;
+    int64_t sum = 0;
+    int sampleCount = 0;
+    RutApplySample sample[4]{};
+    int negativeSampleCount = 0;
+    RutApplySample negativeSample[4]{};
+    bool pulseTargetValid = false;
+    RutApplySample pulseTarget{};
+};
+
+static bool CaptureRutApplyBefore(void* object, int32_t* blockDelta, int blockIndex,
+                                  RutApplySnapshot* out) {
+    if (!object || !blockDelta || !out) return false;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        frostmod::rutdiag::Geometry g;
+        g.width = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_WIDTH);
+        g.height = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_HEIGHT);
+        g.blockWidth = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_WIDTH);
+        g.blockHeight = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_HEIGHT);
+        g.blocksPerRow = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCKS_PER_ROW);
+        g.blockCount = *reinterpret_cast<const int*>(base + mxb::OFF_TERRAIN_BLOCK_COUNT);
+        if (g.width <= 0 || g.height <= 0 || g.width > 32768 || g.height > 32768 ||
+            g.blockWidth <= 0 || g.blockHeight <= 0 || g.blockWidth > 1024 ||
+            g.blockHeight > 1024 || g.blocksPerRow <= 0 || g.blocksPerRow > 32768 ||
+            g.blockCount <= 0 || g.blockCount > 1073741824)
+            return false;
+        auto shape = frostmod::rutdiag::MapBlock(g, blockIndex);
+        if (!shape.valid) return false;
+        auto authoritative =
+            *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_AUTHORITATIVE);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        if (!authoritative || !heights) return false;
+        int32_t minimum = 0x7fffffff;
+        int32_t maximum = (-2147483647 - 1);
+        for (int row = 0; row < shape.height; ++row) {
+            for (int col = 0; col < shape.width; ++col) {
+                const int local = row * shape.width + col;
+                const int32_t delta = blockDelta[local];
+                if (!delta) continue;
+                ++out->nonzero;
+                if (delta > 0) ++out->positive; else ++out->negative;
+                if (delta < minimum) minimum = delta;
+                if (delta > maximum) maximum = delta;
+                out->sum += delta;
+                if (out->sampleCount < 4) {
+                    auto& sample = out->sample[out->sampleCount++];
+                    sample.x = shape.x + col;
+                    sample.y = shape.y + row;
+                    sample.cell = static_cast<uint64_t>(sample.y) * g.width + sample.x;
+                    sample.delta = delta;
+                    sample.before = authoritative[sample.cell];
+                    sample.heightBefore = heights[sample.cell];
+                }
+                if (delta < 0 && out->negativeSampleCount < 4) {
+                    auto& sample = out->negativeSample[out->negativeSampleCount++];
+                    sample.x = shape.x + col;
+                    sample.y = shape.y + row;
+                    sample.cell = static_cast<uint64_t>(sample.y) * g.width + sample.x;
+                    sample.delta = delta;
+                    sample.before = authoritative[sample.cell];
+                    sample.heightBefore = heights[sample.cell];
+                }
+            }
+        }
+        const uint64_t pulseCell = g_rutNegativePulseCell.load(std::memory_order_acquire);
+        const int pulseBlock = g_rutNegativePulseBlock.load(std::memory_order_acquire);
+        if (g_rutNegativePulseState.load(std::memory_order_acquire) ==
+                frostmod::rutdiag::PulseState::Fired &&
+            pulseCell != UINT64_MAX && blockIndex == pulseBlock) {
+            const uint64_t x = pulseCell % static_cast<uint64_t>(g.width);
+            const uint64_t y = pulseCell / static_cast<uint64_t>(g.width);
+            if (x >= static_cast<uint64_t>(shape.x) &&
+                x < static_cast<uint64_t>(shape.x + shape.width) &&
+                y >= static_cast<uint64_t>(shape.y) &&
+                y < static_cast<uint64_t>(shape.y + shape.height)) {
+                const uint64_t local = (y - shape.y) * static_cast<uint64_t>(shape.width) +
+                                       (x - shape.x);
+                auto& sample = out->pulseTarget;
+                sample.x = static_cast<int>(x);
+                sample.y = static_cast<int>(y);
+                sample.cell = pulseCell;
+                sample.delta = blockDelta[local];
+                sample.before = authoritative[pulseCell];
+                sample.heightBefore = heights[pulseCell];
+                out->pulseTargetValid = true;
+            }
+        }
+        out->geometry = g;
+        out->shape = shape;
+        out->minimum = out->nonzero ? minimum : 0;
+        out->maximum = out->nonzero ? maximum : 0;
+        out->ok = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->ok = false;
+        return false;
+    }
+}
+
+static void CaptureRutApplyAfter(void* object, RutApplySnapshot* snapshot) {
+    if (!object || !snapshot || !snapshot->ok) return;
+    __try {
+        const auto base = reinterpret_cast<const uint8_t*>(object);
+        auto authoritative =
+            *reinterpret_cast<int32_t* const*>(base + mxb::OFF_TERRAIN_AUTHORITATIVE);
+        auto heights = *reinterpret_cast<int16_t* const*>(base + mxb::OFF_TERRAIN_GRID);
+        if (!authoritative || !heights) { snapshot->ok = false; return; }
+        for (int i = 0; i < snapshot->sampleCount; ++i) {
+            snapshot->sample[i].after = authoritative[snapshot->sample[i].cell];
+            snapshot->sample[i].heightAfter = heights[snapshot->sample[i].cell];
+        }
+        for (int i = 0; i < snapshot->negativeSampleCount; ++i) {
+            snapshot->negativeSample[i].after = authoritative[snapshot->negativeSample[i].cell];
+            snapshot->negativeSample[i].heightAfter = heights[snapshot->negativeSample[i].cell];
+        }
+        if (snapshot->pulseTargetValid) {
+            snapshot->pulseTarget.after = authoritative[snapshot->pulseTarget.cell];
+            snapshot->pulseTarget.heightAfter = heights[snapshot->pulseTarget.cell];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        snapshot->ok = false;
+    }
+}
+
+static bool StockRutWriteAccepted(const RutLiveSnapshot& before, const RutLiveSnapshot& after) {
+    if (!before.ok || !after.ok || !before.footprint.valid || !after.footprint.valid)
+        return false;
+    for (int i = 0; i < 4; ++i) {
+        for (int prior = 0; prior < i; ++prior)
+            if (before.footprint.cell[i] == before.footprint.cell[prior]) return false;
+        if (before.footprint.cell[i] != after.footprint.cell[i] ||
+            after.cell[i] <= before.cell[i])
+            return false;
+    }
+    return true;
+}
+
+static void SelectRutNegativePulse(void* object, const RutLiveSnapshot& before,
+                                   const RutLiveSnapshot& after, uint64_t writerCall) {
+    using namespace frostmod::rutdiag;
+    if (!g_rutNegativePulseEnabled.load(std::memory_order_acquire) ||
+        g_rutNegativePulseState.load(std::memory_order_acquire) != PulseState::Waiting ||
+        !StockRutWriteAccepted(before, after))
+        return;
+
+    __try {
+        const auto base = reinterpret_cast<uint8_t*>(object);
+        auto outgoing = *reinterpret_cast<int32_t**>(base + mxb::OFF_TERRAIN_OUTGOING_DELTA);
+        auto dirty = *reinterpret_cast<uint8_t**>(base + mxb::OFF_TERRAIN_DIRTY_OUTGOING);
+        if (!outgoing || !dirty) return;
+        const size_t cellCount = static_cast<size_t>(after.geometry.width) * after.geometry.height;
+        const size_t dirtyCount = static_cast<size_t>(after.geometry.blockCount);
+        PulseCandidate candidate = SelectNegativePulseCandidate(
+            after.geometry, after.footprint, outgoing, cellCount, dirty, dirtyCount);
+        if (!candidate.valid) {
+            const uint64_t refusal =
+                g_rutNegativePulseRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (refusal <= 4 || refusal % 1024 == 0)
+                Log("[rutpulse] REFUSED candidate=%llu source_writer_call=%llu: no adjacent "
+                    "cell in a different clean, entirely-zero block; pulse remains armed.",
+                    (unsigned long long)refusal, (unsigned long long)writerCall);
+            return;
+        }
+        if (!TryBeginPulseSelection(g_rutNegativePulseState)) return;
+
+        // Re-run every selection precondition after claiming. The candidate remains zero;
+        // the serializer hook later revalidates it before the only signed assignment.
+        candidate = SelectNegativePulseCandidate(
+            after.geometry, after.footprint, outgoing, cellCount, dirty, dirtyCount);
+        if (!candidate.valid) {
+            ReleasePulse(g_rutNegativePulseState);
+            Log("[rutpulse] REFUSED source_writer_call=%llu: candidate changed before arming; "
+                "nothing was modified and the pulse remains armed.",
+                (unsigned long long)writerCall);
+            return;
+        }
+
+        const int32_t beforeCell = outgoing[candidate.cell];
+        const uint8_t beforeDirty = dirty[candidate.block];
+        const uint64_t pulseId = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ writerCall;
+        g_rutPulsePending = {after.geometry, candidate, outgoing, dirty, cellCount, dirtyCount,
+                             pulseId, writerCall};
+        g_rutNegativePulseId.store(pulseId, std::memory_order_release);
+        g_rutNegativePulseCell.store(candidate.cell, std::memory_order_release);
+        g_rutNegativePulseBlock.store(candidate.block, std::memory_order_release);
+        g_rutNegativePulseWriterCall.store(writerCall, std::memory_order_release);
+        ArmPulse(g_rutNegativePulseState);
+        // Queue only the selected block. The target cell remains zero until its row reaches
+        // the raw-deflate hook, so later stock wheel writes cannot overwrite our test value.
+        dirty[candidate.block] = 1;
+        const uint8_t afterDirty = dirty[candidate.block];
+        Log("[rutpulse] SELECTED id=%016llx source_writer_call=%llu target=(%d,%d)#%llu "
+            "block=%d outbound=%d unchanged dirty=%u>%u state=armed-for-serialization",
+            (unsigned long long)pulseId, (unsigned long long)writerCall,
+            candidate.x, candidate.y, (unsigned long long)candidate.cell, candidate.block,
+            beforeCell, beforeDirty, afterDirty);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A fault may have occurred after queuing the dirty block. Permanently close the
+        // one-shot rather than risk a second selection in this process.
+        CompletePulse(g_rutNegativePulseState);
+        Log("[rutpulse] REFUSED source_writer_call=%llu: guarded selection fault; one-shot "
+            "is closed for this process and no retry will occur.",
+            (unsigned long long)writerCall);
+    }
+}
+
+static const char* SerializationRefusal(frostmod::rutdiag::SerializationDecision decision) {
+    using frostmod::rutdiag::SerializationDecision;
+    switch (decision) {
+        case SerializationDecision::RefuseDirty:
+            return "target dirty marker was not consumed before serialization";
+        case SerializationDecision::RefuseNonzero: return "target block changed before serialization";
+        default: return "saved target metadata is invalid";
+    }
+}
+
+int __fastcall hkZlibDeflate(void* stream, int flush) {
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    if (g_rutNegativePulseEnabled.load(std::memory_order_acquire) &&
+        caller == g_base + mxb::RVA_TERRAIN_DEFLATE_ROW_RET && stream &&
+        g_rutNegativePulseState.load(std::memory_order_acquire) ==
+            frostmod::rutdiag::PulseState::Armed) {
+        __try {
+            const auto* z = reinterpret_cast<const RutZStreamPrefix*>(stream);
+            const auto& pending = g_rutPulsePending;
+            int32_t* target = pending.outgoing && pending.candidate.cell < pending.outgoingCount
+                ? pending.outgoing + pending.candidate.cell : nullptr;
+            if (frostmod::rutdiag::SpanContainsCell(z->nextIn, z->availableIn, target) &&
+                frostmod::rutdiag::TryClaimPulseInjection(g_rutNegativePulseState)) {
+                const int32_t beforeCell = *target;
+                const uint8_t beforeDirty = pending.dirty[pending.candidate.block];
+                const auto decision = frostmod::rutdiag::InjectAtSerialization(
+                    pending.geometry, pending.candidate, pending.outgoing, pending.outgoingCount,
+                    pending.dirty, pending.dirtyCount, z->nextIn, z->availableIn);
+                if (decision == frostmod::rutdiag::SerializationDecision::Inject) {
+                    const int32_t afterCell = *target;
+                    const uint8_t afterDirty = pending.dirty[pending.candidate.block];
+                    CompletePulse(g_rutNegativePulseState);
+                    Log("[rutpulse] FIRED id=%016llx source_writer_call=%llu "
+                        "target=(%d,%d)#%llu block=%d stage=pre-deflate "
+                        "outbound=%d>%d dirty=%u>%u delta=%d one_shot=complete",
+                        (unsigned long long)pending.id,
+                        (unsigned long long)pending.writerCall,
+                        pending.candidate.x, pending.candidate.y,
+                        (unsigned long long)pending.candidate.cell, pending.candidate.block,
+                        beforeCell, afterCell, beforeDirty, afterDirty,
+                        frostmod::rutdiag::kNegativePulseDelta);
+                } else {
+                    const uint64_t pulseId = pending.id;
+                    const uint64_t sourceCall = pending.writerCall;
+                    const int block = pending.candidate.block;
+                    g_rutPulsePending = {};
+                    g_rutNegativePulseId.store(0, std::memory_order_release);
+                    g_rutNegativePulseCell.store(UINT64_MAX, std::memory_order_release);
+                    g_rutNegativePulseBlock.store(-1, std::memory_order_release);
+                    g_rutNegativePulseWriterCall.store(0, std::memory_order_release);
+                    ReleasePulse(g_rutNegativePulseState);
+                    Log("[rutpulse] REFUSED serialization id=%016llx source_writer_call=%llu "
+                        "block=%d: %s; no cell was modified and selection may retry.",
+                        (unsigned long long)pulseId, (unsigned long long)sourceCall, block,
+                        SerializationRefusal(decision));
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            CompletePulse(g_rutNegativePulseState);
+            Log("[rutpulse] REFUSED serialization: guarded access fault; one-shot is closed "
+                "for this process and no retry will occur.");
+        }
+    }
+    return g_origZlibDeflate(stream, flush);
+}
+
+int __fastcall hkTerrainDeformPoint(void* object, float worldX, float worldY, double magnitude) {
+    const uint64_t call = g_rutDiagCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const frostmod::rutdiag::Config cfg{true, 48, 256};
+    const bool shouldLog = frostmod::rutdiag::ShouldLog(call, cfg);
+    const bool pulseWaiting = g_rutNegativePulseEnabled.load(std::memory_order_acquire) &&
+        g_rutNegativePulseState.load(std::memory_order_acquire) ==
+            frostmod::rutdiag::PulseState::Waiting;
+    if (!shouldLog && !pulseWaiting)
+        return g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
+
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const DWORD thread = GetCurrentThreadId();
+    RutLiveSnapshot before, after;
+    CaptureRutSnapshot(object, worldX, worldY, &before);
+    const int result = g_origTerrainDeformPoint(object, worldX, worldY, magnitude);
+    CaptureRutSnapshot(object, worldX, worldY, &after);
+    if (pulseWaiting) SelectRutNegativePulse(object, before, after, call);
+    if (!shouldLog) return result;
+
+    const uint64_t suppressed = call > cfg.burst && cfg.sampleEvery
+        ? cfg.sampleEvery - 1 : 0;
+    Log("[rutdiag] call=%llu tid=%lu caller=mxbikes.exe+0x%zx pos=(%.6f,%.6f) "
+        "magnitude=%.12g result=%d suppressed_since_sample=%llu",
+        (unsigned long long)call, (unsigned long)thread,
+        caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+        worldX, worldY, magnitude, result, (unsigned long long)suppressed);
+    if (!before.ok || !after.ok) {
+        Log("[rutdiag] call=%llu snapshot unavailable before=%d after=%d; original call still ran unchanged",
+            (unsigned long long)call, before.ok ? 1 : 0, after.ok ? 1 : 0);
+        return result;
+    }
+
+    int64_t total = 0;
+    int changed = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int64_t delta = static_cast<int64_t>(after.cell[i]) - before.cell[i];
+        total += delta;
+        if (delta) ++changed;
+    }
+    Log("[rutdiag] call=%llu grid=%dx%d block=%dx%d changed=%d total_delta=%lld "
+        "c0=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u "
+        "c1=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u",
+        (unsigned long long)call, before.geometry.width, before.geometry.height,
+        before.geometry.blockWidth, before.geometry.blockHeight, changed, (long long)total,
+        before.footprint.x[0], before.footprint.y[0],
+        (unsigned long long)before.footprint.cell[0], before.cell[0], after.cell[0],
+        (long long)(static_cast<int64_t>(after.cell[0]) - before.cell[0]),
+        before.footprint.block[0], before.dirty[0], after.dirty[0],
+        before.footprint.x[1], before.footprint.y[1],
+        (unsigned long long)before.footprint.cell[1], before.cell[1], after.cell[1],
+        (long long)(static_cast<int64_t>(after.cell[1]) - before.cell[1]),
+        before.footprint.block[1], before.dirty[1], after.dirty[1]);
+    Log("[rutdiag] call=%llu c2=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u "
+        "c3=(%d,%d)#%llu %d>%d d=%lld dirty[%d]=%u>%u",
+        (unsigned long long)call,
+        before.footprint.x[2], before.footprint.y[2],
+        (unsigned long long)before.footprint.cell[2], before.cell[2], after.cell[2],
+        (long long)(static_cast<int64_t>(after.cell[2]) - before.cell[2]),
+        before.footprint.block[2], before.dirty[2], after.dirty[2],
+        before.footprint.x[3], before.footprint.y[3],
+        (unsigned long long)before.footprint.cell[3], before.cell[3], after.cell[3],
+        (long long)(static_cast<int64_t>(after.cell[3]) - before.cell[3]),
+        before.footprint.block[3], before.dirty[3], after.dirty[3]);
+    Log("[rutdiag] call=%llu heights base/current c0=%d/%d>%d c1=%d/%d>%d "
+        "c2=%d/%d>%d c3=%d/%d>%d",
+        (unsigned long long)call,
+        before.baseHeight[0], before.height[0], after.height[0],
+        before.baseHeight[1], before.height[1], after.height[1],
+        before.baseHeight[2], before.height[2], after.height[2],
+        before.baseHeight[3], before.height[3], after.height[3]);
+    return result;
+}
+
+int __fastcall hkTerrainApplyBlock(void* object, int32_t* blockDelta, int blockIndex) {
+    const uint64_t call = g_rutApplyCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Join reconstruction can apply roughly a thousand blocks before the rider moves. Keep
+    // sampling frequent enough that a short two-client pass still lands in the log afterward.
+    const frostmod::rutdiag::Config cfg{true, 24, 16};
+    const bool shouldLog = frostmod::rutdiag::ShouldLog(call, cfg);
+
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const DWORD thread = GetCurrentThreadId();
+    RutApplySnapshot snapshot;
+    CaptureRutApplyBefore(object, blockDelta, blockIndex, &snapshot);
+    const int result = g_origTerrainApplyBlock(object, blockDelta, blockIndex);
+    CaptureRutApplyAfter(object, &snapshot);
+    const bool pulseBlockExpected =
+        g_rutNegativePulseState.load(std::memory_order_acquire) ==
+            frostmod::rutdiag::PulseState::Fired &&
+        blockIndex == g_rutNegativePulseBlock.load(std::memory_order_acquire);
+    const bool forceNegativeEvidence = snapshot.ok && snapshot.negative > 0;
+    const bool forcePulseEvidence = snapshot.ok && snapshot.pulseTargetValid;
+    if (!shouldLog && !forceNegativeEvidence && !forcePulseEvidence && !pulseBlockExpected)
+        return result;
+    if (!snapshot.ok) {
+        Log("[rutdiag/apply] call=%llu tid=%lu caller=mxbikes.exe+0x%zx block=%d result=%d "
+            "snapshot unavailable; original call still ran unchanged",
+            (unsigned long long)call, (unsigned long)thread,
+            caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+            blockIndex, result);
+        if (pulseBlockExpected)
+            Log("[rutpulse/apply] id=%016llx role=source-unavailable apply_call=%llu "
+                "source_writer_call=%llu block=%d; target snapshot failed before/after the "
+                "stock apply, so no result is inferred.",
+                (unsigned long long)g_rutNegativePulseId.load(std::memory_order_acquire),
+                (unsigned long long)call,
+                (unsigned long long)g_rutNegativePulseWriterCall.load(std::memory_order_acquire),
+                blockIndex);
+        return result;
+    }
+    Log("[rutdiag/apply] call=%llu tid=%lu caller=mxbikes.exe+0x%zx block=%d "
+        "region=(%d,%d %dx%d) nonzero=%d pos=%d neg=%d min=%d max=%d sum=%lld result=%d",
+        (unsigned long long)call, (unsigned long)thread,
+        caller >= g_base ? (size_t)(caller - g_base) : (size_t)caller,
+        blockIndex, snapshot.shape.x, snapshot.shape.y, snapshot.shape.width,
+        snapshot.shape.height, snapshot.nonzero, snapshot.positive, snapshot.negative,
+        snapshot.minimum, snapshot.maximum, (long long)snapshot.sum, result);
+    for (int i = 0; i < snapshot.sampleCount; ++i) {
+        const auto& sample = snapshot.sample[i];
+        Log("[rutdiag/apply] call=%llu sample%d=(%d,%d)#%llu delta=%d authoritative=%d>%d "
+            "observed=%lld height16=%d>%d height_delta=%d",
+            (unsigned long long)call, i, sample.x, sample.y,
+            (unsigned long long)sample.cell, sample.delta, sample.before, sample.after,
+            (long long)(static_cast<int64_t>(sample.after) - sample.before),
+            (int)sample.heightBefore, (int)sample.heightAfter,
+            (int)sample.heightAfter - (int)sample.heightBefore);
+    }
+    for (int i = 0; i < snapshot.negativeSampleCount; ++i) {
+        const auto& sample = snapshot.negativeSample[i];
+        const bool localTarget = sample.cell ==
+                g_rutNegativePulseCell.load(std::memory_order_acquire) &&
+            blockIndex == g_rutNegativePulseBlock.load(std::memory_order_acquire);
+        if (!localTarget) {
+            Log("[rutpulse/apply] id=remote-match role=watcher apply_call=%llu "
+                "target=(%d,%d)#%llu block=%d delta=%d authoritative=%d>%d observed=%lld "
+                "height16=%d>%d height_delta=%d",
+                (unsigned long long)call, sample.x, sample.y,
+                (unsigned long long)sample.cell, blockIndex, sample.delta,
+                sample.before, sample.after,
+                (long long)(static_cast<int64_t>(sample.after) - sample.before),
+                (int)sample.heightBefore, (int)sample.heightAfter,
+                (int)sample.heightAfter - (int)sample.heightBefore);
+        }
+    }
+    if (snapshot.pulseTargetValid) {
+        using frostmod::rutdiag::ApplyResult;
+        const auto& sample = snapshot.pulseTarget;
+        const ApplyResult classification = frostmod::rutdiag::ClassifyApplyResult(sample.delta);
+        const char* role = classification == ApplyResult::Exact ? "source-match" :
+            classification == ApplyResult::Missing ? "source-missing" : "source-mismatch";
+        Log("[rutpulse/apply] id=%016llx role=%s apply_call=%llu "
+            "source_writer_call=%llu target=(%d,%d)#%llu block=%d requested=%d delta=%d "
+            "authoritative=%d>%d observed=%lld height16=%d>%d height_delta=%d",
+            (unsigned long long)g_rutNegativePulseId.load(std::memory_order_acquire), role,
+            (unsigned long long)call,
+            (unsigned long long)g_rutNegativePulseWriterCall.load(std::memory_order_acquire),
+            sample.x, sample.y, (unsigned long long)sample.cell, blockIndex,
+            frostmod::rutdiag::kNegativePulseDelta, sample.delta, sample.before, sample.after,
+            (long long)(static_cast<int64_t>(sample.after) - sample.before),
+            (int)sample.heightBefore, (int)sample.heightAfter,
+            (int)sample.heightAfter - (int)sample.heightBefore);
+    } else if (pulseBlockExpected) {
+        Log("[rutpulse/apply] id=%016llx role=source-unavailable apply_call=%llu "
+            "source_writer_call=%llu block=%d; saved target does not map inside the returned "
+            "block, so no result is inferred.",
+            (unsigned long long)g_rutNegativePulseId.load(std::memory_order_acquire),
+            (unsigned long long)call,
+            (unsigned long long)g_rutNegativePulseWriterCall.load(std::memory_order_acquire),
+            blockIndex);
+    }
+    return result;
+}
+
+static bool RutDiagnosticFlagPresent() {
+    char flag[MAX_PATH] = {0};
+    if (!g_logPath[0]) return false;
+    strcpy_s(flag, g_logPath);
+    if (char* slash = strrchr(flag, '\\')) {
+        *(slash + 1) = 0;
+        strcat_s(flag, "frostmod_rutdiag.flag");
+    } else {
+        return false;
+    }
+    return GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool RutNegativePulseFlagPresent() {
+    char flag[MAX_PATH] = {0};
+    if (!g_logPath[0]) return false;
+    strcpy_s(flag, g_logPath);
+    if (char* slash = strrchr(flag, '\\')) {
+        *(slash + 1) = 0;
+        strcat_s(flag, "frostmod_rut_negative_pulse.flag");
+    } else {
+        return false;
+    }
+    return GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool HostTimestampIsBeta21e() {
+    __try {
+        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_base + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->FileHeader.TimeDateStamp == mxb::MXB_BETA21E_TIMESTAMP;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static uint8_t* ResolveRutDiagnosticTarget(uintptr_t rva, const char* signature,
+                                           const char* mask, const char* label) {
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[rutdiag] %s REFUSED: cannot read the executable range.", label);
+        return nullptr;
+    }
+    const size_t length = strlen(mask);
+    uint8_t* expected = reinterpret_cast<uint8_t*>(g_base + rva);
+    if (expected >= begin && expected + length <= end && mxb::LooksDetoured(expected)) {
+        Log("[rutdiag] %s REFUSED: expected RVA 0x%zx is already hooked.", label, (size_t)rva);
+        return nullptr;
+    }
+    if (expected >= begin && expected + length <= end && MatchAt(expected, signature, mask))
+        return expected;
+    uint8_t* found = PatternScan(begin, end, signature, mask);
+    if (!found) {
+        Log("[rutdiag] %s REFUSED: signature not found; stock deformation remains untouched.", label);
+        return nullptr;
+    }
+    // A signature that is no longer unique is not a relocation rule; it is a guess.
+    uint8_t* duplicate = found + 1 < end ? PatternScan(found + 1, end, signature, mask) : nullptr;
+    if (duplicate) {
+        Log("[rutdiag] %s REFUSED: signature is ambiguous at RVAs 0x%zx and 0x%zx.", label,
+            (size_t)(found - g_base), (size_t)(duplicate - g_base));
+        return nullptr;
+    }
+    Log("[rutdiag] %s RELOCATED by signature: RVA 0x%zx (offsets.h says 0x%zx).", label,
+        (size_t)(found - g_base), (size_t)rva);
+    return found;
+}
+
+static bool ValidateRutSerializerRowCall(uint8_t* deflate) {
+    if (!deflate || mxb::RVA_TERRAIN_DEFLATE_ROW_RET < 5) return false;
+    __try {
+        const uint8_t* call = reinterpret_cast<const uint8_t*>(
+            g_base + mxb::RVA_TERRAIN_DEFLATE_ROW_RET - 5);
+        if (call[0] != 0xE8) return false;
+        int32_t relative = 0;
+        std::memcpy(&relative, call + 1, sizeof(relative));
+        return call + 5 + relative == deflate;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void InstallRutDiagnostic() {
+    const bool diagnosticRequested = RutDiagnosticFlagPresent();
+    const bool pulseRequested = RutNegativePulseFlagPresent();
+    if (!diagnosticRequested && !pulseRequested) return;
+    if (pulseRequested && !diagnosticRequested) {
+        Log("[rutpulse] REFUSED: pulse marker requires the separate rut diagnostic marker; "
+            "stock deformation remains untouched.");
+        return;
+    }
+    if (ResolveHostGame() != &GAME_MXB || !g_game->offsets_complete) {
+        Log("[rutdiag] flag present but ignored: this diagnostic is derived only for MX Bikes beta21e.");
+        return;
+    }
+    if (!HostTimestampIsBeta21e()) {
+        Log("[rutdiag] REFUSED: host TimeDateStamp is not beta21e 0x%08X; stock deformation remains untouched.",
+            mxb::MXB_BETA21E_TIMESTAMP);
+        return;
+    }
+    uint8_t* writer = ResolveRutDiagnosticTarget(
+        mxb::RVA_TERRAIN_DEFORM_POINT, mxb::SIG_TERRAIN_DEFORM_POINT,
+        mxb::SIG_TERRAIN_DEFORM_POINT_MASK, "writer");
+    const bool writerArmed = writer &&
+        InstallHook(writer, reinterpret_cast<void*>(&hkTerrainDeformPoint),
+                    reinterpret_cast<void**>(&g_origTerrainDeformPoint),
+                    "terrainDeformPoint(0x1f5ac0)");
+    if (writerArmed) {
+        if (pulseRequested)
+            Log("[rutdiag] writer ARMED @ RVA 0x%zx: observation plus separately gated "
+                "one-shot candidate selection; first 48 calls then every 256th.",
+                (size_t)(writer - g_base));
+        else
+            Log("[rutdiag] writer ARMED observation-only @ RVA 0x%zx: first 48 calls then "
+                "every 256th.", (size_t)(writer - g_base));
+    }
+    uint8_t* apply = ResolveRutDiagnosticTarget(
+        mxb::RVA_TERRAIN_APPLY_BLOCK, mxb::SIG_TERRAIN_APPLY_BLOCK,
+        mxb::SIG_TERRAIN_APPLY_BLOCK_MASK, "received-block apply");
+    const bool applyArmed = apply &&
+        InstallHook(apply, reinterpret_cast<void*>(&hkTerrainApplyBlock),
+                    reinterpret_cast<void**>(&g_origTerrainApplyBlock),
+                    "terrainApplyBlock(0x1f60c0)");
+    if (applyArmed)
+        Log("[rutdiag] received-block apply ARMED observation-only @ RVA 0x%zx: first 24 blocks "
+            "then every 16th; no values, dirty flags or packets are modified.",
+            (size_t)(apply - g_base));
+    bool serializerArmed = false;
+    if (pulseRequested) {
+        uint8_t* deflate = ResolveRutDiagnosticTarget(
+            mxb::RVA_ZLIB_DEFLATE, mxb::SIG_ZLIB_DEFLATE,
+            mxb::SIG_ZLIB_DEFLATE_MASK, "outbound serializer");
+        if (deflate && !ValidateRutSerializerRowCall(deflate)) {
+            Log("[rutpulse] outbound serializer REFUSED: the mapped terrain-row call no "
+                "longer targets the verified deflate routine.");
+            deflate = nullptr;
+        }
+        serializerArmed = deflate &&
+            InstallHook(deflate, reinterpret_cast<void*>(&hkZlibDeflate),
+                        reinterpret_cast<void**>(&g_origZlibDeflate),
+                        "outboundTerrainDeflate(0x147e80)");
+        if (serializerArmed)
+            Log("[rutpulse] outbound serializer ARMED @ RVA 0x%zx: injection is restricted "
+                "to the mapped terrain row immediately before compression.",
+                (size_t)(deflate - g_base));
+    }
+    if (pulseRequested && writerArmed && applyArmed && serializerArmed) {
+        g_rutNegativePulseEnabled.store(true, std::memory_order_release);
+        Log("[rutpulse] ARMED PRIVATE TEST ONLY: waits for an accepted stock footprint and "
+            "one adjacent cell in a different clean, entirely-zero block; selects it without "
+            "changing the cell, then writes exactly -262144 at its pre-compression row boundary "
+            "once in this process. Authoritative terrain and packet bytes are untouched.");
+    } else if (pulseRequested) {
+        Log("[rutpulse] REFUSED: writer, apply and outbound-serializer exact-signature hooks "
+            "must all arm before the one-shot can write; stock deformation remains untouched.");
+    }
+}
+
 static void InstallTerrainGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
         Log("[terrain] guard off for %s - the sampler is MX Bikes' and has no twin here.",
@@ -5137,6 +5861,7 @@ DWORD WINAPI Init(LPVOID) {
             InstallGhsGuard(delta);
             InstallTerrainGuard(delta);
             InstallTrainerGuard(delta);
+            InstallRutDiagnostic();
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);

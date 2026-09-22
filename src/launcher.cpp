@@ -605,6 +605,8 @@ int main(int argc, char** argv) {
     bool probeMount  = false; // --probe-mount: hook the pkz-mount fn to log its args
     bool dumpList    = false; // --dump-serverlist: dump the master server-list blob
     bool captureMaster = false; // --capture-master: sniff master protocol (RE for the mimic master)
+    bool rutDiag = false;     // --rut-diag: observe native terrain point writes (beta21e only)
+    bool rutNegativePulse = false; // --rut-negative-pulse: one private signed transport test
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool unsafeReload = false;// --unsafe-reload: replay a step table the title hasn't confirmed
     int  reloadFrom   = 0;    // --unsafe-reload-from=N: start the replay at step N (0 = step 1)
@@ -649,6 +651,8 @@ int main(int argc, char** argv) {
         else if (a == "--probe-mount")           probeMount = true;
         else if (a == "--dump-serverlist")       dumpList = true;
         else if (a == "--capture-master")        captureMaster = true;
+        else if (a == "--rut-diag")              rutDiag = true;
+        else if (a == "--rut-negative-pulse")  { rutNegativePulse = true; rutDiag = true; }
         else if (a == "--switch-live")           switchLive = true;
         else if (a == "--probe-overjump")        probeOverjump = true;
         // Forcing without the probe would leave no record of what was changed, so this
@@ -782,6 +786,38 @@ int main(int argc, char** argv) {
                "    --dedicated, then share frostmod.log.\n");
     } else {
         DeleteFileA(captureFlag.c_str());
+    }
+    // Observation-only beta21e terrain diagnostic. The DLL independently verifies the host
+    // timestamp and the full native-writer signature before installing anything. Running
+    // without --rut-diag deletes this marker and returns subsequent game launches to stock.
+    std::string rutDiagFlag = ExeDir() + "frostmod_rutdiag.flag";
+    if (rutDiag) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, rutDiagFlag.c_str(), "w") == 0 && f) {
+            fclose(f);
+            printf("[*] --rut-diag ON: observation-only native terrain logging is armed for beta21e.\n"
+                   "    FrostMod does not change rut values or packets; watch [rutdiag] in frostmod.log.\n");
+        } else {
+            printf("[!] --rut-diag NOT ARMED: could not write %s\n", rutDiagFlag.c_str());
+        }
+    } else {
+        DeleteFileA(rutDiagFlag.c_str());
+    }
+    // Deliberately separate from --rut-diag: ordinary observation can never write terrain.
+    // The pulse flag implies the diagnostic hooks because their exact build/signature gates
+    // and apply-side evidence are mandatory for this manual private-server experiment.
+    std::string rutPulseFlag = ExeDir() + "frostmod_rut_negative_pulse.flag";
+    if (rutNegativePulse) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, rutPulseFlag.c_str(), "w") == 0 && f) {
+            fclose(f);
+            printf("[!] --rut-negative-pulse ARMED: PRIVATE TEST ONLY. One clean adjacent cell may\n"
+                   "    receive -262144 once after a confirmed stock rut write. Use a private server.\n");
+        } else {
+            printf("[!] --rut-negative-pulse NOT ARMED: could not write %s\n", rutPulseFlag.c_str());
+        }
+    } else {
+        DeleteFileA(rutPulseFlag.c_str());
     }
     std::string switchFlag = ExeDir() + "frostmod_trackswitch.flag";
     if (switchLive) {

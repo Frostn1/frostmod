@@ -297,6 +297,42 @@ static void terrain_guard_constants_agree() {
     CHECK(mxb::OFF_TERRAIN_GRID > mxb::OFF_TERRAIN_HEIGHT, "the grid should sit past the dims");
 }
 
+static void rut_diagnostic_constants_agree() {
+    CHECK(mxb::MXB_BETA21E_TIMESTAMP == 0x6A21833D, "rut diagnostic build stamp changed");
+    CHECK(mxb::RVA_TERRAIN_DEFORM_POINT == 0x1F5AC0, "rut writer RVA changed");
+    CHECK(mxb::RVA_TERRAIN_APPLY_BLOCK == 0x1F60C0, "rut apply RVA changed");
+    CHECK(mxb::RVA_ZLIB_DEFLATE == 0x147E80, "rut serializer deflate RVA changed");
+    CHECK(mxb::RVA_TERRAIN_DEFLATE_ROW_RET == 0x2A30FF,
+          "rut serializer row return site changed");
+    const size_t sigLen = sizeof(mxb::SIG_TERRAIN_DEFORM_POINT) - 1;
+    const size_t maskLen = sizeof(mxb::SIG_TERRAIN_DEFORM_POINT_MASK) - 1;
+    CHECK(sigLen == 32 && sigLen == maskLen, "rut signature/mask lengths disagree");
+    for (size_t i = 0; i < maskLen; ++i)
+        CHECK(mxb::SIG_TERRAIN_DEFORM_POINT_MASK[i] == 'x',
+              "rut signature byte %zu is unexpectedly wildcarded", i);
+    const auto* sig = reinterpret_cast<const unsigned char*>(mxb::SIG_TERRAIN_DEFORM_POINT);
+    CHECK(sig[11] == 0x4C && sig[12] == 0x8B && sig[13] == 0xB9 &&
+          static_cast<size_t>(sig[14] | (sig[15] << 8) | (sig[16] << 16) | (sig[17] << 24)) ==
+              mxb::OFF_TERRAIN_OUTGOING_DELTA,
+          "rut signature no longer loads obj+OFF_TERRAIN_OUTGOING_DELTA");
+    CHECK(mxb::OFF_TERRAIN_DIRTY_OUTGOING == mxb::OFF_TERRAIN_OUTGOING_DELTA + 8,
+          "outgoing grid and dirty array layout changed");
+    CHECK(!mxb::LooksDetoured(reinterpret_cast<const uint8_t*>(mxb::SIG_TERRAIN_DEFORM_POINT)),
+          "stored rut signature looks like a detour");
+    CHECK(sizeof(mxb::SIG_TERRAIN_APPLY_BLOCK) - 1 == 32 &&
+          sizeof(mxb::SIG_TERRAIN_APPLY_BLOCK_MASK) - 1 == 32,
+          "rut apply signature/mask lengths disagree");
+    CHECK(!mxb::LooksDetoured(reinterpret_cast<const uint8_t*>(mxb::SIG_TERRAIN_APPLY_BLOCK)),
+          "stored rut apply signature looks like a detour");
+    CHECK(sizeof(mxb::SIG_ZLIB_DEFLATE) - 1 == 31 &&
+          sizeof(mxb::SIG_ZLIB_DEFLATE_MASK) - 1 == 31,
+          "rut serializer signature/mask lengths disagree");
+    CHECK(!mxb::LooksDetoured(reinterpret_cast<const uint8_t*>(mxb::SIG_ZLIB_DEFLATE)),
+          "stored rut serializer signature looks like a detour");
+    CHECK(mxb::RVA_TERRAIN_DEFLATE_ROW_RET > mxb::RVA_ZLIB_DEFLATE,
+          "serializer row call cannot return before deflate");
+}
+
 // A patched prologue must never be mistaken for "the game moved this function".
 static void detours_are_recognised_before_the_signature_check() {
     const uint8_t real[]   = {0x48,0x83,0xEC,0x28,0xFF,0xC9,0x83,0xF9,0x09,0x77,0x43,0x48};
@@ -338,6 +374,7 @@ static void world_session_constants_agree() {
 
 int main() {
     terrain_guard_constants_agree();
+    rut_diagnostic_constants_agree();
     world_session_constants_agree();
     ghs_guard_constants_agree();
     detours_are_recognised_before_the_signature_check();

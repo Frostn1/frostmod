@@ -542,24 +542,33 @@ std::string g_hud_seen;
 ULONGLONG   g_hud_looked = 0;
 
 void LoadHud(bool quiet = false) {
-    g_hud_seen  = DiskStamp(coachhud::HudNames(g_event));
-    g_hud_sheet = coachhud::Sheet{};
-    g_hud_file.clear();
+    g_hud_seen = DiskStamp(coachhud::HudNames(g_event));
+    coachhud::Sheet found;
+    std::string     taken;
     for (const std::string& name : coachhud::HudNames(g_event)) {
         std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
         coachhud::Sheet s;
         if (!b.empty() && coachhud::Parse(b.data(), b.size(), s) && coachhud::Fits(s, g_event)) {
-            g_hud_sheet = std::move(s);
-            g_hud_file  = name;
+            found = std::move(s);
+            taken = name;
             break;
         }
     }
+    // A newer file that doesn't parse leaves the sheet in use alone: dropping it for nothing
+    // would blank the gap and the ghost mid-session. Its stamp is kept above, so it isn't
+    // re-read every second either; the next write Coach makes is looked at again.
+    if (quiet && taken.empty()) {
+        if (!g_hud_file.empty()) Log("hud", "a newer sheet didn't read; keeping the one in use");
+        return;
+    }
+    g_hud_sheet = std::move(found);
+    g_hud_file  = taken;
     g_ref.load(g_hud_sheet.ref);
     // Without a sheet the map, the stance and the setup card still draw; only the gap, the
     // ghost and the section tips need one, so this is a note rather than a failure.
     if (!quiet) {
         Log("hud", coachlog::SheetText("HUD sheet", g_hud_file, !g_hud_file.empty(), int(g_hud_sheet.sections.size())));
-    } else if (!g_hud_file.empty()) {
+    } else {
         Log("hud", "picked up a newer sheet: " + std::to_string(g_hud_sheet.sections.size()) + " sections");
     }
 }

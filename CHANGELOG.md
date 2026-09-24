@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **MXB Coach starts coaching on the lap after your first good one, without restarting the
+  game.** On a track Coach hadn't coached you on yet, the recorder only looked for Coach's cue
+  sheet when the track loaded. Coach writes that sheet a few seconds after your first good lap,
+  so the cues, the gap and the ghost only turned up after you quit and loaded the same track
+  again. Now, while there's no sheet, the recorder checks for one about once a second and
+  starts using it straight away, mid-lap included. A sheet already in use is still swapped only
+  at the line. The gap and ghost sheet now updates during a session too; before, it was only
+  read when the track loaded.
+
 ## 2026-09-19 — v0.37.0
 
 ### Fixed

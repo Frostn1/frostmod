@@ -218,7 +218,46 @@ static void ACrashClearsIt() {
     CHECK(!p.showing(), "cleared by the crash");
 }
 
+// A sheet that wasn't there when the track loaded is looked for while riding, not only at the
+// next event. That was the bug: set a lap, quit, reload the track, and only then be coached.
+static void AMissingSheetIsLookedForWhileRiding() {
+    using coachcue::ShouldLook;
+    CHECK(ShouldLook(false, false, 5000, 3000), "no sheet: look during the lap");
+    CHECK(!ShouldLook(false, false, 3500, 3000), "but no more than once a second");
+    CHECK(ShouldLook(false, false, 4000, 3000), "a second on, look again");
+    CHECK(!ShouldLook(true, false, 99000, 3000), "a sheet in use is not swapped mid-lap");
+    CHECK(ShouldLook(true, true, 3001, 3000), "it is swapped at the line");
+    CHECK(ShouldLook(false, true, 3001, 3000), "and a missing one is looked for there too");
+    CHECK(ShouldLook(false, false, 100, 3000), "a clock that went backwards doesn't stall the look");
+}
+
+// Taken mid-lap, a sheet's cues still ahead fire and the ones already passed wait for the next
+// lap, rather than all going off at once.
+static void ASheetTakenMidLapStartsFromHere() {
+    coachcue::Sheet s;
+    Load(Sheet(1000, {{200, coachcue::BRAKE, 1, "Brake"}, {700, coachcue::THROTTLE, 1, "Gas"}}), s);
+    coachcue::Player p;
+    p.set_practice(true);
+    float t = 0;
+    Ride(p, 1000, 0, 400, 20, t, [](float) {});
+    p.load(s);
+    std::string order;
+    const coachcue::Cue* last = nullptr;
+    auto note = [&](float) {
+        const coachcue::Cue* c = p.showing();
+        if (c && c != last) order += c->text + ";";
+        last = c;
+    };
+    Ride(p, 1000, 400, 1000, 20, t, note);
+    CHECK(order == "Gas;", "the rest of this lap: %s", order.c_str());
+    order.clear();
+    Ride(p, 1000, 0, 1000, 20, t, note);
+    CHECK(order == "Brake;Gas;", "the whole of the next: %s", order.c_str());
+}
+
 int main() {
+    AMissingSheetIsLookedForWhileRiding();
+    ASheetTakenMidLapStartsFromHere();
     ReadsWhatTheAppWrites();
     RefusesWhatTheAppDoesNotWrite();
     OnlyInPractice();

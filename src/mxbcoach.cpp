@@ -227,9 +227,25 @@ void WriteRecorderInfo() {
 /// that is the whole point of them moving on — so a sheet loaded once and kept for the event
 /// is the same cues at the same metres every lap, however hard the app works.
 std::string g_cue_file;
-FILETIME    g_cue_time = {};
+std::string g_cue_seen;       // DiskStamp of the candidates at the last look
+ULONGLONG   g_cue_looked = 0;  // GetTickCount64 of the last look
+
+/// Which of a sheet's candidate files are on disk, and when each was written, as one string.
+/// A look compares it with the last one's, so a file is read only when it has changed. A
+/// sheet that is there but made for another length of track is not re-read every second.
+std::string DiskStamp(const std::vector<std::string>& names) {
+    std::string out;
+    for (const std::string& name : names) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (!GetFileAttributesExA((g_base + "cues\\" + name).c_str(), GetFileExInfoStandard, &a)) continue;
+        out += name + "@" + std::to_string(a.ftLastWriteTime.dwHighDateTime) + ":" +
+               std::to_string(a.ftLastWriteTime.dwLowDateTime) + ";";
+    }
+    return out;
+}
 
 void LoadCues(bool quiet = false) {
+    g_cue_seen = DiskStamp(coachcue::SheetNames(g_event));
     for (const std::string& name : coachcue::SheetNames(g_event)) {
         const std::string path = g_base + "cues\\" + name;
         std::vector<uint8_t> b = ReadFile(path);
@@ -238,8 +254,6 @@ void LoadCues(bool quiet = false) {
             const int cues = int(s.cues.size());
             g_cues.load(std::move(s));
             g_cue_file = path;
-            WIN32_FILE_ATTRIBUTE_DATA a;
-            if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) g_cue_time = a.ftLastWriteTime;
             if (!quiet) Log("cues", coachlog::SheetText("cue sheet", name, true, cues));
             else Log("cues", "picked up a newer sheet: " + std::to_string(cues) + " cues");
             return;
@@ -250,13 +264,14 @@ void LoadCues(bool quiet = false) {
     if (!quiet) Log("cues", coachlog::SheetText("cue sheet", "", false, 0));
 }
 
-/// At the line, take a sheet the app has rewritten since the last one was read. The lap
-/// boundary is where every cue is re-armed anyway, so nothing is half-fired across the swap.
-void MaybeReloadCues() {
-    if (g_cue_file.empty()) return;
-    WIN32_FILE_ATTRIBUTE_DATA a;
-    if (!GetFileAttributesExA(g_cue_file.c_str(), GetFileExInfoStandard, &a)) return;
-    if (CompareFileTime(&a.ftLastWriteTime, &g_cue_time) == 0) return;
+/// Take a sheet the app has written since the last look; coachcue::ShouldLook says when.
+void LookForCues(bool at_line) {
+    const ULONGLONG now = GetTickCount64();
+    if (!coachcue::ShouldLook(!g_cue_file.empty(), at_line, now, g_cue_looked)) return;
+    g_cue_looked = now;
+    const std::string seen = DiskStamp(coachcue::SheetNames(g_event));
+    // Nothing new, or the file went away: keep what is loaded rather than go quiet mid-lap.
+    if (seen == g_cue_seen || seen.empty()) return;
     LoadCues(true);
 }
 
@@ -520,23 +535,42 @@ bool WriteFont(uint32_t& bytes) {
     return true;
 }
 
-// The app's HUD sheet, found the same way as the cues.
-void LoadHud() {
+// The app's HUD sheet, found the same way as the cues, and looked for again the same way: the
+// gap and the ghost need Coach's lap, which on a new track only exists after the first lap.
+std::string g_hud_file;
+std::string g_hud_seen;
+ULONGLONG   g_hud_looked = 0;
+
+void LoadHud(bool quiet = false) {
+    g_hud_seen  = DiskStamp(coachhud::HudNames(g_event));
     g_hud_sheet = coachhud::Sheet{};
-    std::string taken;
+    g_hud_file.clear();
     for (const std::string& name : coachhud::HudNames(g_event)) {
         std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
         coachhud::Sheet s;
         if (!b.empty() && coachhud::Parse(b.data(), b.size(), s) && coachhud::Fits(s, g_event)) {
             g_hud_sheet = std::move(s);
-            taken       = name;
+            g_hud_file  = name;
             break;
         }
     }
     g_ref.load(g_hud_sheet.ref);
     // Without a sheet the map, the stance and the setup card still draw; only the gap, the
     // ghost and the section tips need one, so this is a note rather than a failure.
-    Log("hud", coachlog::SheetText("HUD sheet", taken, !taken.empty(), int(g_hud_sheet.sections.size())));
+    if (!quiet) {
+        Log("hud", coachlog::SheetText("HUD sheet", g_hud_file, !g_hud_file.empty(), int(g_hud_sheet.sections.size())));
+    } else if (!g_hud_file.empty()) {
+        Log("hud", "picked up a newer sheet: " + std::to_string(g_hud_sheet.sections.size()) + " sections");
+    }
+}
+
+void LookForHud(bool at_line) {
+    const ULONGLONG now = GetTickCount64();
+    if (!coachcue::ShouldLook(!g_hud_file.empty(), at_line, now, g_hud_looked)) return;
+    g_hud_looked = now;
+    const std::string seen = DiskStamp(coachhud::HudNames(g_event));
+    if (seen == g_hud_seen || seen.empty()) return;
+    LoadHud(true);
 }
 
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
@@ -1168,7 +1202,9 @@ __declspec(dllexport) void EventDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     g_cues.clear();
+    g_cue_file.clear();
     g_hud_sheet = coachhud::Sheet{};
+    g_hud_file.clear();
     g_ref.load({});
     g_track.clear();
     g_practice = false;
@@ -1240,7 +1276,9 @@ __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_lap(_pData, _iDataSize);
     g_cues.on_lap();
-    MaybeReloadCues();
+    // The line: a newer sheet is swapped in where every cue is re-armed and the gap restarts.
+    LookForCues(true);
+    LookForHud(true);
 }
 
 __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
@@ -1315,6 +1353,9 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     PollStance(_fTime, _fPos, crashed);
     PollLean(_fTime, _fPos);
     MaybeReloadHudSettings();
+    // Only does anything while a sheet is missing: see coachcue::ShouldLook.
+    LookForCues(false);
+    LookForHud(false);
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries

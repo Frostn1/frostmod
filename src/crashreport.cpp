@@ -1,6 +1,7 @@
 // The live half of the crash report. See crashreport.h for what a report is and why.
 
 #include "crashreport.h"
+#include "nanwatch.h"
 
 #include <windows.h>
 #include <dbghelp.h>
@@ -136,6 +137,35 @@ void WriteRegisters(const CONTEXT& c) {
                 (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
                 (unsigned long long)c.R8, (unsigned long long)c.R9);
     Say(line);
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "[crash] r10=%016llX r11=%016llX r12=%016llX r13=%016llX r14=%016llX r15=%016llX",
+                (unsigned long long)c.R10, (unsigned long long)c.R11,
+                (unsigned long long)c.R12, (unsigned long long)c.R13,
+                (unsigned long long)c.R14, (unsigned long long)c.R15);
+    Say(line);
+
+    // The float side. A NaN that became an index went through an XMM register on its way
+    // to the integer one, and is usually still there (nanwatch.h). Low 64 bits of each, raw,
+    // then which read as not a number - raw too, because plenty of XMM traffic is integer
+    // data whose float reading means nothing, and only the code at the fault can say which.
+    if ((c.ContextFlags & CONTEXT_FLOATING_POINT) != CONTEXT_FLOATING_POINT) {
+        Say("[crash] no float registers in the context.");
+        return;
+    }
+    uint64_t lows[16];
+    for (int i = 0; i < 16; ++i) lows[i] = (uint64_t)c.FltSave.XmmRegisters[i].Low;
+    for (int i = 0; i < 16; i += 4) {
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "[crash] xmm%-2d %016llX  xmm%-2d %016llX  xmm%-2d %016llX  xmm%-2d %016llX",
+                    i, (unsigned long long)lows[i], i + 1, (unsigned long long)lows[i + 1],
+                    i + 2, (unsigned long long)lows[i + 2], i + 3, (unsigned long long)lows[i + 3]);
+        Say(line);
+    }
+    // All 16 as "xmmN (double NaN)" is 294 bytes: room for every one of them.
+    char which[320], summary[360];
+    nanwatch::NonFiniteXmm(lows, which, sizeof(which));
+    _snprintf_s(summary, sizeof(summary), _TRUNCATE, "[crash] not a number in: %s", which);
+    Say(summary);
 }
 
 // Keep the newest kKeepDumps. A player who crashes nightly for a month should not

@@ -51,6 +51,7 @@
 #include "serverfilter.h"
 #include "session.h"
 #include "crashreport.h"
+#include "nanwatch.h"    // the first position that stops being a number
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
@@ -1994,6 +1995,44 @@ static int RadFindEntry(int raceNum) {       // caller holds g_radMutex
 }
 
 // ---- ingest (called from the plugin callbacks; take the lock) ---------------
+// Every position the game hands us goes past the NaN watch (nanwatch.h), so the log says
+// whose position stopped being a number and where they were just before - the part a crash
+// at +0x1F1923 or +0x1A29AE never shows.
+//
+// Fed from the exports themselves, ahead of their session-only return: in MXB App's setup
+// the callbacks go to the session plugin, not to the copy that draws the radar, and the
+// watch has to run wherever they land. Its own lock, not g_radMutex, for the same reason.
+static std::mutex g_nanMutex;
+static frostmod::nanwatch::Watch g_nanWatch;
+static void NanSee(int who, float x, float y, float z) {
+    using frostmod::nanwatch::Edge;
+    const unsigned long long now = GetTickCount64();
+    char line[256], brief[112];
+    {
+        std::lock_guard<std::mutex> lk(g_nanMutex);
+        const Edge e = g_nanWatch.See(who, x, y, z, now);
+        if (e == Edge::None || !g_nanWatch.Budget()) return;
+        g_nanWatch.Describe(who, e, x, y, z, now, line, sizeof(line));
+        g_nanWatch.Brief(who, e, now, brief, sizeof(brief));
+    }
+    // Written outside the lock: the log is file I/O and the physics thread is waiting.
+    Log("[nanwatch] %s", line);
+    frostmod::crash::Note("%s", brief);
+}
+static void NanFeedTelemetry(const void* d, int size) {
+    if (!d || size < (int)sizeof(sdk::VehicleDataPrefix)) return;
+    const auto* b = (const sdk::VehicleDataPrefix*)d;
+    NanSee(frostmod::nanwatch::kMe, b->m_fPosX, b->m_fPosY, b->m_fPosZ);
+}
+static void NanFeedTrackPositions(int n, const void* arr, int elem) {
+    if (!arr || elem < g_abi->tp_size) return;
+    if (n > 64) n = 64;   // the same cap the radar puts on it
+    for (int i = 0; i < n; ++i) {
+        const auto* e = (const sdk::TrackPositionPrefix*)((const char*)arr + (size_t)i * elem);
+        NanSee(e->m_iRaceNum, e->m_fPosX, e->m_fPosY, e->m_fPosZ);
+    }
+}
+
 static void RadStoreTelemetry(const void* d, int size) {
     if (!d || size < (int)sizeof(sdk::VehicleDataPrefix)) return;
     const auto* b = (const sdk::VehicleDataPrefix*)d;
@@ -5674,12 +5713,14 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+    NanFeedTelemetry(_pData, _iDataSize);   // whichever copy the game calls
     if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
 }
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    NanFeedTrackPositions(_iNumVehicles, _pArray, _iElemSize);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
@@ -5690,6 +5731,11 @@ __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    // A rider who left frees their slot, and a newcomer on their number starts clean.
+    if (_pData && _iDataSize >= (int)sizeof(int)) {
+        std::lock_guard<std::mutex> lk(g_nanMutex);
+        g_nanWatch.Forget(*(const int*)_pData);
+    }
     if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
@@ -5717,6 +5763,8 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 // a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     LogCallbackOnce("EventInit", _iDataSize);
+    // A new session reuses race numbers: nobody's last position carries over.
+    { std::lock_guard<std::mutex> lk(g_nanMutex); g_nanWatch.Reset(); }
     const PluginAbi* abi = g_abi;
     if (!_pData || _iDataSize < abi->ev_size) {
         Log("[session] EventInit payload too small (%d < %d per %s) - server unknown",

@@ -44,3 +44,16 @@ jobs:
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
           }
           Get-ChildItem $bin
+
+      # A PR's build, kept for two weeks so a fix can be tried in the game before it is
+      # released. FrostMod's own binaries only - nothing of the game's is in build/bin.
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frostmod-test-${{ github.sha }}
+          path: |
+            build/bin/Release/frostmod.dlo
+            build/bin/Release/frostmod.dll
+            build/bin/Release/frostmod.exe
+            build/bin/Release/mxbcoach.dlo
+          retention-days: 14

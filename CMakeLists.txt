@@ -208,6 +208,12 @@ add_test(NAME lean COMMAND lean_test)
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
 
+# --- NaN watch test --------------------------------------------------------------
+# Whose position stopped being a number, and which XMM registers at a crash hold one
+# that isn't. Pure, so it runs on any host.
+add_executable(nanwatch_test tests/nanwatch_test.cpp)
+add_test(NAME nanwatch COMMAND nanwatch_test)
+
 # --- rejoin test ---------------------------------------------------------------
 # The 36-byte thunk the disconnect path is repointed at. It runs with a live stack frame
 # under it, so its encoding and stack balance are proved here rather than trusted.

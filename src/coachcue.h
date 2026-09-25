@@ -178,6 +178,25 @@ inline std::vector<std::string> SheetNames(const Event& e) {
     return out;
 }
 
+/// How often, at most, to look for a sheet while none is loaded.
+constexpr uint64_t kLookEveryMs = 1000;
+
+/// Whether to look on disk for a newer sheet (a .cue or a .hud) right now.
+///
+/// With one loaded, only at the line: every cue is re-armed there and the gap starts over, so
+/// nothing is half-fired or half-drawn across the swap. Without one, at most once a second
+/// anywhere on the lap: nothing is armed, so taking a sheet mid-lap cuts nothing short. It
+/// has to be mid-lap. MXB Coach writes a track's first sheet a few seconds after the first
+/// good lap, and a sheet that wasn't there when the track loaded used to be never looked for
+/// again, so a rider had to set a lap, quit the game and load the same track before coaching
+/// started.
+inline bool ShouldLook(bool loaded, bool at_line, uint64_t now_ms, uint64_t last_look_ms) {
+    if (at_line) return true;
+    if (loaded) return false;
+    // A clock that went backwards is a clock to trust again, not one to wait out.
+    return now_ms < last_look_ms || now_ms - last_look_ms >= kLookEveryMs;
+}
+
 /// A sheet belongs to a track only if it was made for one of the same length.
 inline bool Fits(const Sheet& s, const Event& e) {
     return e.track_len > 0 && std::fabs(s.track_len - e.track_len) <= 1.0f;

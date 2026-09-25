@@ -316,7 +316,42 @@ static void SidecarSaysNullWhenItDoesNotKnow() {
     CHECK(all.find("\"frames\": [") != std::string::npos, "an empty frame list is still a list");
 }
 
+// One crash was 44 reports: the filter below FrostMod kept resuming the faulting
+// instruction. The gate counts the same fault in a row, and anything else starts over.
+static void TheSameFaultIsCountedNotReportedAgain() {
+    using frostmod::crash::FaultKey;
+    using frostmod::crash::RepeatGate;
+    using frostmod::crash::kResumedFaultLimit;
+    const auto key = [](uintptr_t addr, uintptr_t target, unsigned long thread) {
+        FaultKey k;
+        k.code    = 0xC0000005;
+        k.address = addr;
+        k.target  = target;
+        k.thread  = thread;
+        return k;
+    };
+    const FaultKey loop = key(0x1A29AE, 0xFFFFFFFEDECFCB38ull, 14912);
+
+    // The report that started this: the same fault every ~0.55 s.
+    RepeatGate g;
+    CHECK(g.See(loop, 1000) == 1, "first time");
+    CHECK(g.See(loop, 1550) == 2, "resumed and faulted again");
+    CHECK(g.See(loop, 2100) == kResumedFaultLimit, "the limit is reached on the third");
+
+    // Anything that differs, or comes long after, is a new fault rather than a loop.
+    RepeatGate h;
+    CHECK(h.See(loop, 0) == 1, "first");
+    CHECK(h.See(loop, 60 * 60 * 1000) == 1, "an hour later is a separate, handled fault");
+    CHECK(h.See(key(0x1A29AE, 0x1234, 14912), 60 * 60 * 1000 + 10) == 1, "another target");
+    CHECK(h.See(key(0x1A29AE, 0x1234, 777), 60 * 60 * 1000 + 20) == 1, "another thread");
+    FaultKey other = key(0x1A29AE, 0x1234, 777);
+    other.code = 0xC0000094;  // integer divide by zero
+    CHECK(h.See(other, 60 * 60 * 1000 + 30) == 1, "another exception code");
+    CHECK(h.See(other, 60 * 60 * 1000 + 40) == 2, "then counts again");
+}
+
 int main() {
+    TheSameFaultIsCountedNotReportedAgain();
     EscapeKeepsItParseable();
     SidecarCarriesTheFacts();
     SidecarSaysNullWhenItDoesNotKnow();

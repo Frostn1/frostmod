@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026-09-24 — v0.38.0
 
 ### Fixed
 - **MXB Coach starts coaching on the lap after your first good one, without restarting the

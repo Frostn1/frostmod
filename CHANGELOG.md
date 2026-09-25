@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+- **The log says whose position stopped being a number.** Two of the crashes that end races start
+  with a rider's position turning into NaN, usually in a violent crash, and the game only
+  notices much later, somewhere else. FrostMod now watches the positions the game already
+  hands plugins. The moment one stops being a number, it logs whose it was, where they last
+  were, and how long before. It logs again if the position recovers. That's at most 20 lines
+  a run, and each one goes in the crash report's trail too.
+- **Crash reports carry the float registers.** The report now includes r10 to r15 and all 16 XMM
+  registers, and names the ones that hold something that is not a number. That's where a NaN
+  sits just before it becomes a bad index.
+
 ### Fixed
 - **One crash is one crash report.** When another plugin's crash handler kept resuming a fault,
   the game could sit on the same broken instruction for half a minute, and FrostMod wrote a new

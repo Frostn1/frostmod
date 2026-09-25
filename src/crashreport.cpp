@@ -296,8 +296,15 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
     // g_reporting, so one fault at a time sees the gate.
     if (ep && ep->ExceptionRecord) {
         static RepeatGate gate;
-        const unsigned seen = gate.See((uintptr_t)ep->ExceptionRecord->ExceptionAddress,
-                                       GetCurrentThreadId());
+        const EXCEPTION_RECORD* rec = ep->ExceptionRecord;
+        FaultKey key;
+        key.code    = rec->ExceptionCode;
+        key.address = (uintptr_t)rec->ExceptionAddress;
+        key.target  = rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2
+                          ? (uintptr_t)rec->ExceptionInformation[1]
+                          : 0;
+        key.thread  = GetCurrentThreadId();
+        const unsigned seen = gate.See(key, GetTickCount64());
         if (seen > 1) {
             if (seen == 2)
                 Say("[crash] the same fault again on the same thread: the handler before "

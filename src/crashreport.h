@@ -390,26 +390,41 @@ inline void WriteJson(const Fault& f, const Context& ctx, const Trail& trail,
 // under it, and that filter answered the access violation by resuming it: the instruction
 // ran again, faulted again, and each pass wrote another report while the game hung.
 //
-// So a fault is reported once. The same address on the same thread again means the
-// filter before us resumed it. Past `kResumedFaultLimit`, FrostMod stops handing it back
-// and lets the process end, since a real fix would not fault on the same instruction again.
+// So a fault is reported once. It only counts as the same fault resumed if every detail
+// matches the last one and it comes straight after: the same code, instruction, address it
+// touched and thread, within `kRepeatWindowMs`. Three separate faults that each got handled,
+// an hour apart, are three faults, not a loop. Past `kResumedFaultLimit` repeats, FrostMod
+// stops handing it back and lets the process end: a handler that had fixed anything would
+// not fault on the same instruction at the same target again half a second later.
 // ---------------------------------------------------------------------------
 inline constexpr unsigned kResumedFaultLimit = 3;
+inline constexpr unsigned long long kRepeatWindowMs = 2000;
+
+struct FaultKey {
+    unsigned long code    = 0;  // ExceptionCode
+    uintptr_t     address = 0;  // ExceptionAddress: the instruction
+    uintptr_t     target  = 0;  // for an access violation, the address it touched; else 0
+    unsigned long thread  = 0;
+    bool operator==(const FaultKey& o) const {
+        return code == o.code && address == o.address && target == o.target && thread == o.thread;
+    }
+};
 
 class RepeatGate {
 public:
-    /// How many times in a row this exact fault has now been seen: 1 the first time.
-    unsigned See(uintptr_t address, unsigned long thread) {
-        if (count_ > 0 && address == address_ && thread == thread_) return ++count_;
-        address_ = address;
-        thread_  = thread;
-        return count_ = 1;
+    /// How many times in a row this exact fault has now been seen, each within the window
+    /// of the last: 1 the first time, or whenever anything differs or time has passed.
+    unsigned See(const FaultKey& key, unsigned long long now_ms) {
+        const bool again = count_ > 0 && key == last_ && now_ms >= at_ && now_ms - at_ <= kRepeatWindowMs;
+        last_ = key;
+        at_   = now_ms;
+        return count_ = again ? count_ + 1 : 1;
     }
 
 private:
-    uintptr_t     address_ = 0;
-    unsigned long thread_  = 0;
-    unsigned      count_   = 0;
+    FaultKey           last_;
+    unsigned long long at_    = 0;
+    unsigned           count_ = 0;
 };
 
 // ---------------------------------------------------------------------------

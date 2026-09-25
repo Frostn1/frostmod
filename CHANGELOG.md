@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **One crash is one crash report.** When another plugin's crash handler kept resuming a fault,
+  the game could sit on the same broken instruction for half a minute, and FrostMod wrote a new
+  report every half second (44 of them for one crash on OneTwoSixProvingGrounds). FrostMod now
+  reports the fault once, notes that it was resumed, and after the third time on the same
+  instruction lets the game close instead of hanging.
+
 ## 2026-09-24 — v0.38.0
 
 ### Fixed

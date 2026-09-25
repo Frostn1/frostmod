@@ -383,6 +383,36 @@ inline void WriteJson(const Fault& f, const Context& ctx, const Trail& trail,
 }
 
 // ---------------------------------------------------------------------------
+// The same fault, again.
+//
+// One crash on OneTwoSixProvingGrounds came back as 44 reports, one every half second for 26
+// seconds, all at one instruction on one thread. FrostMod chains to whatever filter sat
+// under it, and that filter answered the access violation by resuming it: the instruction
+// ran again, faulted again, and each pass wrote another report while the game hung.
+//
+// So a fault is reported once. The same address on the same thread again means the
+// filter before us resumed it. Past `kResumedFaultLimit`, FrostMod stops handing it back
+// and lets the process end, since a real fix would not fault on the same instruction again.
+// ---------------------------------------------------------------------------
+inline constexpr unsigned kResumedFaultLimit = 3;
+
+class RepeatGate {
+public:
+    /// How many times in a row this exact fault has now been seen: 1 the first time.
+    unsigned See(uintptr_t address, unsigned long thread) {
+        if (count_ > 0 && address == address_ && thread == thread_) return ++count_;
+        address_ = address;
+        thread_  = thread;
+        return count_ = 1;
+    }
+
+private:
+    uintptr_t     address_ = 0;
+    unsigned long thread_  = 0;
+    unsigned      count_   = 0;
+};
+
+// ---------------------------------------------------------------------------
 // The live half.
 // ---------------------------------------------------------------------------
 #ifdef _WIN32

@@ -290,6 +290,28 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
     if (!g_reporting.compare_exchange_strong(expected, true))
         return g_prev ? g_prev(ep) : EXCEPTION_CONTINUE_SEARCH;
 
+    // The same fault again: the filter we chained to resumed it rather than ending the
+    // process. It was reported the first time; say so once, and past the limit stop handing
+    // it back, so the game ends instead of hanging on one instruction. Only touched under
+    // g_reporting, so one fault at a time sees the gate.
+    if (ep && ep->ExceptionRecord) {
+        static RepeatGate gate;
+        const unsigned seen = gate.See((uintptr_t)ep->ExceptionRecord->ExceptionAddress,
+                                       GetCurrentThreadId());
+        if (seen > 1) {
+            if (seen == 2)
+                Say("[crash] the same fault again on the same thread: the handler before "
+                    "FrostMod resumed it. Not reported again.");
+            const bool give_up = seen >= kResumedFaultLimit;
+            if (give_up)
+                Say("[crash] still faulting on the same instruction; no longer handing it "
+                    "back. The game is going down.");
+            g_reporting.store(false);
+            if (give_up) return EXCEPTION_EXECUTE_HANDLER;
+            return g_prev ? g_prev(ep) : EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
     if (ep && ep->ExceptionRecord) {
         const EXCEPTION_RECORD* r = ep->ExceptionRecord;
         char where[MAX_PATH + 64], line[MAX_PATH + 160];

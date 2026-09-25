@@ -316,7 +316,22 @@ static void SidecarSaysNullWhenItDoesNotKnow() {
     CHECK(all.find("\"frames\": [") != std::string::npos, "an empty frame list is still a list");
 }
 
+// One crash was 44 reports: the filter below FrostMod kept resuming the faulting
+// instruction. The gate counts the same fault in a row, and anything else starts over.
+static void TheSameFaultIsCountedNotReportedAgain() {
+    using frostmod::crash::RepeatGate;
+    using frostmod::crash::kResumedFaultLimit;
+    RepeatGate g;
+    CHECK(g.See(0x1A29AE, 14912) == 1, "first time");
+    CHECK(g.See(0x1A29AE, 14912) == 2, "resumed and faulted again");
+    CHECK(g.See(0x1A29AE, 14912) == kResumedFaultLimit, "the limit is reached on the third");
+    CHECK(g.See(0x1A29AE, 777) == 1, "another thread is another fault");
+    CHECK(g.See(0x1F1923, 777) == 1, "another address is another fault");
+    CHECK(g.See(0x1F1923, 777) == 2, "then counts again");
+}
+
 int main() {
+    TheSameFaultIsCountedNotReportedAgain();
     EscapeKeepsItParseable();
     SidecarCarriesTheFacts();
     SidecarSaysNullWhenItDoesNotKnow();

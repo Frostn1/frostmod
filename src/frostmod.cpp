@@ -2017,6 +2017,11 @@ using PaintApply_t = int64_t(__fastcall*)(int, const char*, int*);
 // Per rider slot: which parts were waiting on a paint when the reload began.
 // Bit 0 is the bike, bit 1 + p is mxb::kGearParts[p].
 static uint32_t g_paintMissing[mxb::VEHICLE_MAX];
+// And what each slot had installed then, so a paint deleted during the reload can be
+// taken back to stock: bit 0 = the bike paint was installed, and per gear part the
+// number of its named paints that were.
+static bool g_bikePaintPresent[mxb::VEHICLE_MAX];
+static int  g_gearFound[mxb::VEHICLE_MAX][mxb::kGearPartCount];
 
 static bool PaintsSupported() {
     // MX only: these are beta21e addresses with no GP Bikes / KRP counterpart yet.
@@ -2129,6 +2134,8 @@ static bool ReadGear(uintptr_t v, const mxb::GearPart& part, GearState& st) {
 
 static void SnapshotMissingPaints() {
     memset(g_paintMissing, 0, sizeof(g_paintMissing));
+    memset(g_bikePaintPresent, 0, sizeof(g_bikePaintPresent));
+    memset(g_gearFound, 0, sizeof(g_gearFound));
     if (!PaintsSupported()) { Log("[paint] live paints off on this title/build"); return; }
     int n = 0, riders = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
@@ -2138,14 +2145,18 @@ static void SnapshotMissingPaints() {
         char bike[32], paint[32];
         if (ReadVehicle(i, bike, paint)) {
             const int idx = BikeIndexOf(bike);
-            if (idx >= 0 && !PaintInTable(idx, paint)) {
+            if (idx >= 0 && PaintInTable(idx, paint)) {
+                g_bikePaintPresent[i] = true;
+            } else if (idx >= 0) {
                 g_paintMissing[i] |= 1u;
                 Log("[paint] rider slot %d: bike paint '%s' on %s is not installed", i, paint, bike);
             }
         }
         for (int p = 0; p < mxb::kGearPartCount; ++p) {
             GearState st;
-            if (!ReadGear(v, mxb::kGearParts[p], st) || !st.missing) continue;
+            if (!ReadGear(v, mxb::kGearParts[p], st)) continue;
+            g_gearFound[i][p] = st.found;
+            if (!st.missing) continue;
             g_paintMissing[i] |= 1u << (1 + p);
             Log("[paint] rider slot %d: %s paint not installed (%d of %d named are)", i,
                 mxb::kGearParts[p].what, st.found, st.named);
@@ -2174,14 +2185,49 @@ static bool CallBusPaint(BusFn bus, int handle, const char* paths) {
     }
 }
 
-// Re-apply the bike paint on every object the game painted when it built this bike: the
-// ridden bike's parts in the rider-gfx block, then the cloned stand bike. paint_apply only
-// reads the handle through the pointer, so it is called once per handle, as 0x4CE00 does.
-static bool ApplyBikePaint(int i) {
-    char bike[32], paint[32];
-    if (!ReadVehicle(i, bike, paint)) return false;
+// What "stock" means for a paint that is gone. The game has no revert: a name it cannot
+// find hands the engine "", which leaves the old textures on. But bikes ship a paint that
+// IS the stock look, named "stock", so re-painting with it takes the bike back. Gear has
+// no such convention; "stock" or "default" is used when the model has one, else the
+// model's first paint. Returns the table entry, or 0 when the model has no paints at all.
+static uintptr_t StockEntry(uintptr_t table_rva, uintptr_t count_rva, int model) {
+    const int count = SafeReadInt((const int*)(g_base + count_rva));
+    const uintptr_t tab = ReadPtr(table_rva);
+    if (!tab || count <= 0 || count > 1000000) return 0;
+    uintptr_t first = 0;
+    char name[0x84];
+    for (int i = 0; i < count; ++i) {
+        const uintptr_t e = tab + (uintptr_t)i * mxb::PAINT_STRIDE;
+        if (SafeReadInt((const int*)(e + mxb::PAINT_BIKE)) != model) continue;
+        if (!first) first = e;
+        if (SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name)) &&
+            (_stricmp(name, "stock") == 0 || _stricmp(name, "default") == 0))
+            return e;
+    }
+    return first;
+}
+
+// Paint the bike on every object the game painted when it built it: the ridden bike's
+// parts in the rider-gfx block, then the cloned stand bike. paint_apply only reads the
+// handle through the pointer, so it is called once per handle, as 0x4CE00 does.
+// `to_stock` paints the bike's stock paint instead of the rider's, whose file is gone.
+static bool ApplyBikePaint(int i, bool to_stock) {
+    char bike[32], own[32], stock[0x84];
+    if (!ReadVehicle(i, bike, own)) return false;
     const int idx = BikeIndexOf(bike);   // the bike array was rebuilt too
-    if (idx < 0 || !PaintInTable(idx, paint)) return false;
+    if (idx < 0) return false;
+    const char* paint = own;
+    if (to_stock) {
+        if (PaintInTable(idx, own)) return false;   // it came back after all
+        const uintptr_t e = StockEntry(mxb::RVA_PAINT_TABLE, mxb::RVA_PAINT_COUNT, idx);
+        if (!e || !SafeCopyStr((void*)(e + mxb::PAINT_NAME), stock, sizeof(stock))) {
+            Log("[paint] rider slot %d: %s has no paint to go back to - left as it is", i, bike);
+            return false;
+        }
+        paint = stock;
+    } else if (!PaintInTable(idx, own)) {
+        return false;
+    }
     const uintptr_t v = VehicleAt(i);
     int* handles[_countof(mxb::VEH_GFX_PAINTED) + 1];
     int nh = 0;
@@ -2189,8 +2235,8 @@ static bool ApplyBikePaint(int i) {
     handles[nh++] = (int*)(v + mxb::VEH_HANDLE);
     // Logged before the calls, like the reload steps: a fault that escapes the guard
     // still leaves this as the last line.
-    Log("[paint] rider slot %d: applying bike paint '%s' on %s (bike %d, body handle %d)",
-        i, paint, bike, idx, SafeReadInt(handles[0]));
+    Log("[paint] rider slot %d: %s bike paint '%s' on %s (bike %d, body handle %d)", i,
+        to_stock ? "reverting to" : "applying", paint, bike, idx, SafeReadInt(handles[0]));
     int ok = 0;
     for (int h = 0; h < nh; ++h) {
         if (SafeReadInt(handles[h]) <= 0) continue;
@@ -2200,12 +2246,15 @@ static bool ApplyBikePaint(int i) {
     return ok > 0;
 }
 
-// Re-apply one gear part the way the builder does: every installed paint of the part, as
+// Paint one gear part the way the builder does: one path per paint source, as
 // fmt(root, model folder, name), joined with '|', sent to each of the part's handles.
-static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
+// A source whose paint is installed uses it; with `to_stock`, one whose paint is gone uses
+// the model's stock paint instead (see StockEntry).
+static bool ApplyGearPaint(int i, const mxb::GearPart& part, bool to_stock) {
     const uintptr_t v = VehicleAt(i);
     GearState st;
-    if (!ReadGear(v, part, st) || st.found == 0) return false;
+    if (!ReadGear(v, part, st)) return false;
+    if (!to_stock && st.found == 0) return false;
     const uintptr_t model = ReadPtr(part.model_table) + (uintptr_t)st.model * part.model_stride;
     char folder[64];
     if (!SafeCopyStr((void*)model, folder, sizeof(folder))) return false;
@@ -2213,17 +2262,20 @@ static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
     for (int k = 0; k < part.nsrc; ++k) {
         char paint[32];
         if (!SafeCopyStr((void*)(v + part.src[k].veh_name), paint, sizeof(paint)) || !paint[0]) continue;
-        const uintptr_t e = GearPaintEntry(part.src[k], st.model, paint);
+        uintptr_t e = GearPaintEntry(part.src[k], st.model, paint);
+        if (!e && to_stock) e = StockEntry(part.src[k].table, part.src[k].count, st.model);
         if (!e) continue;
-        char root[0x104], one[400];
+        char root[0x104], name[0x84], one[400];
         if (!SafeCopyStr((void*)(e + 0x88), root, sizeof(root))) continue;
-        _snprintf_s(one, sizeof(one), _TRUNCATE, part.src[k].fmt, root, folder, paint);
+        if (!SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name))) continue;
+        _snprintf_s(one, sizeof(one), _TRUNCATE, part.src[k].fmt, root, folder, name);
         if (paths[0]) strcat_s(paths, "|");
         strcat_s(paths, one);
     }
     BusFn bus = ResolveBus();
     if (!paths[0] || !bus) return false;
-    Log("[paint] rider slot %d: applying %s paint '%s'", i, part.what, paths);
+    Log("[paint] rider slot %d: %s %s paint '%s'", i, to_stock ? "reverting" : "applying",
+        part.what, paths);
     int ok = 0;
     for (int h = 0; h < part.nhandle; ++h) {
         const int handle = SafeReadInt((const int*)(v + mxb::VEH_GFX + part.handle[h]));
@@ -2236,22 +2288,35 @@ static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
 
 static void ApplyArrivedPaints() {
     if (!PaintsSupported()) return;
-    int applied = 0;
+    int applied = 0, reverted = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         const uint32_t was = g_paintMissing[i];
         g_paintMissing[i] = 0;
-        if (!was) continue;
         // Everything is re-read: the rider may have left, or the slot been reused, during
-        // the reload, and every list was rebuilt. A part is re-applied only when at least
-        // one of its paints is installed now.
+        // the reload, and every list was rebuilt.
         if (SafeReadInt((const int*)VehicleAt(i)) == 0) continue;
-        if ((was & 1u) && ApplyBikePaint(i)) ++applied;
-        for (int p = 0; p < mxb::kGearPartCount; ++p)
-            if ((was & (1u << (1 + p))) && ApplyGearPaint(i, mxb::kGearParts[p])) ++applied;
+
+        // Arrived: was missing, is installed now.
+        if ((was & 1u) && ApplyBikePaint(i, false)) ++applied;
+        // Gone: was installed, is not any more -> back to stock.
+        if (g_bikePaintPresent[i] && ApplyBikePaint(i, true)) ++reverted;
+
+        for (int p = 0; p < mxb::kGearPartCount; ++p) {
+            const mxb::GearPart& part = mxb::kGearParts[p];
+            GearState st;
+            const bool have = ReadGear(VehicleAt(i), part, st);
+            if (have && st.found < g_gearFound[i][p]) {
+                if (ApplyGearPaint(i, part, true)) ++reverted;
+            } else if ((was & (1u << (1 + p))) && ApplyGearPaint(i, part, false)) {
+                ++applied;
+            }
+        }
     }
-    if (applied) {
-        Log("[paint] applied %d newly installed paint(s) to riders on track", applied);
-        SetStatus(applied == 1 ? "new paint applied" : "new paints applied to riders", 4000);
+    if (applied || reverted) {
+        Log("[paint] %d newly installed paint(s) applied, %d removed paint(s) taken back to stock",
+            applied, reverted);
+        SetStatus(reverted && !applied ? "removed paints back to stock"
+                                       : "rider paints updated", 4000);
     }
 }
 

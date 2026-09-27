@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026-09-26 — v0.39.0
 
 ### Added
 - **A paint you download mid-session shows up on that rider straight away.** Your game picks
@@ -13,6 +13,9 @@
 - **The same goes for their gear.** A suit, gloves, boots, helmet or goggles paint that lands
   mid-session is applied on the next reload too, as long as you already have the helmet or
   boots model it belongs to. A helmet or boots model that is new to you still needs a rejoin.
+- **MXB App's paint sync can trigger it for you.** FrostMod now answers the app's
+  `refresh_paints` command, which the app sends after it downloads or removes paints, so the
+  new looks appear without pressing R.
 
 ### Fixed
 - **One crash is one crash report.** When another plugin's crash handler kept resuming a fault,

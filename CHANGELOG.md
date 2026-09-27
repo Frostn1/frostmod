@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-09-27 — v0.39.2
+
+### Fixed
+- **A rider rejoining no longer risks crashing your game.** When someone leaves and comes back,
+  your game keeps their old bike and rider around and rebuilds them through a shortcut that
+  reads a series entry using the bike's number - far past the end of the list. Usually that
+  memory happens to be readable and you get the rejoined rider drawn on top of the one who left;
+  sometimes it is not and the game crashes (seen live, in the middle of a practice session).
+  FrostMod now clears a departing rider's bike and rider the way the game does at the end of a
+  session, so a rejoin is built from scratch like a first join. MX Bikes only; part of the
+  existing rejoin fix (`rejoinfix=0` in `frostmod_radar.cfg` turns it off).
+
 ## Unreleased
 
 ### Added

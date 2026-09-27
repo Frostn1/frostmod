@@ -621,6 +621,7 @@ constexpr uintptr_t RVA_IDENTITY       = 0x598D78; // its bytes (0x2AC when a cl
 constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything shorter than 648
 constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
 constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
+constexpr uintptr_t RVA_OWN_VEHICLE    = 0xE62710; // i32: own vehicle record + 1 (0 = none); a change moves it (0x6ABB0)
 constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
 constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

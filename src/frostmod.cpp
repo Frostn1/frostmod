@@ -51,6 +51,10 @@
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
+#include "changefree.h" // bike change: free the old own-vehicle record
+#include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
+#include <io.h>         // _finddata64i32_t (the race filter's find hooks)
+#include <memory>
 #include "crashreport.h"
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 
@@ -387,6 +391,148 @@ void LogScanCallers(const std::string& dir, const std::string& ext) {
 }
 
 // ---------------------------------------------------------------------------
+// RACE MODE: the mod list MXB App's Auto race mode wants the game to see
+// ---------------------------------------------------------------------------
+// frostmod_racemode.txt (next to frostmod_mods.txt) lists the tracks and bikes a race
+// needs; the rules are in racefilter.h. The scanner (0x158BE0) builds its whole listing
+// inside one call - folders via _findfirst/_findnext, then every *.pkz in the folder,
+// opened and walked for the folders inside it - and hands it out entry by entry later
+// (job 0x30D -> 0x159250). So the filter sits on MSVCR90's find functions, armed only
+// while hkScan is running a scan the list has a say over: an entry skipped there is never
+// listed, and a skipped .pkz is never opened. Stock content (tracks/..., relative to the
+// game folder) is never in scope; only paths under the mods folder are.
+// Map: mxbikes/engine/content.c.
+using RaceFilterPtr = std::shared_ptr<const frostmod::RaceFilter>;
+static std::mutex g_rfMutex;
+static RaceFilterPtr g_rf;                               // null = no filtering
+static std::string g_rfModsDir;
+static std::set<std::string> g_rfSeen, g_rfHidden;       // this pass, for the one log line
+static std::atomic<ULONGLONG> g_rfLastHit{0};
+static std::atomic<bool> g_rfDirty{false};
+static thread_local const frostmod::RaceFilter* t_rf = nullptr;   // armed by hkScan
+static thread_local const std::string* t_rfScope = nullptr;
+
+using FindFirst_t = intptr_t(__cdecl*)(const char*, _finddata64i32_t*);
+using FindNext_t  = int(__cdecl*)(intptr_t, _finddata64i32_t*);
+using FindClose_t = int(__cdecl*)(intptr_t);
+static FindFirst_t g_origFindFirst = nullptr;
+static FindNext_t  g_origFindNext = nullptr;
+static FindClose_t g_findClose = nullptr;
+static bool g_rfHooked = false, g_rfNextHooked = false, g_rfFirstHooked = false;
+
+static std::string RfSibling(const char* name) {
+    std::string p = g_logPath;
+    const size_t s = p.find_last_of("\\/");
+    return s == std::string::npos ? std::string() : p.substr(0, s + 1) + name;
+}
+static bool RfReadFile(const std::string& path, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (path.empty() || fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < (4u << 20); ) out.append(buf, n);
+    fclose(f);
+    return true;
+}
+
+// (Re)read the list. From Init before the scan hook goes in, and from the race_filter verb.
+void RaceFilterLoad(const char* why) {
+    std::string mods = g_modsPath, text;
+    if (mods.empty() && RfReadFile(RfSibling("frostmod_mods.txt"), text)) {
+        mods = text.substr(0, text.find_first_of("\r\n"));
+        while (!mods.empty() && (mods.back() == ' ' || mods.back() == '\t')) mods.pop_back();
+    }
+    const bool haveFile = RfReadFile(RfSibling("frostmod_racemode.txt"), text);
+    auto f = std::make_shared<frostmod::RaceFilter>();
+    const int n = haveFile ? f->Load(text) : 0;
+    {
+        std::lock_guard<std::mutex> lk(g_rfMutex);
+        g_rf = f->Active() ? RaceFilterPtr(f) : nullptr;
+        g_rfModsDir = mods;
+        g_rfSeen.clear(); g_rfHidden.clear();
+    }
+    g_rfDirty.store(false);
+    if (n > 0)
+        Log("[racemode] %s: %d mod(s) listed in frostmod_racemode.txt - the game sees only "
+            "those under mods/tracks and mods/bikes", why, n);
+    else
+        Log("[racemode] %s: %s - nothing filtered", why,
+            haveFile ? "frostmod_racemode.txt lists no tracks/ or bikes/ mod" : "no frostmod_racemode.txt");
+}
+
+// The game's find functions are the narrow (ANSI code page) ones; the list is UTF-8.
+static std::string RfUtf8(const char* acp) {
+    wchar_t w[MAX_PATH];
+    const int n = MultiByteToWideChar(CP_ACP, 0, acp, -1, w, MAX_PATH);
+    if (n <= 0) return acp;
+    char u[MAX_PATH * 3];
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), nullptr, nullptr) > 0 ? u : acp;
+}
+static bool RfPass(const _finddata64i32_t* fd) {
+    const std::string name = RfUtf8(fd->name);
+    const bool ok = t_rf->Allows(*t_rfScope, name);
+    if (name != "." && name != "..") {
+        const std::string key = *t_rfScope + "/" + frostmod::RaceFilter::Norm(name);
+        std::lock_guard<std::mutex> lk(g_rfMutex);
+        g_rfSeen.insert(key);
+        if (!ok) g_rfHidden.insert(key);
+        g_rfLastHit.store(GetTickCount64());
+        g_rfDirty.store(true);
+    }
+    return ok;
+}
+intptr_t __cdecl hkFindFirst(const char* spec, _finddata64i32_t* fd) {
+    const intptr_t h = g_origFindFirst(spec, fd);
+    if (h == -1 || !t_rf) return h;
+    while (!RfPass(fd)) {
+        if (g_origFindNext(h, fd) != 0) {                // nothing left to show
+            if (g_findClose) g_findClose(h);
+            return -1;                                  // the game then skips its findclose
+        }
+    }
+    return h;
+}
+int __cdecl hkFindNext(intptr_t h, _finddata64i32_t* fd) {
+    for (;;) {
+        const int r = g_origFindNext(h, fd);
+        if (r != 0 || !t_rf || RfPass(fd)) return r;
+    }
+}
+bool InstallHook(void* target, void* detour, void** original, const char* name);   // fwd
+// The find hooks go in only once there is a list, so a player who never uses race mode
+// runs the game's CRT untouched.
+void RaceFilterEnsureHooks() {
+    if (g_rfHooked) return;
+    {
+        std::lock_guard<std::mutex> lk(g_rfMutex);
+        if (!g_rf) return;
+    }
+    HMODULE crt = GetModuleHandleA("MSVCR90.dll");
+    auto ff = crt ? GetProcAddress(crt, "_findfirst64i32") : nullptr;
+    auto fn = crt ? GetProcAddress(crt, "_findnext64i32") : nullptr;
+    g_findClose = crt ? (FindClose_t)GetProcAddress(crt, "_findclose") : nullptr;
+    if (!ff || !fn || !g_findClose) {
+        Log("[racemode] MSVCR90 find functions not found - the list cannot be applied");
+        return;
+    }
+    // next first: once findfirst is live it calls through g_origFindNext. Each is tracked on
+    // its own so a retry (the race_filter verb) finishes a half-done install.
+    if (!g_rfNextHooked)
+        g_rfNextHooked = InstallHook((void*)fn, (void*)&hkFindNext, (void**)&g_origFindNext, "MSVCR90!_findnext64i32");
+    if (g_rfNextHooked && !g_rfFirstHooked)
+        g_rfFirstHooked = InstallHook((void*)ff, (void*)&hkFindFirst, (void**)&g_origFindFirst, "MSVCR90!_findfirst64i32");
+    g_rfHooked = g_rfNextHooked && g_rfFirstHooked;
+}
+// Once a frame: one line per scan pass saying how much the list hid.
+void RaceFilterTick() {
+    if (!g_rfDirty.load() || GetTickCount64() - g_rfLastHit.load() < 1500) return;
+    g_rfDirty.store(false);
+    std::lock_guard<std::mutex> lk(g_rfMutex);
+    Log("[racemode] %zu of %zu tracks/bikes entries hidden", g_rfHidden.size(), g_rfSeen.size());
+    g_rfSeen.clear(); g_rfHidden.clear();
+}
+
+// ---------------------------------------------------------------------------
 // hooks that CAPTURE the game's own content-load calls
 // ---------------------------------------------------------------------------
 int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
@@ -394,6 +540,25 @@ int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
     // calls it for many folders - e.g. ui/str, and mods content with ext "pkz".
     std::string dir = SafeStr(a1);
     std::string ext = SafeStr(a2);
+
+    // Race mode: arm the find hooks for this scan if the list has a say over the folder.
+    RaceFilterPtr rf;
+    std::string rfScope;
+    if (g_rfHooked) {
+        std::string mods;
+        {
+            std::lock_guard<std::mutex> lk(g_rfMutex);
+            rf = g_rf; mods = g_rfModsDir;
+        }
+        if (rf) rfScope = rf->Scope(dir, mods);
+    }
+    struct RfArm {
+        const frostmod::RaceFilter* prevRf; const std::string* prevScope;
+        RfArm(const frostmod::RaceFilter* f, const std::string* s) : prevRf(t_rf), prevScope(t_rfScope) {
+            t_rf = f; t_rfScope = s;
+        }
+        ~RfArm() { t_rf = prevRf; t_rfScope = prevScope; }
+    } rfArm(rfScope.empty() ? nullptr : rf.get(), &rfScope);
 
     // Record each DISTINCT (dir, ext) once; store all, but only LOG the first few
     // (the startup scan fires hundreds of times and would bury everything else).
@@ -2584,6 +2749,13 @@ static ULONGLONG g_chDeadline = 0;
 static uint8_t g_chSent[mxb::IDENTITY_MAX];
 static int g_chSentLen = 0;
 static uint8_t g_chSelBackup[mxb::SEL_SPAN];
+// The own vehicle before the change, and - once accepted - the old record waiting to be
+// freed (see changefree.h: the game builds the new bike in a free record and never tears
+// the old one down).
+static frostmod::ChangeSnapshot g_chOld;
+static frostmod::ChangeSnapshot g_chFree;
+static ULONGLONG g_chFreeSince = 0;
+static void RjTearDown(int i);                           // fwd (the rejoin fix's teardown)
 
 enum { CH_BIKE, CH_PAINT, CH_HELMET, CH_HELMET_PAINT, CH_GOGGLES, CH_SUIT, CH_GLOVES,
        CH_BOOTS, CH_BOOTS_PAINT, CH_COUNT };
@@ -2772,6 +2944,10 @@ static void ApplyChange() {
     if (!changed) { g_chError = "nothing changed"; return; }
     memcpy(g_chSent, blob, len);
     g_chSentLen = len;
+    g_chOld = {};
+    if (const int own = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
+        own >= 0 && own < mxb::VEHICLE_MAX)
+        g_chOld = {own, SafeReadInt((const int*)(VehicleAt(own) + mxb::VEH_KEY))};
     Log("[change] CHANGEREQUEST: bike '%s' paint '%s' helmet '%s' boots '%s' (%d bytes)",
         blob + 0x20, blob + 0x80, blob + 0xE0, blob + 0x1A0, len);
     if (!CallChangeRequest(bus, blob, len)) {
@@ -2791,7 +2967,31 @@ static void ApplyChange() {
 // Settle a change in flight, once a frame from Tick. Accepted = the server's CHANGEANSWER
 // made our identity the blob we sent. Anything else by the deadline is a refusal (pits
 // only, class, session type...), and the selection goes back to what it was.
+// After an accept: free the old own-vehicle record once the game has moved off it.
+static void ChFreeOldTick() {
+    if (g_chFree.index < 0) return;
+    // Left the server (no accepted identity): whatever was pending belongs to that session.
+    const int idLen = SafeReadInt((const int*)(g_base + mxb::RVA_IDENTITY_LEN));
+    if (idLen < mxb::IDENTITY_MIN || idLen > mxb::IDENTITY_MAX) { g_chFree = {}; return; }
+    const uintptr_t v = VehicleAt(g_chFree.index);
+    const int now = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
+    const auto d = frostmod::DecideChangeFree(g_chFree, now, SafeReadInt((const int*)v) != 0,
+                                              SafeReadInt((const int*)(v + mxb::VEH_KEY)),
+                                              GetTickCount64() - g_chFreeSince, mxb::VEHICLE_MAX);
+    if (d == frostmod::ChangeFree::Wait) return;
+    if (d == frostmod::ChangeFree::Free) {
+        Log("[change] own bike moved from vehicle %d to %d - freeing the old one (race %d) so it "
+            "does not stay on the stand", g_chFree.index, now, g_chFree.key);
+        RjTearDown(g_chFree.index);
+    } else {
+        Log("[change] own vehicle %d not freed (index now %d; it was already gone, reused, or the "
+            "game never moved off it)", g_chFree.index, now);
+    }
+    g_chFree = {};
+}
+
 void PollChange() {
+    ChFreeOldTick();
     if (!g_chPending) return;
     const int ans = g_chAnswer.load();
     if (ans != INT_MIN && ans != 0) {                     // an explicit refusal
@@ -2810,6 +3010,8 @@ void PollChange() {
         g_chPending = false;
         SwapNetEvent(false);
         Log("[change] accepted by the server - the game rebuilds the bike from here");
+        g_chFree = g_chOld;                              // freed by ChFreeOldTick from next frame
+        g_chFreeSince = GetTickCount64();
         SetStatus("change accepted", 4000);
         return;
     }
@@ -4698,6 +4900,7 @@ void Tick() {
     // to do here rather than on a timer, and the window it watches for is only five seconds
     // wide.
     WorldWatch();
+    RaceFilterTick();
     RjTick();   // rejoin: free the vehicles of riders who left (see RjDisconnected)
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
@@ -5425,6 +5628,14 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
         RequestReload();
+    } else if (verb == "race_filter") {
+        // MXB App's Auto race mode wrote (or deleted) frostmod_racemode.txt: re-read it and
+        // run the full reload so the game's lists match it - a join from the in-game
+        // browser gets slimmed mid-session. No file clears the filter.
+        Log("[cmd] race mode mod list changed - re-reading it and reloading");
+        RaceFilterLoad("race_filter");
+        RaceFilterEnsureHooks();
+        RequestReload();
     } else if (verb == "refresh_gear") {
         Log("[cmd] gear refresh requested by MXB App");
         RequestGearRefresh();
@@ -5844,6 +6055,15 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
+    // The event is auto-reset and outlives the game while frostmod.exe (or MXB App) holds it,
+    // so a pulse sent while no game was running - a paint sync, the mods watcher - is still
+    // set when the next game starts. Consumed on the first frame, it ran the full 21-step
+    // reload at every game start (seen in a player's log: 40 of 41 sessions, 7-11 s each
+    // with the mods on another drive), right while the game loads or joins. The game reads
+    // the mods folder itself at startup, so a signal from before now asks for nothing.
+    if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0)
+        Log("[init] ignoring a reload signal sent before this game started (the game's own "
+            "startup scan already reads the mods folder)");
     if (g_game->content_derived())
         Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
 
@@ -5857,6 +6077,9 @@ DWORD WINAPI Init(LPVOID) {
         Log("[sig] build drift detected: delta = 0x%zx (fixed RVAs are adjusted by this).",
             (size_t)delta);
     if (scanAddr) {
+        // Race mode's list has to be in place before the startup scan, like the hook itself.
+        RaceFilterLoad("startup");
+        RaceFilterEnsureHooks();
         InstallHook((void*)scanAddr, &hkScan, (void**)&g_origScan, "scanFolder");
 
         // Resolve the content-load routine (fcn.1400ef210) - the reload target. It has

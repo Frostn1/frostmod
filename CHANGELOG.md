@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-09-27 — v0.40.0
+
+### Added
+- **Race mode shows the game only the tracks and bikes a race needs, without moving files.**
+  When MXB App writes `frostmod_racemode.txt` next to `frostmod_mods.txt` (one mod per line,
+  relative to `mods/`, e.g. `tracks/Red Bud` or `bikes/KTM 450.pkz`), the game's scan of
+  `mods/tracks` and `mods/bikes` skips everything else, so a hidden `.pkz` is never even
+  opened. Only the folders the file names anything under are filtered; rider gear, tyres and
+  the stock game are untouched. No file means no filtering, so a crash never leaves a player
+  with a short list. A new `race_filter` command re-reads the file and reloads mods, so a
+  join from the in-game browser can be slimmed mid-session. The log says how many entries
+  each scan hid (`[racemode] N of M tracks/bikes entries hidden`).
+
+### Fixed
+- **Changing bike no longer leaves the old one behind.** After a change in the pits (F8 → 0)
+  the game builds the new bike next to the old one and never removes the old: it stayed on
+  the pit stand with you spawned inside it, HUD plugins showed two speed/gear readouts, and a
+  change made on track left a frozen rider behind. FrostMod now removes the old bike once the
+  game has switched to the new one, the same way the game clears bikes at the end of a
+  session. It only acts after a change FrostMod sent and the server accepted.
+
+## 2026-09-27 — v0.39.4
+
+### Fixed
+- **No more long freeze when the game starts or you join a server.** A reload request that
+  MXB App sent while the game was closed (after a paint sync, or when it saw your mods folder
+  change) stayed waiting, and FrostMod acted on it the moment the next game started: a full
+  rescan of every track, bike and piece of gear, right while the game was loading or joining.
+  With a big mods folder, or one on another drive, that is a 10-20 second freeze. FrostMod now
+  drops a request that arrived before the game started; the game reads the mods folder itself
+  when it loads.
+
 ## 2026-09-27 — v0.39.3
 
 ### Removed

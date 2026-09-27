@@ -603,6 +603,8 @@ constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
 
 // ---- mid-session change (F8 -> 0) - map: net/change.c ---------------------------------------
 constexpr uint32_t  CMD_CHANGE_REQUEST = 0x365;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
+constexpr uintptr_t RVA_NET_EVENT_PTR  = 0x9CB8B0; // client net-event callback (0x120890)
+constexpr int       NET_EVENT_CHANGEANSWER = 4;    // raised by CHANGEANSWER with the rej code
 constexpr uintptr_t RVA_IDENTITY_LEN   = 0x598D74; // i32: the identity the server last accepted
 constexpr uintptr_t RVA_IDENTITY       = 0x598D78; // its bytes (0x2AC when a client builds it)
 constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything shorter than 648

@@ -27,6 +27,7 @@
 #include <set>
 #include <map>        // command files -> what we last acted on (see the command channel)
 #include <cstring>
+#include <climits>
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
@@ -2683,6 +2684,46 @@ void OpenChange() {
 }
 void CloseChange() { g_chOpen.store(false); }
 
+// The server's answer. The client's CHANGEANSWER handler (0x2A51E9) hands the code to the
+// game as net event 4 through the event callback pointer [0x9CB8B0]; while a change is in
+// flight that pointer is wrapped so the code is seen here, then passed on untouched.
+using NetEvent_t = int64_t(__fastcall*)(int, int, int, int);
+static NetEvent_t g_origNetEvent = nullptr;
+static std::atomic<int> g_chAnswer{INT_MIN};           // INT_MIN = no answer yet
+static int64_t __fastcall ChNetEvent(int ev, int a, int b, int c) {
+    if (ev == mxb::NET_EVENT_CHANGEANSWER) {
+        g_chAnswer.store(a);
+        Log("[change] got CHANGEANSWER (0x10) rej=%d", a);
+    }
+    return g_origNetEvent ? g_origNetEvent(ev, a, b, c) : 0;
+}
+static bool SwapNetEvent(bool on) {
+    const uintptr_t slot = g_base + mxb::RVA_NET_EVENT_PTR;
+    __try {
+        void* cur = *(void* volatile*)slot;
+        if (on) {
+            if (cur == (void*)&ChNetEvent) return true;
+            if (!cur) return false;
+            g_origNetEvent = (NetEvent_t)cur;
+            *(void* volatile*)slot = (void*)&ChNetEvent;
+        } else if (cur == (void*)&ChNetEvent && g_origNetEvent) {
+            *(void* volatile*)slot = (void*)g_origNetEvent;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static const char* ChRejText(int rej) {
+    switch (rej) {   // mxbserver's codes (#99); a stock server's come from its join check
+    case 1: return "malformed request";
+    case 2: return "bike/series/tyre not allowed on this server";
+    case 3: return "you are on track - go to the pits";
+    case 4: return "only in waiting, practice or warmup";
+    case 5: return "wait 5 s between changes";
+    case 6: return "server busy, try again";
+    default: return "refused by the server";
+    }
+}
+
 static bool CallChangeRequest(BusFn bus, const uint8_t* blob, int len) {
     __try {
         bus(mxb::CMD_CHANGE_REQUEST, (void*)blob, (void*)(intptr_t)len, nullptr, nullptr, nullptr,
@@ -2725,6 +2766,8 @@ static void ApplyChange() {
         Log("[change] bus 0x365 faulted - selection restored");
         return;
     }
+    g_chAnswer.store(INT_MIN);
+    if (!SwapNetEvent(true)) Log("[change] could not watch for the answer - will judge by the identity");
     g_chPending = true;
     g_chDeadline = GetTickCount64() + 8000;
     CloseChange();
@@ -2736,20 +2779,33 @@ static void ApplyChange() {
 // only, class, session type...), and the selection goes back to what it was.
 void PollChange() {
     if (!g_chPending) return;
+    const int ans = g_chAnswer.load();
+    if (ans != INT_MIN && ans != 0) {                     // an explicit refusal
+        g_chPending = false;
+        SwapNetEvent(false);
+        WriteBytes(g_base + mxb::RVA_SELECTION + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+        char msg[120];
+        sprintf_s(msg, "change refused (%d): %s", ans, ChRejText(ans));
+        Log("[change] %s - selection restored", msg);
+        SetStatus(msg, 6000);
+        return;
+    }
     uint8_t now[mxb::IDENTITY_MAX] = {0};
     int len = 0;
     if (ChReadIdentity(now, len) && len == g_chSentLen && memcmp(now, g_chSent, 0x240) == 0) {
         g_chPending = false;
+        SwapNetEvent(false);
         Log("[change] accepted by the server - the game rebuilds the bike from here");
         SetStatus("change accepted", 4000);
         return;
     }
     if (GetTickCount64() < g_chDeadline) return;
     g_chPending = false;
+    SwapNetEvent(false);
     WriteBytes(g_base + mxb::RVA_SELECTION + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
-    Log("[change] no acceptance within 8 s - refused by the server (pits only, the bike's "
-        "class, or the session type); selection restored");
-    SetStatus("change refused by the server (pits only?)", 6000);
+    Log("[change] no answer within 8 s%s - selection restored",
+        ans == INT_MIN ? " (no CHANGEANSWER seen at all)" : " (accepted but identity differs)");
+    SetStatus(ans == INT_MIN ? "no answer from the server" : "change not applied", 6000);
 }
 
 // Keys while the panel is open: Up/Down row, Left/Right value, Enter send, Esc close.

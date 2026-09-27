@@ -4837,12 +4837,23 @@ void Tick() {
     if (uint64_t until = g_drawDiagUntil.load(std::memory_order_relaxed)) {
         static uint64_t winFrames = 0, winBaseDraw = 0, nextLog = 0;
         const uint64_t nowMs = GetTickCount64();
+        bool measurable = true;
         if (nextLog == 0) {                       // first frame of a fresh window
             winFrames = 0; winBaseDraw = g_drawCalls.load(std::memory_order_relaxed);
             nextLog = nowMs + 1000;
+            // This copy only sees Draw() when the game loaded IT as its plugin. Injected next
+            // to the session plugin (the MXB App setup) the game calls the plugin copy, and
+            // this counter is 0 before and after any reload - "DEAD" would be a false alarm.
+            if (winBaseDraw == 0) {
+                Log("[drawdiag] not measurable here: the game has never called this copy's "
+                    "Draw() (injected beside the session plugin), so a reload's effect on "
+                    "plugin HUDs cannot be seen from it");
+                g_drawDiagUntil.store(0, std::memory_order_relaxed); nextLog = 0;
+                measurable = false;
+            }
         }
-        ++winFrames;
-        if (nowMs >= nextLog) {
+        if (measurable) ++winFrames;
+        if (measurable && nowMs >= nextLog) {
             const uint64_t d = g_drawCalls.load(std::memory_order_relaxed);
             const uint64_t draws = d - winBaseDraw;
             Log("[drawdiag] frames/s=%llu Draw()/s=%llu  (plugin Draw dispatch %s)",
@@ -4850,7 +4861,7 @@ void Tick() {
                 draws ? "ALIVE" : "DEAD - co-existing HUD plugins go dark");
             winFrames = 0; winBaseDraw = d; nextLog = nowMs + 1000;
         }
-        if (nowMs >= until) {
+        if (measurable && nowMs >= until) {
             g_drawDiagUntil.store(0, std::memory_order_relaxed); nextLog = 0;
             Log("[drawdiag] window closed");
         }

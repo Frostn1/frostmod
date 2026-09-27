@@ -2548,6 +2548,128 @@ static uintptr_t         g_rjCall    = 0;        // VA of the call we rewrote
 static uint8_t           g_rjOrig[rejoin::kCallLen] = {0};
 static bool              g_rjPatched = false;
 
+// ---- rejoin, part two: the rider's vehicle -----------------------------------------------
+// The entity is not the only thing a departure leaves behind. The rider's VEHICLE record
+// (0xF4EE20, one per rider, with every bike and rider object) stays live too, and when the
+// same rider is added again, vehicle create finds it by race number and takes its reuse
+// shortcut (0x5CAE0 at 0x5D11C). That shortcut skips the series lookup and uses the BIKE
+// index as the series index - read at 0x5DDBE, [0xF3DB38] + bike * 0x234, well past the
+// few series there are. Where that memory is unmapped the game dies (seen live: 0xC0000005
+// in sprintf, frame mxbikes+0x5DE04); where it is not, the rejoined rider is built on top
+// of the one who left (the "two bikes in one").
+//
+// So after a rider leaves, their vehicle is torn down the way session end tears down every
+// vehicle (0x71D50) and the record is freed. A rejoin then takes the fresh path. It runs on
+// a later frame, once the game's own disconnect handling (0x605F0, which may be queued) has
+// released the rider's load request - until then the record is still the game's.
+struct RjVehicle { int conn; int key; };               // conn id -> which vehicle, by race no.
+static RjVehicle g_rjVeh[mxb::VEHICLE_MAX];              // refreshed every frame
+struct RjGone { int conn; int veh; int key; ULONGLONG since; };
+static RjGone g_rjGone[16];
+static std::atomic<int> g_rjGoneN{0};
+
+using EntityRemove_t = int64_t(__fastcall*)(int);
+static void RjEntityRemove(int id) {
+    __try { ((EntityRemove_t)(g_base + rejoin::kRvaEntityRemove))(id); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Called by the thunk, after the roster memset, with the departing id (the old behaviour:
+// the game's entity removal), plus a note of which vehicle was theirs.
+static void __fastcall RjDisconnected(int id) {
+    RjEntityRemove(id);
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (g_rjVeh[i].conn != id) continue;
+        const int n = g_rjGoneN.load();
+        if (n < (int)_countof(g_rjGone)) {
+            g_rjGone[n] = {id, i, g_rjVeh[i].key, GetTickCount64()};
+            g_rjGoneN.store(n + 1);
+        }
+        break;
+    }
+}
+
+static uintptr_t RjRequestOf(int veh) {
+    for (int r = 0; r < mxb::LOAD_REQUEST_MAX; ++r) {
+        const uintptr_t q = g_base + mxb::RVA_LOAD_REQUESTS + (uintptr_t)r * mxb::LOAD_REQUEST_STRIDE;
+        if (SafeReadInt((const int*)q) != 0 && SafeReadInt((const int*)(q + 0x30)) == veh + 1) return q;
+    }
+    return 0;
+}
+static bool RjBus(uint32_t cmd, intptr_t a, intptr_t b) {
+    BusFn bus = ResolveBus();
+    if (!bus) return false;
+    __try {
+        bus(cmd, (void*)a, (void*)b, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+using VehicleFree_t = int64_t(__fastcall*)(void*);
+static bool RjFree(uintptr_t fn, void* arg) {
+    __try { ((VehicleFree_t)fn)(arg); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
+// its conditions, then the record is zeroed as session end zeroes all of them.
+static void RjTearDown(int i) {
+    const uintptr_t v = g_base + mxb::RVA_VEHICLES + (uintptr_t)i * mxb::VEHICLE_STRIDE;
+    const auto rd = [&](int off) { return SafeReadInt((const int*)(v + off)); };
+    const int kind = rd(mxb::VEH_KIND);
+    if (kind == 1) {
+        if (rd(mxb::VEH_LIVE2) == 0) {
+            RjBus(0x239, rd(mxb::VEH_ID), 0);
+            RjFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+        } else if (rd(mxb::VEH_ENTITY_ON) != 0) {
+            RjBus(0x285, rd(mxb::VEH_ENTITY), 0);
+            RjFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+        }
+    }
+    if (kind <= 2) {
+        RjBus(0x18C, rd(mxb::VEH_50A8), 0);
+        RjBus(0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
+    }
+    if (kind <= 3) {
+        RjBus(0x27A, rd(mxb::VEH_5838), 0);
+        RjBus(0x5C, rd(mxb::VEH_HANDLE), 0);
+        RjFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX));
+    }
+    RjBus(0xEE, rd(mxb::VEH_TEAM), 0);
+    __try { memset((void*)v, 0, mxb::VEHICLE_STRIDE); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Once a frame from Tick: remember who owns which vehicle, and free the vehicles of riders
+// who have left once the game is done with them.
+static void RjTick() {
+    if (!g_rjPatched || !g_rjOn.load()) return;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        const uintptr_t v = g_base + mxb::RVA_VEHICLES + (uintptr_t)i * mxb::VEHICLE_STRIDE;
+        const uintptr_t q = SafeReadInt((const int*)v) ? RjRequestOf(i) : 0;
+        if (q) g_rjVeh[i] = {SafeReadInt((const int*)(q + 4)), SafeReadInt((const int*)(v + mxb::VEH_KEY))};
+    }
+    int n = g_rjGoneN.load();
+    for (int k = 0; k < n; ) {
+        RjGone g = g_rjGone[k];
+        const uintptr_t v = g_base + mxb::RVA_VEHICLES + (uintptr_t)g.veh * mxb::VEHICLE_STRIDE;
+        bool done = false;
+        if (SafeReadInt((const int*)v) == 0 || SafeReadInt((const int*)(v + mxb::VEH_KEY)) != g.key) {
+            done = true;                               // already gone, or reused by someone else
+        } else if (!RjRequestOf(g.veh)) {
+            // The game has let go of it (its disconnect handling freed the load request).
+            Log("[rejoin] rider %d left: freeing their vehicle %d (race %d) so a rejoin is built fresh",
+                g.conn, g.veh, g.key);
+            RjTearDown(g.veh);
+            g_rjVeh[g.veh] = {0, 0};
+            done = true;
+        } else if (GetTickCount64() - g.since > 30000) {
+            Log("[rejoin] rider %d left but vehicle %d is still in use after 30 s - leaving it",
+                g.conn, g.veh);
+            done = true;
+        }
+        if (done) { g_rjGone[k] = g_rjGone[--n]; } else { ++k; }
+    }
+    g_rjGoneN.store(n);
+}
+
 // Executable bytes the call can actually name: rel32 reaches about 2 GB, so walk outward
 // from the site and take the first free granule, as AfAllocCellNear does for its cell.
 static uint8_t* RjAllocThunkNear(uintptr_t site) {
@@ -2599,7 +2721,7 @@ static bool RjApply() {
 
     g_rjThunk = RjAllocThunkNear(call);
     if (!g_rjThunk) { Log("[rejoin] not applied: no free page within reach"); return false; }
-    if (!rejoin::BuildThunk(g_rjThunk, memsetVa, g_base + rejoin::kRvaEntityRemove)) {
+    if (!rejoin::BuildThunk(g_rjThunk, memsetVa, reinterpret_cast<uintptr_t>(&RjDisconnected))) {
         VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
         Log("[rejoin] not applied: thunk could not be built");
         return false;
@@ -2643,8 +2765,8 @@ static bool RjApply() {
     }
 
     g_rjCall = call; g_rjPatched = true;
-    Log("[rejoin] on: a rider's entity is freed when they disconnect, so a rejoin cannot "
-        "land on top of their last one (at +0x%llX)", (unsigned long long)rejoin::kRvaCall);
+    Log("[rejoin] on: a rider's entity and vehicle are freed when they disconnect, so a "
+        "rejoin is built fresh (at +0x%llX)", (unsigned long long)rejoin::kRvaCall);
     return true;
 }
 
@@ -4278,6 +4400,7 @@ void Tick() {
     // to do here rather than on a timer, and the window it watches for is only five seconds
     // wide.
     WorldWatch();
+    RjTick();   // rejoin: free the vehicles of riders who left (see RjDisconnected)
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the

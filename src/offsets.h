@@ -535,6 +535,17 @@ constexpr int       PAINT_NAME        = 0x04;
 constexpr uintptr_t RVA_VEHICLES      = 0xF4EE20;
 constexpr int       VEHICLE_MAX       = 50;
 constexpr int       VEHICLE_STRIDE    = 0x5B24;    // +0x00 live
+// Vehicle-record fields session end's per-vehicle teardown (0x71D50) touches; the rejoin fix
+// runs that teardown for a rider who left. Map: game/rider_gfx.c.
+constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0;   // int(void* rec+0x274): every gfx object
+constexpr uintptr_t RVA_VEHICLE_SUBFREE  = 0x4FE70;   // void(void* rec+0x4EEC)
+constexpr uintptr_t RVA_BIKE_PAINTS_ARG  = 0x109DE94; // the int bus 0xCF takes first
+constexpr uintptr_t RVA_LOAD_REQUESTS    = 0xE5A6A0;  // 100 x 0x40: +0 live, +4 conn id, +0x30 vehicle+1
+constexpr int       LOAD_REQUEST_MAX     = 100;
+constexpr int       LOAD_REQUEST_STRIDE  = 0x40;
+constexpr int VEH_KEY = 0x0C, VEH_ID = 0x04, VEH_KIND = 0x270, VEH_50A8 = 0x50A8, VEH_LIVE2 = 0x50AC,
+              VEH_ENTITY_ON = 0x50B0, VEH_ENTITY = 0x50B8, VEH_50BC = 0x50BC, VEH_SUB = 0x4EEC,
+              VEH_5838 = 0x5838, VEH_TEAM = 0x5B20;
 constexpr int       VEH_BIKE          = 0x30;      // bike folder name (roster blob +0x20)
 constexpr int       VEH_PAINT         = 0x90;      // paint name
 constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "stand" bike (0x4CD60)

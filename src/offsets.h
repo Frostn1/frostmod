@@ -541,6 +541,38 @@ constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "st
 constexpr int       VEH_GFX           = 0x274;
 constexpr int       VEH_GFX_PAINTED[] = { 0x00, 0x10, 0x14, 0x50, 0x60, 0x70 };
 
+// Rider gear. The same builder (0x4CE00) paints three more objects of the rider-gfx block,
+// each with a '|'-joined list of .pnt paths, one per paint source, looked up by name in
+// that source's scanned table (entry +0 = the model's index, +4 name, +0x88 root dir) and
+// formatted as fmt(root, model folder, name). Every table here is a DIR row of the reload.
+//   suit + gloves   -> +0x1D4          (0x4D173..0x4D3A3)
+//   boots paint     -> +0x1D8, +0x1DC  (0x4D3A9..0x4D4DD)
+//   helmet + goggles-> +0x1E0          (0x4D4DF..0x4D7AD)
+// A part is only painted when its MODEL is installed; a missing model is a different
+// object entirely and is not something a repaint can fix.
+struct GearSrc  { uintptr_t table, count; const char* fmt; int veh_name; };
+struct GearPart {
+    const char* what;
+    uintptr_t model_table, model_count; int model_stride; int veh_model;
+    GearSrc src[2]; int nsrc;
+    int handle[2]; int nhandle;
+};
+constexpr GearPart kGearParts[] = {
+    {"suit", 0xF3DC68, 0xF3DC60, 0x1224, 0x0D0,
+     {{0xF3DC90, 0xF3DB50, "%srider\\riders\\%s\\paints\\%s.pnt", 0x170},
+      {0xF48208, 0xF3DC58, "%srider\\riders\\%s\\gloves\\%s.pnt", 0x1F0}}, 2,
+     {0x1D4, 0}, 1},
+    {"boots", 0xF4EDB0, 0xF3DB58, 0x208, 0x1B0,
+     {{0xF432A0, 0xF48660, "%srider\\boots\\%s\\paints\\%s.pnt", 0x1D0}, {}}, 1,
+     {0x1D8, 0x1DC}, 2},
+    {"helmet", 0xF3DC70, 0xF3DC64, 0x268, 0x0F0,
+     {{0x109E090, 0xF48620, "%srider\\helmets\\%s\\paints\\%s.pnt", 0x110},
+      {0xF3DC28, 0x10A30F4, "%srider\\helmets\\%s\\goggles\\%s.pnt", 0x130}}, 2,
+     {0x1E0, 0}, 1},
+};
+constexpr int kGearPartCount = (int)(sizeof(kGearParts) / sizeof(kGearParts[0]));
+constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char* paths)
+
 } // namespace mxb
 
 // ============ GP Bikes ========================================================

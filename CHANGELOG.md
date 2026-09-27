@@ -10,6 +10,9 @@
   want of a paint and applies any that are now installed. Riders already showing their paint
   are not touched. MX Bikes only. Deleting a paint still leaves it on their bike until you
   rejoin.
+- **The same goes for their gear.** A suit, gloves, boots, helmet or goggles paint that lands
+  mid-session is applied on the next reload too, as long as you already have the helmet or
+  boots model it belongs to. A helmet or boots model that is new to you still needs a rejoin.
 
 ### Fixed
 - **One crash is one crash report.** When another plugin's crash handler kept resuming a fault,

@@ -2437,6 +2437,264 @@ void RebuildRiders() {
 }
 
 // ===========================================================================
+// CHANGE BIKE / GEAR (F8 -> 0)
+//
+// The game has a stock mid-session identity change (see the map's net/change.c): the
+// client sends CHANGEREQUEST 0x0F with a new identity blob (bus 0x365), the server checks
+// it like a join and answers CHANGEANSWER; on accept the client recomputes its content
+// check itself (mode 34, 0x6ABB0) and answers CHECKENTERING, and every client - this one
+// included - rebuilds the rider from CHANGEINFO (0x5E570). No stock screen reaches it in a
+// session, so this panel does: pick bike, paint and gear from what is installed, and send.
+//
+// FrostMod builds the blob from the identity the server last accepted (0x598D78) with the
+// picked names written in, and writes the same names into the local selection (0xE54A40)
+// so the game's own follow-up (checksum, local rebuild) sees them. If the server refuses,
+// the selection is put back. The server decides what is allowed: pits only, the bike's
+// class, practice or warmup (mxbserver); a stock server applies its join checks.
+std::atomic<bool> g_chOpen{false};
+
+struct ChRow {
+    const char* label;
+    int blob;                        // offset of the name in the identity blob
+    int sel;                         // offset in the selection struct 0xE54A40
+    std::vector<std::string> opts;
+    int cur = 0;
+};
+static std::vector<ChRow> g_chRows;
+static int g_chCursor = 0;
+static std::string g_chError;
+// The request in flight: what was sent, what to restore, and until when to wait.
+static bool g_chPending = false;
+static ULONGLONG g_chDeadline = 0;
+static uint8_t g_chSent[mxb::IDENTITY_MAX];
+static int g_chSentLen = 0;
+static uint8_t g_chSelBackup[mxb::SEL_SPAN];
+
+enum { CH_BIKE, CH_PAINT, CH_HELMET, CH_HELMET_PAINT, CH_GOGGLES, CH_SUIT, CH_GLOVES,
+       CH_BOOTS, CH_BOOTS_PAINT, CH_COUNT };
+
+// Names in a model list (entry +0 is the folder), or a paint table's names for one model.
+static std::vector<std::string> ChModels(uintptr_t table, uintptr_t count, int stride) {
+    std::vector<std::string> out;
+    const int n = SafeReadInt((const int*)(g_base + count));
+    const uintptr_t arr = ReadPtr(table);
+    char name[64];
+    for (int i = 0; arr && i < n && i < 100000; ++i)
+        if (SafeCopyStr((void*)(arr + (uintptr_t)i * stride), name, sizeof(name)) && name[0]) out.push_back(name);
+    return out;
+}
+static std::vector<std::string> ChPaints(uintptr_t table, uintptr_t count, int model) {
+    std::vector<std::string> out;
+    const int n = SafeReadInt((const int*)(g_base + count));
+    const uintptr_t tab = ReadPtr(table);
+    char name[64];
+    for (int i = 0; tab && model >= 0 && i < n && i < 1000000; ++i) {
+        const uintptr_t e = tab + (uintptr_t)i * mxb::PAINT_STRIDE;
+        if (SafeReadInt((const int*)(e + mxb::PAINT_BIKE)) != model) continue;
+        if (SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name)) && name[0]) out.push_back(name);
+    }
+    return out;
+}
+static int ChIndexOf(const std::vector<std::string>& v, const char* name) {
+    for (size_t i = 0; i < v.size(); ++i) if (_stricmp(v[i].c_str(), name) == 0) return (int)i;
+    return -1;
+}
+static const char* ChValue(int row) {
+    const ChRow& r = g_chRows[row];
+    return r.opts.empty() ? "" : r.opts[r.cur].c_str();
+}
+
+// Rebuild the option lists that depend on a model after the model row moved.
+static void ChRefreshDependents(const char* identity) {
+    const mxb::GearPart& suit = mxb::kGearParts[0];
+    const mxb::GearPart& boots = mxb::kGearParts[1];
+    const mxb::GearPart& helmet = mxb::kGearParts[2];
+    auto keep = [&](ChRow& r, std::vector<std::string> opts) {
+        const std::string was = r.opts.empty() ? std::string() : r.opts[r.cur];
+        r.opts = std::move(opts);
+        int i = was.empty() ? -1 : ChIndexOf(r.opts, was.c_str());
+        if (i < 0 && identity) i = ChIndexOf(r.opts, identity + r.blob);
+        r.cur = i < 0 ? 0 : i;
+    };
+    keep(g_chRows[CH_PAINT], ChPaints(mxb::RVA_PAINT_TABLE, mxb::RVA_PAINT_COUNT,
+                                      BikeIndexOf(ChValue(CH_BIKE))));
+    const int h = GearModelIndex(helmet, ChValue(CH_HELMET));
+    keep(g_chRows[CH_HELMET_PAINT], ChPaints(helmet.src[0].table, helmet.src[0].count, h));
+    keep(g_chRows[CH_GOGGLES], ChPaints(helmet.src[1].table, helmet.src[1].count, h));
+    char riderModel[32] = {0};
+    if (identity) strncpy_s(riderModel, identity + 0xC0, _TRUNCATE);
+    const int rm = GearModelIndex(suit, riderModel);
+    keep(g_chRows[CH_SUIT], ChPaints(suit.src[0].table, suit.src[0].count, rm));
+    keep(g_chRows[CH_GLOVES], ChPaints(suit.src[1].table, suit.src[1].count, rm));
+    const int bt = GearModelIndex(boots, ChValue(CH_BOOTS));
+    keep(g_chRows[CH_BOOTS_PAINT], ChPaints(boots.src[0].table, boots.src[0].count, bt));
+}
+
+// The identity the server last accepted from us, or false when there is none yet.
+static bool ChReadIdentity(uint8_t (&blob)[mxb::IDENTITY_MAX], int& len) {
+    len = SafeReadInt((const int*)(g_base + mxb::RVA_IDENTITY_LEN));
+    if (len < mxb::IDENTITY_MIN || len > mxb::IDENTITY_MAX) return false;
+    return SafeReadBytes((const char*)(g_base + mxb::RVA_IDENTITY), (char*)blob, len) == (size_t)len;
+}
+
+void OpenChange() {
+    g_chError.clear();
+    if (!PaintsSupported()) { SetStatus("change: not supported here", 3000); return; }
+    uint8_t id[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (!ChReadIdentity(id, len)) {
+        Log("[change] no accepted identity yet - join a server first");
+        SetStatus("change: join a server first", 3000);
+        return;
+    }
+    const char* ident = (const char*)id;
+    const mxb::GearPart& boots = mxb::kGearParts[1];
+    const mxb::GearPart& helmet = mxb::kGearParts[2];
+    g_chRows = {
+        {"Bike",         0x020, 0xAE0, {}}, {"Bike paint",   0x080, 0xB40, {}},
+        {"Helmet",       0x0E0, 0xBA0, {}}, {"Helmet paint", 0x100, 0xBC0, {}},
+        {"Goggles",      0x120, 0xBE0, {}}, {"Suit",         0x160, 0xC20, {}},
+        {"Gloves",       0x1E0, 0xCA0, {}}, {"Boots",        0x1A0, 0xC60, {}},
+        {"Boots paint",  0x1C0, 0xC80, {}},
+    };
+    // Bikes: folder names from the bike array, in its own order.
+    {
+        std::vector<std::string> bikes;
+        const int n = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+        const uintptr_t arr = ReadPtr(mxb::RVA_BIKE_LIST);
+        char name[64];
+        for (int i = 0; arr && i < n && i < 100000; ++i)
+            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) && name[0])
+                bikes.push_back(name);
+        g_chRows[CH_BIKE].opts = bikes;
+    }
+    g_chRows[CH_HELMET].opts = ChModels(helmet.model_table, helmet.model_count, helmet.model_stride);
+    g_chRows[CH_BOOTS].opts  = ChModels(boots.model_table, boots.model_count, boots.model_stride);
+    for (int r : {CH_BIKE, CH_HELMET, CH_BOOTS}) {
+        const int i = ChIndexOf(g_chRows[r].opts, ident + g_chRows[r].blob);
+        g_chRows[r].cur = i < 0 ? 0 : i;
+    }
+    ChRefreshDependents(ident);
+    g_chCursor = 0;
+    g_chOpen.store(true);
+    Log("[change] panel opened - %zu bike(s), %zu helmet(s), %zu boots; current bike '%s'",
+        g_chRows[CH_BIKE].opts.size(), g_chRows[CH_HELMET].opts.size(),
+        g_chRows[CH_BOOTS].opts.size(), ident + 0x20);
+}
+void CloseChange() { g_chOpen.store(false); }
+
+static bool CallChangeRequest(BusFn bus, const uint8_t* blob, int len) {
+    __try {
+        bus(mxb::CMD_CHANGE_REQUEST, (void*)blob, (void*)(intptr_t)len, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool WriteBytes(uintptr_t at, const void* src, size_t n) {
+    __try { memcpy((void*)at, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Send the picked identity. Frame thread only (called from the key handler in Tick).
+static void ApplyChange() {
+    if (g_chPending) { g_chError = "a change is already waiting for the server"; return; }
+    BusFn bus = ResolveBus();
+    uint8_t blob[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (!bus || !ChReadIdentity(blob, len)) { g_chError = "not connected to a server"; return; }
+    const uintptr_t sel = g_base + mxb::RVA_SELECTION;
+    if (SafeReadBytes((const char*)(sel + mxb::SEL_FIRST), (char*)g_chSelBackup, mxb::SEL_SPAN) != mxb::SEL_SPAN) {
+        g_chError = "cannot read the game's selection"; return;
+    }
+    bool changed = false;
+    for (const ChRow& r : g_chRows) {
+        char field[32] = {0};
+        strncpy_s(field, ChValue((int)(&r - &g_chRows[0])), _TRUNCATE);
+        if (strncmp((const char*)blob + r.blob, field, sizeof(field)) != 0) changed = true;
+        memcpy(blob + r.blob, field, sizeof(field));
+        if (!WriteBytes(sel + r.sel, field, sizeof(field))) { g_chError = "cannot write the selection"; return; }
+    }
+    if (!changed) { g_chError = "nothing changed"; return; }
+    memcpy(g_chSent, blob, len);
+    g_chSentLen = len;
+    Log("[change] CHANGEREQUEST: bike '%s' paint '%s' helmet '%s' boots '%s' (%d bytes)",
+        blob + 0x20, blob + 0x80, blob + 0xE0, blob + 0x1A0, len);
+    if (!CallChangeRequest(bus, blob, len)) {
+        WriteBytes(sel + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+        g_chError = "sending the change faulted";
+        Log("[change] bus 0x365 faulted - selection restored");
+        return;
+    }
+    g_chPending = true;
+    g_chDeadline = GetTickCount64() + 8000;
+    CloseChange();
+    SetStatus("change sent - waiting for the server", 8000);
+}
+
+// Settle a change in flight, once a frame from Tick. Accepted = the server's CHANGEANSWER
+// made our identity the blob we sent. Anything else by the deadline is a refusal (pits
+// only, class, session type...), and the selection goes back to what it was.
+void PollChange() {
+    if (!g_chPending) return;
+    uint8_t now[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (ChReadIdentity(now, len) && len == g_chSentLen && memcmp(now, g_chSent, 0x240) == 0) {
+        g_chPending = false;
+        Log("[change] accepted by the server - the game rebuilds the bike from here");
+        SetStatus("change accepted", 4000);
+        return;
+    }
+    if (GetTickCount64() < g_chDeadline) return;
+    g_chPending = false;
+    WriteBytes(g_base + mxb::RVA_SELECTION + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+    Log("[change] no acceptance within 8 s - refused by the server (pits only, the bike's "
+        "class, or the session type); selection restored");
+    SetStatus("change refused by the server (pits only?)", 6000);
+}
+
+// Keys while the panel is open: Up/Down row, Left/Right value, Enter send, Esc close.
+void HandleChangeKeys() {
+    if (!g_chOpen.load() || g_chRows.empty()) return;
+    static bool pU, pD, pL, pR, pE, pX;
+    auto edge = [](int vk, bool& prev) {
+        const bool k = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool e = k && !prev; prev = k; return e;
+    };
+    const int n = (int)g_chRows.size();
+    if (edge(VK_UP, pU))   g_chCursor = (g_chCursor - 1 + n) % n;
+    if (edge(VK_DOWN, pD)) g_chCursor = (g_chCursor + 1) % n;
+    const bool left = edge(VK_LEFT, pL), right = edge(VK_RIGHT, pR);
+    if (left || right) {
+        ChRow& r = g_chRows[g_chCursor];
+        const int m = (int)r.opts.size();
+        if (m) {
+            r.cur = (r.cur + (right ? 1 : m - 1)) % m;
+            if (g_chCursor == CH_BIKE || g_chCursor == CH_HELMET || g_chCursor == CH_BOOTS)
+                ChRefreshDependents(nullptr);
+            g_chError.clear();
+        }
+    }
+    if (edge(VK_RETURN, pE)) ApplyChange();
+    if (edge(VK_ESCAPE, pX)) { CloseChange(); Log("[change] panel closed (Esc)"); }
+}
+
+// Panel text, shared by both renderers.
+static int ChangeLines(char (*out)[160], int max) {
+    int k = 0;
+    sprintf_s(out[k++], 160, "Change bike / gear   (in the pits; the server decides)");
+    for (int i = 0; i < (int)g_chRows.size() && k < max - 2; ++i) {
+        const ChRow& r = g_chRows[i];
+        sprintf_s(out[k++], 160, "%s %-13s < %s >%s", i == g_chCursor ? ">" : " ", r.label,
+                  r.opts.empty() ? "(none installed)" : r.opts[r.cur].c_str(),
+                  r.opts.size() > 1 ? "" : "");
+    }
+    sprintf_s(out[k++], 160, "%s", g_chError.empty()
+        ? "  Up/Down row   Left/Right choose   Enter send   Esc close" : g_chError.c_str());
+    return k;
+}
+
+
+// ===========================================================================
 // RADAR + RIDER OUTLINES (ESP)  -  sanctioned PiBoSo telemetry
 //
 // Data comes entirely from the plugin API callbacks (implemented at the bottom
@@ -3212,6 +3470,7 @@ static const MenuItem kMenu[] = {
     { '7', "Hide overlay (recording)" },
     { '8', "Server announcements" },
     { '9', "Rebuild riders (experimental)" },
+    { '0', "Change bike / gear (pits)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -3410,6 +3669,25 @@ static void DrawDirectConnect(int w, int h, int lh) {
 
 // The model-swap panel: two-level scrolled list. Level 0 lists bikes; level 1 lists the
 // chosen bike's variants with row 0 = the active one (green "(active)"). Switcher styling.
+static void DrawChangeGL(int w, int h, int lh) {
+    char lines[16][160];
+    const int n = ChangeLines(lines, 16);
+    const int bw = 600, bh = n * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+    int y = y1 - 17;
+    for (int i = 0; i < n; ++i) {
+        if (i == 0) glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+        else if (i == n - 1) glColor4f(g_chError.empty() ? 0.6f : 1.0f, g_chError.empty() ? 0.66f : 0.62f,
+                                        g_chError.empty() ? 0.76f : 0.45f, 1.0f);
+        else glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        if (i - 1 == g_chCursor) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4);
+                                   glColor4f(0.90f, 0.94f, 1.0f, 1.0f); }
+        GlText(x0 + 8, y, lines[i]); y -= lh;
+    }
+}
+
 static void DrawModelSwap(int w, int h, int lh) {
     const bool lvl1 = (g_msLevel == 1);
     std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
@@ -3805,7 +4083,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
+        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -3853,7 +4131,9 @@ void DrawOverlay(HDC hdc) {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     const int lh = 18;                           // line height
-    if (ms) {
+    if (g_chOpen.load() && !reloading) {
+        DrawChangeGL(w, h, lh);
+    } else if (ms) {
         DrawModelSwap(w, h, lh);
     } else if (trk) {
         DrawTrackManager(w, h, lh);
@@ -4037,7 +4317,7 @@ static void BuildOverlayDrawLists() {
     if (g_cleanView.load()) return;      // hand the engine nothing at all
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -4065,6 +4345,20 @@ static void BuildOverlayDrawLists() {
     const unsigned long cAmber = ToABGR(1.0f,  0.85f, 0.45f, 1.0f);
     const unsigned long cHi    = ToABGR(0.47f, 0.78f, 1.0f, 0.18f);
 
+    if (g_chOpen.load() && !reloading) {
+        char lines[16][160];
+        const int n = ChangeLines(lines, 16);
+        const float w = 0.46f, h = n * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        for (int i = 0; i < n; ++i) {
+            if (i - 1 == g_chCursor) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            const unsigned long c = i == 0 ? cBlue : i == n - 1 ? (g_chError.empty() ? cGray : cAmber) : cWhite;
+            DText(MX + PADX, y, lines[i], c, FS);
+            y += LH;
+        }
+        return;
+    }
     if (ms) {
         const bool lvl1 = (g_msLevel == 1);
         std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
@@ -4362,6 +4656,8 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
 void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
+void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
+extern std::atomic<bool> g_chOpen;
 void MenuAction(int d) {
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
@@ -4385,6 +4681,7 @@ void MenuAction(int d) {
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
+    case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // the '0' row
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -4512,7 +4809,9 @@ void Tick() {
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
         ClearClean();                                    // never open something invisible
-        if (g_msOpen.load()) {                               // F8 also closes an open list
+        if (g_chOpen.load()) {
+            CloseChange(); Log("[change] panel closed (F8)");
+        } else if (g_msOpen.load()) {                        // F8 also closes an open list
             CloseModelSwap(); Log("[model] model swap closed (F8).");
         } else if (g_trkOpen.load()) {
             CloseTrackManager(); Log("[trklib] track manager closed (F8).");
@@ -4533,6 +4832,11 @@ void Tick() {
             bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;
             if (k && !prevDigit[d] && d <= kMenuCount) MenuAction(d);
             prevDigit[d] = k;
+        }
+        {   // '0' is the tenth row
+            bool k = (GetAsyncKeyState('0') & 0x8000) != 0;
+            if (k && !prevDigit[0] && kMenuCount >= 10) MenuAction(10);
+            prevDigit[0] = k;
         }
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
@@ -4655,6 +4959,9 @@ void Tick() {
         if (enter)     AttemptDirectConnect();               // parse + connect (keeps box open on error)
         else if (esc) { CloseDirectConnect(); Log("[connect] direct connect closed (Esc)."); }
     }
+
+    HandleChangeKeys();
+    PollChange();
 
     // Bike model swap (F8 > 3): two-level list. Up/Down move (held-key repeat); Enter picks
     // a bike (level 0 -> level 1) or swaps the highlighted variant (level 1); Esc backs out

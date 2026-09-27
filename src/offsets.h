@@ -589,6 +589,16 @@ constexpr int       NOTICE_STRIDE    = 0x108;
 constexpr uintptr_t RVA_NOTICE_COUNT = 0xE626D4;   // lines used, up to NOTICE_MAX
 constexpr uintptr_t RVA_NOTICE_WRAP  = 0xE627D8;   // next slot once the ring is full
 constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
+
+// ---- mid-session change (F8 -> 0) - map: net/change.c ---------------------------------------
+constexpr uint32_t  CMD_CHANGE_REQUEST = 0x365;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
+constexpr uintptr_t RVA_IDENTITY_LEN   = 0x598D74; // i32: the identity the server last accepted
+constexpr uintptr_t RVA_IDENTITY       = 0x598D78; // its bytes (0x2AC when a client builds it)
+constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything shorter than 648
+constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
+constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
+constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
+constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
 constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0; // int(void* rec+0x274)
 constexpr uintptr_t RVA_VEHICLE_SUBFREE = 0x4FE70; // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

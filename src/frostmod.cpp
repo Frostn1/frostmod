@@ -2341,16 +2341,16 @@ static void ApplyArrivedPaints() {
 
         // Arrived: was missing, is installed now.
         if ((was & 1u) && ApplyBikePaint(i, false)) ++applied;
-        // Gone: was installed, is not any more -> back to stock.
-        if (g_bikePaintPresent[i] && ApplyBikePaint(i, true)) ++reverted;
+        // A paint that was deleted is NOT taken back to stock: painting the bike's "stock"
+        // paint over it did not restore the stock look live (the stock look is the model's
+        // own textures). That takes a rebuild; see RIDER REBUILD.
 
         for (int p = 0; p < mxb::kGearPartCount; ++p) {
             const mxb::GearPart& part = mxb::kGearParts[p];
             GearState st;
             const bool have = ReadGear(VehicleAt(i), part, st);
-            if (have && st.found < g_gearFound[i][p]) {
-                if (ApplyGearPaint(i, part, true)) ++reverted;
-            } else if ((was & (1u << (1 + p))) && ApplyGearPaint(i, part, false)) {
+            (void)have;
+            if ((was & (1u << (1 + p))) && ApplyGearPaint(i, part, false)) {
                 ++applied;
             }
         }

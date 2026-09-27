@@ -2653,19 +2653,50 @@ static bool CallLink(int* payload) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Gear MODELS, not just paints (dev: devmenu=1). 0x5E570 starts with 0x4CA20, which
+// memsets the whole rider-gfx block without destroying anything in it: the old objects
+// leak and stay drawn ("kept the old parts"). And while the LOCAL rider is riding (own
+// vehicle +0x50C4, no change in progress) it skips the builder and leaves the rider for
+// later (+0x4EE8 = 1) - with the parts dropped first that is an invisible rider. So, in
+// the pits only: the game's own vehicle-gfx teardown 0x4E0D0 (attachments first, then
+// every object), the +0x5B0C stand clone as session end drops it, and then 0x5E570 runs
+// its full build - block reset, bike clones, and 0x4CE00 with +0x1D0 == 0, which loads
+// the rider, helmet and boots models by name from the lists refresh_gear just rebuilt.
+// Map: game/rider_gfx.c.
+using GfxTeardown_t = int64_t(__fastcall*)(void*);
+static bool CallGfxTeardown(uintptr_t block) {
+    __try { ((GfxTeardown_t)(g_base + mxb::RVA_VEHICLE_GFX_FREE))((void*)block); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static void ReleaseRiderGfx(int i, BusFn bus) {
+    const uintptr_t v = VehicleAt(i);
+    const uintptr_t blk = v + mxb::VEH_GFX;
+    Log("[rebuild] slot %d: tearing down its gfx (body %d, boots %d/%d, helmet %d, stand clone %d)", i,
+        SafeReadInt((const int*)(blk + 0x1D4)), SafeReadInt((const int*)(blk + 0x1D8)),
+        SafeReadInt((const int*)(blk + 0x1DC)), SafeReadInt((const int*)(blk + 0x1E0)),
+        SafeReadInt((const int*)(v + mxb::VEH_HANDLE)));
+    if (!CallGfxTeardown(blk)) Log("[rebuild] slot %d: gfx teardown faulted", i);
+    const int stand = SafeReadInt((const int*)(v + mxb::VEH_HANDLE));
+    if (stand > 0 && CallBus2(bus, 0x5C, stand, 0)) {
+        __try { *(volatile int*)(v + mxb::VEH_HANDLE) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __try { *(volatile int*)(blk + mxb::GFX_BUILT) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool g_rebuildModels = false;                     // set by RebuildRiders (dev path)
+
 static bool RebuildRider(int i, BusFn bus) {
     const uintptr_t req = LoadRequestOf(i);
     char name[32];
     RiderNameOf(req, name);
     if (!req) { Log("[rebuild] slot %d: no load request - skipped", i); return false; }
     const int conn = SafeReadInt((const int*)(req + 4));
+    if (g_rebuildModels) ReleaseRiderGfx(i, bus);
     // Logged before the call: a fault that escapes the guard still leaves this line last.
     Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
     NoticeRing notices;
     SaveNotices(notices);
-    // Not DropRiderParts: live, 0x5E570 re-cloned the bike but never re-ran the full rider
-    // build, so dropped parts stayed gone - the rider vanished and only the bike showed.
-    (void)bus;
+    // Not DropRiderParts: a part drop on track was followed by a skipped build (see above).
     const int rc = CallRiderReload(conn);
     RestoreNotices(notices);
     const int raceNum = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
@@ -2679,6 +2710,13 @@ static bool RebuildRider(int i, BusFn bus) {
     } else if (rc == 0) {
         Log("[rebuild] slot %d: no race entry for race %d - not re-linked (rider will be static)", i, raceNum);
     }
+    if (g_rebuildModels) {
+        const uintptr_t blk = VehicleAt(i) + mxb::VEH_GFX;
+        Log("[rebuild] slot %d: after: built %d, body %d, boots %d/%d, helmet %d, pending %d", i,
+            SafeReadInt((const int*)(blk + mxb::GFX_BUILT)), SafeReadInt((const int*)(blk + 0x1D4)),
+            SafeReadInt((const int*)(blk + 0x1D8)), SafeReadInt((const int*)(blk + 0x1DC)),
+            SafeReadInt((const int*)(blk + 0x1E0)), SafeReadInt((const int*)(VehicleAt(i) + 0x4EE8)));
+    }
     Log("[rebuild] slot %d: rider re-load returned %d (0 = built)%s", i, rc,
         notices.ok ? ", join notice suppressed" : "");
     return rc == 0;
@@ -2686,6 +2724,15 @@ static bool RebuildRider(int i, BusFn bus) {
 
 // Every remote rider on the client, rebuilt. Refuses unless it can tell which vehicle is
 // the local rider's.
+// 0x5E570's own test (0x5EEA1..0x5EED6) for skipping the builder: no change in progress
+// ([0xE6270C] == 0) and the local vehicle's +0x50C4 set - the local rider is riding.
+static bool GameDefersRiderBuild() {
+    if (SafeReadInt((const int*)(g_base + mxb::RVA_CHANGE_BUSY)) != 0) return false;
+    const int own = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE));
+    if (own < 1 || own > mxb::VEHICLE_MAX) return false;
+    return SafeReadInt((const int*)(VehicleAt(own - 1) + mxb::VEH_RIDING)) != 0;
+}
+
 void RebuildRiders() {
     if (!PaintsSupported()) { SetStatus("rebuild: not supported here", 3000); return; }
     BusFn bus = ResolveBus();
@@ -2695,6 +2742,14 @@ void RebuildRiders() {
         SetStatus("rebuild: not in a session", 3000);
         return;
     }
+    // In the pits only: while the local rider rides, 0x5E570 resets the block but skips the
+    // build, and a torn-down rider would stay invisible.
+    if (GameDefersRiderBuild()) {
+        Log("[rebuild] refused: on track - the game defers rider builds while you ride");
+        SetStatus("go to the pits to rebuild riders", 4000);
+        return;
+    }
+    g_rebuildModels = true;
     Log("[rebuild] EXPERIMENTAL rebuild of every remote rider (local rider '%s' is skipped)", me);
     int done = 0, tried = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
@@ -2712,6 +2767,7 @@ void RebuildRiders() {
         ++tried;
         if (RebuildRider(i, bus)) ++done;
     }
+    g_rebuildModels = false;
     Log("[rebuild] done: %d of %d remote rider(s) rebuilt", done, tried);
     SetStatus(tried ? "riders rebuilt (experimental)" : "no remote riders to rebuild", 4000);
 }
@@ -3766,7 +3822,7 @@ static const MenuItem kMenu[] = {
     { '5', "Overlay size",                  true,  6  },
     { '6', "Toggle this overlay",           false, 2  },
     { '7', "Hide overlay (recording)",      false, 7  },
-    { '8', "Rebuild riders (experimental)", false, 9, true },
+    { '8', "Rebuild riders - load new gear models (dev, pits)", false, 9, true },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };

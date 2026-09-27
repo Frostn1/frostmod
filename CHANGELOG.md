@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-27 — v0.40.2
+
+### Changed (developer menu only, `devmenu=1`)
+- **"Rebuild riders" now loads new gear models** (helmets, boots, rider models installed
+  since a rider joined), not just paints. Each remote rider's objects are removed the way the
+  game removes them at session end, then the game rebuilds the rider in full from the updated
+  gear lists. Use it after a gear refresh. It only runs in the pits: while you ride, the game
+  postpones rider builds and a rebuilt rider would stay invisible. Not yet tested in game.
+
 ## 2026-09-27 — v0.40.1
 
 ### Fixed

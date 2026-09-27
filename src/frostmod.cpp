@@ -2483,7 +2483,9 @@ static bool RebuildRider(int i, BusFn bus) {
     Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
     NoticeRing notices;
     SaveNotices(notices);
-    if (bus) DropRiderParts(i, bus);
+    // Not DropRiderParts: live, 0x5E570 re-cloned the bike but never re-ran the full rider
+    // build, so dropped parts stayed gone - the rider vanished and only the bike showed.
+    (void)bus;
     const int rc = CallRiderReload(conn);
     RestoreNotices(notices);
     const int raceNum = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));

@@ -181,6 +181,11 @@ add_test(NAME session COMMAND session_test)
 add_executable(racefilter_test tests/racefilter_test.cpp)
 add_test(NAME racefilter COMMAND racefilter_test)
 
+# --- bike change: which old vehicle record to free (src/changefree.h) -----------
+# Freeing the wrong record takes a live rider out of the game.
+add_executable(changefree_test tests/changefree_test.cpp)
+add_test(NAME changefree COMMAND changefree_test)
+
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.
 add_executable(crashreport_test tests/crashreport_test.cpp)

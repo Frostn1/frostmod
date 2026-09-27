@@ -13,6 +13,14 @@
   join from the in-game browser can be slimmed mid-session. The log says how many entries
   each scan hid (`[racemode] N of M tracks/bikes entries hidden`).
 
+### Fixed
+- **Changing bike no longer leaves the old one behind.** After a change in the pits (F8 → 0)
+  the game builds the new bike next to the old one and never removes the old: it stayed on
+  the pit stand with you spawned inside it, HUD plugins showed two speed/gear readouts, and a
+  change made on track left a frozen rider behind. FrostMod now removes the old bike once the
+  game has switched to the new one, the same way the game clears bikes at the end of a
+  session. It only acts after a change FrostMod sent and the server accepted.
+
 ## 2026-09-27 — v0.39.4
 
 ### Fixed

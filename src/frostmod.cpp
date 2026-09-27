@@ -51,6 +51,7 @@
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "serverfilter.h"
 #include "session.h"
+#include "changefree.h" // bike change: free the old own-vehicle record
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
 #include <io.h>         // _finddata64i32_t (the race filter's find hooks)
 #include <memory>
@@ -2736,6 +2737,13 @@ static ULONGLONG g_chDeadline = 0;
 static uint8_t g_chSent[mxb::IDENTITY_MAX];
 static int g_chSentLen = 0;
 static uint8_t g_chSelBackup[mxb::SEL_SPAN];
+// The own vehicle before the change, and - once accepted - the old record waiting to be
+// freed (see changefree.h: the game builds the new bike in a free record and never tears
+// the old one down).
+static frostmod::ChangeSnapshot g_chOld;
+static frostmod::ChangeSnapshot g_chFree;
+static ULONGLONG g_chFreeSince = 0;
+static void RjTearDown(int i);                           // fwd (the rejoin fix's teardown)
 
 enum { CH_BIKE, CH_PAINT, CH_HELMET, CH_HELMET_PAINT, CH_GOGGLES, CH_SUIT, CH_GLOVES,
        CH_BOOTS, CH_BOOTS_PAINT, CH_COUNT };
@@ -2924,6 +2932,10 @@ static void ApplyChange() {
     if (!changed) { g_chError = "nothing changed"; return; }
     memcpy(g_chSent, blob, len);
     g_chSentLen = len;
+    g_chOld = {};
+    if (const int own = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
+        own >= 0 && own < mxb::VEHICLE_MAX)
+        g_chOld = {own, SafeReadInt((const int*)(VehicleAt(own) + mxb::VEH_KEY))};
     Log("[change] CHANGEREQUEST: bike '%s' paint '%s' helmet '%s' boots '%s' (%d bytes)",
         blob + 0x20, blob + 0x80, blob + 0xE0, blob + 0x1A0, len);
     if (!CallChangeRequest(bus, blob, len)) {
@@ -2943,7 +2955,28 @@ static void ApplyChange() {
 // Settle a change in flight, once a frame from Tick. Accepted = the server's CHANGEANSWER
 // made our identity the blob we sent. Anything else by the deadline is a refusal (pits
 // only, class, session type...), and the selection goes back to what it was.
+// After an accept: free the old own-vehicle record once the game has moved off it.
+static void ChFreeOldTick() {
+    if (g_chFree.index < 0) return;
+    const uintptr_t v = VehicleAt(g_chFree.index);
+    const int now = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
+    const auto d = frostmod::DecideChangeFree(g_chFree, now, SafeReadInt((const int*)v) != 0,
+                                              SafeReadInt((const int*)(v + mxb::VEH_KEY)),
+                                              GetTickCount64() - g_chFreeSince, mxb::VEHICLE_MAX);
+    if (d == frostmod::ChangeFree::Wait) return;
+    if (d == frostmod::ChangeFree::Free) {
+        Log("[change] own bike moved from vehicle %d to %d - freeing the old one (race %d) so it "
+            "does not stay on the stand", g_chFree.index, now, g_chFree.key);
+        RjTearDown(g_chFree.index);
+    } else {
+        Log("[change] own vehicle %d not freed (index now %d; it was already gone, reused, or the "
+            "game never moved off it)", g_chFree.index, now);
+    }
+    g_chFree = {};
+}
+
 void PollChange() {
+    ChFreeOldTick();
     if (!g_chPending) return;
     const int ans = g_chAnswer.load();
     if (ans != INT_MIN && ans != 0) {                     // an explicit refusal
@@ -2962,6 +2995,8 @@ void PollChange() {
         g_chPending = false;
         SwapNetEvent(false);
         Log("[change] accepted by the server - the game rebuilds the bike from here");
+        g_chFree = g_chOld;                              // freed by ChFreeOldTick from next frame
+        g_chFreeSince = GetTickCount64();
         SetStatus("change accepted", 4000);
         return;
     }

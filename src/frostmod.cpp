@@ -2351,16 +2351,56 @@ static uintptr_t LoadRequestOf(int i) {
     return 0;
 }
 
+// 0x5E570 announces the rider as if they had just joined ("CC_Joined"): it appends a line
+// to the game's notice ring and posts it. A rebuild is not a join, so the ring is put back
+// the way it was - its three counters and the one slot the line lands in.
+struct NoticeRing {
+    int count, wrap, seq, slot;
+    uint8_t saved[mxb::NOTICE_STRIDE];
+    bool ok;
+};
+static void SaveNotices(NoticeRing& n) {
+    const uintptr_t b = g_base;
+    n.count = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_COUNT));
+    n.wrap  = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_WRAP));
+    n.seq   = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_SEQ));
+    n.slot  = n.count < mxb::NOTICE_MAX ? n.count : n.wrap;   // where the next line goes
+    n.ok = n.slot >= 0 && n.slot < mxb::NOTICE_MAX &&
+           SafeReadBytes((const char*)(b + mxb::RVA_NOTICES + (uintptr_t)n.slot * mxb::NOTICE_STRIDE),
+                         (char*)n.saved, sizeof(n.saved)) == sizeof(n.saved);
+}
+static void RestoreNotices(const NoticeRing& n) {
+    if (!n.ok) return;
+    const uintptr_t b = g_base;
+    __try {
+        memcpy((void*)(b + mxb::RVA_NOTICES + (uintptr_t)n.slot * mxb::NOTICE_STRIDE), n.saved, sizeof(n.saved));
+        *(volatile int*)(b + mxb::RVA_NOTICE_COUNT) = n.count;
+        *(volatile int*)(b + mxb::RVA_NOTICE_WRAP)  = n.wrap;
+        *(volatile int*)(b + mxb::RVA_NOTICE_SEQ)   = n.seq;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// The rider's name as the load request carries it (+0x08). The vehicle record's own copy
+// (+0x10) reads empty after a re-load.
+static void RiderNameOf(uintptr_t req, char (&out)[32]) {
+    out[0] = 0;
+    if (req) SafeCopyStr((void*)(req + 8), out, sizeof(out));
+}
+
 static bool RebuildRider(int i, BusFn) {
-    char name[32] = {0};
-    SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
     const uintptr_t req = LoadRequestOf(i);
-    if (!req) { Log("[rebuild] slot %d '%s': no load request - skipped", i, name); return false; }
+    char name[32];
+    RiderNameOf(req, name);
+    if (!req) { Log("[rebuild] slot %d: no load request - skipped", i); return false; }
     const int conn = SafeReadInt((const int*)(req + 4));
     // Logged before the call: a fault that escapes the guard still leaves this line last.
     Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
+    NoticeRing notices;
+    SaveNotices(notices);
     const int rc = CallRiderReload(conn);
-    Log("[rebuild] slot %d: rider re-load returned %d (0 = built)", i, rc);
+    RestoreNotices(notices);
+    Log("[rebuild] slot %d: rider re-load returned %d (0 = built)%s", i, rc,
+        notices.ok ? ", join notice suppressed" : "");
     return rc == 0;
 }
 
@@ -2380,9 +2420,15 @@ void RebuildRiders() {
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         const uintptr_t v = VehicleAt(i);
         if (SafeReadInt((const int*)v) == 0) continue;
-        char name[32] = {0};
+        // Either copy of the name identifies the local rider; the vehicle's own can be empty
+        // after an earlier re-load, and the local rider must never be rebuilt.
+        char name[32] = {0}, reqName[32];
         SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
-        if (_stricmp(name, me) == 0) { Log("[rebuild] slot %d '%s': local rider - skipped", i, name); continue; }
+        RiderNameOf(LoadRequestOf(i), reqName);
+        if (_stricmp(name, me) == 0 || _stricmp(reqName, me) == 0) {
+            Log("[rebuild] slot %d '%s': local rider - skipped", i, reqName[0] ? reqName : name);
+            continue;
+        }
         ++tried;
         if (RebuildRider(i, bus)) ++done;
     }

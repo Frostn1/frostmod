@@ -581,6 +581,14 @@ constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char
 // them again with vehicle create, so models and paints are all looked up afresh.
 constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CAE0;  // int(int conn_id, int flag)
 constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E570;  // int(int conn_id): the CHANGEINFO rebuild
+// The game's notice ring ("X joined", "X disconnected"): 100 lines of 0x108, text at +0x64.
+// 0x5E570 appends a CC_Joined line at 0x5FD4A..0x5FE53; the rebuild puts the ring back.
+constexpr uintptr_t RVA_NOTICES      = 0xE5BFA0;
+constexpr int       NOTICE_MAX       = 100;
+constexpr int       NOTICE_STRIDE    = 0x108;
+constexpr uintptr_t RVA_NOTICE_COUNT = 0xE626D4;   // lines used, up to NOTICE_MAX
+constexpr uintptr_t RVA_NOTICE_WRAP  = 0xE627D8;   // next slot once the ring is full
+constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
 constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0; // int(void* rec+0x274)
 constexpr uintptr_t RVA_VEHICLE_SUBFREE = 0x4FE70; // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-09-27 — v0.39.3
+
+### Removed
+- **The radar and the rider outlines.** Both overlays, their F8 entries (old `4` and `5`),
+  their settings and the OpenGL hooks the outlines needed are gone. The F8 menu now holds
+  only what players use: reload mods, change bike / gear, bike model swap, server
+  announcements, overlay size, the corner hint and hide-overlay. The rider data MXB App's
+  voice chat reads is unchanged.
+
+### Added
+- **Change bike, paint or gear without leaving the server (F8 → 0).** In the pits, pick a
+  different bike, bike paint, helmet (and its paint and goggles), suit, gloves or boots from
+  what you have installed, and press Enter. FrostMod asks the server through the game's own
+  change request; if it agrees, everyone sees your new bike or look without anyone rejoining.
+  The server decides what is allowed - on an mxbserver: pits only, practice or warmup, bikes of
+  the server's class - and the panel tells you why when it says no.
+- **Installing a helmet, boots or rider model only rebuilds the rider lists.** MXB App can now
+  ask FrostMod for a gear-only refresh (`refresh_gear`), which rescans helmets, boots, rider
+  models and protections and their paints instead of every track and bike in the game. Each
+  step of a reload is timed in the log.
+- **Rebuild riders (F8 → 9, experimental).** Rebuilds every other rider with the game's own
+  re-load, so paints you installed while they were on track show on them. It keeps them
+  visible and hittable, and the "joined" message it would print is hidden. A new helmet or
+  boots MODEL still needs them to rejoin.
+
 ## 2026-09-27 — v0.39.2
 
 ### Fixed

@@ -34,7 +34,7 @@ treated as an explicit path to the DLL.
 | `--uninstall-startup` | — | — | Stop running at login (removes the entry above). |
 | `--no-filter-servers` | — | filter **on** | Turn the server filter off (reload only; leaves the browser untouched). |
 | `--filter-servers` | — | *(already on)* | Force the filter on. Redundant now that it's the default; kept for clarity. |
-| `--game <id>` | `mxb` \| `gpb` \| `krp` | `mxb` | Which title to attach to. On `gpb` (GP Bikes) reload is **off** — its offsets are derived but unconfirmed and crashed the game (see `--unsafe-reload`). On `krp` (Kart Racing Pro) reload is off because its offsets are not derived at all yet: the plugin loads and the overlay, radar and session block work, and one capture run closes the gap (`tasks/kart-racing-pro-port.md`). The server-browser filter is MX Bikes only on both. |
+| `--game <id>` | `mxb` \| `gpb` \| `krp` | `mxb` | Which title to attach to. On `gpb` (GP Bikes) reload is **off** — its offsets are derived but unconfirmed and crashed the game (see `--unsafe-reload`). On `krp` (Kart Racing Pro) reload is off because its offsets are not derived at all yet: the plugin loads and the overlay and session block work, and one capture run closes the gap (`tasks/kart-racing-pro-port.md`). The server-browser filter is MX Bikes only on both. |
 | `--process <name>` | exe name | `mxbikes.exe` | Inject into a process by image name (`gpbikes.exe`, `kart.exe`). `--game` is the friendlier form of the same thing, and both now set the mods folder and the plugin identity alike. |
 | `--mods "<path>"` | folder | `Documents\PiBoSo\<title>\mods` | Watch a different mods folder. The default follows `--game`/`--process`, so GP Bikes reads GP Bikes' folder and Kart Racing Pro reads `Kart Racing Pro\mods`. |
 | `<path>` | `.dll` path | `frostmod.dll` next to the exe | Positional: load a specific DLL build. |
@@ -73,24 +73,25 @@ F-key per feature.
 | In the menu | Action |
 |-------------|--------|
 | `1` | Reload mods (rescans content from disk, with a progress bar) |
-| `2` | Toggle the corner hint overlay |
+| `2` | Change bike / gear — in the pits, swap bike, paint and rider gear without leaving the server |
 | `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
-| `4` | Radar — heading-up disc of riders around you (`PageUp`/`PageDown` = range) |
-| `5` | Rider outlines — on-screen box around each rider |
-| `6` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
+| `4` | Server announcements — show or hide a FrostServer's styled messages |
+| `5` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
+| `6` | Toggle the corner hint overlay |
 | `7` | Hide overlay — everything FrostMod draws, for recording (see below) |
 
+With `devmenu=1` in `frostmod_radar.cfg`, an `8` row appears: **Rebuild riders
+(experimental)**, for testing.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
-as it does of a 1080p one. Row `6` is on top of that, for when you want it bigger (or
-smaller) than that. Radar blips and outlines are colored by lap status: **white** = same
-lap as you, **red** = a rider lapping you (a lap ahead), **blue** = a rider you are
-lapping (backmarker). The toggles, the range and the overlay size persist across
-restarts, in `frostmod_radar.cfg` next to `frostmod.log`.
+as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
+smaller) than that. The size and the toggles persist across restarts, in
+`frostmod_radar.cfg` next to `frostmod.log`.
 
 ### Hide overlay (menu `7`)
 
-`F7` hides **everything FrostMod draws** — the corner pill, the radar, the rider outlines.
-It is stronger than the overlay toggle at menu `2`, which only drops the corner hint. Press
+`F7` hides **everything FrostMod draws** — the corner pill, the menu and any panel.
+It is stronger than the overlay toggle at menu `6`, which only drops the corner hint. Press
 it again to bring it all back; it is also on the menu at F8 → `7`.
 
 The key keeps working while the overlay is hidden, and F8 brings the overlay back before
@@ -132,7 +133,7 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 | `frostmod.log` | The live log, streamed into the console. Falls back to `%TEMP%\frostmod.log` if that folder is read-only. |
 | `frostmod_serverfilter.yaml` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
 | `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag`, `frostmod_unsafe_reload.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
-| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
+| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync), `refresh_gear` (a gear model changed) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
 
 ### Running inside a Wine prefix (Linux and macOS)
 

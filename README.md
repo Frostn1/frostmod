@@ -13,7 +13,7 @@ derived, for the other two PiBoSo sims.
 
 | | MX Bikes | GP Bikes | Kart Racing Pro |
 |---|---|---|---|
-| Plugin loads (overlay, radar, voice session block) | yes | yes | yes |
+| Plugin loads (overlay, voice session block) | yes | yes | yes |
 | Live mod reload | yes | not confirmed — refused unless armed | **not yet** |
 | Server-browser spam filter | yes | no | no |
 

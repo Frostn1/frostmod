@@ -525,6 +525,11 @@ constexpr uintptr_t RVA_PAINTS_LOADER = 0x17320;   // the DIR row in kReloadStep
 // Every paint list's loader - bike, suit, gloves, boots, helmet, goggles - each a DIR row of
 // kReloadSteps. A paint-only refresh replays just these rows (RequestPaintRefresh).
 constexpr uintptr_t kPaintReloadRvas[] = {0x17320, 0x19330, 0x1A770, 0x1A110, 0x18360, 0x189C0};
+// Rider gear: helmets (+ paints, goggles), helmet cams, rider models (+ suits, gloves),
+// boots (+ paints), protections (+ paints), and the bike paints (same pass). Model lists
+// are SC rows that come before the paint rows indexing into them in the table.
+constexpr uintptr_t kGearReloadRvas[] = {0x17F80, 0x18360, 0x189C0, 0x19060, 0x1BDD0, 0x19330,
+                                         0x19DA0, 0x1A110, 0x1A770, 0x1C140, 0x1C450, 0x17320};
 constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
 constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
 constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count
@@ -586,6 +591,43 @@ constexpr GearPart kGearParts[] = {
 };
 constexpr int kGearPartCount = (int)(sizeof(kGearParts) / sizeof(kGearParts[0]));
 constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char* paths)
+
+// ---- rider rebuild (EXPERIMENTAL) --------------------------------------------
+// Tear one remote rider down the way session end does (0x71D50, per vehicle) and build
+// them again with vehicle create, so models and paints are all looked up afresh.
+constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CAE0;  // int(int conn_id, int flag)
+constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E570;  // int(int conn_id): the CHANGEINFO rebuild
+// Rider parts of the rider-gfx block, as the game's teardown 0x44950 drops them.
+constexpr uintptr_t RVA_ATTACH_DROP  = 0x37C60;   // void(int a, int b): drop attachment (a, b)
+constexpr int GFX_BUILT              = 0x1D0;     // rider objects built -> builder only repaints
+constexpr int GFX_RIDER_ATTACH_A     = 0x374;     // attachments of the rider body (+0x1D4)
+constexpr int GFX_RIDER_ATTACH_B     = 0x378;
+constexpr int GFX_RIDER_PARTS[]      = {0x1D4, 0x1D8, 0x1DC, 0x1E0, 0x1E4, 0x1F4, 0x1F8};
+// The game's notice ring ("X joined", "X disconnected"): 100 lines of 0x108, text at +0x64.
+// 0x5E570 appends a CC_Joined line at 0x5FD4A..0x5FE53; the rebuild puts the ring back.
+constexpr uintptr_t RVA_NOTICES      = 0xE5BFA0;
+constexpr int       NOTICE_MAX       = 100;
+constexpr int       NOTICE_STRIDE    = 0x108;
+constexpr uintptr_t RVA_NOTICE_COUNT = 0xE626D4;   // lines used, up to NOTICE_MAX
+constexpr uintptr_t RVA_NOTICE_WRAP  = 0xE627D8;   // next slot once the ring is full
+constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
+
+// ---- mid-session change (F8 -> 0) - map: net/change.c ---------------------------------------
+constexpr uint32_t  CMD_CHANGE_REQUEST = 0x365;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
+constexpr uintptr_t RVA_NET_EVENT_PTR  = 0x9CB8B0; // client net-event callback (0x120890)
+constexpr int       NET_EVENT_CHANGEANSWER = 4;    // raised by CHANGEANSWER with the rej code
+constexpr uintptr_t RVA_IDENTITY_LEN   = 0x598D74; // i32: the identity the server last accepted
+constexpr uintptr_t RVA_IDENTITY       = 0x598D78; // its bytes (0x2AC when a client builds it)
+constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything shorter than 648
+constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
+constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
+constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
+constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
+constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})
+constexpr uintptr_t RVA_RACE_ENTRY_COUNT = 0x5121D8;
+constexpr uintptr_t RVA_RACE_ENTRY_KEY   = 0x5122A4; // first entry's race number; slot at +0xC
+constexpr int       RACE_ENTRY_STRIDE    = 0x178;
+constexpr int VEH_LINK = 0x5B18;   // the index kind 15 links (other VEH_* in the rejoin block)
 
 } // namespace mxb
 

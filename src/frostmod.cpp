@@ -1025,6 +1025,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 }
 
 void RequestReload();                          // fwd (defined with the reload code below)
+void RequestPaintRefresh();                    // fwd (same place: paint lists only)
 void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
@@ -1802,9 +1803,17 @@ std::atomic<int>  g_reloadDone{0};    // steps completed (drives the progress ba
 // surgical reload (which would explain co-existing HUD plugins like MXBMRP3 going dark
 // while FrostMod survives via its GL swap-hook fallback). 0 => off. Remove once confirmed.
 std::atomic<uint64_t> g_drawDiagUntil{0};
-static int  g_reloadCur = 0;          // next step to run
+static int  g_reloadCur = 0;          // next position in g_reloadPlan to run
 static int  g_reloadStart = 0;        // index this run began at (nonzero only when skipping)
 static bool g_reloadPrimed = false;   // have we presented one frame before starting work?
+// The steps this run replays, as indices into g_game->reload_steps: every step for a full
+// reload, only the paint rows for a paint refresh (see RequestPaintRefresh).
+static int  g_reloadPlan[64];
+static int  g_reloadPlanN = 0;
+static bool g_reloadPaintsOnly = false;
+// A full reload asked for while a paint refresh runs. It is not dropped: it starts as soon
+// as the paint refresh finishes, since only the full reload picks up new tracks and bikes.
+static bool g_fullReloadQueued = false;
 // Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
 // table this title has not confirmed. Only the person collecting a diagnostic log should
 // ever turn it on - see the refusal in RequestReload.
@@ -1843,9 +1852,25 @@ static void RunReloadStep(int i) {
 void AdvanceReload() {
     if (!g_reloadActive.load()) return;
     if (!g_reloadPrimed) { g_reloadPrimed = true; return; }   // show the 0% frame first
-    if (g_reloadCur < g_game->reload_count) {
-        RunReloadStep(g_reloadCur);
-        g_reloadDone.store(++g_reloadCur);
+    if (g_reloadCur < g_reloadPlanN) {
+        RunReloadStep(g_reloadPlan[g_reloadCur]);
+        ++g_reloadCur;
+        // The overlay's bar is out of the full table's step count; scale a short plan to it.
+        g_reloadDone.store(g_reloadPaintsOnly
+                               ? g_reloadCur * g_game->reload_count / g_reloadPlanN
+                               : g_reloadPlan[g_reloadCur - 1] + 1);
+    } else if (g_reloadPaintsOnly) {
+        g_reloadActive.store(false);
+        g_reloadPaintsOnly = false;
+        Log("[reload] paint refresh done - %d paint list(s) rebuilt from disk.", g_reloadPlanN);
+        ApplyArrivedPaints();
+        frostmod::crash::Note("paint refresh finished");
+        SetStatus("paints refreshed", 2500);
+        if (g_fullReloadQueued) {
+            g_fullReloadQueued = false;
+            Log("[reload] running the full reload that was asked for during the paint refresh");
+            RequestReload();
+        }
     } else {
         g_reloadActive.store(false);
         if (g_reloadStart > 0)
@@ -1890,13 +1915,25 @@ void RequestReload() {
         SetStatus("reload unavailable (offsets mismatch)", 5000);
         return;
     }
-    if (g_reloadActive.load()) { Log("[reload] already in progress - ignoring"); return; }
+    if (g_reloadActive.load()) {
+        if (g_reloadPaintsOnly) {
+            g_fullReloadQueued = true;
+            Log("[reload] a paint refresh is running - the full reload will follow it");
+        } else {
+            Log("[reload] already in progress - ignoring");
+        }
+        return;
+    }
     // Re-read the server-filter blocklist too, so editing it takes effect live.
     frostmod::serverfilter::Reload();
     // Normally 0. --unsafe-reload-from=N starts partway in, so the progress bar begins at
     // the same offset rather than claiming work that was never done.
     const int first = (g_unsafeReload && g_unsafeReloadFrom > 1) ? g_unsafeReloadFrom - 1 : 0;
-    g_reloadCur = first; g_reloadStart = first; g_reloadDone.store(first); g_reloadPrimed = false;
+    g_reloadPlanN = 0;
+    for (int i = first; i < g_game->reload_count && g_reloadPlanN < (int)_countof(g_reloadPlan); ++i)
+        g_reloadPlan[g_reloadPlanN++] = i;
+    g_reloadPaintsOnly = false;
+    g_reloadCur = 0; g_reloadStart = first; g_reloadDone.store(first); g_reloadPrimed = false;
     SnapshotMissingPaints();      // which riders are stock only for want of their paint
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
     // The thread id is still logged, but it is no longer the open question: a v0.12.0
@@ -1915,6 +1952,45 @@ void RequestReload() {
     // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
     g_drawDiagUntil.store(GetTickCount64() + 20000);
     Log("[drawdiag] armed 20s - watching plugin Draw() dispatch across this reload");
+}
+
+// The cheap reload, for when only paints changed (MXB App's paint sync): rebuild just the
+// six paint lists - bike, suit, gloves, boots, helmet, goggles - then run the live-paints
+// pass. The full reload also rescans tracks, bikes, tyres and the rest, and on a big mods
+// folder that is the spike players notice; a paint sync needs none of it.
+//
+// Coalesces with whatever is already running: during a full reload it is dropped (that
+// reload rebuilds the paint lists and runs the same pass); during another paint refresh it
+// is dropped too. One sync burst therefore costs one refresh.
+void RequestPaintRefresh() {
+    Log("[ui] paint refresh requested");
+    if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
+        Log("[reload] paint refresh not available here - running the full reload instead");
+        RequestReload();
+        return;
+    }
+    if (g_reloadActive.load()) {
+        Log("[reload] %s already running - it covers the paints; not starting another",
+            g_reloadPaintsOnly ? "a paint refresh is" : "a full reload is");
+        return;
+    }
+    g_reloadPlanN = 0;
+    for (int i = 0; i < g_game->reload_count; ++i)
+        for (uintptr_t rva : mxb::kPaintReloadRvas)
+            if (g_game->reload_steps[i].rva == rva && g_reloadPlanN < (int)_countof(g_reloadPlan))
+                g_reloadPlan[g_reloadPlanN++] = i;
+    if (g_reloadPlanN == 0) {
+        Log("[reload] no paint rows in this title's table - running the full reload instead");
+        RequestReload();
+        return;
+    }
+    g_reloadPaintsOnly = true;
+    g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
+    SnapshotMissingPaints();
+    g_reloadActive.store(true);
+    frostmod::crash::Note("paint refresh started (%d steps)", g_reloadPlanN);
+    Log("[reload] paint refresh (%d of %d list(s), stepped over frames)", g_reloadPlanN,
+        g_game->reload_count);
 }
 
 // ===========================================================================
@@ -4938,11 +5014,11 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         Log("[cmd] reload requested by MXB App");
         RequestReload();
     } else if (verb == "refresh_paints") {
-        // MXB App's paint sync has written or removed .pnt files. The reload rebuilds the
-        // paint lists, and its live-paints pass applies whatever riders on track were
-        // missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
+        // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
+        // only the paint lists, and its live-paints pass applies whatever riders on track
+        // were missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
         Log("[cmd] paint refresh requested by MXB App");
-        RequestReload();
+        RequestPaintRefresh();
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike

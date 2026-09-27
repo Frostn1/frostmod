@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-27 — v0.39.1
+
+### Fixed
+- **A paint sync no longer stutters the game.** When MXB App downloaded or removed paints
+  mid-session, FrostMod rebuilt every content list - tracks, bikes, tyres and the rest - which
+  on a big mods folder is a noticeable hitch. It now rebuilds only the six paint lists (bike,
+  suit, gloves, boots, helmet, goggles) and applies what arrived. Several requests in one sync
+  collapse into one refresh, and a full reload asked for meanwhile still runs right after.
+
 ## 2026-09-26 — v0.39.0
 
 ### Added

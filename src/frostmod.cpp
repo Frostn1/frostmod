@@ -27,6 +27,7 @@
 #include <set>
 #include <map>        // command files -> what we last acted on (see the command channel)
 #include <cstring>
+#include <climits>
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
@@ -1026,6 +1027,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 
 void RequestReload();                          // fwd (defined with the reload code below)
 void RequestPaintRefresh();                    // fwd (same place: paint lists only)
+void RequestGearRefresh();                     // fwd (same place: rider gear lists)
 void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
@@ -1814,6 +1816,7 @@ static bool g_reloadPaintsOnly = false;
 // A full reload asked for while a paint refresh runs. It is not dropped: it starts as soon
 // as the paint refresh finishes, since only the full reload picks up new tracks and bikes.
 static bool g_fullReloadQueued = false;
+static const char* g_refreshWhat = "paint refresh";   // label of the partial refresh running
 // Set by a paint refresh: re-apply every remote rider's installed paints, not only the ones
 // that were missing. A rider who rejoined was re-added by the game's reuse path, which does
 // not re-paint, so their paint - already in the table - never shows (paint sync, live).
@@ -1857,7 +1860,12 @@ void AdvanceReload() {
     if (!g_reloadActive.load()) return;
     if (!g_reloadPrimed) { g_reloadPrimed = true; return; }   // show the 0% frame first
     if (g_reloadCur < g_reloadPlanN) {
+        LARGE_INTEGER t0, t1, hz;
+        QueryPerformanceCounter(&t0);
         RunReloadStep(g_reloadPlan[g_reloadCur]);
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&hz);
+        // The hitch a player feels is the longest single step (one per frame): measured.
+        Log("[reload]   step took %.1f ms", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)hz.QuadPart);
         ++g_reloadCur;
         // The overlay's bar is out of the full table's step count; scale a short plan to it.
         g_reloadDone.store(g_reloadPaintsOnly
@@ -1866,13 +1874,13 @@ void AdvanceReload() {
     } else if (g_reloadPaintsOnly) {
         g_reloadActive.store(false);
         g_reloadPaintsOnly = false;
-        Log("[reload] paint refresh done - %d paint list(s) rebuilt from disk.", g_reloadPlanN);
+        Log("[reload] %s done - %d list(s) rebuilt from disk.", g_refreshWhat, g_reloadPlanN);
         ApplyArrivedPaints();
-        frostmod::crash::Note("paint refresh finished");
-        SetStatus("paints refreshed", 2500);
+        frostmod::crash::Note("%s finished", g_refreshWhat);
+        SetStatus(g_refreshWhat, 2500);
         if (g_fullReloadQueued) {
             g_fullReloadQueued = false;
-            Log("[reload] running the full reload that was asked for during the paint refresh");
+            Log("[reload] running the full reload that was asked for during the %s", g_refreshWhat);
             RequestReload();
         }
     } else {
@@ -1966,36 +1974,57 @@ void RequestReload() {
 // Coalesces with whatever is already running: during a full reload it is dropped (that
 // reload rebuilds the paint lists and runs the same pass); during another paint refresh it
 // is dropped too. One sync burst therefore costs one refresh.
-void RequestPaintRefresh() {
-    Log("[ui] paint refresh requested");
+// A partial reload: replay only the given rows of the step table, in the table's own order
+// (a model list before the paint lists that index into it), then the live-paints pass.
+static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
+    Log("[ui] %s requested", what);
     if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
-        Log("[reload] paint refresh not available here - running the full reload instead");
+        Log("[reload] %s not available here - running the full reload instead", what);
         RequestReload();
         return;
     }
     if (g_reloadActive.load()) {
-        Log("[reload] %s already running - it covers the paints; not starting another",
-            g_reloadPaintsOnly ? "a paint refresh is" : "a full reload is");
+        if (g_reloadPaintsOnly && strcmp(g_refreshWhat, what) != 0) {
+            // A different partial refresh is running: the full reload covers both.
+            g_fullReloadQueued = true;
+            Log("[reload] %s is running - the full reload will follow it", g_refreshWhat);
+        } else {
+            Log("[reload] %s already running - it covers this; not starting another",
+                g_reloadPaintsOnly ? g_refreshWhat : "a full reload is");
+        }
         return;
     }
     g_reloadPlanN = 0;
     for (int i = 0; i < g_game->reload_count; ++i)
-        for (uintptr_t rva : mxb::kPaintReloadRvas)
-            if (g_game->reload_steps[i].rva == rva && g_reloadPlanN < (int)_countof(g_reloadPlan))
+        for (int k = 0; k < nrvas; ++k)
+            if (g_game->reload_steps[i].rva == rvas[k] && g_reloadPlanN < (int)_countof(g_reloadPlan))
                 g_reloadPlan[g_reloadPlanN++] = i;
     if (g_reloadPlanN == 0) {
-        Log("[reload] no paint rows in this title's table - running the full reload instead");
+        Log("[reload] no rows for the %s in this title's table - running the full reload instead", what);
         RequestReload();
         return;
     }
+    g_refreshWhat = what;
     g_reloadPaintsOnly = true;
     g_reapplyAll = true;
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
-    frostmod::crash::Note("paint refresh started (%d steps)", g_reloadPlanN);
-    Log("[reload] paint refresh (%d of %d list(s), stepped over frames)", g_reloadPlanN,
+    frostmod::crash::Note("%s started (%d steps)", what, g_reloadPlanN);
+    Log("[reload] %s (%d of %d list(s), stepped over frames)", what, g_reloadPlanN,
         g_game->reload_count);
+}
+
+void RequestPaintRefresh() {
+    RequestPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas), "paint refresh");
+}
+
+// Rider gear models arrived or changed (helmets, boots, rider models, protections, helmet
+// cams) - MXB App sends this for a change under mods\rider that is not only paints. Their
+// model lists and every paint list that indexes into them, and nothing else: tracks, bikes,
+// tyres and series stay as they are.
+void RequestGearRefresh() {
+    RequestPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
 }
 
 // ===========================================================================
@@ -2022,6 +2051,11 @@ using PaintApply_t = int64_t(__fastcall*)(int, const char*, int*);
 // Per rider slot: which parts were waiting on a paint when the reload began.
 // Bit 0 is the bike, bit 1 + p is mxb::kGearParts[p].
 static uint32_t g_paintMissing[mxb::VEHICLE_MAX];
+// And what each slot had installed then, so a paint deleted during the reload can be
+// taken back to stock: bit 0 = the bike paint was installed, and per gear part the
+// number of its named paints that were.
+static bool g_bikePaintPresent[mxb::VEHICLE_MAX];
+static int  g_gearFound[mxb::VEHICLE_MAX][mxb::kGearPartCount];
 
 static bool PaintsSupported() {
     // MX only: these are beta21e addresses with no GP Bikes / KRP counterpart yet.
@@ -2134,6 +2168,8 @@ static bool ReadGear(uintptr_t v, const mxb::GearPart& part, GearState& st) {
 
 static void SnapshotMissingPaints() {
     memset(g_paintMissing, 0, sizeof(g_paintMissing));
+    memset(g_bikePaintPresent, 0, sizeof(g_bikePaintPresent));
+    memset(g_gearFound, 0, sizeof(g_gearFound));
     if (!PaintsSupported()) { Log("[paint] live paints off on this title/build"); return; }
     int n = 0, riders = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
@@ -2143,14 +2179,18 @@ static void SnapshotMissingPaints() {
         char bike[32], paint[32];
         if (ReadVehicle(i, bike, paint)) {
             const int idx = BikeIndexOf(bike);
-            if (idx >= 0 && !PaintInTable(idx, paint)) {
+            if (idx >= 0 && PaintInTable(idx, paint)) {
+                g_bikePaintPresent[i] = true;
+            } else if (idx >= 0) {
                 g_paintMissing[i] |= 1u;
                 Log("[paint] rider slot %d: bike paint '%s' on %s is not installed", i, paint, bike);
             }
         }
         for (int p = 0; p < mxb::kGearPartCount; ++p) {
             GearState st;
-            if (!ReadGear(v, mxb::kGearParts[p], st) || !st.missing) continue;
+            if (!ReadGear(v, mxb::kGearParts[p], st)) continue;
+            g_gearFound[i][p] = st.found;
+            if (!st.missing) continue;
             g_paintMissing[i] |= 1u << (1 + p);
             Log("[paint] rider slot %d: %s paint not installed (%d of %d named are)", i,
                 mxb::kGearParts[p].what, st.found, st.named);
@@ -2179,14 +2219,49 @@ static bool CallBusPaint(BusFn bus, int handle, const char* paths) {
     }
 }
 
-// Re-apply the bike paint on every object the game painted when it built this bike: the
-// ridden bike's parts in the rider-gfx block, then the cloned stand bike. paint_apply only
-// reads the handle through the pointer, so it is called once per handle, as 0x4CE00 does.
-static bool ApplyBikePaint(int i) {
-    char bike[32], paint[32];
-    if (!ReadVehicle(i, bike, paint)) return false;
+// What "stock" means for a paint that is gone. The game has no revert: a name it cannot
+// find hands the engine "", which leaves the old textures on. But bikes ship a paint that
+// IS the stock look, named "stock", so re-painting with it takes the bike back. Gear has
+// no such convention; "stock" or "default" is used when the model has one, else the
+// model's first paint. Returns the table entry, or 0 when the model has no paints at all.
+static uintptr_t StockEntry(uintptr_t table_rva, uintptr_t count_rva, int model) {
+    const int count = SafeReadInt((const int*)(g_base + count_rva));
+    const uintptr_t tab = ReadPtr(table_rva);
+    if (!tab || count <= 0 || count > 1000000) return 0;
+    uintptr_t first = 0;
+    char name[0x84];
+    for (int i = 0; i < count; ++i) {
+        const uintptr_t e = tab + (uintptr_t)i * mxb::PAINT_STRIDE;
+        if (SafeReadInt((const int*)(e + mxb::PAINT_BIKE)) != model) continue;
+        if (!first) first = e;
+        if (SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name)) &&
+            (_stricmp(name, "stock") == 0 || _stricmp(name, "default") == 0))
+            return e;
+    }
+    return first;
+}
+
+// Paint the bike on every object the game painted when it built it: the ridden bike's
+// parts in the rider-gfx block, then the cloned stand bike. paint_apply only reads the
+// handle through the pointer, so it is called once per handle, as 0x4CE00 does.
+// `to_stock` paints the bike's stock paint instead of the rider's, whose file is gone.
+static bool ApplyBikePaint(int i, bool to_stock) {
+    char bike[32], own[32], stock[0x84];
+    if (!ReadVehicle(i, bike, own)) return false;
     const int idx = BikeIndexOf(bike);   // the bike array was rebuilt too
-    if (idx < 0 || !PaintInTable(idx, paint)) return false;
+    if (idx < 0) return false;
+    const char* paint = own;
+    if (to_stock) {
+        if (PaintInTable(idx, own)) return false;   // it came back after all
+        const uintptr_t e = StockEntry(mxb::RVA_PAINT_TABLE, mxb::RVA_PAINT_COUNT, idx);
+        if (!e || !SafeCopyStr((void*)(e + mxb::PAINT_NAME), stock, sizeof(stock))) {
+            Log("[paint] rider slot %d: %s has no paint to go back to - left as it is", i, bike);
+            return false;
+        }
+        paint = stock;
+    } else if (!PaintInTable(idx, own)) {
+        return false;
+    }
     const uintptr_t v = VehicleAt(i);
     int* handles[_countof(mxb::VEH_GFX_PAINTED) + 1];
     int nh = 0;
@@ -2194,8 +2269,8 @@ static bool ApplyBikePaint(int i) {
     handles[nh++] = (int*)(v + mxb::VEH_HANDLE);
     // Logged before the calls, like the reload steps: a fault that escapes the guard
     // still leaves this as the last line.
-    Log("[paint] rider slot %d: applying bike paint '%s' on %s (bike %d, body handle %d)",
-        i, paint, bike, idx, SafeReadInt(handles[0]));
+    Log("[paint] rider slot %d: %s bike paint '%s' on %s (bike %d, body handle %d)", i,
+        to_stock ? "reverting to" : "applying", paint, bike, idx, SafeReadInt(handles[0]));
     int ok = 0;
     for (int h = 0; h < nh; ++h) {
         if (SafeReadInt(handles[h]) <= 0) continue;
@@ -2205,12 +2280,15 @@ static bool ApplyBikePaint(int i) {
     return ok > 0;
 }
 
-// Re-apply one gear part the way the builder does: every installed paint of the part, as
+// Paint one gear part the way the builder does: one path per paint source, as
 // fmt(root, model folder, name), joined with '|', sent to each of the part's handles.
-static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
+// A source whose paint is installed uses it; with `to_stock`, one whose paint is gone uses
+// the model's stock paint instead (see StockEntry).
+static bool ApplyGearPaint(int i, const mxb::GearPart& part, bool to_stock) {
     const uintptr_t v = VehicleAt(i);
     GearState st;
-    if (!ReadGear(v, part, st) || st.found == 0) return false;
+    if (!ReadGear(v, part, st)) return false;
+    if (!to_stock && st.found == 0) return false;
     const uintptr_t model = ReadPtr(part.model_table) + (uintptr_t)st.model * part.model_stride;
     char folder[64];
     if (!SafeCopyStr((void*)model, folder, sizeof(folder))) return false;
@@ -2218,17 +2296,20 @@ static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
     for (int k = 0; k < part.nsrc; ++k) {
         char paint[32];
         if (!SafeCopyStr((void*)(v + part.src[k].veh_name), paint, sizeof(paint)) || !paint[0]) continue;
-        const uintptr_t e = GearPaintEntry(part.src[k], st.model, paint);
+        uintptr_t e = GearPaintEntry(part.src[k], st.model, paint);
+        if (!e && to_stock) e = StockEntry(part.src[k].table, part.src[k].count, st.model);
         if (!e) continue;
-        char root[0x104], one[400];
+        char root[0x104], name[0x84], one[400];
         if (!SafeCopyStr((void*)(e + 0x88), root, sizeof(root))) continue;
-        _snprintf_s(one, sizeof(one), _TRUNCATE, part.src[k].fmt, root, folder, paint);
+        if (!SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name))) continue;
+        _snprintf_s(one, sizeof(one), _TRUNCATE, part.src[k].fmt, root, folder, name);
         if (paths[0]) strcat_s(paths, "|");
         strcat_s(paths, one);
     }
     BusFn bus = ResolveBus();
     if (!paths[0] || !bus) return false;
-    Log("[paint] rider slot %d: applying %s paint '%s'", i, part.what, paths);
+    Log("[paint] rider slot %d: %s %s paint '%s'", i, to_stock ? "reverting" : "applying",
+        part.what, paths);
     int ok = 0;
     for (int h = 0; h < part.nhandle; ++h) {
         const int handle = SafeReadInt((const int*)(v + mxb::VEH_GFX + part.handle[h]));
@@ -2244,7 +2325,7 @@ static void ApplyArrivedPaints() {
     const bool all = g_reapplyAll;
     g_reapplyAll = false;
     const char* me = frostmod::crash::TheContext().rider;
-    int applied = 0;
+    int applied = 0, reverted = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         uint32_t was = g_paintMissing[i];
         g_paintMissing[i] = 0;
@@ -2254,21 +2335,534 @@ static void ApplyArrivedPaints() {
             if (!(me[0] && _stricmp(name, me) == 0))    // never the local rider
                 was = 0xFFFFFFFFu;                     // every part; installed ones only
         }
-        if (!was) continue;
         // Everything is re-read: the rider may have left, or the slot been reused, during
-        // the reload, and every list was rebuilt. A part is re-applied only when at least
-        // one of its paints is installed now.
+        // the reload, and every list was rebuilt.
         if (SafeReadInt((const int*)VehicleAt(i)) == 0) continue;
-        if ((was & 1u) && ApplyBikePaint(i)) ++applied;
-        for (int p = 0; p < mxb::kGearPartCount; ++p)
-            if ((was & (1u << (1 + p))) && ApplyGearPaint(i, mxb::kGearParts[p])) ++applied;
+
+        // Arrived: was missing, is installed now.
+        if ((was & 1u) && ApplyBikePaint(i, false)) ++applied;
+        // Gone: was installed, is not any more -> back to stock.
+        if (g_bikePaintPresent[i] && ApplyBikePaint(i, true)) ++reverted;
+
+        for (int p = 0; p < mxb::kGearPartCount; ++p) {
+            const mxb::GearPart& part = mxb::kGearParts[p];
+            GearState st;
+            const bool have = ReadGear(VehicleAt(i), part, st);
+            if (have && st.found < g_gearFound[i][p]) {
+                if (ApplyGearPaint(i, part, true)) ++reverted;
+            } else if ((was & (1u << (1 + p))) && ApplyGearPaint(i, part, false)) {
+                ++applied;
+            }
+        }
     }
-    if (applied) {
-        Log("[paint] applied %d paint(s) to riders on track%s", applied,
-            all ? " (paint refresh: every remote rider)" : "");
-        SetStatus(applied == 1 ? "new paint applied" : "new paints applied to riders", 4000);
+    if (applied || reverted) {
+        Log("[paint] %d paint(s) applied%s, %d removed paint(s) taken back to stock",
+            applied, all ? " (paint refresh: every remote rider)" : "", reverted);
+        SetStatus(reverted && !applied ? "removed paints back to stock"
+                                       : "rider paints updated", 4000);
     }
 }
+
+// ===========================================================================
+// RIDER REBUILD (EXPERIMENTAL, F8 -> 9)
+//
+// A repaint cannot change a MODEL, and cannot take a paint back to stock: the stock look
+// is the model's own textures, which only building the objects again restores.
+//
+// The game has its own rebuild for a rider it already knows: when a peer changes identity
+// mid-session the server broadcasts CHANGEINFO (0x13), and every client runs the RIDER
+// re-load 0x5E570(conn id) for them (net event 6 -> mode 36 -> 0x69A00; see the map's
+// net/change.c). This calls exactly that, the way 0x69A00 does when the join queue is not
+// deferring. Nothing is torn down by hand: the first version of this did (session-end
+// teardown + vehicle create 0x5CAE0) and left the rider invisible - alive, collidable,
+// drawn at a pose nobody updated.
+//
+// Remote riders only. The local rider's vehicle is simulated here and is never touched.
+using RiderReload_t = int(__fastcall*)(int);
+
+static int CallRiderReload(int conn) {
+    __try { return ((RiderReload_t)(g_base + mxb::RVA_RIDER_RELOAD))(conn); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// The load request that owns vehicle i (+0x30 == i + 1), or 0.
+static uintptr_t LoadRequestOf(int i) {
+    for (int r = 0; r < mxb::LOAD_REQUEST_MAX; ++r) {
+        const uintptr_t q = g_base + mxb::RVA_LOAD_REQUESTS + (uintptr_t)r * mxb::LOAD_REQUEST_STRIDE;
+        if (SafeReadInt((const int*)q) != 0 && SafeReadInt((const int*)(q + 0x30)) == i + 1) return q;
+    }
+    return 0;
+}
+
+// 0x5E570 announces the rider as if they had just joined ("CC_Joined"): it appends a line
+// to the game's notice ring and posts it. A rebuild is not a join, so the ring is put back
+// the way it was - its three counters and the one slot the line lands in.
+struct NoticeRing {
+    int count, wrap, seq, slot;
+    uint8_t saved[mxb::NOTICE_STRIDE];
+    bool ok;
+};
+static void SaveNotices(NoticeRing& n) {
+    const uintptr_t b = g_base;
+    n.count = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_COUNT));
+    n.wrap  = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_WRAP));
+    n.seq   = SafeReadInt((const int*)(b + mxb::RVA_NOTICE_SEQ));
+    n.slot  = n.count < mxb::NOTICE_MAX ? n.count : n.wrap;   // where the next line goes
+    n.ok = n.slot >= 0 && n.slot < mxb::NOTICE_MAX &&
+           SafeReadBytes((const char*)(b + mxb::RVA_NOTICES + (uintptr_t)n.slot * mxb::NOTICE_STRIDE),
+                         (char*)n.saved, sizeof(n.saved)) == sizeof(n.saved);
+}
+static void RestoreNotices(const NoticeRing& n) {
+    if (!n.ok) return;
+    const uintptr_t b = g_base;
+    __try {
+        memcpy((void*)(b + mxb::RVA_NOTICES + (uintptr_t)n.slot * mxb::NOTICE_STRIDE), n.saved, sizeof(n.saved));
+        *(volatile int*)(b + mxb::RVA_NOTICE_COUNT) = n.count;
+        *(volatile int*)(b + mxb::RVA_NOTICE_WRAP)  = n.wrap;
+        *(volatile int*)(b + mxb::RVA_NOTICE_SEQ)   = n.seq;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// The rider's name as the load request carries it (+0x08). The vehicle record's own copy
+// (+0x10) reads empty after a re-load.
+static void RiderNameOf(uintptr_t req, char (&out)[32]) {
+    out[0] = 0;
+    if (req) SafeCopyStr((void*)(req + 8), out, sizeof(out));
+}
+
+static bool CallBus2(BusFn bus, uint32_t cmd, intptr_t a, intptr_t b) {
+    __try {
+        bus(cmd, (void*)a, (void*)b, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+using AttachDrop_t = int64_t(__fastcall*)(int, int);
+static bool CallAttachDrop(int a, int b) {
+    __try { ((AttachDrop_t)(g_base + mxb::RVA_ATTACH_DROP))(a, b); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Make the next build of this rider load its gear MODELS again. On a rider it already has,
+// the builder only repaints: the block's "built" flag (+0x1D0) sends 0x4CE00 down the
+// repaint path, so a helmet or boots model installed since the join never appears. So the
+// rider-part objects go, exactly as the game's own teardown 0x44950 drops them - the two
+// rider attachments first (0x37C60), then each part (bus 0x5C) - and the flag is cleared.
+// The bike's objects are left alone: the re-load repaints those as before.
+static void DropRiderParts(int i, BusFn bus) {
+    const uintptr_t blk = VehicleAt(i) + mxb::VEH_GFX;
+    const auto at = [&](int off) { return SafeReadInt((const int*)(blk + off)); };
+    const int body = at(0x1D4);
+    if (body > 0) {
+        CallAttachDrop(body, at(mxb::GFX_RIDER_ATTACH_A));
+        CallAttachDrop(body, at(mxb::GFX_RIDER_ATTACH_B));
+    }
+    int dropped = 0;
+    for (int off : mxb::GFX_RIDER_PARTS) {
+        const int h = at(off);
+        if (h <= 0) continue;
+        if (CallBus2(bus, 0x5C, h, 0)) ++dropped;
+        __try { *(volatile int*)(blk + off) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __try { *(volatile int*)(blk + mxb::GFX_BUILT) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    Log("[rebuild] slot %d: %d rider part(s) dropped, gear models will load fresh", i, dropped);
+}
+
+
+// The re-load builds a NEW physics entity and a new link index (vehicle +0x5B18), and
+// nothing re-sends the race-number -> slot link to it: seen live, the rebuilt rider was
+// collidable but frozen, the server's updates going nowhere. A join gets the link from
+// GAME_MESSAGE kind 15 (0x62A10); the rebuild replays that with the slot the race entry
+// already holds (entry +0xC, set by the last kind 15).
+using RiderLink_t = int64_t(__fastcall*)(int*);
+static int RaceSlotOf(int raceNum) {
+    const int n = SafeReadInt((const int*)(g_base + mxb::RVA_RACE_ENTRY_COUNT));
+    for (int e = 0; e < n && e < 1000; ++e) {
+        const uintptr_t k = g_base + mxb::RVA_RACE_ENTRY_KEY + (uintptr_t)e * mxb::RACE_ENTRY_STRIDE;
+        if (SafeReadInt((const int*)k) == raceNum) return SafeReadInt((const int*)(k + 0xC));
+    }
+    return -2;
+}
+static bool CallLink(int* payload) {
+    __try { ((RiderLink_t)(g_base + mxb::RVA_RIDER_LINK))(payload); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool RebuildRider(int i, BusFn bus) {
+    const uintptr_t req = LoadRequestOf(i);
+    char name[32];
+    RiderNameOf(req, name);
+    if (!req) { Log("[rebuild] slot %d: no load request - skipped", i); return false; }
+    const int conn = SafeReadInt((const int*)(req + 4));
+    // Logged before the call: a fault that escapes the guard still leaves this line last.
+    Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
+    NoticeRing notices;
+    SaveNotices(notices);
+    // Not DropRiderParts: live, 0x5E570 re-cloned the bike but never re-ran the full rider
+    // build, so dropped parts stayed gone - the rider vanished and only the bike showed.
+    (void)bus;
+    const int rc = CallRiderReload(conn);
+    RestoreNotices(notices);
+    const int raceNum = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+    const int slot = RaceSlotOf(raceNum);
+    if (rc == 0 && slot >= 0) {
+        int payload[2] = {raceNum, slot};
+        Log("[rebuild] slot %d: re-linking race %d -> slot %d (entity %d, link index %d)", i, raceNum,
+            slot, SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_ENTITY)),
+            SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_LINK)));
+        if (!CallLink(payload)) Log("[rebuild] slot %d: re-link faulted", i);
+    } else if (rc == 0) {
+        Log("[rebuild] slot %d: no race entry for race %d - not re-linked (rider will be static)", i, raceNum);
+    }
+    Log("[rebuild] slot %d: rider re-load returned %d (0 = built)%s", i, rc,
+        notices.ok ? ", join notice suppressed" : "");
+    return rc == 0;
+}
+
+// Every remote rider on the client, rebuilt. Refuses unless it can tell which vehicle is
+// the local rider's.
+void RebuildRiders() {
+    if (!PaintsSupported()) { SetStatus("rebuild: not supported here", 3000); return; }
+    BusFn bus = ResolveBus();
+    const char* me = frostmod::crash::TheContext().rider;
+    if (!bus || !me[0]) {
+        Log("[rebuild] refused: %s", !bus ? "no engine bus" : "local rider name unknown (not in a session?)");
+        SetStatus("rebuild: not in a session", 3000);
+        return;
+    }
+    Log("[rebuild] EXPERIMENTAL rebuild of every remote rider (local rider '%s' is skipped)", me);
+    int done = 0, tried = 0;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        if (SafeReadInt((const int*)v) == 0) continue;
+        // Either copy of the name identifies the local rider; the vehicle's own can be empty
+        // after an earlier re-load, and the local rider must never be rebuilt.
+        char name[32] = {0}, reqName[32];
+        SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
+        RiderNameOf(LoadRequestOf(i), reqName);
+        if (_stricmp(name, me) == 0 || _stricmp(reqName, me) == 0) {
+            Log("[rebuild] slot %d '%s': local rider - skipped", i, reqName[0] ? reqName : name);
+            continue;
+        }
+        ++tried;
+        if (RebuildRider(i, bus)) ++done;
+    }
+    Log("[rebuild] done: %d of %d remote rider(s) rebuilt", done, tried);
+    SetStatus(tried ? "riders rebuilt (experimental)" : "no remote riders to rebuild", 4000);
+}
+
+// ===========================================================================
+// CHANGE BIKE / GEAR (F8 -> 0)
+//
+// The game has a stock mid-session identity change (see the map's net/change.c): the
+// client sends CHANGEREQUEST 0x0F with a new identity blob (bus 0x365), the server checks
+// it like a join and answers CHANGEANSWER; on accept the client recomputes its content
+// check itself (mode 34, 0x6ABB0) and answers CHECKENTERING, and every client - this one
+// included - rebuilds the rider from CHANGEINFO (0x5E570). No stock screen reaches it in a
+// session, so this panel does: pick bike, paint and gear from what is installed, and send.
+//
+// FrostMod builds the blob from the identity the server last accepted (0x598D78) with the
+// picked names written in, and writes the same names into the local selection (0xE54A40)
+// so the game's own follow-up (checksum, local rebuild) sees them. If the server refuses,
+// the selection is put back. The server decides what is allowed: pits only, the bike's
+// class, practice or warmup (mxbserver); a stock server applies its join checks.
+std::atomic<bool> g_chOpen{false};
+
+struct ChRow {
+    const char* label;
+    int blob;                        // offset of the name in the identity blob
+    int sel;                         // offset in the selection struct 0xE54A40
+    std::vector<std::string> opts;
+    int cur = 0;
+};
+static std::vector<ChRow> g_chRows;
+static int g_chCursor = 0;
+static std::string g_chError;
+// The request in flight: what was sent, what to restore, and until when to wait.
+static bool g_chPending = false;
+static ULONGLONG g_chDeadline = 0;
+static uint8_t g_chSent[mxb::IDENTITY_MAX];
+static int g_chSentLen = 0;
+static uint8_t g_chSelBackup[mxb::SEL_SPAN];
+
+enum { CH_BIKE, CH_PAINT, CH_HELMET, CH_HELMET_PAINT, CH_GOGGLES, CH_SUIT, CH_GLOVES,
+       CH_BOOTS, CH_BOOTS_PAINT, CH_COUNT };
+
+// Names in a model list (entry +0 is the folder), or a paint table's names for one model.
+static std::vector<std::string> ChModels(uintptr_t table, uintptr_t count, int stride) {
+    std::vector<std::string> out;
+    const int n = SafeReadInt((const int*)(g_base + count));
+    const uintptr_t arr = ReadPtr(table);
+    char name[64];
+    for (int i = 0; arr && i < n && i < 100000; ++i)
+        if (SafeCopyStr((void*)(arr + (uintptr_t)i * stride), name, sizeof(name)) && name[0]) out.push_back(name);
+    return out;
+}
+static std::vector<std::string> ChPaints(uintptr_t table, uintptr_t count, int model) {
+    std::vector<std::string> out;
+    const int n = SafeReadInt((const int*)(g_base + count));
+    const uintptr_t tab = ReadPtr(table);
+    char name[64];
+    for (int i = 0; tab && model >= 0 && i < n && i < 1000000; ++i) {
+        const uintptr_t e = tab + (uintptr_t)i * mxb::PAINT_STRIDE;
+        if (SafeReadInt((const int*)(e + mxb::PAINT_BIKE)) != model) continue;
+        if (SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name)) && name[0]) out.push_back(name);
+    }
+    return out;
+}
+static int ChIndexOf(const std::vector<std::string>& v, const char* name) {
+    for (size_t i = 0; i < v.size(); ++i) if (_stricmp(v[i].c_str(), name) == 0) return (int)i;
+    return -1;
+}
+static const char* ChValue(int row) {
+    const ChRow& r = g_chRows[row];
+    return r.opts.empty() ? "" : r.opts[r.cur].c_str();
+}
+
+// Rebuild the option lists that depend on a model after the model row moved.
+static void ChRefreshDependents(const char* identity) {
+    const mxb::GearPart& suit = mxb::kGearParts[0];
+    const mxb::GearPart& boots = mxb::kGearParts[1];
+    const mxb::GearPart& helmet = mxb::kGearParts[2];
+    auto keep = [&](ChRow& r, std::vector<std::string> opts) {
+        const std::string was = r.opts.empty() ? std::string() : r.opts[r.cur];
+        r.opts = std::move(opts);
+        int i = was.empty() ? -1 : ChIndexOf(r.opts, was.c_str());
+        if (i < 0 && identity) i = ChIndexOf(r.opts, identity + r.blob);
+        r.cur = i < 0 ? 0 : i;
+    };
+    keep(g_chRows[CH_PAINT], ChPaints(mxb::RVA_PAINT_TABLE, mxb::RVA_PAINT_COUNT,
+                                      BikeIndexOf(ChValue(CH_BIKE))));
+    const int h = GearModelIndex(helmet, ChValue(CH_HELMET));
+    keep(g_chRows[CH_HELMET_PAINT], ChPaints(helmet.src[0].table, helmet.src[0].count, h));
+    keep(g_chRows[CH_GOGGLES], ChPaints(helmet.src[1].table, helmet.src[1].count, h));
+    char riderModel[32] = {0};
+    if (identity) strncpy_s(riderModel, identity + 0xC0, _TRUNCATE);
+    const int rm = GearModelIndex(suit, riderModel);
+    keep(g_chRows[CH_SUIT], ChPaints(suit.src[0].table, suit.src[0].count, rm));
+    keep(g_chRows[CH_GLOVES], ChPaints(suit.src[1].table, suit.src[1].count, rm));
+    const int bt = GearModelIndex(boots, ChValue(CH_BOOTS));
+    keep(g_chRows[CH_BOOTS_PAINT], ChPaints(boots.src[0].table, boots.src[0].count, bt));
+}
+
+// The identity the server last accepted from us, or false when there is none yet.
+static bool ChReadIdentity(uint8_t (&blob)[mxb::IDENTITY_MAX], int& len) {
+    len = SafeReadInt((const int*)(g_base + mxb::RVA_IDENTITY_LEN));
+    if (len < mxb::IDENTITY_MIN || len > mxb::IDENTITY_MAX) return false;
+    return SafeReadBytes((const char*)(g_base + mxb::RVA_IDENTITY), (char*)blob, len) == (size_t)len;
+}
+
+void OpenChange() {
+    g_chError.clear();
+    if (!PaintsSupported()) { SetStatus("change: not supported here", 3000); return; }
+    uint8_t id[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (!ChReadIdentity(id, len)) {
+        Log("[change] no accepted identity yet - join a server first");
+        SetStatus("change: join a server first", 3000);
+        return;
+    }
+    const char* ident = (const char*)id;
+    const mxb::GearPart& boots = mxb::kGearParts[1];
+    const mxb::GearPart& helmet = mxb::kGearParts[2];
+    g_chRows = {
+        {"Bike",         0x020, 0xAE0, {}}, {"Bike paint",   0x080, 0xB40, {}},
+        {"Helmet",       0x0E0, 0xBA0, {}}, {"Helmet paint", 0x100, 0xBC0, {}},
+        {"Goggles",      0x120, 0xBE0, {}}, {"Suit",         0x160, 0xC20, {}},
+        {"Gloves",       0x1E0, 0xCA0, {}}, {"Boots",        0x1A0, 0xC60, {}},
+        {"Boots paint",  0x1C0, 0xC80, {}},
+    };
+    // Bikes: folder names from the bike array, in its own order.
+    {
+        std::vector<std::string> bikes;
+        const int n = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+        const uintptr_t arr = ReadPtr(mxb::RVA_BIKE_LIST);
+        char name[64];
+        for (int i = 0; arr && i < n && i < 100000; ++i)
+            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) && name[0])
+                bikes.push_back(name);
+        g_chRows[CH_BIKE].opts = bikes;
+    }
+    g_chRows[CH_HELMET].opts = ChModels(helmet.model_table, helmet.model_count, helmet.model_stride);
+    g_chRows[CH_BOOTS].opts  = ChModels(boots.model_table, boots.model_count, boots.model_stride);
+    for (int r : {CH_BIKE, CH_HELMET, CH_BOOTS}) {
+        const int i = ChIndexOf(g_chRows[r].opts, ident + g_chRows[r].blob);
+        g_chRows[r].cur = i < 0 ? 0 : i;
+    }
+    ChRefreshDependents(ident);
+    g_chCursor = 0;
+    g_chOpen.store(true);
+    Log("[change] panel opened - %zu bike(s), %zu helmet(s), %zu boots; current bike '%s'",
+        g_chRows[CH_BIKE].opts.size(), g_chRows[CH_HELMET].opts.size(),
+        g_chRows[CH_BOOTS].opts.size(), ident + 0x20);
+}
+void CloseChange() { g_chOpen.store(false); }
+
+// The server's answer. The client's CHANGEANSWER handler (0x2A51E9) hands the code to the
+// game as net event 4 through the event callback pointer [0x9CB8B0]; while a change is in
+// flight that pointer is wrapped so the code is seen here, then passed on untouched.
+using NetEvent_t = int64_t(__fastcall*)(int, int, int, int);
+static NetEvent_t g_origNetEvent = nullptr;
+static std::atomic<int> g_chAnswer{INT_MIN};           // INT_MIN = no answer yet
+static int64_t __fastcall ChNetEvent(int ev, int a, int b, int c) {
+    if (ev == mxb::NET_EVENT_CHANGEANSWER) {
+        g_chAnswer.store(a);
+        Log("[change] got CHANGEANSWER (0x10) rej=%d", a);
+    }
+    return g_origNetEvent ? g_origNetEvent(ev, a, b, c) : 0;
+}
+static bool SwapNetEvent(bool on) {
+    const uintptr_t slot = g_base + mxb::RVA_NET_EVENT_PTR;
+    __try {
+        void* cur = *(void* volatile*)slot;
+        if (on) {
+            if (cur == (void*)&ChNetEvent) return true;
+            if (!cur) return false;
+            g_origNetEvent = (NetEvent_t)cur;
+            *(void* volatile*)slot = (void*)&ChNetEvent;
+        } else if (cur == (void*)&ChNetEvent && g_origNetEvent) {
+            *(void* volatile*)slot = (void*)g_origNetEvent;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static const char* ChRejText(int rej) {
+    switch (rej) {   // mxbserver's codes (#99); a stock server's come from its join check
+    case 1: return "malformed request";
+    case 2: return "bike/series/tyre not allowed on this server";
+    case 3: return "you are on track - go to the pits";
+    case 4: return "only in waiting, practice or warmup";
+    case 5: return "wait 5 s between changes";
+    case 6: return "server busy, try again";
+    default: return "refused by the server";
+    }
+}
+
+static bool CallChangeRequest(BusFn bus, const uint8_t* blob, int len) {
+    __try {
+        bus(mxb::CMD_CHANGE_REQUEST, (void*)blob, (void*)(intptr_t)len, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool WriteBytes(uintptr_t at, const void* src, size_t n) {
+    __try { memcpy((void*)at, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Send the picked identity. Frame thread only (called from the key handler in Tick).
+static void ApplyChange() {
+    if (g_chPending) { g_chError = "a change is already waiting for the server"; return; }
+    BusFn bus = ResolveBus();
+    uint8_t blob[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (!bus || !ChReadIdentity(blob, len)) { g_chError = "not connected to a server"; return; }
+    const uintptr_t sel = g_base + mxb::RVA_SELECTION;
+    if (SafeReadBytes((const char*)(sel + mxb::SEL_FIRST), (char*)g_chSelBackup, mxb::SEL_SPAN) != mxb::SEL_SPAN) {
+        g_chError = "cannot read the game's selection"; return;
+    }
+    bool changed = false;
+    for (const ChRow& r : g_chRows) {
+        char field[32] = {0};
+        strncpy_s(field, ChValue((int)(&r - &g_chRows[0])), _TRUNCATE);
+        if (strncmp((const char*)blob + r.blob, field, sizeof(field)) != 0) changed = true;
+        memcpy(blob + r.blob, field, sizeof(field));
+        if (!WriteBytes(sel + r.sel, field, sizeof(field))) { g_chError = "cannot write the selection"; return; }
+    }
+    if (!changed) { g_chError = "nothing changed"; return; }
+    memcpy(g_chSent, blob, len);
+    g_chSentLen = len;
+    Log("[change] CHANGEREQUEST: bike '%s' paint '%s' helmet '%s' boots '%s' (%d bytes)",
+        blob + 0x20, blob + 0x80, blob + 0xE0, blob + 0x1A0, len);
+    if (!CallChangeRequest(bus, blob, len)) {
+        WriteBytes(sel + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+        g_chError = "sending the change faulted";
+        Log("[change] bus 0x365 faulted - selection restored");
+        return;
+    }
+    g_chAnswer.store(INT_MIN);
+    if (!SwapNetEvent(true)) Log("[change] could not watch for the answer - will judge by the identity");
+    g_chPending = true;
+    g_chDeadline = GetTickCount64() + 8000;
+    CloseChange();
+    SetStatus("change sent - waiting for the server", 8000);
+}
+
+// Settle a change in flight, once a frame from Tick. Accepted = the server's CHANGEANSWER
+// made our identity the blob we sent. Anything else by the deadline is a refusal (pits
+// only, class, session type...), and the selection goes back to what it was.
+void PollChange() {
+    if (!g_chPending) return;
+    const int ans = g_chAnswer.load();
+    if (ans != INT_MIN && ans != 0) {                     // an explicit refusal
+        g_chPending = false;
+        SwapNetEvent(false);
+        WriteBytes(g_base + mxb::RVA_SELECTION + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+        char msg[120];
+        sprintf_s(msg, "change refused (%d): %s", ans, ChRejText(ans));
+        Log("[change] %s - selection restored", msg);
+        SetStatus(msg, 6000);
+        return;
+    }
+    uint8_t now[mxb::IDENTITY_MAX] = {0};
+    int len = 0;
+    if (ChReadIdentity(now, len) && len == g_chSentLen && memcmp(now, g_chSent, 0x240) == 0) {
+        g_chPending = false;
+        SwapNetEvent(false);
+        Log("[change] accepted by the server - the game rebuilds the bike from here");
+        SetStatus("change accepted", 4000);
+        return;
+    }
+    if (GetTickCount64() < g_chDeadline) return;
+    g_chPending = false;
+    SwapNetEvent(false);
+    WriteBytes(g_base + mxb::RVA_SELECTION + mxb::SEL_FIRST, g_chSelBackup, mxb::SEL_SPAN);
+    Log("[change] no answer within 8 s%s - selection restored",
+        ans == INT_MIN ? " (no CHANGEANSWER seen at all)" : " (accepted but identity differs)");
+    SetStatus(ans == INT_MIN ? "no answer from the server" : "change not applied", 6000);
+}
+
+// Keys while the panel is open: Up/Down row, Left/Right value, Enter send, Esc close.
+void HandleChangeKeys() {
+    if (!g_chOpen.load() || g_chRows.empty()) return;
+    static bool pU, pD, pL, pR, pE, pX;
+    auto edge = [](int vk, bool& prev) {
+        const bool k = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool e = k && !prev; prev = k; return e;
+    };
+    const int n = (int)g_chRows.size();
+    if (edge(VK_UP, pU))   g_chCursor = (g_chCursor - 1 + n) % n;
+    if (edge(VK_DOWN, pD)) g_chCursor = (g_chCursor + 1) % n;
+    const bool left = edge(VK_LEFT, pL), right = edge(VK_RIGHT, pR);
+    if (left || right) {
+        ChRow& r = g_chRows[g_chCursor];
+        const int m = (int)r.opts.size();
+        if (m) {
+            r.cur = (r.cur + (right ? 1 : m - 1)) % m;
+            if (g_chCursor == CH_BIKE || g_chCursor == CH_HELMET || g_chCursor == CH_BOOTS)
+                ChRefreshDependents(nullptr);
+            g_chError.clear();
+        }
+    }
+    if (edge(VK_RETURN, pE)) ApplyChange();
+    if (edge(VK_ESCAPE, pX)) { CloseChange(); Log("[change] panel closed (Esc)"); }
+}
+
+// Panel text, shared by both renderers.
+static int ChangeLines(char (*out)[160], int max) {
+    int k = 0;
+    sprintf_s(out[k++], 160, "Change bike / gear   (in the pits; the server decides)");
+    for (int i = 0; i < (int)g_chRows.size() && k < max - 2; ++i) {
+        const ChRow& r = g_chRows[i];
+        sprintf_s(out[k++], 160, "%s %-13s < %s >%s", i == g_chCursor ? ">" : " ", r.label,
+                  r.opts.empty() ? "(none installed)" : r.opts[r.cur].c_str(),
+                  r.opts.size() > 1 ? "" : "");
+    }
+    sprintf_s(out[k++], 160, "%s", g_chError.empty()
+        ? "  Up/Down row   Left/Right choose   Enter send   Esc close" : g_chError.c_str());
+    return k;
+}
+
 
 // ===========================================================================
 // RADAR + RIDER OUTLINES (ESP)  -  sanctioned PiBoSo telemetry
@@ -3167,6 +3761,8 @@ static const MenuItem kMenu[] = {
     { '6', "Overlay size", true },
     { '7', "Hide overlay (recording)" },
     { '8', "Server announcements" },
+    { '9', "Rebuild riders (experimental)" },
+    { '0', "Change bike / gear (pits)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -3365,6 +3961,25 @@ static void DrawDirectConnect(int w, int h, int lh) {
 
 // The model-swap panel: two-level scrolled list. Level 0 lists bikes; level 1 lists the
 // chosen bike's variants with row 0 = the active one (green "(active)"). Switcher styling.
+static void DrawChangeGL(int w, int h, int lh) {
+    char lines[16][160];
+    const int n = ChangeLines(lines, 16);
+    const int bw = 600, bh = n * lh + 8;
+    const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
+    glColor4f(0.04f, 0.05f, 0.08f, 0.90f);
+    FillRect(x0, y0, x1, y1);
+    int y = y1 - 17;
+    for (int i = 0; i < n; ++i) {
+        if (i == 0) glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
+        else if (i == n - 1) glColor4f(g_chError.empty() ? 0.6f : 1.0f, g_chError.empty() ? 0.66f : 0.62f,
+                                        g_chError.empty() ? 0.76f : 0.45f, 1.0f);
+        else glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
+        if (i - 1 == g_chCursor) { glColor4f(0.47f, 0.78f, 1.0f, 0.18f); FillRect(x0 + 4, y - 3, x1 - 4, y + lh - 4);
+                                   glColor4f(0.90f, 0.94f, 1.0f, 1.0f); }
+        GlText(x0 + 8, y, lines[i]); y -= lh;
+    }
+}
+
 static void DrawModelSwap(int w, int h, int lh) {
     const bool lvl1 = (g_msLevel == 1);
     std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
@@ -3760,7 +4375,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
+        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -3808,7 +4423,9 @@ void DrawOverlay(HDC hdc) {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     const int lh = 18;                           // line height
-    if (ms) {
+    if (g_chOpen.load() && !reloading) {
+        DrawChangeGL(w, h, lh);
+    } else if (ms) {
         DrawModelSwap(w, h, lh);
     } else if (trk) {
         DrawTrackManager(w, h, lh);
@@ -3992,7 +4609,7 @@ static void BuildOverlayDrawLists() {
     if (g_cleanView.load()) return;      // hand the engine nothing at all
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
@@ -4020,6 +4637,20 @@ static void BuildOverlayDrawLists() {
     const unsigned long cAmber = ToABGR(1.0f,  0.85f, 0.45f, 1.0f);
     const unsigned long cHi    = ToABGR(0.47f, 0.78f, 1.0f, 0.18f);
 
+    if (g_chOpen.load() && !reloading) {
+        char lines[16][160];
+        const int n = ChangeLines(lines, 16);
+        const float w = 0.46f, h = n * LH + 0.010f;
+        DQuad(MX, MY, MX + w, MY + h, cPanel);
+        float y = MY + 0.006f;
+        for (int i = 0; i < n; ++i) {
+            if (i - 1 == g_chCursor) DQuad(MX + 0.003f, y - 0.002f, MX + w - 0.003f, y + LH - 0.004f, cHi);
+            const unsigned long c = i == 0 ? cBlue : i == n - 1 ? (g_chError.empty() ? cGray : cAmber) : cWhite;
+            DText(MX + PADX, y, lines[i], c, FS);
+            y += LH;
+        }
+        return;
+    }
     if (ms) {
         const bool lvl1 = (g_msLevel == 1);
         std::vector<std::string>& items = lvl1 ? g_msVars : g_msBikes;
@@ -4316,6 +4947,9 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
+void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
+void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
+extern std::atomic<bool> g_chOpen;
 void MenuAction(int d) {
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
@@ -4338,6 +4972,8 @@ void MenuAction(int d) {
     case 8: { bool on = !g_msgOn.load(); g_msgOn.store(on); SaveOverlaySettings();
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
+    case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // the '0' row
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -4426,12 +5062,23 @@ void Tick() {
     if (uint64_t until = g_drawDiagUntil.load(std::memory_order_relaxed)) {
         static uint64_t winFrames = 0, winBaseDraw = 0, nextLog = 0;
         const uint64_t nowMs = GetTickCount64();
+        bool measurable = true;
         if (nextLog == 0) {                       // first frame of a fresh window
             winFrames = 0; winBaseDraw = g_drawCalls.load(std::memory_order_relaxed);
             nextLog = nowMs + 1000;
+            // This copy only sees Draw() when the game loaded IT as its plugin. Injected next
+            // to the session plugin (the MXB App setup) the game calls the plugin copy, and
+            // this counter is 0 before and after any reload - "DEAD" would be a false alarm.
+            if (winBaseDraw == 0) {
+                Log("[drawdiag] not measurable here: the game has never called this copy's "
+                    "Draw() (injected beside the session plugin), so a reload's effect on "
+                    "plugin HUDs cannot be seen from it");
+                g_drawDiagUntil.store(0, std::memory_order_relaxed); nextLog = 0;
+                measurable = false;
+            }
         }
-        ++winFrames;
-        if (nowMs >= nextLog) {
+        if (measurable) ++winFrames;
+        if (measurable && nowMs >= nextLog) {
             const uint64_t d = g_drawCalls.load(std::memory_order_relaxed);
             const uint64_t draws = d - winBaseDraw;
             Log("[drawdiag] frames/s=%llu Draw()/s=%llu  (plugin Draw dispatch %s)",
@@ -4439,7 +5086,7 @@ void Tick() {
                 draws ? "ALIVE" : "DEAD - co-existing HUD plugins go dark");
             winFrames = 0; winBaseDraw = d; nextLog = nowMs + 1000;
         }
-        if (nowMs >= until) {
+        if (measurable && nowMs >= until) {
             g_drawDiagUntil.store(0, std::memory_order_relaxed); nextLog = 0;
             Log("[drawdiag] window closed");
         }
@@ -4466,7 +5113,9 @@ void Tick() {
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
         ClearClean();                                    // never open something invisible
-        if (g_msOpen.load()) {                               // F8 also closes an open list
+        if (g_chOpen.load()) {
+            CloseChange(); Log("[change] panel closed (F8)");
+        } else if (g_msOpen.load()) {                        // F8 also closes an open list
             CloseModelSwap(); Log("[model] model swap closed (F8).");
         } else if (g_trkOpen.load()) {
             CloseTrackManager(); Log("[trklib] track manager closed (F8).");
@@ -4487,6 +5136,11 @@ void Tick() {
             bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;
             if (k && !prevDigit[d] && d <= kMenuCount) MenuAction(d);
             prevDigit[d] = k;
+        }
+        {   // '0' is the tenth row
+            bool k = (GetAsyncKeyState('0') & 0x8000) != 0;
+            if (k && !prevDigit[0] && kMenuCount >= 10) MenuAction(10);
+            prevDigit[0] = k;
         }
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
@@ -4609,6 +5263,9 @@ void Tick() {
         if (enter)     AttemptDirectConnect();               // parse + connect (keeps box open on error)
         else if (esc) { CloseDirectConnect(); Log("[connect] direct connect closed (Esc)."); }
     }
+
+    HandleChangeKeys();
+    PollChange();
 
     // Bike model swap (F8 > 3): two-level list. Up/Down move (held-key repeat); Enter picks
     // a bike (level 0 -> level 1) or swaps the highlighted variant (level 1); Esc backs out
@@ -5151,6 +5808,9 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
         RequestReload();
+    } else if (verb == "refresh_gear") {
+        Log("[cmd] gear refresh requested by MXB App");
+        RequestGearRefresh();
     } else if (verb == "refresh_paints") {
         // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
         // only the paint lists, and its live-paints pass applies whatever riders on track

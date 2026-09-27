@@ -1,0 +1,133 @@
+# Windows code signing through Azure Artifact Signing (formerly Trusted Signing).
+#
+# Used by release-build.yml. Run it after the CMake build, then sign every PE that ships with
+# `scripts/sign-windows.ps1 <file>...` before anything is packaged, uploaded or attached to the
+# release. Signing changes the file's bytes, so it has to come before anything that records them:
+# the zips, the build artifact, and the size and sha256 digest GitHub reports for each release
+# asset, which MXB App checks FrostMod downloads against.
+#
+# Same Azure app registration, account and certificate profile as MXB App (Frostn1/mxb-app); the
+# setup is in that repo's docs/signing/SETUP.md. This repo needs its own federated credential for
+# the subject repo:Frostn1/frostmod:environment:code-signing, plus the same three secrets and
+# three variables.
+#
+# With none of the inputs set (a fork, or before the secrets are added here), it logs a
+# "Windows code signing skipped" notice and does nothing: `enabled` is "false" and
+# sign-windows.ps1 skips, so the release still builds, unsigned, as before. With only some of
+# them set it fails, so a typo can't quietly ship an unsigned release.
+#
+# The calling job needs `permissions: id-token: write` for the OIDC login.
+
+name: Artifact Signing (Windows)
+description: Log in to Azure over OIDC and set up SignTool with the Artifact Signing client.
+
+inputs:
+  azure-client-id:
+    description: App registration (client) id with a federated credential for this repo.
+    required: false
+  azure-tenant-id:
+    description: Microsoft Entra tenant id.
+    required: false
+  azure-subscription-id:
+    description: Subscription holding the Artifact Signing account.
+    required: false
+  endpoint:
+    description: Regional endpoint of the account, e.g. https://wus2.codesigning.azure.net
+    required: false
+  account:
+    description: Artifact Signing account name.
+    required: false
+  profile:
+    description: Certificate profile name (Public Trust).
+    required: false
+
+outputs:
+  enabled:
+    description: '"true" when signing is set up for this job.'
+    value: ${{ steps.check.outputs.enabled }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check signing configuration
+      id: check
+      shell: bash
+      env:
+        CLIENT: ${{ inputs.azure-client-id }}
+        TENANT: ${{ inputs.azure-tenant-id }}
+        SUBSCRIPTION: ${{ inputs.azure-subscription-id }}
+        ENDPOINT: ${{ inputs.endpoint }}
+        ACCOUNT: ${{ inputs.account }}
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        missing=()
+        [ -n "$CLIENT" ] || missing+=(AZURE_CLIENT_ID)
+        [ -n "$TENANT" ] || missing+=(AZURE_TENANT_ID)
+        [ -n "$SUBSCRIPTION" ] || missing+=(AZURE_SUBSCRIPTION_ID)
+        [ -n "$ENDPOINT" ] || missing+=(ARTIFACT_SIGNING_ENDPOINT)
+        [ -n "$ACCOUNT" ] || missing+=(ARTIFACT_SIGNING_ACCOUNT)
+        [ -n "$PROFILE" ] || missing+=(ARTIFACT_SIGNING_PROFILE)
+        if [ "${#missing[@]}" -eq 6 ]; then
+          echo "::notice title=Windows code signing skipped::Not configured (no AZURE_* secrets or ARTIFACT_SIGNING_* variables). This build is unsigned. See docs/signing/SETUP.md in Frostn1/mxb-app."
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+        elif [ "${#missing[@]}" -gt 0 ]; then
+          echo "::error title=Windows code signing half-configured::Missing: ${missing[*]}. Set all six, or none to build unsigned. See docs/signing/SETUP.md in Frostn1/mxb-app."
+          exit 1
+        else
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Azure login (OIDC)
+      if: steps.check.outputs.enabled == 'true'
+      uses: azure/login@v3
+      with:
+        client-id: ${{ inputs.azure-client-id }}
+        tenant-id: ${{ inputs.azure-tenant-id }}
+        subscription-id: ${{ inputs.azure-subscription-id }}
+
+    - name: Install SignTool and the Artifact Signing client
+      if: steps.check.outputs.enabled == 'true'
+      shell: pwsh
+      env:
+        ENDPOINT: ${{ inputs.endpoint }}
+        ACCOUNT: ${{ inputs.account }}
+        PROFILE: ${{ inputs.profile }}
+        # Pinned so a release doesn't change tools under it. SignTool must be 10.0.2261.755 or
+        # newer (Artifact Signing's requirement); the client is the dlib SignTool loads.
+        SDK_BUILDTOOLS_VERSION: 10.0.28000.2705
+        SIGNING_CLIENT_VERSION: 1.0.128
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = Join-Path $env:RUNNER_TEMP 'artifact-signing'
+        New-Item -ItemType Directory -Force $root | Out-Null
+        nuget install Microsoft.Windows.SDK.BuildTools -Version $env:SDK_BUILDTOOLS_VERSION -OutputDirectory $root -ExcludeVersion -NonInteractive | Out-Null
+        nuget install Microsoft.ArtifactSigning.Client -Version $env:SIGNING_CLIENT_VERSION -OutputDirectory $root -ExcludeVersion -NonInteractive | Out-Null
+        $signtool = Get-ChildItem "$root\Microsoft.Windows.SDK.BuildTools" -Recurse -Filter signtool.exe |
+          Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+        $dlib = Get-ChildItem "$root\Microsoft.ArtifactSigning.Client" -Recurse -Filter Azure.CodeSigning.Dlib.dll |
+          Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+        if (-not $signtool) { throw 'signtool.exe (x64) not found in Microsoft.Windows.SDK.BuildTools' }
+        if (-not $dlib) { throw 'Azure.CodeSigning.Dlib.dll (x64) not found in Microsoft.ArtifactSigning.Client' }
+
+        # Only the Azure CLI credential: azure/login above left an OIDC session there, and every
+        # other credential in the chain would just be tried and fail first.
+        $metadata = [ordered]@{
+          Endpoint               = $env:ENDPOINT
+          CodeSigningAccountName = $env:ACCOUNT
+          CertificateProfileName = $env:PROFILE
+          CorrelationId          = "$env:GITHUB_REPOSITORY@$env:GITHUB_RUN_ID"
+          ExcludeCredentials     = @(
+            'EnvironmentCredential', 'ManagedIdentityCredential', 'WorkloadIdentityCredential',
+            'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+            'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+          )
+        }
+        $metadataPath = Join-Path $root 'metadata.json'
+        $metadata | ConvertTo-Json | Set-Content -Path $metadataPath -Encoding utf8
+
+        # What scripts/sign-windows.ps1 reads.
+        "ARTIFACT_SIGNING=1" | Add-Content $env:GITHUB_ENV
+        "ARTIFACT_SIGNING_SIGNTOOL=$($signtool.FullName)" | Add-Content $env:GITHUB_ENV
+        "ARTIFACT_SIGNING_DLIB=$($dlib.FullName)" | Add-Content $env:GITHUB_ENV
+        "ARTIFACT_SIGNING_METADATA=$metadataPath" | Add-Content $env:GITHUB_ENV
+        Write-Host "Artifact Signing ready: $($signtool.FullName)"

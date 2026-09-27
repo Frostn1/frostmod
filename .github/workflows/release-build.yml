@@ -6,6 +6,11 @@ name: Build Windows Release
 # files (the exact names frostmod.exe --update looks for on releases/latest) PLUS
 # a ready-to-run Release.zip, and the frostserver files PLUS a FrostServer.zip.
 # Can also be run manually (workflow_dispatch) to produce a build artifact only.
+#
+# Every shipped .exe/.dll/.dlo is Authenticode-signed with Azure Artifact Signing right after
+# the build, before anything is zipped, uploaded or attached (see the "Sign" steps below and
+# .github/actions/artifact-signing). Until the Azure secrets are set it skips, and the release
+# is unsigned as before.
 on:
   release:
     types: [published]
@@ -17,6 +22,13 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # The environment is what the Azure federated credential trusts: the OIDC subject is
+    # repo:Frostn1/frostmod:environment:code-signing whatever tag is being released. No
+    # protection rules; it only names the job. Setup: docs/signing/SETUP.md in Frostn1/mxb-app.
+    environment: code-signing
+    permissions:
+      contents: write    # upload assets onto the release
+      id-token: write    # OIDC login for code signing (.github/actions/artifact-signing)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,6 +54,45 @@ jobs:
       - name: Build (Release)
         run: cmake --build build --config Release
 
+      - name: Set up Windows code signing
+        id: signing
+        uses: ./.github/actions/artifact-signing
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          account: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          profile: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+
+      # Sign the linker outputs, then remake each .dlo from its signed .dll. CMake's post-build
+      # copy made the .dlo files before this step, and a .dlo must stay a byte-for-byte copy of
+      # its .dll (same PE, same signature). Only mxbcoach.dlo ships, not mxbcoach.dll, but it is
+      # signed as the .dll for the same reason. This runs before Collect, so dist/, both zips,
+      # the build artifact and the release assets all carry the signed bytes, and the size and
+      # sha256 digest GitHub records for each asset on upload (what MXB App checks a FrostMod
+      # download against) are the signed file's.
+      - name: Sign binaries
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $bin = 'build/bin/Release'
+          ./scripts/sign-windows.ps1 `
+            "$bin/frostmod.exe" "$bin/frostmod.dll" `
+            "$bin/frostserver.exe" "$bin/frostserver.dll" `
+            "$bin/mxbcoach.dll"
+          foreach ($name in 'frostmod','frostserver','mxbcoach') {
+            Copy-Item "$bin/$name.dll" "$bin/$name.dlo" -Force
+          }
+          # Every PE that ships must now verify.
+          $signtool = $env:ARTIFACT_SIGNING_SIGNTOOL
+          foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
+                         'frostserver.exe','frostserver.dll','frostserver.dlo',
+                         'mxbcoach.dlo') {
+            & $signtool verify /pa "$bin/$f" | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f is not signed"; exit 1 }
+          }
+
       - name: Collect binaries
         shell: pwsh
         run: |
@@ -65,6 +116,8 @@ jobs:
       # are deliberately NOT bundled.
       - name: Package Release.zip
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
           $stage = 'staging/FrostMod'
           New-Item -ItemType Directory -Force $stage | Out-Null
@@ -117,10 +170,16 @@ jobs:
             "UPDATE"
             "  frostmod.exe --update      downloads and installs the latest release."
             ""
+          )
+          $readme += if ($env:SIGNED -eq 'true') { @(
+            "NOTE: these binaries are code-signed. FrostMod is open source - build it"
+            "yourself or use plugin mode if you prefer. See the project page."
+          ) } else { @(
             "NOTE: these binaries are not code-signed, so Windows SmartScreen or your"
             "antivirus may warn on first run. FrostMod is open source - build it"
             "yourself or use plugin mode if you prefer. See the project page."
-          ) -join "`r`n"
+          ) }
+          $readme = $readme -join "`r`n"
           Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
 
           Compress-Archive -Path $stage -DestinationPath dist/Release.zip -Force
@@ -133,6 +192,8 @@ jobs:
       # plugin on first run, so no config is bundled.
       - name: Package FrostServer.zip
         shell: pwsh
+        env:
+          SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
           $stage = 'staging/FrostServer'
           New-Item -ItemType Directory -Force $stage | Out-Null
@@ -161,8 +222,11 @@ jobs:
             "  frostserver.exe --track `"Some Track Name`""
             "     serves the same API with no game attached."
             ""
-            "NOTE: unsigned binaries; Windows SmartScreen/AV may warn on first run."
-          ) -join "`r`n"
+          )
+          if ($env:SIGNED -ne 'true') {
+            $readme += "NOTE: unsigned binaries; Windows SmartScreen/AV may warn on first run."
+          }
+          $readme = $readme -join "`r`n"
           Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
 
           Compress-Archive -Path $stage -DestinationPath dist/FrostServer.zip -Force

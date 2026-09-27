@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-09-27 — v0.39.4
+
+### Fixed
+- **No more long freeze when the game starts or you join a server.** A reload request that
+  MXB App sent while the game was closed (after a paint sync, or when it saw your mods folder
+  change) stayed waiting, and FrostMod acted on it the moment the next game started: a full
+  rescan of every track, bike and piece of gear, right while the game was loading or joining.
+  With a big mods folder, or one on another drive, that is a 10-20 second freeze. FrostMod now
+  drops a request that arrived before the game started; the game reads the mods folder itself
+  when it loads.
+
 ## 2026-09-27 — v0.39.3
 
 ### Removed

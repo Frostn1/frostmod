@@ -5844,6 +5844,15 @@ DWORD WINAPI Init(LPVOID) {
     g_reloadEvent = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModReload");
     g_dumpEvent   = CreateEventA(nullptr, FALSE /*auto-reset*/, FALSE, "Local\\FrostModDumpNow");
     if (!g_reloadEvent) Log("[init] note: could not create reload event (%lu)", GetLastError());
+    // The event is auto-reset and outlives the game while frostmod.exe (or MXB App) holds it,
+    // so a pulse sent while no game was running - a paint sync, the mods watcher - is still
+    // set when the next game starts. Consumed on the first frame, it ran the full 21-step
+    // reload at every game start (seen in a player's log: 40 of 41 sessions, 7-11 s each
+    // with the mods on another drive), right while the game loads or joins. The game reads
+    // the mods folder itself at startup, so a signal from before now asks for nothing.
+    if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0)
+        Log("[init] ignoring a reload signal sent before this game started (the game's own "
+            "startup scan already reads the mods folder)");
     if (g_game->content_derived())
         Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
 

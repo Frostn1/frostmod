@@ -1026,6 +1026,7 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 
 void RequestReload();                          // fwd (defined with the reload code below)
 void RequestPaintRefresh();                    // fwd (same place: paint lists only)
+void RequestGearRefresh();                     // fwd (same place: rider gear lists)
 void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
@@ -1814,6 +1815,7 @@ static bool g_reloadPaintsOnly = false;
 // A full reload asked for while a paint refresh runs. It is not dropped: it starts as soon
 // as the paint refresh finishes, since only the full reload picks up new tracks and bikes.
 static bool g_fullReloadQueued = false;
+static const char* g_refreshWhat = "paint refresh";   // label of the partial refresh running
 // Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
 // table this title has not confirmed. Only the person collecting a diagnostic log should
 // ever turn it on - see the refusal in RequestReload.
@@ -1853,7 +1855,12 @@ void AdvanceReload() {
     if (!g_reloadActive.load()) return;
     if (!g_reloadPrimed) { g_reloadPrimed = true; return; }   // show the 0% frame first
     if (g_reloadCur < g_reloadPlanN) {
+        LARGE_INTEGER t0, t1, hz;
+        QueryPerformanceCounter(&t0);
         RunReloadStep(g_reloadPlan[g_reloadCur]);
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&hz);
+        // The hitch a player feels is the longest single step (one per frame): measured.
+        Log("[reload]   step took %.1f ms", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)hz.QuadPart);
         ++g_reloadCur;
         // The overlay's bar is out of the full table's step count; scale a short plan to it.
         g_reloadDone.store(g_reloadPaintsOnly
@@ -1862,13 +1869,13 @@ void AdvanceReload() {
     } else if (g_reloadPaintsOnly) {
         g_reloadActive.store(false);
         g_reloadPaintsOnly = false;
-        Log("[reload] paint refresh done - %d paint list(s) rebuilt from disk.", g_reloadPlanN);
+        Log("[reload] %s done - %d list(s) rebuilt from disk.", g_refreshWhat, g_reloadPlanN);
         ApplyArrivedPaints();
-        frostmod::crash::Note("paint refresh finished");
-        SetStatus("paints refreshed", 2500);
+        frostmod::crash::Note("%s finished", g_refreshWhat);
+        SetStatus(g_refreshWhat, 2500);
         if (g_fullReloadQueued) {
             g_fullReloadQueued = false;
-            Log("[reload] running the full reload that was asked for during the paint refresh");
+            Log("[reload] running the full reload that was asked for during the %s", g_refreshWhat);
             RequestReload();
         }
     } else {
@@ -1962,35 +1969,56 @@ void RequestReload() {
 // Coalesces with whatever is already running: during a full reload it is dropped (that
 // reload rebuilds the paint lists and runs the same pass); during another paint refresh it
 // is dropped too. One sync burst therefore costs one refresh.
-void RequestPaintRefresh() {
-    Log("[ui] paint refresh requested");
+// A partial reload: replay only the given rows of the step table, in the table's own order
+// (a model list before the paint lists that index into it), then the live-paints pass.
+static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
+    Log("[ui] %s requested", what);
     if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
-        Log("[reload] paint refresh not available here - running the full reload instead");
+        Log("[reload] %s not available here - running the full reload instead", what);
         RequestReload();
         return;
     }
     if (g_reloadActive.load()) {
-        Log("[reload] %s already running - it covers the paints; not starting another",
-            g_reloadPaintsOnly ? "a paint refresh is" : "a full reload is");
+        if (g_reloadPaintsOnly && strcmp(g_refreshWhat, what) != 0) {
+            // A different partial refresh is running: the full reload covers both.
+            g_fullReloadQueued = true;
+            Log("[reload] %s is running - the full reload will follow it", g_refreshWhat);
+        } else {
+            Log("[reload] %s already running - it covers this; not starting another",
+                g_reloadPaintsOnly ? g_refreshWhat : "a full reload is");
+        }
         return;
     }
     g_reloadPlanN = 0;
     for (int i = 0; i < g_game->reload_count; ++i)
-        for (uintptr_t rva : mxb::kPaintReloadRvas)
-            if (g_game->reload_steps[i].rva == rva && g_reloadPlanN < (int)_countof(g_reloadPlan))
+        for (int k = 0; k < nrvas; ++k)
+            if (g_game->reload_steps[i].rva == rvas[k] && g_reloadPlanN < (int)_countof(g_reloadPlan))
                 g_reloadPlan[g_reloadPlanN++] = i;
     if (g_reloadPlanN == 0) {
-        Log("[reload] no paint rows in this title's table - running the full reload instead");
+        Log("[reload] no rows for the %s in this title's table - running the full reload instead", what);
         RequestReload();
         return;
     }
+    g_refreshWhat = what;
     g_reloadPaintsOnly = true;
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
-    frostmod::crash::Note("paint refresh started (%d steps)", g_reloadPlanN);
-    Log("[reload] paint refresh (%d of %d list(s), stepped over frames)", g_reloadPlanN,
+    frostmod::crash::Note("%s started (%d steps)", what, g_reloadPlanN);
+    Log("[reload] %s (%d of %d list(s), stepped over frames)", what, g_reloadPlanN,
         g_game->reload_count);
+}
+
+void RequestPaintRefresh() {
+    RequestPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas), "paint refresh");
+}
+
+// Rider gear models arrived or changed (helmets, boots, rider models, protections, helmet
+// cams) - MXB App sends this for a change under mods\rider that is not only paints. Their
+// model lists and every paint list that indexes into them, and nothing else: tracks, bikes,
+// tyres and series stay as they are.
+void RequestGearRefresh() {
+    RequestPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
 }
 
 // ===========================================================================
@@ -2387,7 +2415,46 @@ static void RiderNameOf(uintptr_t req, char (&out)[32]) {
     if (req) SafeCopyStr((void*)(req + 8), out, sizeof(out));
 }
 
-static bool RebuildRider(int i, BusFn) {
+static bool CallBus2(BusFn bus, uint32_t cmd, intptr_t a, intptr_t b) {
+    __try {
+        bus(cmd, (void*)a, (void*)b, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+using AttachDrop_t = int64_t(__fastcall*)(int, int);
+static bool CallAttachDrop(int a, int b) {
+    __try { ((AttachDrop_t)(g_base + mxb::RVA_ATTACH_DROP))(a, b); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Make the next build of this rider load its gear MODELS again. On a rider it already has,
+// the builder only repaints: the block's "built" flag (+0x1D0) sends 0x4CE00 down the
+// repaint path, so a helmet or boots model installed since the join never appears. So the
+// rider-part objects go, exactly as the game's own teardown 0x44950 drops them - the two
+// rider attachments first (0x37C60), then each part (bus 0x5C) - and the flag is cleared.
+// The bike's objects are left alone: the re-load repaints those as before.
+static void DropRiderParts(int i, BusFn bus) {
+    const uintptr_t blk = VehicleAt(i) + mxb::VEH_GFX;
+    const auto at = [&](int off) { return SafeReadInt((const int*)(blk + off)); };
+    const int body = at(0x1D4);
+    if (body > 0) {
+        CallAttachDrop(body, at(mxb::GFX_RIDER_ATTACH_A));
+        CallAttachDrop(body, at(mxb::GFX_RIDER_ATTACH_B));
+    }
+    int dropped = 0;
+    for (int off : mxb::GFX_RIDER_PARTS) {
+        const int h = at(off);
+        if (h <= 0) continue;
+        if (CallBus2(bus, 0x5C, h, 0)) ++dropped;
+        __try { *(volatile int*)(blk + off) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __try { *(volatile int*)(blk + mxb::GFX_BUILT) = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    Log("[rebuild] slot %d: %d rider part(s) dropped, gear models will load fresh", i, dropped);
+}
+
+
+static bool RebuildRider(int i, BusFn bus) {
     const uintptr_t req = LoadRequestOf(i);
     char name[32];
     RiderNameOf(req, name);
@@ -2397,6 +2464,7 @@ static bool RebuildRider(int i, BusFn) {
     Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
     NoticeRing notices;
     SaveNotices(notices);
+    if (bus) DropRiderParts(i, bus);
     const int rc = CallRiderReload(conn);
     RestoreNotices(notices);
     Log("[rebuild] slot %d: rider re-load returned %d (0 = built)%s", i, rc,
@@ -5504,6 +5572,9 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
         RequestReload();
+    } else if (verb == "refresh_gear") {
+        Log("[cmd] gear refresh requested by MXB App");
+        RequestGearRefresh();
     } else if (verb == "refresh_paints") {
         // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
         // only the paint lists, and its live-paints pass applies whatever riders on track

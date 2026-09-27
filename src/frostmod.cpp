@@ -2321,6 +2321,148 @@ static void ApplyArrivedPaints() {
 }
 
 // ===========================================================================
+// RIDER REBUILD (EXPERIMENTAL, F8 -> 9)
+//
+// A repaint cannot change a MODEL, and cannot take a paint back to stock: the stock look
+// is the model's own textures, which only building the objects again restores. The game
+// never rebuilds a known rider mid-session (vehicle create on a rider it already has only
+// repaints, flag +0x1D0), so this does it by hand, with the game's own routines:
+//
+//   1. tear the vehicle down exactly as session end does for each rider (0x71D50):
+//      physics entity (bus 0x285, or 0x239), 0x4FE70, bus 0x18C / 0xCF, bus 0x27A,
+//      the stand clone (bus 0x5C), every gfx object (0x4E0D0), the team object (bus 0xEE)
+//   2. free the rider's load request, then run vehicle create 0x5CAE0(conn id, flag): it
+//      finds the record by race number and rebuilds bike and rider from the roster blob,
+//      every model and paint looked up afresh
+//   3. re-send the race-number -> slot link (GAME_MESSAGE kind 15, 0x62A10), which is what
+//      ties the new physics entity to the server's position updates
+//
+// Remote riders only. The local rider's vehicle is simulated here and is never touched.
+using VehicleCreate_t = int(__fastcall*)(int, int);
+using VehicleFree_t   = int64_t(__fastcall*)(void*);
+using RiderLink_t     = int64_t(__fastcall*)(int*);
+
+static bool CallBus2(BusFn bus, uint32_t cmd, intptr_t a, intptr_t b) {
+    __try {
+        bus(cmd, (void*)a, (void*)b, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool CallFree(uintptr_t fn, void* arg) {
+    __try { ((VehicleFree_t)fn)(arg); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static int CallCreate(int conn, int flag) {
+    __try { return ((VehicleCreate_t)(g_base + mxb::RVA_VEHICLE_CREATE))(conn, flag); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static bool CallLink(int* payload) {
+    __try { ((RiderLink_t)(g_base + mxb::RVA_RIDER_LINK))(payload); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The load request that owns vehicle i (+0x30 == i + 1), or 0.
+static uintptr_t LoadRequestOf(int i) {
+    for (int r = 0; r < mxb::LOAD_REQUEST_MAX; ++r) {
+        const uintptr_t q = g_base + mxb::RVA_LOAD_REQUESTS + (uintptr_t)r * mxb::LOAD_REQUEST_STRIDE;
+        if (SafeReadInt((const int*)q) != 0 && SafeReadInt((const int*)(q + 0x30)) == i + 1) return q;
+    }
+    return 0;
+}
+
+// The slot kind 15 last linked this race number to, or -2 when there is no race entry.
+static int RaceSlotOf(int raceNum) {
+    const int n = SafeReadInt((const int*)(g_base + mxb::RVA_RACE_ENTRY_COUNT));
+    for (int e = 0; e < n && e < 1000; ++e) {
+        const uintptr_t k = g_base + mxb::RVA_RACE_ENTRY_KEY + (uintptr_t)e * mxb::RACE_ENTRY_STRIDE;
+        if (SafeReadInt((const int*)k) == raceNum) return SafeReadInt((const int*)(k + 0xC));
+    }
+    return -2;
+}
+
+static bool RebuildRider(int i, BusFn bus) {
+    const uintptr_t v = VehicleAt(i);
+    const auto rd = [&](int off) { return SafeReadInt((const int*)(v + off)); };
+    char name[32] = {0};
+    SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
+    const uintptr_t req = LoadRequestOf(i);
+    if (!req) { Log("[rebuild] slot %d '%s': no load request - skipped", i, name); return false; }
+    const int conn = SafeReadInt((const int*)(req + 4));
+    const int flag = SafeReadInt((const int*)(req + 0x28));
+    const int raceNum = rd(mxb::VEH_KEY);
+    const int slot = RaceSlotOf(raceNum);
+    const int kind = rd(mxb::VEH_KIND);
+    Log("[rebuild] slot %d '%s': conn %d flag %d race %d link slot %d kind %d - tearing down",
+        i, name, conn, flag, raceNum, slot, kind);
+
+    // 1. Teardown, in 0x71D50's order and under its conditions.
+    if (kind == 1) {
+        if (rd(mxb::VEH_LIVE2) == 0) {
+            CallBus2(bus, 0x239, rd(mxb::VEH_ID), 0);
+            CallFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+        } else if (rd(mxb::VEH_ENTITY_ON) != 0) {
+            CallBus2(bus, 0x285, rd(mxb::VEH_ENTITY), 0);
+            CallFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+        }
+    }
+    if (kind <= 2) {
+        CallBus2(bus, 0x18C, rd(mxb::VEH_50A8), 0);
+        CallBus2(bus, 0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
+    }
+    if (kind <= 3) {
+        CallBus2(bus, 0x27A, rd(mxb::VEH_5838), 0);
+        CallBus2(bus, 0x5C, rd(mxb::VEH_HANDLE), 0);
+        if (!CallFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX)))
+            Log("[rebuild] slot %d: gfx teardown faulted", i);
+    }
+    CallBus2(bus, 0xEE, rd(mxb::VEH_TEAM), 0);
+
+    // 2. Build again. Vehicle create takes the first FREE load request, so the old one is
+    // released first, the way the disconnect handler (0x605F0) releases it.
+    memset((void*)req, 0, mxb::LOAD_REQUEST_STRIDE);
+    Log("[rebuild] slot %d: vehicle create(conn %d, flag %d)", i, conn, flag);
+    const int rc = CallCreate(conn, flag);
+    Log("[rebuild] slot %d: vehicle create returned %d (0 = built)", i, rc);
+
+    // 3. Re-link the new entity to the server's updates, as kind 15 does.
+    if (slot >= -1) {
+        int payload[2] = {raceNum, slot};
+        Log("[rebuild] slot %d: re-linking race %d -> slot %d", i, raceNum, slot);
+        if (!CallLink(payload)) Log("[rebuild] slot %d: re-link faulted", i);
+    } else {
+        Log("[rebuild] slot %d: no race entry for race %d - not re-linked", i, raceNum);
+    }
+    return rc == 0;
+}
+
+// Every remote rider on the client, rebuilt. Refuses unless it can tell which vehicle is
+// the local rider's.
+void RebuildRiders() {
+    if (!PaintsSupported()) { SetStatus("rebuild: not supported here", 3000); return; }
+    BusFn bus = ResolveBus();
+    const char* me = frostmod::crash::TheContext().rider;
+    if (!bus || !me[0]) {
+        Log("[rebuild] refused: %s", !bus ? "no engine bus" : "local rider name unknown (not in a session?)");
+        SetStatus("rebuild: not in a session", 3000);
+        return;
+    }
+    Log("[rebuild] EXPERIMENTAL rebuild of every remote rider (local rider '%s' is skipped)", me);
+    int done = 0, tried = 0;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        if (SafeReadInt((const int*)v) == 0) continue;
+        char name[32] = {0};
+        SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
+        if (_stricmp(name, me) == 0) { Log("[rebuild] slot %d '%s': local rider - skipped", i, name); continue; }
+        ++tried;
+        if (RebuildRider(i, bus)) ++done;
+    }
+    Log("[rebuild] done: %d of %d remote rider(s) rebuilt", done, tried);
+    SetStatus(tried ? "riders rebuilt (experimental)" : "no remote riders to rebuild", 4000);
+}
+
+// ===========================================================================
 // RADAR + RIDER OUTLINES (ESP)  -  sanctioned PiBoSo telemetry
 //
 // Data comes entirely from the plugin API callbacks (implemented at the bottom
@@ -3095,6 +3237,7 @@ static const MenuItem kMenu[] = {
     { '6', "Overlay size", true },
     { '7', "Hide overlay (recording)" },
     { '8', "Server announcements" },
+    { '9', "Rebuild riders (experimental)" },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -4244,6 +4387,7 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
+void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
 void MenuAction(int d) {
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
@@ -4266,6 +4410,7 @@ void MenuAction(int d) {
     case 8: { bool on = !g_msgOn.load(); g_msgOn.store(on); SaveOverlaySettings();
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):

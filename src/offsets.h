@@ -623,7 +623,7 @@ constexpr uintptr_t RVA_BIKE_PAINTS_ARG  = 0x109DE94; // the int bus 0xCF takes 
 // Vehicle-record fields the teardown touches (see the 0x71D50 loop).
 constexpr int VEH_KEY = 0x0C, VEH_ID = 0x04, VEH_KIND = 0x270, VEH_50A8 = 0x50A8, VEH_LIVE2 = 0x50AC,
               VEH_ENTITY_ON = 0x50B0, VEH_ENTITY = 0x50B8, VEH_50BC = 0x50BC, VEH_SUB = 0x4EEC,
-              VEH_5838 = 0x5838, VEH_TEAM = 0x5B20;
+              VEH_5838 = 0x5838, VEH_TEAM = 0x5B20, VEH_LINK = 0x5B18;
 
 } // namespace mxb
 

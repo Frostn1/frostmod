@@ -2454,6 +2454,25 @@ static void DropRiderParts(int i, BusFn bus) {
 }
 
 
+// The re-load builds a NEW physics entity and a new link index (vehicle +0x5B18), and
+// nothing re-sends the race-number -> slot link to it: seen live, the rebuilt rider was
+// collidable but frozen, the server's updates going nowhere. A join gets the link from
+// GAME_MESSAGE kind 15 (0x62A10); the rebuild replays that with the slot the race entry
+// already holds (entry +0xC, set by the last kind 15).
+using RiderLink_t = int64_t(__fastcall*)(int*);
+static int RaceSlotOf(int raceNum) {
+    const int n = SafeReadInt((const int*)(g_base + mxb::RVA_RACE_ENTRY_COUNT));
+    for (int e = 0; e < n && e < 1000; ++e) {
+        const uintptr_t k = g_base + mxb::RVA_RACE_ENTRY_KEY + (uintptr_t)e * mxb::RACE_ENTRY_STRIDE;
+        if (SafeReadInt((const int*)k) == raceNum) return SafeReadInt((const int*)(k + 0xC));
+    }
+    return -2;
+}
+static bool CallLink(int* payload) {
+    __try { ((RiderLink_t)(g_base + mxb::RVA_RIDER_LINK))(payload); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static bool RebuildRider(int i, BusFn bus) {
     const uintptr_t req = LoadRequestOf(i);
     char name[32];
@@ -2467,6 +2486,17 @@ static bool RebuildRider(int i, BusFn bus) {
     if (bus) DropRiderParts(i, bus);
     const int rc = CallRiderReload(conn);
     RestoreNotices(notices);
+    const int raceNum = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+    const int slot = RaceSlotOf(raceNum);
+    if (rc == 0 && slot >= 0) {
+        int payload[2] = {raceNum, slot};
+        Log("[rebuild] slot %d: re-linking race %d -> slot %d (entity %d, link index %d)", i, raceNum,
+            slot, SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_ENTITY)),
+            SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_LINK)));
+        if (!CallLink(payload)) Log("[rebuild] slot %d: re-link faulted", i);
+    } else if (rc == 0) {
+        Log("[rebuild] slot %d: no race entry for race %d - not re-linked (rider will be static)", i, raceNum);
+    }
     Log("[rebuild] slot %d: rider re-load returned %d (0 = built)%s", i, rc,
         notices.ok ? ", join notice suppressed" : "");
     return rc == 0;

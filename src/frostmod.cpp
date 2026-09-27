@@ -1814,6 +1814,10 @@ static bool g_reloadPaintsOnly = false;
 // A full reload asked for while a paint refresh runs. It is not dropped: it starts as soon
 // as the paint refresh finishes, since only the full reload picks up new tracks and bikes.
 static bool g_fullReloadQueued = false;
+// Set by a paint refresh: re-apply every remote rider's installed paints, not only the ones
+// that were missing. A rider who rejoined was re-added by the game's reuse path, which does
+// not re-paint, so their paint - already in the table - never shows (paint sync, live).
+static bool g_reapplyAll = false;
 // Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
 // table this title has not confirmed. Only the person collecting a diagnostic log should
 // ever turn it on - see the refusal in RequestReload.
@@ -1985,6 +1989,7 @@ void RequestPaintRefresh() {
         return;
     }
     g_reloadPaintsOnly = true;
+    g_reapplyAll = true;
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
@@ -2235,11 +2240,20 @@ static bool ApplyGearPaint(int i, const mxb::GearPart& part) {
 }
 
 static void ApplyArrivedPaints() {
-    if (!PaintsSupported()) return;
+    if (!PaintsSupported()) { g_reapplyAll = false; return; }
+    const bool all = g_reapplyAll;
+    g_reapplyAll = false;
+    const char* me = frostmod::crash::TheContext().rider;
     int applied = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
-        const uint32_t was = g_paintMissing[i];
+        uint32_t was = g_paintMissing[i];
         g_paintMissing[i] = 0;
+        if (all && SafeReadInt((const int*)VehicleAt(i)) != 0) {
+            char name[32] = {0};
+            SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
+            if (!(me[0] && _stricmp(name, me) == 0))    // never the local rider
+                was = 0xFFFFFFFFu;                     // every part; installed ones only
+        }
         if (!was) continue;
         // Everything is re-read: the rider may have left, or the slot been reused, during
         // the reload, and every list was rebuilt. A part is re-applied only when at least
@@ -2250,7 +2264,8 @@ static void ApplyArrivedPaints() {
             if ((was & (1u << (1 + p))) && ApplyGearPaint(i, mxb::kGearParts[p])) ++applied;
     }
     if (applied) {
-        Log("[paint] applied %d newly installed paint(s) to riders on track", applied);
+        Log("[paint] applied %d paint(s) to riders on track%s", applied,
+            all ? " (paint refresh: every remote rider)" : "");
         SetStatus(applied == 1 ? "new paint applied" : "new paints applied to riders", 4000);
     }
 }

@@ -3624,14 +3624,14 @@ void DrawOverlay(HDC hdc) {
         // compact pill: hint / status, or the reload progress bar
         const int bw = 250, bh = reloading ? 38 : 24;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
-        glColor4f(0.0f, 0.443f, 0.890f, 0.95f);      // mxbsecure blue #0071e3
+        glColor4f(0.0f, 0.0f, 0.0f, 0.45f);          // faded black
         FillRect(x0, y0, x1, y1);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);           // white text
+        glColor4f(0.0f, 0.443f, 0.890f, 1.0f);       // mxbsecure blue #0071e3
         GlText(x0 + 8, y1 - 17, line);
         if (reloading) {                             // progress bar along the bottom
             const int bx0 = x0 + 8, bx1 = x1 - 8, by0 = y0 + 7, by1 = by0 + 6;
             glColor4f(1.0f, 1.0f, 1.0f, 0.25f); FillRect(bx0, by0, bx1, by1);
-            glColor4f(1.0f, 1.0f, 1.0f, 0.95f);
+            glColor4f(0.0f, 0.443f, 0.890f, 0.95f);
             FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
         }
     }
@@ -3963,12 +3963,12 @@ static void BuildOverlayDrawLists() {
             strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
         }
         const float w = 0.20f, h = reloading ? 0.060f : 0.034f;
-        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.0f, 0.443f, 0.890f, 0.95f));   // #0071e3
-        DText(MX + PADX, MY + 0.006f, line, ToABGR(1.0f, 1.0f, 1.0f, 1.0f), FS);
+        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.0f, 0.0f, 0.0f, 0.45f));   // faded black
+        DText(MX + PADX, MY + 0.006f, line, ToABGR(0.0f, 0.443f, 0.890f, 1.0f), FS);   // #0071e3
         if (reloading) {
             const float bx0 = MX + PADX, bx1 = MX + w - PADX, by0 = MY + h - 0.014f, by1 = by0 + 0.008f;
             DQuad(bx0, by0, bx1, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.25f));
-            DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.95f));
+            DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(0.0f, 0.443f, 0.890f, 0.95f));
         }
     }
 }

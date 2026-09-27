@@ -3,7 +3,7 @@
 ## 2026-09-26 — v0.39.0
 
 ### Added
-- **The in-game pill reads "Game Integration v0.39.0 - F8"**, in white on mxbsecure blue.
+- **The in-game pill reads "Game Integration v0.39.0 - F8"**, in mxbsecure blue on a lighter, more see-through black.
 - **A paint you download mid-session shows up on that rider straight away.** Your game picks
   each rider's paint once, when their bike is built. If you don't have their paint then, they
   ride stock until you rejoin, even after the file lands in your paints folder. Now, when you

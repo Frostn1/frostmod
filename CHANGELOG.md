@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-27 — v0.40.0
+
+### Added
+- **Race mode shows the game only the tracks and bikes a race needs, without moving files.**
+  When MXB App writes `frostmod_racemode.txt` next to `frostmod_mods.txt` (one mod per line,
+  relative to `mods/`, e.g. `tracks/Red Bud` or `bikes/KTM 450.pkz`), the game's scan of
+  `mods/tracks` and `mods/bikes` skips everything else, so a hidden `.pkz` is never even
+  opened. Only the folders the file names anything under are filtered; rider gear, tyres and
+  the stock game are untouched. No file means no filtering, so a crash never leaves a player
+  with a short list. A new `race_filter` command re-reads the file and reloads mods, so a
+  join from the in-game browser can be slimmed mid-session. The log says how many entries
+  each scan hid (`[racemode] N of M tracks/bikes entries hidden`).
+
 ## 2026-09-27 — v0.39.4
 
 ### Fixed

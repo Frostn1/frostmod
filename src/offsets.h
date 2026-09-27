@@ -580,6 +580,7 @@ constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char
 // Tear one remote rider down the way session end does (0x71D50, per vehicle) and build
 // them again with vehicle create, so models and paints are all looked up afresh.
 constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CAE0;  // int(int conn_id, int flag)
+constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E570;  // int(int conn_id): the CHANGEINFO rebuild
 constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0; // int(void* rec+0x274)
 constexpr uintptr_t RVA_VEHICLE_SUBFREE = 0x4FE70; // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

@@ -2324,42 +2324,22 @@ static void ApplyArrivedPaints() {
 // RIDER REBUILD (EXPERIMENTAL, F8 -> 9)
 //
 // A repaint cannot change a MODEL, and cannot take a paint back to stock: the stock look
-// is the model's own textures, which only building the objects again restores. The game
-// never rebuilds a known rider mid-session (vehicle create on a rider it already has only
-// repaints, flag +0x1D0), so this does it by hand, with the game's own routines:
+// is the model's own textures, which only building the objects again restores.
 //
-//   1. tear the vehicle down exactly as session end does for each rider (0x71D50):
-//      physics entity (bus 0x285, or 0x239), 0x4FE70, bus 0x18C / 0xCF, bus 0x27A,
-//      the stand clone (bus 0x5C), every gfx object (0x4E0D0), the team object (bus 0xEE)
-//   2. free the rider's load request, then run vehicle create 0x5CAE0(conn id, flag): it
-//      finds the record by race number and rebuilds bike and rider from the roster blob,
-//      every model and paint looked up afresh
-//   3. re-send the race-number -> slot link (GAME_MESSAGE kind 15, 0x62A10), which is what
-//      ties the new physics entity to the server's position updates
+// The game has its own rebuild for a rider it already knows: when a peer changes identity
+// mid-session the server broadcasts CHANGEINFO (0x13), and every client runs the RIDER
+// re-load 0x5E570(conn id) for them (net event 6 -> mode 36 -> 0x69A00; see the map's
+// net/change.c). This calls exactly that, the way 0x69A00 does when the join queue is not
+// deferring. Nothing is torn down by hand: the first version of this did (session-end
+// teardown + vehicle create 0x5CAE0) and left the rider invisible - alive, collidable,
+// drawn at a pose nobody updated.
 //
 // Remote riders only. The local rider's vehicle is simulated here and is never touched.
-using VehicleCreate_t = int(__fastcall*)(int, int);
-using VehicleFree_t   = int64_t(__fastcall*)(void*);
-using RiderLink_t     = int64_t(__fastcall*)(int*);
+using RiderReload_t = int(__fastcall*)(int);
 
-static bool CallBus2(BusFn bus, uint32_t cmd, intptr_t a, intptr_t b) {
-    __try {
-        bus(cmd, (void*)a, (void*)b, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-static bool CallFree(uintptr_t fn, void* arg) {
-    __try { ((VehicleFree_t)fn)(arg); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-static int CallCreate(int conn, int flag) {
-    __try { return ((VehicleCreate_t)(g_base + mxb::RVA_VEHICLE_CREATE))(conn, flag); }
+static int CallRiderReload(int conn) {
+    __try { return ((RiderReload_t)(g_base + mxb::RVA_RIDER_RELOAD))(conn); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
-}
-static bool CallLink(int* payload) {
-    __try { ((RiderLink_t)(g_base + mxb::RVA_RIDER_LINK))(payload); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 // The load request that owns vehicle i (+0x30 == i + 1), or 0.
@@ -2371,68 +2351,16 @@ static uintptr_t LoadRequestOf(int i) {
     return 0;
 }
 
-// The slot kind 15 last linked this race number to, or -2 when there is no race entry.
-static int RaceSlotOf(int raceNum) {
-    const int n = SafeReadInt((const int*)(g_base + mxb::RVA_RACE_ENTRY_COUNT));
-    for (int e = 0; e < n && e < 1000; ++e) {
-        const uintptr_t k = g_base + mxb::RVA_RACE_ENTRY_KEY + (uintptr_t)e * mxb::RACE_ENTRY_STRIDE;
-        if (SafeReadInt((const int*)k) == raceNum) return SafeReadInt((const int*)(k + 0xC));
-    }
-    return -2;
-}
-
-static bool RebuildRider(int i, BusFn bus) {
-    const uintptr_t v = VehicleAt(i);
-    const auto rd = [&](int off) { return SafeReadInt((const int*)(v + off)); };
+static bool RebuildRider(int i, BusFn) {
     char name[32] = {0};
-    SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
+    SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
     const uintptr_t req = LoadRequestOf(i);
     if (!req) { Log("[rebuild] slot %d '%s': no load request - skipped", i, name); return false; }
     const int conn = SafeReadInt((const int*)(req + 4));
-    const int flag = SafeReadInt((const int*)(req + 0x28));
-    const int raceNum = rd(mxb::VEH_KEY);
-    const int slot = RaceSlotOf(raceNum);
-    const int kind = rd(mxb::VEH_KIND);
-    Log("[rebuild] slot %d '%s': conn %d flag %d race %d link slot %d kind %d - tearing down",
-        i, name, conn, flag, raceNum, slot, kind);
-
-    // 1. Teardown, in 0x71D50's order and under its conditions.
-    if (kind == 1) {
-        if (rd(mxb::VEH_LIVE2) == 0) {
-            CallBus2(bus, 0x239, rd(mxb::VEH_ID), 0);
-            CallFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
-        } else if (rd(mxb::VEH_ENTITY_ON) != 0) {
-            CallBus2(bus, 0x285, rd(mxb::VEH_ENTITY), 0);
-            CallFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
-        }
-    }
-    if (kind <= 2) {
-        CallBus2(bus, 0x18C, rd(mxb::VEH_50A8), 0);
-        CallBus2(bus, 0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
-    }
-    if (kind <= 3) {
-        CallBus2(bus, 0x27A, rd(mxb::VEH_5838), 0);
-        CallBus2(bus, 0x5C, rd(mxb::VEH_HANDLE), 0);
-        if (!CallFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX)))
-            Log("[rebuild] slot %d: gfx teardown faulted", i);
-    }
-    CallBus2(bus, 0xEE, rd(mxb::VEH_TEAM), 0);
-
-    // 2. Build again. Vehicle create takes the first FREE load request, so the old one is
-    // released first, the way the disconnect handler (0x605F0) releases it.
-    memset((void*)req, 0, mxb::LOAD_REQUEST_STRIDE);
-    Log("[rebuild] slot %d: vehicle create(conn %d, flag %d)", i, conn, flag);
-    const int rc = CallCreate(conn, flag);
-    Log("[rebuild] slot %d: vehicle create returned %d (0 = built)", i, rc);
-
-    // 3. Re-link the new entity to the server's updates, as kind 15 does.
-    if (slot >= -1) {
-        int payload[2] = {raceNum, slot};
-        Log("[rebuild] slot %d: re-linking race %d -> slot %d", i, raceNum, slot);
-        if (!CallLink(payload)) Log("[rebuild] slot %d: re-link faulted", i);
-    } else {
-        Log("[rebuild] slot %d: no race entry for race %d - not re-linked", i, raceNum);
-    }
+    // Logged before the call: a fault that escapes the guard still leaves this line last.
+    Log("[rebuild] slot %d '%s': rider re-load 0x5E570(conn %d)", i, name, conn);
+    const int rc = CallRiderReload(conn);
+    Log("[rebuild] slot %d: rider re-load returned %d (0 = built)", i, rc);
     return rc == 0;
 }
 

@@ -514,6 +514,33 @@ constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadStep
 constexpr uintptr_t RVA_RELOAD_STR  = 0x3333EB;
 constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 
+// ---- live paints (add-only) -------------------------------------------------
+// The game picks a rider's paint ONCE, when it builds their bike: paint_apply looks the
+// name up in the scanned paints table and hands the .pnt path to the engine, which bakes
+// it into that bike's materials. A name that is not in the table gives "" = stock. So a
+// paint that arrives after the bike was built stays stock until something re-applies it.
+// That is what RefreshPaints does, after the paints row (0x17320) of the reload has run.
+// Removing a paint is NOT covered: paint_apply with "" is a no-op, not a revert.
+constexpr uintptr_t RVA_PAINTS_LOADER = 0x17320;   // the DIR row in kReloadSteps
+constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
+constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
+constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count
+constexpr int       PAINT_STRIDE      = 0x18C;     // +0x00 bike index, +0x04 name
+constexpr int       PAINT_BIKE        = 0x00;
+constexpr int       PAINT_NAME        = 0x04;
+// Vehicle records: one per remote rider, filled by vehicle create 0x5CAE0.
+constexpr uintptr_t RVA_VEHICLES      = 0xF4EE20;
+constexpr int       VEHICLE_MAX       = 50;
+constexpr int       VEHICLE_STRIDE    = 0x5B24;    // +0x00 live
+constexpr int       VEH_BIKE          = 0x30;      // bike folder name (roster blob +0x20)
+constexpr int       VEH_PAINT         = 0x90;      // paint name
+constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "stand" bike (0x4CD60)
+// The bike that is actually ridden and drawn is a set of engine objects in the rider-gfx
+// block at +0x274, built by 0x4D8C0 -> 0x4CE00. That builder paints each of these handles
+// with the same .pnt path (bus 0x9E at 0x4CEE1, 0x4CF55 x2, 0x4CF7A/0x4CF86/0x4CF97).
+constexpr int       VEH_GFX           = 0x274;
+constexpr int       VEH_GFX_PAINTED[] = { 0x00, 0x10, 0x14, 0x50, 0x60, 0x70 };
+
 } // namespace mxb
 
 // ============ GP Bikes ========================================================

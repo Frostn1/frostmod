@@ -49,17 +49,22 @@ int main() {
     CHECK(DecideChangeFree(ChangeSnapshot{}, 7, true, 0, 16, kMax) == ChangeFree::Drop, "no snapshot");
     CHECK(DecideChangeFree(ChangeSnapshot{60, 17}, 7, true, 17, 16, kMax) == ChangeFree::Drop, "bad snapshot");
 
-    // Riding by the page stack: "mtrack" exactly; the pits page "mtrackm" is not riding.
+    // Riding by the page stack, as read live on a server.
     {
-        const char* track[] = {"mtrack"};
-        const char* pits[] = {"mtrackm"};
-        const char* menu[] = {"mmain", "mserver"};
-        const char* over[] = {"mtrack", "mpause"};
-        CHECK(frostmod::PagesShowRiding(track, 1), "mtrack is riding");
-        CHECK(!frostmod::PagesShowRiding(pits, 1), "mtrackm is the pits");
+        const char* riding[] = {"mtrackm"};
+        const char* riding2[] = {"mtrack"};
+        const char* pits[] = {"chat", "pit", "multi_pit"};
+        const char* pitsSettings[] = {"chat", "pit", "settings"};
+        const char* leaving[] = {"mtrackm", "pit", "multi_pit"};   // the frame between the two
+        const char* menu[] = {"main_menu", "multisetup"};
+        CHECK(frostmod::PagesShowRiding(riding, 1), "mtrackm is riding");
+        CHECK(frostmod::PagesShowRiding(riding2, 1), "mtrack is riding");
+        CHECK(!frostmod::PagesShowRiding(pits, 3), "the pits");
+        CHECK(!frostmod::PagesShowRiding(pitsSettings, 3), "settings over the pits");
+        CHECK(!frostmod::PagesShowRiding(leaving, 3), "a pit page under it is not riding");
         CHECK(!frostmod::PagesShowRiding(menu, 2), "menus are not riding");
-        CHECK(frostmod::PagesShowRiding(over, 2), "a page over the track is still riding");
         CHECK(!frostmod::PagesShowRiding(nullptr, 0), "empty stack");
+        CHECK(!frostmod::PagesShowRiding(riding, 0), "depth 0");
     }
 
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }

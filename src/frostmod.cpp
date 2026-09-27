@@ -2849,7 +2849,7 @@ void OpenChange() {
     g_chError.clear();
     if (!PaintsSupported()) { SetStatus("change: not supported here", 3000); return; }
     if (ChRiding() == 1) {
-        Log("[change] panel refused - on track (page mtrack)");
+        Log("[change] panel refused - on track (the game is on its track page, not the pits)");
         SetStatus(kChGoToPits, 4000);
         return;
     }

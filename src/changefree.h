@@ -21,18 +21,26 @@ struct ChangeSnapshot {
 
 enum class ChangeFree { Wait, Free, Drop };
 
-// Is the player riding? The game's page stack holds "mtrack" while on track; the pits are
-// "mtrackm" (the track menu). A change there is accepted by the server but the game builds
-// the new bike in the pits while the ride goes on without one: a black screen until the
-// player goes back to the pits. So the panel refuses on track.
+// Is the player riding? Read live on a server (2026-09-27): the pits are the stack
+// {chat, pit, multi_pit} (settings on top while open), riding is {mtrackm}; "mtrack" is the
+// same screen's other variant. A change accepted while riding makes the game build the new
+// bike in the pits while the ride goes on without one: a black screen until the player goes
+// back to the pits. So: riding = a track page on the stack and no pit page under it.
+inline bool PageIs(const char* s, const char* want) {
+    if (!s) return false;
+    while (*s && *s == *want) { ++s; ++want; }
+    return *s == 0 && *want == 0;
+}
 inline bool PagesShowRiding(const char* const* names, int n) {
+    bool track = false;
     for (int i = 0; i < n; ++i) {
         const char* s = names[i];
-        if (s && s[0] == 'm' && s[1] == 't' && s[2] == 'r' && s[3] == 'a' && s[4] == 'c' &&
-            s[5] == 'k' && s[6] == 0)
-            return true;
+        if (PageIs(s, "pit") || PageIs(s, "multi_pit") || PageIs(s, "testingday_pit") ||
+            PageIs(s, "straightrhythm_pit"))
+            return false;
+        if (PageIs(s, "mtrack") || PageIs(s, "mtrackm")) track = true;
     }
-    return false;
+    return track;
 }
 
 // Decide, once a frame after the accept.

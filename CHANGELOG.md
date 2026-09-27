@@ -11,6 +11,11 @@
   FrostMod now clears a departing rider's bike and rider the way the game does at the end of a
   session, so a rejoin is built from scratch like a first join. MX Bikes only; part of the
   existing rejoin fix (`rejoinfix=0` in `frostmod_radar.cfg` turns it off).
+- **A rider who rejoins shows their paint again.** When MXB App's paint sync asks FrostMod to
+  refresh paints, FrostMod only re-applied paints that had just arrived. A rider who left and
+  came back already had their paint installed, but the game rebuilds a returning rider without
+  painting them, so they rode stock. A paint refresh now re-applies every other rider's
+  installed paints.
 
 ## Unreleased
 

@@ -1817,6 +1817,10 @@ static bool g_reloadPaintsOnly = false;
 // as the paint refresh finishes, since only the full reload picks up new tracks and bikes.
 static bool g_fullReloadQueued = false;
 static const char* g_refreshWhat = "paint refresh";   // label of the partial refresh running
+// Set by a paint refresh: re-apply every remote rider's installed paints, not only the ones
+// that were missing. A rider who rejoined was re-added by the game's reuse path, which does
+// not re-paint, so their paint - already in the table - never shows (paint sync, live).
+static bool g_reapplyAll = false;
 // Set from frostmod_unsafe_reload.flag (frostmod.exe --unsafe-reload) at init: run a step
 // table this title has not confirmed. Only the person collecting a diagnostic log should
 // ever turn it on - see the refusal in RequestReload.
@@ -2002,6 +2006,7 @@ static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* 
     }
     g_refreshWhat = what;
     g_reloadPaintsOnly = true;
+    g_reapplyAll = true;
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
@@ -2316,11 +2321,20 @@ static bool ApplyGearPaint(int i, const mxb::GearPart& part, bool to_stock) {
 }
 
 static void ApplyArrivedPaints() {
-    if (!PaintsSupported()) return;
+    if (!PaintsSupported()) { g_reapplyAll = false; return; }
+    const bool all = g_reapplyAll;
+    g_reapplyAll = false;
+    const char* me = frostmod::crash::TheContext().rider;
     int applied = 0, reverted = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
-        const uint32_t was = g_paintMissing[i];
+        uint32_t was = g_paintMissing[i];
         g_paintMissing[i] = 0;
+        if (all && SafeReadInt((const int*)VehicleAt(i)) != 0) {
+            char name[32] = {0};
+            SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
+            if (!(me[0] && _stricmp(name, me) == 0))    // never the local rider
+                was = 0xFFFFFFFFu;                     // every part; installed ones only
+        }
         // Everything is re-read: the rider may have left, or the slot been reused, during
         // the reload, and every list was rebuilt.
         if (SafeReadInt((const int*)VehicleAt(i)) == 0) continue;
@@ -2342,8 +2356,8 @@ static void ApplyArrivedPaints() {
         }
     }
     if (applied || reverted) {
-        Log("[paint] %d newly installed paint(s) applied, %d removed paint(s) taken back to stock",
-            applied, reverted);
+        Log("[paint] %d paint(s) applied%s, %d removed paint(s) taken back to stock",
+            applied, all ? " (paint refresh: every remote rider)" : "", reverted);
         SetStatus(reverted && !applied ? "removed paints back to stock"
                                        : "rider paints updated", 4000);
     }

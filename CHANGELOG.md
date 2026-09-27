@@ -2,6 +2,13 @@
 
 ## 2026-09-27 — v0.39.3
 
+### Removed
+- **The radar and the rider outlines.** Both overlays, their F8 entries (old `4` and `5`),
+  their settings and the OpenGL hooks the outlines needed are gone. The F8 menu now holds
+  only what players use: reload mods, change bike / gear, bike model swap, server
+  announcements, overlay size, the corner hint and hide-overlay. The rider data MXB App's
+  voice chat reads is unchanged.
+
 ### Added
 - **Change bike, paint or gear without leaving the server (F8 → 0).** In the pits, pick a
   different bike, bike paint, helmet (and its paint and goggles), suit, gloves or boots from

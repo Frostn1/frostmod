@@ -2865,7 +2865,11 @@ static int ChangeLines(char (*out)[160], int max) {
 
 
 // ===========================================================================
-// RADAR + RIDER OUTLINES (ESP)  -  sanctioned PiBoSo telemetry
+// RIDER TELEMETRY  -  sanctioned PiBoSo callbacks
+//
+// The radar and the on-screen rider outlines this section used to feed were removed in
+// v0.39.3. What remains is the data itself, because the MXB App session block (voice
+// chat's who-is-where) publishes the same table - see SessionPublish.
 //
 // Data comes entirely from the plugin API callbacks (implemented at the bottom
 // of this file, next to Draw()): RunTelemetry (our world pos), RaceTrackPosition
@@ -2890,28 +2894,8 @@ static int ChangeLines(char (*out)[160], int max) {
 // SDKs agree byte for byte, not because it was convenient. Every ingest below still
 // guards on the size the callback itself reports.
 
-// ---- World-axis / yaw conventions -------------------------------------------
-// Settled against PiBoSo's own SDK header and cross-checked against MXBMRP3
-// (https://github.com/thomas4f/mxbmrp3, MIT), which renders a working radar for
-// the same games from the same callback. All three agree with what was here:
-// ground = (X, Z) with Y up, rotate by +yaw, no offset.
-static inline void GroundUV(float x, float y, float z, float& u, float& v) {
-    (void)y; u = x; v = z;            // ground plane = (X, Z); up = Y
-}
-static constexpr float RAD_YAW_SIGN   = 1.0f;   // rotate by +yaw
-static constexpr float RAD_YAW_OFFSET = 0.0f;   // degrees; "ahead" is already at the top
-
-// m_fYaw is in DEGREES. cosf/sinf take radians, so it must be converted before
-// it reaches them -- the bug this block used to hide behind. Feeding degrees
-// straight in doesn't tilt the radar slightly, it scales the heading by 57.3 and
-// makes the rotation arbitrary, which reads as "the radar is broken" rather than
-// as "a constant needs flipping". No amount of flipping the two above fixes it.
-static constexpr float RAD_DEG_TO_RAD = 0.017453292519943295f;
 
 // ---- shared rider snapshot (producer = game data threads; consumer = render) -
-static std::atomic<bool> g_radarOn{false};   // radar HUD panel
-static std::atomic<bool> g_espOn{false};     // on-screen rider outlines
-static float             g_radarRange = 80.0f; // metres shown edge-to-center
 
 // ---- overlay size ----------------------------------------------------------
 // The GL overlay lays out in device pixels, so on a 4K screen it drew at half the
@@ -3410,15 +3394,19 @@ static void OverlaySettingsPath(char* out, size_t n) {
     strncat_s(out, n, "frostmod_radar.cfg", _TRUNCATE);
 }
 
+// devmenu=1 in frostmod_radar.cfg shows the developer rows of the F8 menu (the
+// experimental rider rebuild). Off for players.
+static bool g_devMenu = false;
+
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "w") || !f) return;
-    fprintf(f, "radar=%d\noutlines=%d\nrange=%d\nuiscale=%d\nantifreeze=%d\nantifreezems=%d\n",
-            g_radarOn.load() ? 1 : 0, g_espOn.load() ? 1 : 0, (int)g_radarRange,
+    fprintf(f, "uiscale=%d\nantifreeze=%d\nantifreezems=%d\n",
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     fprintf(f, "rejoinfix=%d\n", g_rjOn.load() ? 1 : 0);
+    if (g_devMenu) fprintf(f, "devmenu=1\n");
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3426,10 +3414,8 @@ static void LoadOverlaySettings() {
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128]; int v;
     while (fgets(line, sizeof(line), f)) {
-        if      (sscanf_s(line, "radar=%d",    &v) == 1) g_radarOn.store(v != 0);
-        else if (sscanf_s(line, "outlines=%d", &v) == 1) g_espOn.store(v != 0);
-        else if (sscanf_s(line, "range=%d",    &v) == 1 && v >= 10 && v <= 500) g_radarRange = (float)v;
-        else if (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
+        if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
+        else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -3441,19 +3427,14 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "rejoinfix=%d", &v) == 1) g_rjOn.store(v != 0);
     }
     fclose(f);
-    Log("[overlay] settings loaded: radar=%d outlines=%d range=%dm size=%d%% antifreeze=%d/%.2fs "
-        "servermsg=%d y=%d port=%d",
-        g_radarOn.load(), g_espOn.load(), (int)g_radarRange, g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load());
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d%s",
+        g_uiPct.load(),
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(),
+        g_devMenu ? " devmenu=1" : "");
     Log("[overlay] settings loaded: rejoinfix=%d", g_rjOn.load() ? 1 : 0);
 }
 
-// ---- consumer: a per-frame snapshot of the OTHER riders relative to me ------
-// lap: +1 = they are lapping YOU (a lap ahead -> red), -1 = you are lapping them
-// (a lap behind -> blue), 0 = same lap (white). rx/ry are heading-up radar-disc
-// coords in [-1,1] (ry up = ahead). bearing is the world heading to them
-// relative to my facing, for the ESP arrow fallback. wx/wy/wz = world pos.
-struct RadBlip { float rx, ry, dist, bearing, wx, wy, wz, yawDeg; int lap; int raceNum; };
+// ---- which rider is me ---------------------------------------------------
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
 // (no telemetry / no track positions). outMe* receive my world pos + heading.
 // "me" = the RaceTrackPosition entry closest to my telemetry world pos. Caller holds
@@ -3471,45 +3452,6 @@ static int RadFindMe() {
     return me;
 }
 
-static int RadBuildBlips(RadBlip* out, int maxOut, float rangeM,
-                         float* outMeYawDeg, float* outMeX, float* outMeY, float* outMeZ) {
-    std::lock_guard<std::mutex> lk(g_radMutex);
-    const int me = RadFindMe();
-    if (me < 0) return -1;
-    const float myYawDeg = g_radRiders[me].yawDeg;
-    if (outMeYawDeg) *outMeYawDeg = myYawDeg;
-    if (outMeX) *outMeX = g_radRiders[me].x;
-    if (outMeY) *outMeY = g_radRiders[me].y;
-    if (outMeZ) *outMeZ = g_radRiders[me].z;
-    int myLaps = 0; { int ei = RadFindEntry(g_radRiders[me].raceNum);
-                      if (ei >= 0) myLaps = g_radEntries[ei].numLaps; }
-    float meu, mev; GroundUV(g_radRiders[me].x, g_radRiders[me].y, g_radRiders[me].z, meu, mev);
-    const float a  = (RAD_YAW_SIGN * myYawDeg + RAD_YAW_OFFSET) * RAD_DEG_TO_RAD;
-    const float ca = cosf(a), sa = sinf(a);
-
-    int count = 0;
-    for (int i = 0; i < g_radN && count < maxOut; ++i) {
-        if (i == me) continue;
-        const RadRider& r = g_radRiders[i];
-        float ru, rv; GroundUV(r.x, r.y, r.z, ru, rv);
-        float du = ru - meu, dv = rv - mev;
-        // rotate world delta into heading-up radar space (forward -> +ry/up)
-        float rx =  du * ca - dv * sa;
-        float ry =  du * sa + dv * ca;
-        float dist = sqrtf(du*du + dv*dv);
-        int lap = 0; { int ei = RadFindEntry(r.raceNum);
-                       if (ei >= 0) { int l = g_radEntries[ei].numLaps;
-                                      lap = (l > myLaps) ? +1 : (l < myLaps ? -1 : 0); } }
-        RadBlip& b = out[count++];
-        b.rx = rangeM > 0 ? rx / rangeM : 0; b.ry = rangeM > 0 ? ry / rangeM : 0;
-        // clamp to the disc; riders past range sit on the rim
-        float m = sqrtf(b.rx*b.rx + b.ry*b.ry);
-        if (m > 1.0f) { b.rx /= m; b.ry /= m; }
-        b.dist = dist; b.bearing = atan2f(rx, ry);   // 0 = ahead, +right
-        b.wx = r.x; b.wy = r.y; b.wz = r.z; b.yawDeg = r.yawDeg; b.lap = lap; b.raceNum = r.raceNum;
-    }
-    return count;
-}
 
 // One line the first time each plugin callback fires, with the size the game passed.
 // Without this a callback that arrives with an unexpected payload size is indistinguishable
@@ -3563,174 +3505,6 @@ static void SessionPublish() {
     frostmod::session::EndWrite(*block);
 }
 
-// ---- lap-status colors (shared by both render paths) ------------------------
-// same lap = white, they're lapping you = red, you're lapping them = blue.
-static void LapColorRGB(int lap, float& r, float& g, float& b) {
-    if (lap > 0)      { r = 1.00f; g = 0.32f; b = 0.32f; }   // red
-    else if (lap < 0) { r = 0.40f; g = 0.70f; b = 1.00f; }   // blue
-    else              { r = 0.94f; g = 0.96f; b = 1.00f; }   // white
-}
-
-
-// ---- camera view-projection capture (fixed-function OpenGL) -----------------
-// The engine sets a perspective PROJECTION then loads the camera view as the
-// first MODELVIEW before any per-object matrix. We snoop glMatrixMode +
-// glLoadMatrixf to grab both, compose VP = Proj * View (column-major), and
-// validate it each frame by projecting known riders. g_inOverlay suppresses
-// capture while OUR overlay is drawing its own ortho matrices.
-using glMatrixMode_t  = void (WINAPI*)(GLenum);
-using glLoadMatrixf_t = void (WINAPI*)(const GLfloat*);
-static glMatrixMode_t  g_origGlMatrixMode  = nullptr;
-static glLoadMatrixf_t g_origGlLoadMatrixf = nullptr;
-
-// The rest of the fixed-function matrix surface, hooked for the diagnostic only.
-//
-// The capture below has never once seen a perspective projection: five sessions of reporter
-// logs across three GPUs hold 18,081 loadMatrix lines and not a single persp=1, so `g_vp` is
-// never composed and the outline has always fallen back to arrows. Two holes in the evidence
-// are worth closing before concluding the game keeps its camera somewhere we can't reach.
-//
-// The first is WHEN: the dump is armed from the first presented frame, which is the main menu.
-// A menu that draws in ortho says nothing about the pass that draws the track.
-//
-// The second is WHAT: only glLoadMatrixf was ever watched. An engine that sets its projection
-// with glFrustum, or builds it with glMultMatrixf, or uploads row-major with
-// glLoadTransposeMatrixf, is completely invisible to that one hook — and that is a far cheaper
-// explanation for a silent capture than "it is all shaders".
-using glMultMatrixf_t          = void (WINAPI*)(const GLfloat*);
-using glLoadTransposeMatrixf_t = void (WINAPI*)(const GLfloat*);
-using glFrustum_t              = void (WINAPI*)(double, double, double, double, double, double);
-using glGetFloatv_t            = void (WINAPI*)(GLenum, GLfloat*);
-static glMultMatrixf_t          g_origGlMultMatrixf          = nullptr;
-static glLoadTransposeMatrixf_t g_origGlLoadTransposeMatrixf = nullptr;
-static glFrustum_t              g_origGlFrustum              = nullptr;
-static glGetFloatv_t            g_pGlGetFloatv               = nullptr;
-
-static std::atomic<bool> g_inOverlay{false};
-static std::atomic<bool> g_vpValid{false};
-static std::atomic<int>  g_glDiag{0};          // >0 => log the next N matrix loads once
-static GLenum g_glMode = 0;
-static bool   g_projPrimed = false;
-static float  g_capProj[16], g_capView[16], g_vp[16];
-
-static bool IsPerspectiveProj(const GLfloat* m) {   // GL column-major perspective
-    return m[15] == 0.0f && m[11] < -0.5f && m[11] > -1.5f;
-}
-static void MatMul16(const float* a, const float* b, float* o) {   // o = a*b, column-major
-    for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) {
-            float s = 0; for (int k = 0; k < 4; ++k) s += a[k*4 + r] * b[c*4 + k];
-            o[c*4 + r] = s;
-        }
-}
-void WINAPI hkGlMatrixMode(GLenum mode) { g_glMode = mode; g_origGlMatrixMode(mode); }
-
-/// One line per matrix seen while the diagnostic is armed, whichever call carried it.
-static void DiagMatrix(const char* via, const GLfloat* m) {
-    const int left = g_glDiag.load(std::memory_order_relaxed);
-    if (left <= 0 || !m) return;
-    Log("[esp/diag] %s mode=0x%X persp=%d m11=%.3f m15=%.3f", via, g_glMode, (int)IsPerspectiveProj(m),
-        m[11], m[15]);
-    g_glDiag.store(left - 1, std::memory_order_relaxed);
-}
-
-void WINAPI hkGlMultMatrixf(const GLfloat* m) {
-    DiagMatrix("multMatrix", m);
-    g_origGlMultMatrixf(m);
-}
-void WINAPI hkGlLoadTransposeMatrixf(const GLfloat* m) {
-    // Row-major, so the perspective row sits where the test doesn't look; logged raw and read
-    // by eye rather than run through IsPerspectiveProj, which would always say no.
-    const int left = g_glDiag.load(std::memory_order_relaxed);
-    if (left > 0 && m) {
-        Log("[esp/diag] loadTranspose mode=0x%X m3=%.3f m7=%.3f m11=%.3f m15=%.3f", g_glMode, m[3], m[7],
-            m[11], m[15]);
-        g_glDiag.store(left - 1, std::memory_order_relaxed);
-    }
-    g_origGlLoadTransposeMatrixf(m);
-}
-void WINAPI hkGlFrustum(double l, double r, double b, double t, double n, double f) {
-    // A projection built here never passes through glLoadMatrixf at all, so the capture would
-    // never see it however long it watched.
-    const int left = g_glDiag.load(std::memory_order_relaxed);
-    if (left > 0) {
-        Log("[esp/diag] glFrustum mode=0x%X l=%.3f r=%.3f b=%.3f t=%.3f near=%.3f far=%.1f", g_glMode, l,
-            r, b, t, n, f);
-        g_glDiag.store(left - 1, std::memory_order_relaxed);
-    }
-    g_origGlFrustum(l, r, b, t, n, f);
-}
-void WINAPI hkGlLoadMatrixf(const GLfloat* m) {
-    // glLoadMatrixf is hot; only do capture work when the outline feature (or the
-    // one-shot diagnostic) actually needs it. Otherwise this is a cheap passthrough.
-    if (m && !g_inOverlay.load(std::memory_order_relaxed)
-        && (g_espOn.load(std::memory_order_relaxed) || g_glDiag.load(std::memory_order_relaxed))) {
-        DiagMatrix("loadMatrix", m);
-        if (g_glMode == GL_PROJECTION && IsPerspectiveProj(m)) {
-            memcpy(g_capProj, m, sizeof(g_capProj)); g_projPrimed = true;
-        } else if (g_glMode == GL_MODELVIEW && g_projPrimed) {
-            memcpy(g_capView, m, sizeof(g_capView)); g_projPrimed = false;
-            MatMul16(g_capProj, g_capView, g_vp);    // VP ready; validated per frame
-        }
-    }
-    g_origGlLoadMatrixf(m);
-}
-
-/// What the matrix state is at the moment the plugin is asked to draw, and then a window on
-/// the calls around it.
-///
-/// Two answers in one: the projection read here settles whether a plugin could ever take the
-/// camera by reading current state (if it is ortho, it could not, and no amount of care with
-/// glGetFloatv changes that), and arming the dump from here puts the next few hundred matrix
-/// calls in the log with the track on screen rather than the menu.
-static void DiagOnTrackOnce() {
-    if (g_pGlGetFloatv) {
-        GLfloat proj[16] = {0}, view[16] = {0};
-        g_pGlGetFloatv(GL_PROJECTION_MATRIX, proj);
-        g_pGlGetFloatv(GL_MODELVIEW_MATRIX, view);
-        Log("[esp/diag] on track: Draw() projection persp=%d m11=%.3f m15=%.3f", (int)IsPerspectiveProj(proj),
-            proj[11], proj[15]);
-        Log("[esp/diag] on track: Draw() modelview m12=%.2f m13=%.2f m14=%.2f m15=%.3f", view[12], view[13],
-            view[14], view[15]);
-    } else {
-        Log("[esp/diag] on track: no glGetFloatv, so the state at Draw() can't be read");
-    }
-    g_glDiag.store(400, std::memory_order_relaxed);
-    Log("[esp/diag] on track: watching the next 400 matrix calls");
-}
-
-// Raw projection through the captured VP (no validity gate). *sx,*sy = normalized
-// screen (0..1, top-left origin); *w = clip w (view depth). Returns false if the
-// point is at/behind the camera plane.
-static bool VPProject01(float x, float y, float z, float* sx, float* sy, float* w) {
-    const float* m = g_vp;
-    float cx = m[0]*x + m[4]*y + m[8]*z  + m[12];
-    float cy = m[1]*x + m[5]*y + m[9]*z  + m[13];
-    float cw = m[3]*x + m[7]*y + m[11]*z + m[15];
-    if (cw <= 0.0001f) return false;                 // behind camera
-    *sx = (cx / cw) * 0.5f + 0.5f; *sy = 0.5f - (cy / cw) * 0.5f; *w = cw;
-    return true;
-}
-// Public projector: only succeeds when the VP passed this frame's validation AND
-// the point lands on-screen.
-static bool WorldToScreen01(float x, float y, float z, float* sx, float* sy, float* w) {
-    if (!g_vpValid.load(std::memory_order_relaxed)) return false;
-    if (!VPProject01(x, y, z, sx, sy, w)) return false;
-    return (*sx >= 0 && *sx <= 1 && *sy >= 0 && *sy <= 1);
-}
-
-// Validate the captured VP each frame: project my own world pos + require it to
-// land on-screen with positive depth. Cheap gate; on failure ESP uses arrows.
-static void RadValidateVP() {
-    if (g_vp[15] == 0 && g_vp[0] == 0) { g_vpValid.store(false); return; }   // never captured
-    float meYawDeg, mx, my, mz; RadBlip tmp[1];
-    if (RadBuildBlips(tmp, 1, g_radarRange, &meYawDeg, &mx, &my, &mz) < 0) { g_vpValid.store(false); return; }
-    float sx, sy, w;
-    bool ok = VPProject01(mx, my + 1.0f, mz, &sx, &sy, &w) && w > 0
-              && sx > -0.5f && sx < 1.5f && sy > -0.5f && sy < 1.5f;   // generous: I'm ~on screen
-    g_vpValid.store(ok, std::memory_order_relaxed);
-}
-
 // ---------------------------------------------------------------------------
 // in-game overlay - a corner hint drawn with immediate-mode GL inside the
 // wglSwapBuffers hook, plus the F8 menu and a transient post-reload status line.
@@ -3751,22 +3525,27 @@ char                   g_statusText[128] = {0};
 
 // The FrostMod menu (F8). One entry per action - press its key. New features add a
 // row here instead of another global F-key. Keep labels short (they set the width).
-struct MenuItem { char key; const char* label; bool showsSize; };
+// The F8 menu. `action` is what MenuAction() runs; the key is only what is shown and
+// pressed. `dev` rows show only with devmenu=1 in frostmod_radar.cfg, and sit last.
+struct MenuItem { char key; const char* label; bool showsSize; int action; bool dev; };
 static const MenuItem kMenu[] = {
-    { '1', "Reload mods" },
-    { '2', "Toggle this overlay" },
-    { '3', "Bike model swap" },
-    { '4', "Radar (riders around you)" },
-    { '5', "Rider outlines" },
-    { '6', "Overlay size", true },
-    { '7', "Hide overlay (recording)" },
-    { '8', "Server announcements" },
-    { '9', "Rebuild riders (experimental)" },
-    { '0', "Change bike / gear (pits)" },
+    { '1', "Reload mods",                   false, 1  },
+    { '2', "Change bike / gear (pits)",     false, 10 },
+    { '3', "Bike model swap",               false, 3  },
+    { '4', "Server announcements",          false, 8  },
+    { '5', "Overlay size",                  true,  6  },
+    { '6', "Toggle this overlay",           false, 2  },
+    { '7', "Hide overlay (recording)",      false, 7  },
+    { '8', "Rebuild riders (experimental)", false, 9, true },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
-static const int kMenuCount = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
+static const int kMenuRows = (int)(sizeof(kMenu) / sizeof(kMenu[0]));
+static int MenuCount() {                 // the rows shown: the dev rows only on request
+    int n = 0;
+    for (int i = 0; i < kMenuRows; ++i) if (!kMenu[i].dev || g_devMenu) ++n;
+    return n;
+}
 
 // A row's text, for both renderers. The size row carries its current value, so pressing
 // 6 reads as a setting changing rather than as nothing happening.
@@ -4041,71 +3820,7 @@ static void DrawModelSwap(int w, int h, int lh) {
 }
 
 // ---- radar + ESP, GL immediate-mode (used in injected/menu contexts) --------
-static void GlCircle(int cx, int cy, int r, bool fill) {
-    glBegin(fill ? GL_TRIANGLE_FAN : GL_LINE_LOOP);
-    if (fill) glVertex2i(cx, cy);
-    for (int i = 0; i <= 48; ++i) {
-        float a = (float)i / 48.0f * 6.2831853f;
-        glVertex2i(cx + (int)(cosf(a) * r), cy + (int)(sinf(a) * r));
-    }
-    glEnd();
-}
-static void GlTri(int x0,int y0,int x1,int y1,int x2,int y2) {
-    glBegin(GL_TRIANGLES); glVertex2i(x0,y0); glVertex2i(x1,y1); glVertex2i(x2,y2); glEnd();
-}
-static void GlRectOutline(int x0,int y0,int x1,int y1,int t) {
-    FillRect(x0,y0,x1,y0+t); FillRect(x0,y1-t,x1,y1);
-    FillRect(x0,y0,x0+t,y1); FillRect(x1-t,y0,x1,y1);
-}
 static float ClampF(float v,float lo,float hi){ return v<lo?lo:(v>hi?hi:v); }
-
-// The heading-up radar disc, top-right corner. Blips colored by lap status.
-static void DrawRadarGL(int w, int h) {
-    const int R = 92, M = 18, cx = w - M - R, cy = h - M - R;   // GL y-up: top-right
-    glColor4f(0.03f,0.05f,0.09f,0.72f); GlCircle(cx,cy,R,true);
-    glColor4f(0.45f,0.55f,0.72f,0.55f); GlCircle(cx,cy,R,false); GlCircle(cx,cy,R/2,false);
-    glColor4f(0.30f,0.38f,0.52f,0.5f);
-    FillRect(cx-R,cy-1,cx+R,cy+1); FillRect(cx-1,cy-R,cx+1,cy+R);
-    glColor4f(0.55f,0.85f,1.0f,1.0f);                          // "you" arrow, points up
-    GlTri(cx,cy+9, cx-6,cy-6, cx+6,cy-6);
-    RadBlip blips[64]; float meYawDeg,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
-    for (int i = 0; i < n; ++i) {
-        float r,g,b; LapColorRGB(blips[i].lap,r,g,b); glColor4f(r,g,b,1.0f);
-        int bx = cx + (int)(blips[i].rx * R), by = cy + (int)(blips[i].ry * R);
-        FillRect(bx-3,by-3,bx+3,by+3);
-    }
-    glColor4f(0.6f,0.66f,0.76f,1.0f);
-    char lbl[32]; sprintf_s(lbl,"RADAR %dm", (int)g_radarRange);
-    GlText(cx-R, cy+R+14, lbl);
-}
-
-// On-screen rider outlines. Box when the VP projects them on-screen; otherwise a
-// screen-edge directional arrow (needs no matrix). Colored by lap status.
-static void DrawEspGL(int w, int h) {
-    RadBlip blips[64]; float meYawDeg,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
-    if (n < 0) return;
-    const bool vp = g_vpValid.load(std::memory_order_relaxed);
-    const int scx = w/2, scy = h/2;
-    for (int i = 0; i < n; ++i) {
-        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
-        float sx,sy,wd;
-        if (vp && WorldToScreen01(blips[i].wx, blips[i].wy, blips[i].wz, &sx,&sy,&wd)) {
-            int px = (int)(sx*w), py = (int)((1.0f-sy)*h);      // 0..1 top-left -> GL y-up
-            int hw = (int)ClampF(1400.0f/wd, 8.0f, 140.0f), hh = hw*2;
-            glColor4f(r,g,b,0.95f); GlRectOutline(px-hw, py, px+hw, py+hh, 2);
-        } else {
-            // edge arrow: bearing 0 = ahead(up), +right. GL y-up so ahead = +y.
-            float dx = sinf(blips[i].bearing), dy = cosf(blips[i].bearing);
-            float rad = (float)(h < w ? h : w) * 0.34f;
-            int ax = scx + (int)(dx*rad), ay = scy + (int)(dy*rad);
-            int tx = (int)(dx*10), ty = (int)(dy*10), nx = (int)(-dy*6), ny = (int)(dx*6);
-            glColor4f(r,g,b,0.9f);
-            GlTri(ax+tx, ay+ty, ax-tx+nx, ay-ty+ny, ax-tx-nx, ay-ty-ny);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // server announcements
@@ -4375,7 +4090,7 @@ void DrawOverlay(HDC hdc) {
     // possible to hide the overlay and lose the way back to it.
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load() && !MsgFeedLive()) return;
+        && !g_chOpen.load() && !MsgFeedLive()) return;
 
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -4413,7 +4128,6 @@ void DrawOverlay(HDC hdc) {
         strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
     }
 
-    g_inOverlay.store(true, std::memory_order_relaxed);   // don't let our ortho corrupt VP capture
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
     glOrtho(0, w, 0, h, -1, 1);                  // origin bottom-left, design pixels
@@ -4435,7 +4149,7 @@ void DrawOverlay(HDC hdc) {
         DrawDirectConnect(w, h, lh);
     } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
-        const int rows = kMenuCount + 2;         // title + items + footer
+        const int rows = MenuCount() + 2;        // title + items + footer
         const int bw = 280, bh = rows * lh + 8;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
         glColor4f(0.04f, 0.05f, 0.08f, 0.86f);
@@ -4444,7 +4158,7 @@ void DrawOverlay(HDC hdc) {
         glColor4f(0.47f, 0.78f, 1.0f, 1.0f);
         GlText(x0 + 8, y, "FrostMod v" FROSTMOD_VERSION "  -  menu"); y -= lh;
         glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
-        for (int i = 0; i < kMenuCount; ++i) {
+        for (int i = 0; i < MenuCount(); ++i) {
             char row[96]; MenuRowText(i, row, sizeof(row));
             GlText(x0 + 8, y, row); y -= lh;
         }
@@ -4470,20 +4184,10 @@ void DrawOverlay(HDC hdc) {
     // so a styled line reads as part of the conversation rather than as a separate HUD.
     DrawMessagesGL(w, lh, w > 0 ? (float)pw / (float)w : 1.0f);
 
-    if (g_radarOn.load()) DrawRadarGL(w, h);     // HUD overlays draw on top of any panel
-    if (g_espOn.load()) {
-        // Outlines box riders on screen, so they track the resolution but NOT the user's
-        // overlay size - at 150% the boxes would stop fitting the riders they mark.
-        const int ew = (int)(pw / autoS), eh = (int)(ph / autoS);
-        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, ew, 0, eh, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        DrawEspGL(ew, eh);
-    }
 
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW);  glPopMatrix();
     glPopAttrib();
-    g_inOverlay.store(false, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -4551,55 +4255,6 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
     t.m_iFont = 1; t.m_fSize = size * g_dScale; t.m_iJustify = 0; t.m_ulColor = abgr;
 }
 
-// PiBoSo mirror of the radar/ESP HUD. Normalized 0..1, top-left origin; the disc
-// is drawn in an aspect-corrected square (assume 16:9 - Draw() gives no resolution).
-// Quad budget is shared (cap 64), so blips/boxes are capped to stay within it.
-static constexpr float PB_ASPECT = 9.0f / 16.0f;   // narrow x so the disc isn't stretched
-static void EmitRadarPiBoSo() {
-    const float cx = 0.905f, cy = 0.135f, Ry = 0.105f, Rx = Ry * PB_ASPECT;
-    DQuad(cx - Rx*1.12f, cy - Ry*1.12f, cx + Rx*1.12f, cy + Ry*1.12f, ToABGR(0.03f,0.05f,0.09f,0.72f));
-    DQuad(cx - 0.004f*PB_ASPECT, cy - Ry, cx + 0.004f*PB_ASPECT, cy + Ry, ToABGR(0.30f,0.38f,0.52f,0.5f)); // v axis
-    DQuad(cx - Rx, cy - 0.004f, cx + Rx, cy + 0.004f, ToABGR(0.30f,0.38f,0.52f,0.5f));                     // h axis
-    DQuad(cx - 0.010f*PB_ASPECT, cy - 0.012f, cx + 0.010f*PB_ASPECT, cy + 0.006f, ToABGR(0.55f,0.85f,1.0f,1.0f)); // "you"
-    RadBlip blips[64]; float meYawDeg,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
-    int drawn = 0;
-    for (int i = 0; i < n && drawn < 22; ++i) {
-        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
-        float bx = cx + blips[i].rx * Rx;
-        float by = cy - blips[i].ry * Ry;         // top-left origin: ahead(+ry) -> up(-y)
-        float s = 0.006f;
-        DQuad(bx - s*PB_ASPECT, by - s, bx + s*PB_ASPECT, by + s, ToABGR(r,g,b,1.0f));
-        ++drawn;
-    }
-    DText(cx - Rx, cy + Ry*1.12f + 0.006f, "RADAR", ToABGR(0.6f,0.66f,0.76f,1.0f), 0.017f);
-}
-static void EmitEspPiBoSo() {
-    RadBlip blips[64]; float meYawDeg,mx,my,mz;
-    int n = RadBuildBlips(blips,64,g_radarRange,&meYawDeg,&mx,&my,&mz);
-    if (n < 0) return;
-    const bool vp = g_vpValid.load(std::memory_order_relaxed);
-    int boxes = 0;
-    for (int i = 0; i < n && boxes < 10; ++i) {
-        float r,g,b; LapColorRGB(blips[i].lap,r,g,b);
-        unsigned long col = ToABGR(r,g,b,0.95f);
-        float sx,sy,wd;
-        if (vp && WorldToScreen01(blips[i].wx, blips[i].wy, blips[i].wz, &sx,&sy,&wd)) {
-            float hh = ClampF(1.6f/wd, 0.012f, 0.16f), hw = hh * 0.5f * PB_ASPECT; // taller than wide
-            float x0 = sx - hw, x1 = sx + hw, y0 = sy - hh, y1 = sy + hh, t = 0.0025f;
-            DQuad(x0, y0, x1, y0+t, col); DQuad(x0, y1-t, x1, y1, col);      // hollow box (4 quads)
-            DQuad(x0, y0, x0+t*PB_ASPECT, y1, col); DQuad(x1-t*PB_ASPECT, y0, x1, y1, col);
-            ++boxes;
-        } else {
-            // fallback marker: a dot on a centered ring in the rider's direction
-            float dx = sinf(blips[i].bearing), dy = -cosf(blips[i].bearing);  // ahead -> up
-            float ax = 0.5f + dx*0.34f*PB_ASPECT, ay = 0.5f + dy*0.34f, s = 0.006f;
-            DQuad(ax - s*PB_ASPECT, ay - s, ax + s*PB_ASPECT, ay + s, col);
-            ++boxes;
-        }
-    }
-}
-
 // Fill g_drawQuads/g_drawStrs from the same overlay state DrawOverlay() reads.
 // Normalized-coord mirror of DrawOverlay: quads are backgrounds/highlights/bars
 // (no font needed), strings are labels (font index 1). Panel widths are fractions
@@ -4609,12 +4264,10 @@ static void BuildOverlayDrawLists() {
     if (g_cleanView.load()) return;      // hand the engine nothing at all
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
-        && !g_chOpen.load() && !g_radarOn.load() && !g_espOn.load()) return;
+        && !g_chOpen.load()) return;
 
     // HUD overlays draw first (independent of the modal panel chain below), so the
     // panels' quads sit on top of them and both share the 64-quad budget.
-    if (g_espOn.load())   EmitEspPiBoSo();
-    if (g_radarOn.load()) EmitRadarPiBoSo();
     g_dScale = UiUserScale();                 // from here on: the panels
 
     const bool reloading = g_reloadActive.load();
@@ -4784,12 +4437,12 @@ static void BuildOverlayDrawLists() {
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
     } else if (menu) {
-        const int rows = kMenuCount + 2;
+        const int rows = MenuCount() + 2;
         const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
         DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.86f));
         float y = MY + 0.006f;
         DText(MX + PADX, y, "FrostMod v" FROSTMOD_VERSION "  -  menu", cBlue, FS); y += LH;
-        for (int i = 0; i < kMenuCount; ++i) {
+        for (int i = 0; i < MenuCount(); ++i) {
             char row[96]; MenuRowText(i, row, sizeof(row));
             DText(MX + PADX, y, row, cWhite, FS); y += LH;
         }
@@ -4950,18 +4603,12 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
 void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
 extern std::atomic<bool> g_chOpen;
-void MenuAction(int d) {
+void MenuAction(int d) {   // d = the row's action, not its key
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
     case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
-    case 4: { bool on = !g_radarOn.load(); g_radarOn.store(on); SaveOverlaySettings();
-              SetStatus(on ? "radar: on" : "radar: off", 1500);
-              Log("[radar] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
-    case 5: { bool on = !g_espOn.load(); g_espOn.store(on); SaveOverlaySettings();
-              SetStatus(on ? "rider outlines: on" : "rider outlines: off", 1500);
-              Log("[esp] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     case 6: UiCycleScale(); SaveOverlaySettings();                // menu stays OPEN, so
             Log("[overlay] size %d%%", g_uiPct.load()); break;     // the change is visible
     // Closes the menu on the way out: the whole point is a clean frame, and a menu left
@@ -4973,7 +4620,7 @@ void MenuAction(int d) {
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
-    case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // the '0' row
+    case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // change bike / gear
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -5132,15 +4779,12 @@ void Tick() {
     }
     prevF8 = f8;
     if (g_menuOpen.load()) {
-        for (int d = 1; d <= 9; ++d) {                       // digit -> menu action
-            bool k = (GetAsyncKeyState('0' + d) & 0x8000) != 0;
-            if (k && !prevDigit[d] && d <= kMenuCount) MenuAction(d);
+        for (int i = 0; i < MenuCount(); ++i) {              // a row's key -> its action
+            const int d = kMenu[i].key - '0';
+            if (d < 0 || d > 9) continue;
+            bool k = (GetAsyncKeyState(kMenu[i].key) & 0x8000) != 0;
+            if (k && !prevDigit[d]) MenuAction(kMenu[i].action);
             prevDigit[d] = k;
-        }
-        {   // '0' is the tenth row
-            bool k = (GetAsyncKeyState('0') & 0x8000) != 0;
-            if (k && !prevDigit[0] && kMenuCount >= 10) MenuAction(10);
-            prevDigit[0] = k;
         }
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
@@ -5342,39 +4986,12 @@ void Tick() {
     // Linux, which is outside the Wine prefix we're running in. Rate-limited internally.
     PollCommandFiles();
 
-    // Radar range adjust (PageUp/PageDown) while the radar is shown; validate the
-    // captured camera matrix each frame so the ESP can fall back to arrows if it drifts.
-    if (g_radarOn.load() || g_espOn.load()) {
-        static bool prevPgUp = false, prevPgDn = false;
-        bool pu = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;   // PageUp
-        bool pd = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;   // PageDown
-        if (pu && !prevPgUp) { g_radarRange = ClampF(g_radarRange + 20.0f, 20.0f, 400.0f); SaveOverlaySettings(); }
-        if (pd && !prevPgDn) { g_radarRange = ClampF(g_radarRange - 20.0f, 20.0f, 400.0f); SaveOverlaySettings(); }
-        prevPgUp = pu; prevPgDn = pd;
-        RadValidateVP();
-    }
-
     DrainGameThreadTasks();
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 
-// One-shot: log the GL pipeline identity + arm a short matrix-flow dump. Tells us
-// (from the tester's log) whether fixed-function VP capture is viable or we must
-// pivot to a shader/uniform capture for the ESP. Read-only.
-static void LogGlInfoOnce() {
-    static bool done = false; if (done) return; done = true;
-    const char* ver = (const char*)glGetString(GL_VERSION);
-    const char* sl  = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
-    const char* rnd = (const char*)glGetString(GL_RENDERER);
-    GLint vp[4] = {0,0,0,0}; glGetIntegerv(GL_VIEWPORT, vp);
-    Log("[esp/diag] GL_VERSION='%s' GLSL='%s' RENDERER='%s' viewport=%dx%d",
-        ver ? ver : "?", sl ? sl : "?", rnd ? rnd : "?", vp[2], vp[3]);
-    g_glDiag.store(240, std::memory_order_relaxed);   // dump the next ~240 matrix loads
-}
-
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
 BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
-    LogGlInfoOnce();
     Tick();
     // Draw the GL overlay only when the sanctioned Draw() path is NOT feeding the
     // engine this frame. On track the game calls Draw() every frame (g_drawCalls
@@ -6372,27 +5989,6 @@ DWORD WINAPI Init(LPVOID) {
         if (auto p = GetProcAddress(gl, "wglSwapBuffers"))
             InstallHook((void*)p, &hkWglSwapBuffers,
                         (void**)&g_origWglSwapBuffers, "opengl32!wglSwapBuffers");
-        // camera view-projection capture for the rider outlines (ESP). Snoop the
-        // fixed-function matrix calls; if the engine is core-profile these never
-        // fire and g_vp stays uncaptured (ESP falls back to directional arrows).
-        if (auto p = GetProcAddress(gl, "glMatrixMode"))
-            InstallHook((void*)p, &hkGlMatrixMode,  (void**)&g_origGlMatrixMode,  "opengl32!glMatrixMode");
-        if (auto p = GetProcAddress(gl, "glLoadMatrixf"))
-            InstallHook((void*)p, &hkGlLoadMatrixf, (void**)&g_origGlLoadMatrixf, "opengl32!glLoadMatrixf");
-        // The rest of the matrix surface, for the on-track diagnostic: a projection set with
-        // glFrustum, built with glMultMatrixf, or uploaded row-major never reaches the capture
-        // above, so its silence would prove nothing about the engine.
-        if (auto p = GetProcAddress(gl, "glMultMatrixf"))
-            InstallHook((void*)p, &hkGlMultMatrixf, (void**)&g_origGlMultMatrixf, "opengl32!glMultMatrixf");
-        if (auto p = GetProcAddress(gl, "glLoadTransposeMatrixf"))
-            InstallHook((void*)p, &hkGlLoadTransposeMatrixf, (void**)&g_origGlLoadTransposeMatrixf,
-                        "opengl32!glLoadTransposeMatrixf");
-        if (auto p = GetProcAddress(gl, "glFrustum"))
-            InstallHook((void*)p, &hkGlFrustum, (void**)&g_origGlFrustum, "opengl32!glFrustum");
-        // Read, never hooked: what the matrix state actually is when the plugin is asked to
-        // draw. If the projection there is ortho, reading it in Draw can never give a camera,
-        // which retires that idea with a measurement instead of an argument.
-        g_pGlGetFloatv = (glGetFloatv_t)GetProcAddress(gl, "glGetFloatv");
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
     }
@@ -6790,17 +6386,6 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
         return;
     }
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
-    // The diagnostic that matters, armed the first time the plugin is asked to draw ON TRACK.
-    // The existing one arms at the first presented frame, which is the main menu — and a menu
-    // drawing in ortho says nothing about the pass that draws the track. This is the gap that
-    // has kept the question open.
-    if (_iState == 0) {
-        static bool armed = false;
-        if (!armed) {
-            armed = true;
-            DiagOnTrackOnce();
-        }
-    }
     // The one signal that says where the player was when the game died: the game only
     // calls Draw() on track, spectating or in a replay, and it hands us which.
     {

@@ -3582,7 +3582,7 @@ void DrawOverlay(HDC hdc) {
         std::lock_guard<std::mutex> lk(g_statusMutex);
         strncpy_s(line, g_statusText, _TRUNCATE);
     } else {
-        strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
+        strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
     }
 
     g_inOverlay.store(true, std::memory_order_relaxed);   // don't let our ortho corrupt VP capture
@@ -3624,14 +3624,14 @@ void DrawOverlay(HDC hdc) {
         // compact pill: hint / status, or the reload progress bar
         const int bw = 250, bh = reloading ? 38 : 24;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
-        glColor4f(0.04f, 0.05f, 0.08f, 0.72f);
+        glColor4f(0.0f, 0.443f, 0.890f, 0.95f);      // mxbsecure blue #0071e3
         FillRect(x0, y0, x1, y1);
-        glColor4f(0.47f, 0.78f, 1.0f, 1.0f);         // FrostMod light-blue
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);           // white text
         GlText(x0 + 8, y1 - 17, line);
         if (reloading) {                             // progress bar along the bottom
             const int bx0 = x0 + 8, bx1 = x1 - 8, by0 = y0 + 7, by1 = by0 + 6;
-            glColor4f(1.0f, 1.0f, 1.0f, 0.18f); FillRect(bx0, by0, bx1, by1);
-            glColor4f(0.47f, 0.78f, 1.0f, 0.95f);
+            glColor4f(1.0f, 1.0f, 1.0f, 0.25f); FillRect(bx0, by0, bx1, by1);
+            glColor4f(1.0f, 1.0f, 1.0f, 0.95f);
             FillRect(bx0, by0, bx0 + (int)((bx1 - bx0) * frac), by1);
         }
     }
@@ -3960,15 +3960,15 @@ static void BuildOverlayDrawLists() {
             std::lock_guard<std::mutex> lk(g_statusMutex);
             strncpy_s(line, g_statusText, _TRUNCATE);
         } else {
-            strcpy_s(line, "FrostMod v" FROSTMOD_VERSION "   -   F8: menu");
+            strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
         }
         const float w = 0.20f, h = reloading ? 0.060f : 0.034f;
-        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.72f));
-        DText(MX + PADX, MY + 0.006f, line, cBlue, FS);
+        DQuad(MX, MY, MX + w, MY + h, ToABGR(0.0f, 0.443f, 0.890f, 0.95f));   // #0071e3
+        DText(MX + PADX, MY + 0.006f, line, ToABGR(1.0f, 1.0f, 1.0f, 1.0f), FS);
         if (reloading) {
             const float bx0 = MX + PADX, bx1 = MX + w - PADX, by0 = MY + h - 0.014f, by1 = by0 + 0.008f;
-            DQuad(bx0, by0, bx1, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.18f));
-            DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(0.47f, 0.78f, 1.0f, 0.95f));
+            DQuad(bx0, by0, bx1, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.25f));
+            DQuad(bx0, by0, bx0 + (bx1 - bx0) * frac, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.95f));
         }
     }
 }

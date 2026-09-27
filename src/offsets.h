@@ -522,6 +522,9 @@ constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 // That is what RefreshPaints does, after the paints row (0x17320) of the reload has run.
 // Removing a paint is NOT covered: paint_apply with "" is a no-op, not a revert.
 constexpr uintptr_t RVA_PAINTS_LOADER = 0x17320;   // the DIR row in kReloadSteps
+// Every paint list's loader - bike, suit, gloves, boots, helmet, goggles - each a DIR row of
+// kReloadSteps. A paint-only refresh replays just these rows (RequestPaintRefresh).
+constexpr uintptr_t kPaintReloadRvas[] = {0x17320, 0x19330, 0x1A770, 0x1A110, 0x18360, 0x189C0};
 constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
 constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
 constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count

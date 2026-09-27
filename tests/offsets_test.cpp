@@ -80,6 +80,27 @@ static void live_paints_match_the_paints_row() {
     CHECK(row->z1 == mxb::RVA_PAINT_COUNT, "paints count differs from the reload row");
     CHECK(mxb::VEH_HANDLE + 4 <= mxb::VEHICLE_STRIDE, "vehicle handle outside the record");
     CHECK(mxb::VEH_PAINT + 0x20 <= mxb::VEHICLE_STRIDE, "vehicle paint name outside the record");
+
+    // The paint-only refresh replays exactly the paint rows: each must be a DIR row of the
+    // table, and each gear part's paint tables must be the ones those rows rebuild.
+    for (uintptr_t rva : mxb::kPaintReloadRvas) {
+        const RLStep* r = nullptr;
+        for (int i = 0; i < mxb::kReloadStepCount; ++i)
+            if (mxb::kReloadSteps[i].rva == rva) r = &mxb::kReloadSteps[i];
+        CHECK(r && r->dir == 1, "paint row 0x%zx missing or not a DIR step", (size_t)rva);
+    }
+    for (int p = 0; p < mxb::kGearPartCount; ++p)
+        for (int k = 0; k < mxb::kGearParts[p].nsrc; ++k) {
+            const mxb::GearSrc& src = mxb::kGearParts[p].src[k];
+            bool rebuilt = false;
+            for (uintptr_t rva : mxb::kPaintReloadRvas)
+                for (int i = 0; i < mxb::kReloadStepCount; ++i)
+                    if (mxb::kReloadSteps[i].rva == rva && mxb::kReloadSteps[i].z3 == src.table &&
+                        mxb::kReloadSteps[i].z1 == src.count)
+                        rebuilt = true;
+            CHECK(rebuilt, "%s paint table 0x%zx is not rebuilt by a paint row",
+                  mxb::kGearParts[p].what, (size_t)src.table);
+        }
 }
 
 // GP's loaders each clear their own lists and scan both directories, so every step is SC.

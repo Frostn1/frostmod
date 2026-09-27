@@ -623,20 +623,11 @@ constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
 constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
 constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
 constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
-constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0; // int(void* rec+0x274)
-constexpr uintptr_t RVA_VEHICLE_SUBFREE = 0x4FE70; // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})
-constexpr uintptr_t RVA_LOAD_REQUESTS  = 0xE5A6A0; // 100 x 0x40: +0 live, +4 conn id, +0x28 flag, +0x30 vehicle+1
-constexpr int       LOAD_REQUEST_MAX   = 100;
-constexpr int       LOAD_REQUEST_STRIDE = 0x40;
 constexpr uintptr_t RVA_RACE_ENTRY_COUNT = 0x5121D8;
 constexpr uintptr_t RVA_RACE_ENTRY_KEY   = 0x5122A4; // first entry's race number; slot at +0xC
 constexpr int       RACE_ENTRY_STRIDE    = 0x178;
-constexpr uintptr_t RVA_BIKE_PAINTS_ARG  = 0x109DE94; // the int bus 0xCF takes first
-// Vehicle-record fields the teardown touches (see the 0x71D50 loop).
-constexpr int VEH_KEY = 0x0C, VEH_ID = 0x04, VEH_KIND = 0x270, VEH_50A8 = 0x50A8, VEH_LIVE2 = 0x50AC,
-              VEH_ENTITY_ON = 0x50B0, VEH_ENTITY = 0x50B8, VEH_50BC = 0x50BC, VEH_SUB = 0x4EEC,
-              VEH_5838 = 0x5838, VEH_TEAM = 0x5B20, VEH_LINK = 0x5B18;
+constexpr int VEH_LINK = 0x5B18;   // the index kind 15 links (other VEH_* in the rejoin block)
 
 } // namespace mxb
 

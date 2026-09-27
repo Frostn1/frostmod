@@ -4937,6 +4937,12 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
         RequestReload();
+    } else if (verb == "refresh_paints") {
+        // MXB App's paint sync has written or removed .pnt files. The reload rebuilds the
+        // paint lists, and its live-paints pass applies whatever riders on track were
+        // missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
+        Log("[cmd] paint refresh requested by MXB App");
+        RequestReload();
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike

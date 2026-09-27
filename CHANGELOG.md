@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2026-09-26 — v0.39.0
 
 ### Added
 - **A paint you download mid-session shows up on that rider straight away.** Your game picks

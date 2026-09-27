@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Release binaries can be code-signed.** The release build now signs frostmod.exe,
+  frostmod.dll, frostmod.dlo, frostserver.exe, frostserver.dll, frostserver.dlo and
+  mxbcoach.dlo with Azure Artifact Signing before it zips or uploads them, so Windows
+  SmartScreen and antivirus see a verified publisher. It stays off until the Azure secrets
+  are added to this repo; until then releases are unsigned, as before.
+
 ## 2026-09-27 — v0.39.1
 
 ### Fixed

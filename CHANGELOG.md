@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+- **A paint you download mid-session shows up on that rider straight away.** Your game picks
+  each rider's paint once, when their bike is built. If you don't have their paint then, they
+  ride stock until you rejoin, even after the file lands in your paints folder. Now, when you
+  reload mods (R / F8, or MXB App's Reload), FrostMod checks the riders who were stock for
+  want of a paint and applies any that are now installed. Riders already showing their paint
+  are not touched. MX Bikes only. Deleting a paint still leaves it on their bike until you
+  rejoin.
+
 ### Fixed
 - **One crash is one crash report.** When another plugin's crash handler kept resuming a fault,
   the game could sit on the same broken instruction for half a minute, and FrostMod wrote a new

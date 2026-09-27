@@ -67,6 +67,21 @@ static void mx_table_is_unchanged() {
     CHECK(mxb::RVA_RELOAD_MODS == 0xE54B44, "MX reload_mods moved");
 }
 
+// Live paints re-apply against what the paints row of the reload just rebuilt, so the two
+// must name the same table: the row's third global is the table pointer, its first the count.
+static void live_paints_match_the_paints_row() {
+    const RLStep* row = nullptr;
+    for (int i = 0; i < mxb::kReloadStepCount; ++i)
+        if (mxb::kReloadSteps[i].rva == mxb::RVA_PAINTS_LOADER) row = &mxb::kReloadSteps[i];
+    CHECK(row != nullptr, "no reload row for the paints loader 0x%zx", (size_t)mxb::RVA_PAINTS_LOADER);
+    if (!row) return;
+    CHECK(row->dir == 1, "the paints row is not a DIR step");
+    CHECK(row->z3 == mxb::RVA_PAINT_TABLE, "paints table differs from the reload row");
+    CHECK(row->z1 == mxb::RVA_PAINT_COUNT, "paints count differs from the reload row");
+    CHECK(mxb::VEH_HANDLE + 4 <= mxb::VEHICLE_STRIDE, "vehicle handle outside the record");
+    CHECK(mxb::VEH_PAINT + 0x20 <= mxb::VEHICLE_STRIDE, "vehicle paint name outside the record");
+}
+
 // GP's loaders each clear their own lists and scan both directories, so every step is SC.
 // A DIR step appearing here would need z-globals and the two operands, which GP has not
 // had derived - so it would run with zeros. Fail loudly rather than let that ship.
@@ -342,6 +357,7 @@ int main() {
     ghs_guard_constants_agree();
     detours_are_recognised_before_the_signature_check();
     mx_table_is_unchanged();
+    live_paints_match_the_paints_row();
     gp_table_is_all_self_contained();
     unconfirmed_tables_label_every_step();
     only_confirmed_tables_run_unprompted();

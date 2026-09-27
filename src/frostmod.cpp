@@ -1819,6 +1819,8 @@ static bool g_unsafeReload = false;
 // present-thread call site is what kills it.
 static int  g_unsafeReloadFrom = 1;
 
+static void SnapshotMissingPaints();   // live paints, defined after RequestReload
+static void ApplyArrivedPaints();
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
     const void* S = (const void*)(b + g_game->reload_str);   // "" (game dir = cwd)
@@ -1852,6 +1854,7 @@ void AdvanceReload() {
                 g_reloadStart + 1, g_game->reload_count, g_reloadStart);
         else
             Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
+        ApplyArrivedPaints();
         frostmod::crash::Note("content reload finished");
         SetStatus("reloaded - new mods listed", 4000);
     }
@@ -1894,6 +1897,7 @@ void RequestReload() {
     // the same offset rather than claiming work that was never done.
     const int first = (g_unsafeReload && g_unsafeReloadFrom > 1) ? g_unsafeReloadFrom - 1 : 0;
     g_reloadCur = first; g_reloadStart = first; g_reloadDone.store(first); g_reloadPrimed = false;
+    SnapshotMissingPaints();      // which riders are stock only for want of their paint
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
     // The thread id is still logged, but it is no longer the open question: a v0.12.0
     // reporter log has it matching the boot [capture] scan tid in all three sessions, so
@@ -1911,6 +1915,133 @@ void RequestReload() {
     // TEMP DIAGNOSTIC: watch plugin Draw() dispatch for 20s across (and after) this reload.
     g_drawDiagUntil.store(GetTickCount64() + 20000);
     Log("[drawdiag] armed 20s - watching plugin Draw() dispatch across this reload");
+}
+
+// ===========================================================================
+// LIVE PAINTS (add-only)
+//
+// A rider's paint is picked once, when the game builds their bike (0x5CAE0 ->
+// paint_apply 0x4DC50): the name is looked up in the scanned paints table and, if it is
+// there, the .pnt is read from disk and baked into that bike's materials. If it is not
+// there the bike is built stock and nothing ever looks again - which is why a paint MXB
+// App downloads mid-session stays invisible until you rejoin.
+//
+// So: before the reload, note every live rider whose paint name is missing from the
+// table. After the reload has rescanned paints, call the game's own paint_apply for the
+// ones whose paint is now there. Only those - a rider already showing their paint is
+// never touched, so this never re-textures anyone twice.
+//
+// Removing a paint is deliberately not handled: paint_apply with a missing name hands the
+// engine "", which is a no-op rather than a revert to stock.
+//
+// Everything runs on the render thread (RequestReload/AdvanceReload are called from Tick),
+// the same single thread the game builds bikes on.
+using PaintApply_t = int64_t(__fastcall*)(int, const char*, int*);
+
+static bool g_paintMissing[mxb::VEHICLE_MAX];
+
+static bool PaintsSupported() {
+    // MX only: these are beta21e addresses with no GP Bikes / KRP counterpart yet.
+    return g_game->offsets_complete && g_game->reload_steps == mxb::kReloadSteps && g_contentInit;
+}
+
+static uintptr_t VehicleAt(int i) {
+    return g_base + mxb::RVA_VEHICLES + (uintptr_t)i * mxb::VEHICLE_STRIDE;
+}
+
+// Bike-array index of a folder name, the way vehicle create finds it (strcmp), or -1.
+static int BikeIndexOf(const char* folder) {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr))
+        return -1;
+    if (!arr || count <= 0 || count > 100000) return -1;
+    char name[64];
+    for (int i = 0; i < count; ++i) {
+        if (!SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)))
+            continue;
+        if (strcmp(name, folder) == 0) return i;
+    }
+    return -1;
+}
+
+// Is (bike, paint name) in the scanned paints table? Same test as paint_apply: bike index
+// equal, name _stricmp-equal.
+static bool PaintInTable(int bike, const char* paint) {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_PAINT_COUNT));
+    uintptr_t tab = 0;
+    if (SafeReadBytes((const char*)(g_base + mxb::RVA_PAINT_TABLE), (char*)&tab, sizeof(tab)) != sizeof(tab))
+        return false;
+    if (!tab || count <= 0 || count > 1000000) return false;
+    char name[0x84];
+    for (int i = 0; i < count; ++i) {
+        const uintptr_t e = tab + (uintptr_t)i * mxb::PAINT_STRIDE;
+        if (SafeReadInt((const int*)(e + mxb::PAINT_BIKE)) != bike) continue;
+        if (SafeCopyStr((void*)(e + mxb::PAINT_NAME), name, sizeof(name)) && _stricmp(name, paint) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Read one live vehicle's bike folder and paint name. False for a free record, a record
+// without a paint, or anything unreadable.
+static bool ReadVehicle(int i, char (&bike)[32], char (&paint)[32]) {
+    const uintptr_t v = VehicleAt(i);
+    if (SafeReadInt((const int*)v) == 0) return false;
+    if (!SafeCopyStr((void*)(v + mxb::VEH_BIKE), bike, sizeof(bike))) return false;
+    if (!SafeCopyStr((void*)(v + mxb::VEH_PAINT), paint, sizeof(paint))) return false;
+    return bike[0] && paint[0];
+}
+
+static void SnapshotMissingPaints() {
+    memset(g_paintMissing, 0, sizeof(g_paintMissing));
+    if (!PaintsSupported()) return;
+    int n = 0;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        char bike[32], paint[32];
+        if (!ReadVehicle(i, bike, paint)) continue;
+        const int idx = BikeIndexOf(bike);
+        if (idx < 0 || PaintInTable(idx, paint)) continue;
+        g_paintMissing[i] = true;
+        ++n;
+        Log("[paint] rider slot %d: '%s' on %s is not installed - stock for now", i, paint, bike);
+    }
+    if (n) Log("[paint] %d rider(s) waiting on a paint; re-checking after the reload", n);
+}
+
+static bool CallPaintApply(int bike, const char* paint, int* handle) {
+    __try {
+        ((PaintApply_t)(g_base + mxb::RVA_PAINT_APPLY))(bike, paint, handle);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void ApplyArrivedPaints() {
+    if (!PaintsSupported()) return;
+    int applied = 0;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (!g_paintMissing[i]) continue;
+        g_paintMissing[i] = false;
+        char bike[32], paint[32];
+        // Re-read: the rider may have left, or the slot been reused, during the reload.
+        if (!ReadVehicle(i, bike, paint)) continue;
+        const int idx = BikeIndexOf(bike);   // the bike array was rebuilt too
+        if (idx < 0 || !PaintInTable(idx, paint)) continue;
+        int* handle = (int*)(VehicleAt(i) + mxb::VEH_HANDLE);
+        if (SafeReadInt(handle) <= 0) continue;
+        // Logged before the call, like the reload steps: a fault that escapes the guard
+        // still leaves this as the last line.
+        Log("[paint] rider slot %d: applying '%s' on %s (bike %d, handle %d)",
+            i, paint, bike, idx, SafeReadInt(handle));
+        if (CallPaintApply(idx, paint, handle)) ++applied;
+        else Log("[paint] rider slot %d: paint_apply faulted - left as it was", i);
+    }
+    if (applied) {
+        Log("[paint] applied %d newly installed paint(s) to riders on track", applied);
+        SetStatus(applied == 1 ? "new paint applied to 1 rider" : "new paints applied to riders", 4000);
+    }
 }
 
 // ===========================================================================

@@ -1942,7 +1942,9 @@ static bool g_paintMissing[mxb::VEHICLE_MAX];
 
 static bool PaintsSupported() {
     // MX only: these are beta21e addresses with no GP Bikes / KRP counterpart yet.
-    return g_game->offsets_complete && g_game->reload_steps == mxb::kReloadSteps && g_contentInit;
+    // Compared by the title, not by the step table's address: kReloadSteps is a constexpr
+    // array in a header, so every translation unit has its own copy of it.
+    return g_game == &GAME_MXB && g_game->offsets_complete && g_contentInit;
 }
 
 static uintptr_t VehicleAt(int i) {
@@ -1995,18 +1997,19 @@ static bool ReadVehicle(int i, char (&bike)[32], char (&paint)[32]) {
 
 static void SnapshotMissingPaints() {
     memset(g_paintMissing, 0, sizeof(g_paintMissing));
-    if (!PaintsSupported()) return;
-    int n = 0;
+    if (!PaintsSupported()) { Log("[paint] live paints off on this title/build"); return; }
+    int n = 0, riders = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         char bike[32], paint[32];
         if (!ReadVehicle(i, bike, paint)) continue;
+        ++riders;
         const int idx = BikeIndexOf(bike);
         if (idx < 0 || PaintInTable(idx, paint)) continue;
         g_paintMissing[i] = true;
         ++n;
         Log("[paint] rider slot %d: '%s' on %s is not installed - stock for now", i, paint, bike);
     }
-    if (n) Log("[paint] %d rider(s) waiting on a paint; re-checking after the reload", n);
+    Log("[paint] %d rider(s) on track, %d waiting on a paint; re-checking after the reload", riders, n);
 }
 
 static bool CallPaintApply(int bike, const char* paint, int* handle) {
@@ -2029,14 +2032,25 @@ static void ApplyArrivedPaints() {
         if (!ReadVehicle(i, bike, paint)) continue;
         const int idx = BikeIndexOf(bike);   // the bike array was rebuilt too
         if (idx < 0 || !PaintInTable(idx, paint)) continue;
-        int* handle = (int*)(VehicleAt(i) + mxb::VEH_HANDLE);
-        if (SafeReadInt(handle) <= 0) continue;
-        // Logged before the call, like the reload steps: a fault that escapes the guard
+        // Every object the game painted when it built this bike: the ridden bike's parts
+        // in the rider-gfx block, then the cloned stand bike. paint_apply only reads the
+        // handle through the pointer, so it is called once per handle, as 0x4CE00 does.
+        const uintptr_t v = VehicleAt(i);
+        int* handles[_countof(mxb::VEH_GFX_PAINTED) + 1];
+        int nh = 0;
+        for (int off : mxb::VEH_GFX_PAINTED) handles[nh++] = (int*)(v + mxb::VEH_GFX + off);
+        handles[nh++] = (int*)(v + mxb::VEH_HANDLE);
+        // Logged before the calls, like the reload steps: a fault that escapes the guard
         // still leaves this as the last line.
-        Log("[paint] rider slot %d: applying '%s' on %s (bike %d, handle %d)",
-            i, paint, bike, idx, SafeReadInt(handle));
-        if (CallPaintApply(idx, paint, handle)) ++applied;
-        else Log("[paint] rider slot %d: paint_apply faulted - left as it was", i);
+        Log("[paint] rider slot %d: applying '%s' on %s (bike %d, body handle %d)",
+            i, paint, bike, idx, SafeReadInt(handles[0]));
+        int ok = 0;
+        for (int h = 0; h < nh; ++h) {
+            if (SafeReadInt(handles[h]) <= 0) continue;
+            if (CallPaintApply(idx, paint, handles[h])) ++ok;
+            else Log("[paint] rider slot %d: paint_apply faulted on handle %d", i, SafeReadInt(handles[h]));
+        }
+        if (ok) ++applied;
     }
     if (applied) {
         Log("[paint] applied %d newly installed paint(s) to riders on track", applied);

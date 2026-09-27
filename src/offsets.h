@@ -534,7 +534,12 @@ constexpr int       VEHICLE_MAX       = 50;
 constexpr int       VEHICLE_STRIDE    = 0x5B24;    // +0x00 live
 constexpr int       VEH_BIKE          = 0x30;      // bike folder name (roster blob +0x20)
 constexpr int       VEH_PAINT         = 0x90;      // paint name
-constexpr int       VEH_HANDLE        = 0x5B0C;    // int engine object handle of the bike
+constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "stand" bike (0x4CD60)
+// The bike that is actually ridden and drawn is a set of engine objects in the rider-gfx
+// block at +0x274, built by 0x4D8C0 -> 0x4CE00. That builder paints each of these handles
+// with the same .pnt path (bus 0x9E at 0x4CEE1, 0x4CF55 x2, 0x4CF7A/0x4CF86/0x4CF97).
+constexpr int       VEH_GFX           = 0x274;
+constexpr int       VEH_GFX_PAINTED[] = { 0x00, 0x10, 0x14, 0x50, 0x60, 0x70 };
 
 } // namespace mxb
 

@@ -26,15 +26,18 @@ enum class ChangeFree { Wait, Free, Drop };
 //   oldLive    old record's +0x00 is non-zero
 //   oldKey     old record's race number now
 //   elapsedMs  since the accept
-// Free only on a real move to another valid record, and only while the old record still
-// holds what it held (not zeroed, not reused by someone else). A rejoin never arms this.
+// Free only on a real move to another valid record, only while the old record still holds
+// what it held (not zeroed, not reused by someone else), and only inside the timeout: slot
+// and race number do not identify a record across a disconnect, so a stale decision must
+// expire rather than wait for a match. A rejoin never arms this.
 inline ChangeFree DecideChangeFree(const ChangeSnapshot& s, int nowIndex, bool oldLive, int oldKey,
                                    unsigned long long elapsedMs, int vehicleMax,
                                    unsigned long long timeoutMs = 10000) {
     if (s.index < 0 || s.index >= vehicleMax) return ChangeFree::Drop;
+    if (elapsedMs >= timeoutMs) return ChangeFree::Drop;
     if (!oldLive || oldKey != s.key) return ChangeFree::Drop;        // already gone / reused
     if (nowIndex >= 0 && nowIndex < vehicleMax && nowIndex != s.index) return ChangeFree::Free;
-    return elapsedMs >= timeoutMs ? ChangeFree::Drop : ChangeFree::Wait;
+    return ChangeFree::Wait;
 }
 
 }  // namespace frostmod

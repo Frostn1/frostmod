@@ -42,6 +42,9 @@ int main() {
     CHECK(DecideChangeFree(s, -1, true, 17, 16, kMax) == ChangeFree::Wait, "no index yet");
     CHECK(DecideChangeFree(s, 50, true, 17, 16, kMax) == ChangeFree::Wait, "out of range");
 
+    // A move seen only after the timeout is stale: drop, never free.
+    CHECK(DecideChangeFree(s, 7, true, 17, 10000, kMax) == ChangeFree::Drop, "late move drops");
+
     // Nothing snapshotted (not in a session, or a rejoin): never arms.
     CHECK(DecideChangeFree(ChangeSnapshot{}, 7, true, 0, 16, kMax) == ChangeFree::Drop, "no snapshot");
     CHECK(DecideChangeFree(ChangeSnapshot{60, 17}, 7, true, 17, 16, kMax) == ChangeFree::Drop, "bad snapshot");

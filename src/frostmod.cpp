@@ -418,7 +418,7 @@ using FindClose_t = int(__cdecl*)(intptr_t);
 static FindFirst_t g_origFindFirst = nullptr;
 static FindNext_t  g_origFindNext = nullptr;
 static FindClose_t g_findClose = nullptr;
-static bool g_rfHooked = false;
+static bool g_rfHooked = false, g_rfNextHooked = false, g_rfFirstHooked = false;
 
 static std::string RfSibling(const char* name) {
     std::string p = g_logPath;
@@ -460,10 +460,19 @@ void RaceFilterLoad(const char* why) {
             haveFile ? "frostmod_racemode.txt lists no tracks/ or bikes/ mod" : "no frostmod_racemode.txt");
 }
 
+// The game's find functions are the narrow (ANSI code page) ones; the list is UTF-8.
+static std::string RfUtf8(const char* acp) {
+    wchar_t w[MAX_PATH];
+    const int n = MultiByteToWideChar(CP_ACP, 0, acp, -1, w, MAX_PATH);
+    if (n <= 0) return acp;
+    char u[MAX_PATH * 3];
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), nullptr, nullptr) > 0 ? u : acp;
+}
 static bool RfPass(const _finddata64i32_t* fd) {
-    const bool ok = t_rf->Allows(*t_rfScope, fd->name);
-    if (strcmp(fd->name, ".") != 0 && strcmp(fd->name, "..") != 0) {
-        const std::string key = *t_rfScope + "/" + frostmod::RaceFilter::Norm(fd->name);
+    const std::string name = RfUtf8(fd->name);
+    const bool ok = t_rf->Allows(*t_rfScope, name);
+    if (name != "." && name != "..") {
+        const std::string key = *t_rfScope + "/" + frostmod::RaceFilter::Norm(name);
         std::lock_guard<std::mutex> lk(g_rfMutex);
         g_rfSeen.insert(key);
         if (!ok) g_rfHidden.insert(key);
@@ -506,10 +515,13 @@ void RaceFilterEnsureHooks() {
         Log("[racemode] MSVCR90 find functions not found - the list cannot be applied");
         return;
     }
-    // next first: once findfirst is live it calls through g_origFindNext
-    if (!InstallHook((void*)fn, (void*)&hkFindNext, (void**)&g_origFindNext, "MSVCR90!_findnext64i32")) return;
-    if (!InstallHook((void*)ff, (void*)&hkFindFirst, (void**)&g_origFindFirst, "MSVCR90!_findfirst64i32")) return;
-    g_rfHooked = true;
+    // next first: once findfirst is live it calls through g_origFindNext. Each is tracked on
+    // its own so a retry (the race_filter verb) finishes a half-done install.
+    if (!g_rfNextHooked)
+        g_rfNextHooked = InstallHook((void*)fn, (void*)&hkFindNext, (void**)&g_origFindNext, "MSVCR90!_findnext64i32");
+    if (g_rfNextHooked && !g_rfFirstHooked)
+        g_rfFirstHooked = InstallHook((void*)ff, (void*)&hkFindFirst, (void**)&g_origFindFirst, "MSVCR90!_findfirst64i32");
+    g_rfHooked = g_rfNextHooked && g_rfFirstHooked;
 }
 // Once a frame: one line per scan pass saying how much the list hid.
 void RaceFilterTick() {
@@ -2958,6 +2970,9 @@ static void ApplyChange() {
 // After an accept: free the old own-vehicle record once the game has moved off it.
 static void ChFreeOldTick() {
     if (g_chFree.index < 0) return;
+    // Left the server (no accepted identity): whatever was pending belongs to that session.
+    const int idLen = SafeReadInt((const int*)(g_base + mxb::RVA_IDENTITY_LEN));
+    if (idLen < mxb::IDENTITY_MIN || idLen > mxb::IDENTITY_MAX) { g_chFree = {}; return; }
     const uintptr_t v = VehicleAt(g_chFree.index);
     const int now = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
     const auto d = frostmod::DecideChangeFree(g_chFree, now, SafeReadInt((const int*)v) != 0,

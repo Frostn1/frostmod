@@ -2824,9 +2824,35 @@ static bool ChReadIdentity(uint8_t (&blob)[mxb::IDENTITY_MAX], int& len) {
     return SafeReadBytes((const char*)(g_base + mxb::RVA_IDENTITY), (char*)blob, len) == (size_t)len;
 }
 
+// Riding, by the game's own page stack (see PagesShowRiding). -1 = cannot tell (then the
+// server decides, as before).
+static int ChRiding() {
+    const int layer = SafeReadInt((const int*)(g_base + mxb::RVA_PAGE_LAYER));
+    if (layer < 1 || layer > 16) return -1;
+    const uintptr_t st = g_base + mxb::RVA_PAGE_STACKS + (uintptr_t)(layer - 1) * mxb::PAGE_STACK_STRIDE;
+    const int depth = SafeReadInt((const int*)st);
+    if (depth < 0 || depth > mxb::PAGE_STACK_MAX) return -1;
+    char names[mxb::PAGE_STACK_MAX][16] = {};
+    const char* ptrs[mxb::PAGE_STACK_MAX] = {};
+    for (int i = 0; i < depth; ++i) {
+        const int page = SafeReadInt((const int*)(st + 4 + 4 * i));
+        if (page < 1 || page > mxb::PAGE_COUNT) return -1;
+        const uintptr_t name = ReadPtr(mxb::RVA_PAGE_TABLE + (uintptr_t)(page - 1) * mxb::PAGE_STRIDE);
+        if (!name || !SafeCopyStr((void*)name, names[i], sizeof(names[i]))) return -1;
+        ptrs[i] = names[i];
+    }
+    return frostmod::PagesShowRiding(ptrs, depth) ? 1 : 0;
+}
+static const char kChGoToPits[] = "Go to the pits to change bike";
+
 void OpenChange() {
     g_chError.clear();
     if (!PaintsSupported()) { SetStatus("change: not supported here", 3000); return; }
+    if (ChRiding() == 1) {
+        Log("[change] panel refused - on track (page mtrack)");
+        SetStatus(kChGoToPits, 4000);
+        return;
+    }
     uint8_t id[mxb::IDENTITY_MAX] = {0};
     int len = 0;
     if (!ChReadIdentity(id, len)) {
@@ -2925,6 +2951,7 @@ static bool WriteBytes(uintptr_t at, const void* src, size_t n) {
 // Send the picked identity. Frame thread only (called from the key handler in Tick).
 static void ApplyChange() {
     if (g_chPending) { g_chError = "a change is already waiting for the server"; return; }
+    if (ChRiding() == 1) { g_chError = kChGoToPits; Log("[change] not sent - on track"); return; }
     BusFn bus = ResolveBus();
     uint8_t blob[mxb::IDENTITY_MAX] = {0};
     int len = 0;
@@ -3053,7 +3080,8 @@ void HandleChangeKeys() {
 // Panel text, shared by both renderers.
 static int ChangeLines(char (*out)[160], int max) {
     int k = 0;
-    sprintf_s(out[k++], 160, "Change bike / gear   (in the pits; the server decides)");
+    sprintf_s(out[k++], 160, ChRiding() == 1 ? "Change bike / gear   (go to the pits to change bike)"
+                                             : "Change bike / gear   (in the pits; the server decides)");
     for (int i = 0; i < (int)g_chRows.size() && k < max - 2; ++i) {
         const ChRow& r = g_chRows[i];
         sprintf_s(out[k++], 160, "%s %-13s < %s >%s", i == g_chCursor ? ">" : " ", r.label,

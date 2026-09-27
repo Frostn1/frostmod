@@ -622,6 +622,14 @@ constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything
 constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
 constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
 constexpr uintptr_t RVA_OWN_VEHICLE    = 0xE62710; // i32: own vehicle record + 1 (0 = none); a change moves it (0x6ABB0)
+// The UI page stack - which screen the player is on. Map: ui/pages.c.
+constexpr uintptr_t RVA_PAGE_TABLE     = 0x3954F0; // 34 x 0x28: +0 name*, +8 enter, +0x10, +0x18
+constexpr int       PAGE_STRIDE        = 0x28;
+constexpr int       PAGE_COUNT         = 34;
+constexpr uintptr_t RVA_PAGE_LAYER     = 0x4CF9A8; // i32: current layer, 1-based
+constexpr uintptr_t RVA_PAGE_STACKS    = 0xE55CA4; // per layer, stride 0x254: +0 depth, +4 i32 page[4] (1-based)
+constexpr int       PAGE_STACK_STRIDE  = 0x254;
+constexpr int       PAGE_STACK_MAX     = 4;
 constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
 constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
 constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

@@ -49,6 +49,19 @@ int main() {
     CHECK(DecideChangeFree(ChangeSnapshot{}, 7, true, 0, 16, kMax) == ChangeFree::Drop, "no snapshot");
     CHECK(DecideChangeFree(ChangeSnapshot{60, 17}, 7, true, 17, 16, kMax) == ChangeFree::Drop, "bad snapshot");
 
+    // Riding by the page stack: "mtrack" exactly; the pits page "mtrackm" is not riding.
+    {
+        const char* track[] = {"mtrack"};
+        const char* pits[] = {"mtrackm"};
+        const char* menu[] = {"mmain", "mserver"};
+        const char* over[] = {"mtrack", "mpause"};
+        CHECK(frostmod::PagesShowRiding(track, 1), "mtrack is riding");
+        CHECK(!frostmod::PagesShowRiding(pits, 1), "mtrackm is the pits");
+        CHECK(!frostmod::PagesShowRiding(menu, 2), "menus are not riding");
+        CHECK(frostmod::PagesShowRiding(over, 2), "a page over the track is still riding");
+        CHECK(!frostmod::PagesShowRiding(nullptr, 0), "empty stack");
+    }
+
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("changefree: all passed\n");
     return 0;

@@ -21,6 +21,20 @@ struct ChangeSnapshot {
 
 enum class ChangeFree { Wait, Free, Drop };
 
+// Is the player riding? The game's page stack holds "mtrack" while on track; the pits are
+// "mtrackm" (the track menu). A change there is accepted by the server but the game builds
+// the new bike in the pits while the ride goes on without one: a black screen until the
+// player goes back to the pits. So the panel refuses on track.
+inline bool PagesShowRiding(const char* const* names, int n) {
+    for (int i = 0; i < n; ++i) {
+        const char* s = names[i];
+        if (s && s[0] == 'm' && s[1] == 't' && s[2] == 'r' && s[3] == 'a' && s[4] == 'c' &&
+            s[5] == 'k' && s[6] == 0)
+            return true;
+    }
+    return false;
+}
+
 // Decide, once a frame after the accept.
 //   nowIndex   the own-vehicle index now (global minus one)
 //   oldLive    old record's +0x00 is non-zero

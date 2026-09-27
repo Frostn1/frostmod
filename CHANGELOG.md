@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-27 — v0.40.1
+
+### Fixed
+- **Changing bike on track no longer leaves you on a black screen.** The F8 "Change bike /
+  gear" panel now only opens in the pits; on track it says "Go to the pits to change bike".
+  A change the server accepted while you were on track made the game build the new bike in
+  the pits while your ride carried on without one, which left the screen black until you went
+  back to the pits. FrostMod reads which screen you are on from the game itself.
+
 ## 2026-09-27 — v0.40.0
 
 ### Added

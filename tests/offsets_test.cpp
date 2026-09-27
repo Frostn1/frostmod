@@ -83,6 +83,12 @@ static void live_paints_match_the_paints_row() {
 
     // The paint-only refresh replays exactly the paint rows: each must be a DIR row of the
     // table, and each gear part's paint tables must be the ones those rows rebuild.
+    for (uintptr_t rva : mxb::kGearReloadRvas) {
+        bool found = false;
+        for (int i = 0; i < mxb::kReloadStepCount; ++i)
+            if (mxb::kReloadSteps[i].rva == rva) found = true;
+        CHECK(found, "gear row 0x%zx is not in the reload table", (size_t)rva);
+    }
     for (uintptr_t rva : mxb::kPaintReloadRvas) {
         const RLStep* r = nullptr;
         for (int i = 0; i < mxb::kReloadStepCount; ++i)

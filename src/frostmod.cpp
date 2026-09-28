@@ -176,10 +176,21 @@ static bool ReadBasePointer(const char* dllDir, char (&out)[MAX_PATH]) {
     // rather than opened under a best-fit name that is some other folder.
     wchar_t w[MAX_PATH];
     if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, MAX_PATH)) return false;
-    BOOL lossy = FALSE;
+    // With the UTF-8 system code page the no-best-fit flag and the default-char probe are
+    // invalid - and not needed: UTF-8 spells every folder.
     char a[MAX_PATH];
-    if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, a, MAX_PATH, nullptr, &lossy) || lossy) {
+    const bool acpUtf8 = GetACP() == CP_UTF8;
+    BOOL lossy = FALSE;
+    if (!WideCharToMultiByte(CP_ACP, acpUtf8 ? 0 : WC_NO_BEST_FIT_CHARS, w, -1, a, MAX_PATH,
+                             nullptr, acpUtf8 ? nullptr : &lossy) || lossy) {
         sprintf_s(g_baseNote, "[init] frostmod.dir names a folder this code page cannot spell - using the dll's folder");
+        return false;
+    }
+    // Room for "\" and the longest file FrostMod keeps there (frostmod_unsafe_reload.flag,
+    // frostmod_serverfilter.yaml, ...): a path that fits now but not with a name on it would
+    // overflow the first strcat_s - in DllMain, which takes the game down.
+    if (strlen(a) + 1 + 48 >= MAX_PATH) {
+        sprintf_s(g_baseNote, "[init] frostmod.dir names a folder too long for FrostMod's files - using the dll's folder");
         return false;
     }
     const DWORD attr = GetFileAttributesA(a);

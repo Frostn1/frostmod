@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-09-28 — v0.41.0
+
+### Added
+- **FrostMod can run purely as a game plugin**, with nothing injected: MXB App can install it
+  as `pluginsrostmod.dlo` and stop starting `frostmod.exe`. As a plugin it loads before the
+  game scans the mods folder and gets the game's session events itself, so the separate
+  `frostmod_session.dlo` copy is no longer needed.
+- **`frostmod.dir`**: a one-line file beside `frostmod.dlo` naming the folder FrostMod keeps
+  its files in (log, settings, flags, the MXB App command file, crash reports). MXB App points
+  it at its own FrostMod folder, so nothing ends up in the game's `plugins` folder.
+
+### Fixed
+- **Only one FrostMod per game.** If a plugin copy and an injected copy both end up in the
+  game, the second one now stands down instead of installing the same hooks twice. The log
+  says which mode FrostMod is running in.
+
 ## 2026-09-28 — v0.40.4
 
 ### Fixed

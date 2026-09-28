@@ -2,4 +2,4 @@
 // launcher. Shown in the in-game overlay, the DLL load banner, and the
 // frostmod.exe console.
 #pragma once
-#define FROSTMOD_VERSION "0.40.4"
+#define FROSTMOD_VERSION "0.41.0"

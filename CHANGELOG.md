@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-09-28 — v0.40.3
+
+### Changed
+- **Riders show new helmets, boots and rider models without rejoining.** When MXB App brings
+  in a gear model that a rider already on the server is wearing, FrostMod rebuilds that rider
+  with it as soon as the gear lists are refreshed, if you are in the pits. If you are riding,
+  it waits until you are back in the pits: while you ride the game holds off building riders,
+  and one rebuilt then would stay invisible.
+- **"Rebuild riders (load new gear models)" is now a normal F8 item (F8 → 8)**, no longer
+  behind the developer menu. It rebuilds every other rider with their gear loaded fresh, and
+  only runs in the pits.
+
 ## 2026-09-27 — v0.40.2
 
 ### Changed (developer menu only, `devmenu=1`)

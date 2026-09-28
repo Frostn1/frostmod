@@ -6106,6 +6106,49 @@ static void InstallTrainerGuard(intptr_t delta) {
         Log("[trainer] save guard live. No new trainer is written with the stack in it.");
 }
 
+// The sibling sampler 0x1F1D10 (see offsets.h): same NaN escape, other grid. It answers
+// "no answer" with 1, so that is what a refused query returns here.
+using TerrainSample2Fn = int32_t (*)(void*, void*, void*, float, float);
+static TerrainSample2Fn g_origTerrain2 = nullptr;
+static std::atomic<unsigned> g_terrain2Guarded{0};
+static int32_t hkTerrainSample2(void* obj, void* a2, void* a3, float x, float y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        const unsigned n = g_terrain2Guarded.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 10)
+            Log("[terrain] refused a grid query at (%f, %f) - not a position. This is the "
+                "crash at mxbikes.exe+0x%zx. Refused %u so far.",
+                (double)x, (double)y, (size_t)mxb::RVA_TERRAIN_FAULT2, n);
+        if (n <= 3) {
+            char frames[12][160];
+            const int got = frostmod::crash::CaptureStack(frames, 12);
+            Log("[terrain] who asked (nearest first, %d frame(s)):", got);
+            for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
+        }
+        frostmod::crash::Note("refused a NaN grid query (%u so far)", n);
+        return 1;   // this function's own "no answer"
+    }
+    return g_origTerrain2(obj, a2, a3, x, y);
+}
+
+static void InstallTerrainGuard2(intptr_t delta, uint8_t* begin, uint8_t* end) {
+    uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_TERRAIN_SAMPLE2 + delta);
+    if (fn < begin || fn >= end ||
+        !MatchAt(fn, mxb::SIG_TERRAIN_SAMPLE2, mxb::SIG_TERRAIN_SAMPLE2_MASK)) {
+        uint8_t* found =
+            PatternScan(begin, end, mxb::SIG_TERRAIN_SAMPLE2, mxb::SIG_TERRAIN_SAMPLE2_MASK);
+        if (!found) {
+            Log("[terrain] second guard off: 0x1F1D10's signature is not in this build's .text.");
+            return;
+        }
+        Log("[terrain] second sampler RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
+            (size_t)(found - g_base), (size_t)mxb::RVA_TERRAIN_SAMPLE2);
+        fn = found;
+    }
+    if (InstallHook(fn, (void*)&hkTerrainSample2, (void**)&g_origTerrain2,
+                    "terrainSample2(0x1f1d10)"))
+        Log("[terrain] second height-query guard live @ RVA 0x%zx.", (size_t)(fn - g_base));
+}
+
 static void InstallTerrainGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
         Log("[terrain] guard off for %s - the sampler is MX Bikes' and has no twin here.",
@@ -6117,6 +6160,7 @@ static void InstallTerrainGuard(intptr_t delta) {
         Log("[terrain] guard off: can't read the module's sections to place it.");
         return;
     }
+    InstallTerrainGuard2(delta, begin, end);
     uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_TERRAIN_SAMPLE + delta);
     if (fn < begin || fn >= end ||
         !MatchAt(fn, mxb::SIG_TERRAIN_SAMPLE, mxb::SIG_TERRAIN_SAMPLE_MASK)) {

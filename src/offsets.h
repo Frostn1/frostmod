@@ -414,6 +414,21 @@ constexpr char SIG_TERRAIN_SAMPLE[] =
     "\x4C\x89\x44\x24\x18\x48\x89\x54\x24\x10\x53\x48\x81\xEC\x40\x01\x00\x00"
     "\x4C\x8B\x89\x50\x07\x00\x00\x48\x8B\xD9\x4D\x85\xC9";
 constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// The SIBLING sampler, with the same NaN-blind bounds checks: it reads a second grid
+// (track +0x7A8, 4-byte cells) against the same origin and size. Same shape of call,
+//   int32 f(void* track /*rcx*/, void* a2 /*rdx*/, void* a3 /*r8*/, float x /*xmm3*/,
+//           float y /*arg5*/)
+// returning 1 for "no answer" (no grid, off the map) and 0 when it answered - the opposite
+// of 0x1F1720. A NaN faults at 0x1F1EFC (a player's dump, 2026-09-27). 0x1F5AC0 calls it
+// first and bails on 1, so guarding this covers that caller's own grid read too.
+// Map: game/terrain.c.
+constexpr uintptr_t RVA_TERRAIN_SAMPLE2 = 0x1F1D10;
+constexpr uintptr_t RVA_TERRAIN_FAULT2  = 0x1F1EFC;
+// 38 fixed bytes, no RIP-relative operand. Unique in beta21e's .text.
+constexpr char SIG_TERRAIN_SAMPLE2[] =
+    "\x4C\x89\x44\x24\x18\x41\x57\x48\x81\xEC\xC0\x00\x00\x00\x48\x83\xB9\x50\x07"
+    "\x00\x00\x00\x44\x0F\x29\x74\x24\x10\x4C\x8B\xFA\x44\x0F\x28\xF3\x4C\x8B\xD9";
+constexpr char SIG_TERRAIN_SAMPLE2_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // Does a function's first bytes look like somebody already detoured it? MinHook writes a
 // `jmp rel32`, or `jmp [rip+disp32]` when the trampoline is out of a 2 GB jump's reach;
 // other injectors use `mov rax, imm64; jmp rax`. Worth asking before the signature check

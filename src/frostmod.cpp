@@ -144,12 +144,67 @@ char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin
 char    g_modsPath[MAX_PATH] = {0};   // mods folder (from frostmod_mods.txt the launcher writes)
 char    g_inactivePath[MAX_PATH] = {0}; // <MX Bikes>\FrostMod Inactive Tracks (deactivated .pkz store)
 
+// frostmod.dir: where FrostMod's files live when the dll does not sit with them. As a
+// plugin, FrostMod is <game>\plugins\frostmod.dlo, but its log, settings, flags, command
+// file and crash reports belong in MXB App's FrostMod folder - the one the app writes
+// frostmod_mods.txt into and sweeps for "Send logs". So MXB App writes that folder's path
+// into frostmod.dir beside the .dlo (UTF-8, one line), the way mxbsecure.dir points
+// mxbsecure at its folder. No file, an unreadable one, or a folder that does not exist:
+// the dll's own folder, as before. Every FrostMod path derives from g_logPath's folder, so
+// this one decision moves all of them.
+static char g_baseNote[MAX_PATH + 64] = {0};   // logged once the log exists
+static bool ReadBasePointer(const char* dllDir, char (&out)[MAX_PATH]) {
+    out[0] = 0;
+    char ptr[MAX_PATH];
+    strcpy_s(ptr, dllDir);
+    strcat_s(ptr, "frostmod.dir");
+    FILE* f = nullptr;
+    if (fopen_s(&f, ptr, "rb") != 0 || !f) return false;
+    char buf[MAX_PATH * 3] = {0};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char* s = buf;
+    if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s += 3;
+    if (char* e = strpbrk(s, "\r\n")) *e = 0;
+    while (*s == ' ' || *s == '\t') ++s;
+    size_t len = strlen(s);
+    while (len && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\\' || s[len - 1] == '/'))
+        s[--len] = 0;
+    if (!len) return false;
+    // UTF-8 on disk; FrostMod's paths are ANSI. A folder the code page cannot spell is refused
+    // rather than opened under a best-fit name that is some other folder.
+    wchar_t w[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, MAX_PATH)) return false;
+    BOOL lossy = FALSE;
+    char a[MAX_PATH];
+    if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, a, MAX_PATH, nullptr, &lossy) || lossy) {
+        sprintf_s(g_baseNote, "[init] frostmod.dir names a folder this code page cannot spell - using the dll's folder");
+        return false;
+    }
+    const DWORD attr = GetFileAttributesA(a);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        sprintf_s(g_baseNote, "[init] frostmod.dir names a folder that does not exist - using the dll's folder");
+        return false;
+    }
+    strcpy_s(out, a);
+    strcat_s(out, "\\");
+    return true;
+}
+
 // Resolve the log path once, from the dll's own module handle (its folder is the
-// same folder as frostmod.exe). Called from DllMain before anything else logs.
+// same folder as frostmod.exe) or the folder frostmod.dir names. Called from DllMain
+// before anything else logs.
 void InitLogPath(HMODULE self) {
     char p[MAX_PATH];
     if (self && GetModuleFileNameA(self, p, sizeof(p))) {
         if (char* slash = strrchr(p, '\\')) *(slash + 1) = 0;
+        // The session-only copy keeps its own log beside it; the pointer is the full copy's.
+        char based[MAX_PATH];
+        if (!g_sessionOnly && ReadBasePointer(p, based)) {
+            sprintf_s(g_baseNote, "[init] frostmod.dir: FrostMod's files are in %s", based);
+            strcpy_s(p, based);
+        }
         char cand[MAX_PATH];
         strcpy_s(cand, p);
         // Its own file: the session plugin's folder is the game's `plugins`, which is also
@@ -5734,8 +5789,10 @@ static std::string CommandFilePath() {
 // and the one it can address from outside the prefix. Same folder frostmod_mods.txt and
 // the log already live in.
 static std::string CommandFilePathBesideUs() {
+    // FrostMod's folder: the log's, which is the one frostmod.dir names when there is one.
     char p[MAX_PATH] = {0};
-    if (!g_selfModule || !GetModuleFileNameA(g_selfModule, p, sizeof(p))) return std::string();
+    strcpy_s(p, g_logPath);
+    if (!p[0]) return std::string();
     char* slash = strrchr(p, '\\');
     if (!slash) return std::string();
     *(slash + 1) = 0;
@@ -6248,6 +6305,16 @@ DWORD WINAPI Init(LPVOID) {
     // recent, you're running a stale frostmod.dll (rebuild failed to overwrite it,
     // usually because the game had it locked). Close the game before rebuilding.
     Log("=============== FrostMod v" FROSTMOD_VERSION " loading (dll built " __DATE__ " " __TIME__ ") ===============");
+    {
+        char self[MAX_PATH] = {0};
+        if (g_selfModule) GetModuleFileNameA(g_selfModule, self, sizeof(self));
+        const char* name = strrchr(self, '\\') ? strrchr(self, '\\') + 1 : self;
+        const size_t nl = strlen(name);
+        const bool plugin = nl > 4 && _stricmp(name + nl - 4, ".dlo") == 0;
+        Log("[init] mode: %s (%s)", plugin ? "game plugin - loaded by the game, nothing injected"
+                                           : "injected by frostmod.exe", name);
+        if (g_baseNote[0]) Log("%s", g_baseNote);
+    }
 
     // Before anything else that could fault, so a crash during our own setup is reported
     // rather than being another log that simply stops.
@@ -6729,10 +6796,29 @@ DWORD WINAPI Init(LPVOID) {
 
 // Start Init exactly once, whether we got here via DllMain (injected) or via the
 // PiBoSo Startup() export (plugin). Guarded so the two paths can't double-init.
+// One FrostMod per game. The plugin (frostmod.dlo) and an injected frostmod.dll are two
+// modules, each with its own g_initStarted, and two copies installing the same hooks is
+// how a game goes down. So the first copy to get here takes a per-process name and the
+// second stands down: no Init, no hooks, and its plugin callbacks answer nothing.
+static std::atomic<bool> g_standDown{false};
+static bool ClaimProcess() {
+    char name[64];
+    sprintf_s(name, "Local\\FrostModActive-%lu", GetCurrentProcessId());
+    HANDLE h = CreateMutexA(nullptr, FALSE, name);
+    if (!h) return true;                        // cannot tell: behave as before
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); return false; }
+    return true;                                // held for the life of the process
+}
 void EnsureInit() {
     bool expected = false;
-    if (g_initStarted.compare_exchange_strong(expected, true))
-        CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
+    if (!g_initStarted.compare_exchange_strong(expected, true)) return;
+    if (!ClaimProcess()) {
+        g_standDown.store(true);
+        Log("[init] another FrostMod is already running in this game - this copy stands down "
+            "(no hooks, no overlay). Remove one of frostmod.dlo / the injector.");
+        return;
+    }
+    CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
 }
 
 } // namespace
@@ -6824,6 +6910,11 @@ __declspec(dllexport) void Shutdown() {
 // out-arrays stay valid after return because they are static.
 __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
                                 int* _piNumString, void** _ppString) {
+    if (g_standDown.load()) {                                    // another FrostMod owns this game
+        if (_piNumQuads)  *_piNumQuads  = 0;
+        if (_piNumString) *_piNumString = 0;
+        return;
+    }
     // The overlay belongs to the injected copy, which built the lists this would hand over.
     if (g_sessionOnly) {
         if (_piNumQuads)  *_piNumQuads  = 0;
@@ -6850,27 +6941,32 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
 }
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
 // Classification carries laps-done per race number -> the lap-status coloring.
 __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     if (g_sessionOnly) return;
     // KRP's header has an extra m_iSessionSeries ahead of the count, so both the minimum
     // size and where the count sits are this title's, not MX Bikes'.
@@ -6892,6 +6988,7 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 // rider on a server has: an address reaches only the ones whose app launched the game, and
 // a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     LogCallbackOnce("EventInit", _iDataSize);
     const PluginAbi* abi = g_abi;
     if (!_pData || _iDataSize < abi->ev_size) {
@@ -6942,6 +7039,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
                           server[0] ? server : "<none>");
 }
 __declspec(dllexport) void EventDeinit() {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     Log("[session] event closed");
     frostmod::crash::Note("event closed");
     {
@@ -6962,6 +7060,7 @@ __declspec(dllexport) void EventDeinit() {
 // the room key. A replay (type -1) names no session and is skipped: keying a room on a
 // replay would put a rider watching one into a room with strangers watching another.
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
+    if (g_standDown.load()) return;   // another FrostMod owns this game
     LogCallbackOnce("RaceEvent", _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(sdk::RaceEvent)) return;
     const auto* e = (const sdk::RaceEvent*)_pData;
@@ -6981,11 +7080,11 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (takeServerName) frostmod::crash::TheContext().SetServer(name);
     frostmod::crash::Note("track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  {
+__declspec(dllexport) void RaceSession(void*, int)  { if (g_standDown.load()) return;
     if (g_sessionOnly) return;
     frostmod::crash::Note("session changed (practice/qualify/race)");
     RadResetRace();
 }
-__declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly) RadResetRace(); }
+__declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly && !g_standDown.load()) RadResetRace(); }
 
 } // extern "C"

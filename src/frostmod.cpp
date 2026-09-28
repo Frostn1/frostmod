@@ -2001,6 +2001,8 @@ static bool g_unsafeReload = false;
 static int  g_unsafeReloadFrom = 1;
 
 static void SnapshotMissingPaints();   // live paints, defined after RequestReload
+static void CheckArrivedGear();       // automatic rider rebuild (RIDER REBUILD)
+static void SnapshotMissingGear();
 static void ApplyArrivedPaints();
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
@@ -2041,6 +2043,7 @@ void AdvanceReload() {
         g_reloadPaintsOnly = false;
         Log("[reload] %s done - %d list(s) rebuilt from disk.", g_refreshWhat, g_reloadPlanN);
         ApplyArrivedPaints();
+        CheckArrivedGear();
         frostmod::crash::Note("%s finished", g_refreshWhat);
         SetStatus(g_refreshWhat, 2500);
         if (g_fullReloadQueued) {
@@ -2057,6 +2060,7 @@ void AdvanceReload() {
         else
             Log("[reload] done - all %d content lists rebuilt from disk.", g_game->reload_count);
         ApplyArrivedPaints();
+        CheckArrivedGear();
         frostmod::crash::Note("content reload finished");
         SetStatus("reloaded - new mods listed", 4000);
     }
@@ -2112,6 +2116,7 @@ void RequestReload() {
     g_reloadPaintsOnly = false;
     g_reloadCur = 0; g_reloadStart = first; g_reloadDone.store(first); g_reloadPrimed = false;
     SnapshotMissingPaints();      // which riders are stock only for want of their paint
+    SnapshotMissingGear();        // and which wear a gear model this game lacks
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
     // The thread id is still logged, but it is no longer the open question: a v0.12.0
     // reporter log has it matching the boot [capture] scan tid in all three sessions, so
@@ -2189,6 +2194,7 @@ void RequestPaintRefresh() {
 // model lists and every paint list that indexes into them, and nothing else: tracks, bikes,
 // tyres and series stay as they are.
 void RequestGearRefresh() {
+    if (!g_reloadActive.load()) SnapshotMissingGear();
     RequestPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
 }
 
@@ -2733,43 +2739,129 @@ static bool GameDefersRiderBuild() {
     return SafeReadInt((const int*)(VehicleAt(own - 1) + mxb::VEH_RIDING)) != 0;
 }
 
-void RebuildRiders() {
-    if (!PaintsSupported()) { SetStatus("rebuild: not supported here", 3000); return; }
+// The local rider must never be rebuilt: the own-vehicle index, or either copy of the name
+// (the vehicle's own can read empty after an earlier re-load).
+static bool IsLocalRider(int i, const char* me) {
+    if (SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1 == i) return true;
+    char name[32] = {0}, reqName[32];
+    SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
+    RiderNameOf(LoadRequestOf(i), reqName);
+    return me[0] && (_stricmp(name, me) == 0 || _stricmp(reqName, me) == 0);
+}
+
+// Rebuild the remote riders in `slots` (a bit per vehicle record; ~0 = all), loading their
+// gear models fresh. False, with the reason on the status line, when it cannot run now.
+static bool RebuildRidersIn(uint64_t slots, const char* why) {
+    if (!PaintsSupported()) { SetStatus("rebuild: not supported here", 3000); return false; }
     BusFn bus = ResolveBus();
     const char* me = frostmod::crash::TheContext().rider;
     if (!bus || !me[0]) {
         Log("[rebuild] refused: %s", !bus ? "no engine bus" : "local rider name unknown (not in a session?)");
         SetStatus("rebuild: not in a session", 3000);
-        return;
+        return false;
+    }
+    // Not mid-reload: the model and paint lists are half rebuilt until it finishes.
+    if (g_reloadActive.load()) {
+        Log("[rebuild] not now: a reload is running");
+        SetStatus("rebuild: wait for the reload to finish", 3000);
+        return false;
     }
     // In the pits only: while the local rider rides, 0x5E570 resets the block but skips the
     // build, and a torn-down rider would stay invisible.
     if (GameDefersRiderBuild()) {
-        Log("[rebuild] refused: on track - the game defers rider builds while you ride");
+        Log("[rebuild] not now: on track - the game defers rider builds while you ride");
         SetStatus("go to the pits to rebuild riders", 4000);
-        return;
+        return false;
     }
     g_rebuildModels = true;
-    Log("[rebuild] EXPERIMENTAL rebuild of every remote rider (local rider '%s' is skipped)", me);
+    Log("[rebuild] %s: rebuilding remote riders with fresh gear models (local rider '%s' is skipped)", why, me);
     int done = 0, tried = 0;
-    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
-        const uintptr_t v = VehicleAt(i);
-        if (SafeReadInt((const int*)v) == 0) continue;
-        // Either copy of the name identifies the local rider; the vehicle's own can be empty
-        // after an earlier re-load, and the local rider must never be rebuilt.
-        char name[32] = {0}, reqName[32];
-        SafeCopyStr((void*)(v + 0x10), name, sizeof(name));
-        RiderNameOf(LoadRequestOf(i), reqName);
-        if (_stricmp(name, me) == 0 || _stricmp(reqName, me) == 0) {
-            Log("[rebuild] slot %d '%s': local rider - skipped", i, reqName[0] ? reqName : name);
-            continue;
-        }
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i) {
+        if (!(slots & (1ull << i))) continue;
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0) continue;
+        if (IsLocalRider(i, me)) { Log("[rebuild] slot %d: local rider - skipped", i); continue; }
         ++tried;
         if (RebuildRider(i, bus)) ++done;
     }
     g_rebuildModels = false;
     Log("[rebuild] done: %d of %d remote rider(s) rebuilt", done, tried);
-    SetStatus(tried ? "riders rebuilt (experimental)" : "no remote riders to rebuild", 4000);
+    SetStatus(tried ? "riders rebuilt with their gear" : "no remote riders to rebuild", 4000);
+    return true;
+}
+
+void RebuildRiders() { RebuildRidersIn(~0ull, "F8 menu"); }
+
+// ---- automatic: a gear refresh brought in a model a rider on the server is wearing ------
+// Before the refresh, note every remote rider whose rider, helmet or boots model is not in
+// the lists (the game built them with a stand-in). After it, the ones whose models are all
+// there now are rebuilt - at once in the pits, or as soon as the local rider is back there.
+static uint64_t g_gearMissing = 0, g_gearArrived = 0;
+static int g_gearKey[64];
+static int g_gearMask[64];                                 // which parts were missing
+static bool g_gearWaitLogged = false;
+
+// Bit per part whose model is not in the lists: 1 rider, 2 helmet, 4 boots.
+static int RiderGearMissing(int i) {
+    const uintptr_t v = VehicleAt(i);
+    const struct { const mxb::GearPart* part; int off; } parts[] = {
+        {&mxb::kGearParts[0], 0xD0}, {&mxb::kGearParts[2], 0xF0}, {&mxb::kGearParts[1], 0x1B0}};
+    int mask = 0;
+    for (int k = 0; k < 3; ++k) {
+        char name[32] = {0};
+        if (!SafeCopyStr((void*)(v + parts[k].off), name, sizeof(name)) || !name[0]) continue;
+        if (GearModelIndex(*parts[k].part, name) < 0) mask |= 1 << k;
+    }
+    return mask;
+}
+static void SnapshotMissingGear() {
+    g_gearMissing = 0;
+    const char* me = frostmod::crash::TheContext().rider;
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i) {
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0 || IsLocalRider(i, me)) continue;
+        const int mask = RiderGearMissing(i);
+        if (!mask) continue;
+        g_gearMissing |= 1ull << i;
+        g_gearKey[i] = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+        g_gearMask[i] = mask;
+    }
+    if (g_gearMissing)
+        Log("[rebuild] gear refresh: %d rider(s) are wearing a model this game lacks",
+            (int)__popcnt64(g_gearMissing));
+}
+// After any reload that rebuilt the gear lists.
+static void CheckArrivedGear() {
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i) {
+        if (!(g_gearMissing & (1ull << i))) continue;
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0 ||
+            SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY)) != g_gearKey[i]) continue;
+        // Any part that arrived is worth a rebuild; one still missing keeps its stand-in.
+        const int now = RiderGearMissing(i);
+        if (!(g_gearMask[i] & ~now)) continue;
+        Log("[rebuild] slot %d (race %d): gear model(s) arrived (missing before 0x%x, now 0x%x) - rebuilding",
+            i, g_gearKey[i], g_gearMask[i], now);
+        g_gearArrived |= 1ull << i;
+    }
+    g_gearMissing = 0;
+    g_gearWaitLogged = false;
+}
+// Once a frame, from Tick.
+void ArrivedGearTick() {
+    if (!g_gearArrived || g_reloadActive.load()) return;
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i)       // gone or replaced: drop
+        if ((g_gearArrived & (1ull << i)) &&
+            (SafeReadInt((const int*)VehicleAt(i)) == 0 ||
+             SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY)) != g_gearKey[i]))
+            g_gearArrived &= ~(1ull << i);
+    if (!g_gearArrived) return;
+    if (GameDefersRiderBuild()) {
+        if (!g_gearWaitLogged)
+            Log("[rebuild] new gear models waiting - riders are rebuilt when you are back in the pits");
+        g_gearWaitLogged = true;
+        return;
+    }
+    const uint64_t slots = g_gearArrived;
+    g_gearArrived = 0;
+    RebuildRidersIn(slots, "new gear models arrived");
 }
 
 // ===========================================================================
@@ -3822,7 +3914,7 @@ static const MenuItem kMenu[] = {
     { '5', "Overlay size",                  true,  6  },
     { '6', "Toggle this overlay",           false, 2  },
     { '7', "Hide overlay (recording)",      false, 7  },
-    { '8', "Rebuild riders - load new gear models (dev, pits)", false, 9, true },
+    { '8', "Rebuild riders (load new gear models)", false, 9 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -4887,6 +4979,7 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
 void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
+void ArrivedGearTick(); // fwd (same place)
 void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
 extern std::atomic<bool> g_chOpen;
 void MenuAction(int d) {   // d = the row's action, not its key
@@ -4984,6 +5077,7 @@ void Tick() {
     // to do here rather than on a timer, and the window it watches for is only five seconds
     // wide.
     WorldWatch();
+    ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     RaceFilterTick();
     RjTick();   // rejoin: free the vehicles of riders who left (see RjDisconnected)
 

@@ -622,6 +622,8 @@ constexpr int       IDENTITY_MIN       = 0x288;    // mxbserver refuses anything
 constexpr int       IDENTITY_MAX       = 0x2CB;    // the server's read cap
 constexpr uintptr_t RVA_SELECTION      = 0xE54A40; // local selection; blob fields copy from here
 constexpr uintptr_t RVA_OWN_VEHICLE    = 0xE62710; // i32: own vehicle record + 1 (0 = none); a change moves it (0x6ABB0)
+constexpr uintptr_t RVA_CHANGE_BUSY    = 0xE6270C; // i32: 0x5E570 builds at once while non-zero (0x6ABB0 and mode 35 zero it)
+constexpr int       VEH_RIDING         = 0x50C4;   // on the LOCAL vehicle: riding; 0x5E570 defers rider builds while set
 // The UI page stack - which screen the player is on. Map: ui/pages.c.
 constexpr uintptr_t RVA_PAGE_TABLE     = 0x3954F0; // 34 x 0x28: +0 name*, +8 enter, +0x10, +0x18
 constexpr int       PAGE_STRIDE        = 0x28;

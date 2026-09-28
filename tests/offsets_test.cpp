@@ -296,6 +296,29 @@ static void ghs_guard_constants_agree() {
 // build changes that, the argument we test for NaN is no longer the argument the function
 // reads, and the guard would be refusing queries at random. These tie the claim to the bytes,
 // so a build that moves the frame fails the signature and turns the guard off instead.
+// The second sampler (0x1F1D10), same argument shape: x in xmm3, y as arg5. Its frame is
+// `push r15` + `sub rsp,0xC0`, so arg5 (entry [rsp+0x28]) is read at [rsp+0xF0] - which
+// is what the function does (0x1F1DA2). x arrives in xmm3: `movaps xmm14, xmm3` is in the
+// prologue. A build that changes either fails the signature and leaves the guard off.
+static void terrain_guard2_constants_agree() {
+    const size_t sigLen  = sizeof(mxb::SIG_TERRAIN_SAMPLE2) - 1;
+    const size_t maskLen = sizeof(mxb::SIG_TERRAIN_SAMPLE2_MASK) - 1;
+    CHECK(sigLen == maskLen, "second signature %zu bytes, mask %zu", sigLen, maskLen);
+    for (size_t i = 0; i < maskLen; ++i)
+        CHECK(mxb::SIG_TERRAIN_SAMPLE2_MASK[i] == 'x', "second signature byte %zu wildcarded", i);
+    const unsigned char* sig = (const unsigned char*)mxb::SIG_TERRAIN_SAMPLE2;
+    CHECK(sig[5] == 0x41 && sig[6] == 0x57, "no `push r15` where the frame calculation assumes one");
+    CHECK(sig[7] == 0x48 && sig[8] == 0x81 && sig[9] == 0xEC && sig[10] == 0xC0 &&
+          sig[11] == 0x00 && sig[12] == 0x00 && sig[13] == 0x00,
+          "the frame is not `sub rsp, 0xC0`, so arg5 is not at [rsp+0xF0]");
+    CHECK(0x28 + 8 + 0xC0 == 0xF0, "arithmetic");
+    CHECK(sig[31] == 0x44 && sig[32] == 0x0F && sig[33] == 0x28 && sig[34] == 0xF3,
+          "no `movaps xmm14, xmm3`: x is not in xmm3");
+    CHECK(mxb::RVA_TERRAIN_SAMPLE2 < mxb::RVA_TERRAIN_FAULT2 &&
+          mxb::RVA_TERRAIN_FAULT2 - mxb::RVA_TERRAIN_SAMPLE2 < 0x6DC,
+          "the fault address is not inside the second sampler");
+}
+
 static void terrain_guard_constants_agree() {
     const size_t sigLen  = sizeof(mxb::SIG_TERRAIN_SAMPLE) - 1;
     const size_t maskLen = sizeof(mxb::SIG_TERRAIN_SAMPLE_MASK) - 1;
@@ -380,6 +403,7 @@ static void world_session_constants_agree() {
 
 int main() {
     terrain_guard_constants_agree();
+    terrain_guard2_constants_agree();
     world_session_constants_agree();
     ghs_guard_constants_agree();
     detours_are_recognised_before_the_signature_check();

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-09-28 — v0.40.4
+
+### Fixed
+- **One more mid-race crash blocked (`mxbikes.exe+0x1F1EFC`).** It is the same game bug
+  as the ground-height crash FrostMod already blocks: when a physics calculation briefly
+  produces an invalid position, a second ground lookup in the game read far outside its
+  map and took the game down. FrostMod now turns that lookup away for an invalid position,
+  as the game does for a position off the map. A search of the game code found no other
+  lookup with the same flaw. Seen in a player's crash report mid-race.
+
 ## 2026-09-28 — v0.40.3
 
 ### Changed

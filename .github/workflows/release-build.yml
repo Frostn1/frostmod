@@ -100,8 +100,13 @@ jobs:
                          'mxbcoach.dlo') {
             $verification = & $signtool verify /pa /tw /v "$bin/$f" 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f has no valid timestamped Authenticode signature"; exit 1 }
-            if (($verification -join "`n") -notmatch 'Subject:.*(?:CN=)?Creste LLC') {
+            $signature = Get-AuthenticodeSignature "$bin/$f"
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Creste LLC') {
               Write-Error "$bin/$f is not signed by Creste LLC"
+              exit 1
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              Write-Error "$bin/$f has no RFC3161 timestamp certificate"
               exit 1
             }
           }

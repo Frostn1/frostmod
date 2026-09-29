@@ -65,6 +65,15 @@ jobs:
           account: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
           profile: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
 
+      # A published release must never attach unsigned Windows binaries. Manual runs remain
+      # useful for contributors and forks without the organization's signing configuration.
+      - name: Require signing for a published release
+        if: github.event_name == 'release' && steps.signing.outputs.enabled != 'true'
+        shell: pwsh
+        run: |
+          Write-Error 'Refusing to publish FrostMod binaries without Azure Artifact Signing.'
+          exit 1
+
       # Sign the linker outputs, then remake each .dlo from its signed .dll. CMake's post-build
       # copy made the .dlo files before this step, and a .dlo must stay a byte-for-byte copy of
       # its .dll (same PE, same signature). Only mxbcoach.dlo ships, not mxbcoach.dll, but it is
@@ -89,8 +98,17 @@ jobs:
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
                          'frostserver.exe','frostserver.dll','frostserver.dlo',
                          'mxbcoach.dlo') {
-            & $signtool verify /pa "$bin/$f" | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f is not signed"; exit 1 }
+            $verification = & $signtool verify /pa /tw /v "$bin/$f" 2>&1
+            if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f has no valid timestamped Authenticode signature"; exit 1 }
+            $signature = Get-AuthenticodeSignature "$bin/$f"
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Creste LLC') {
+              Write-Error "$bin/$f is not signed by Creste LLC"
+              exit 1
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              Write-Error "$bin/$f has no RFC3161 timestamp certificate"
+              exit 1
+            }
           }
 
       - name: Collect binaries

@@ -184,6 +184,8 @@ struct Settings {
     // Off by default: they are additions, and a HUD that grows parts on its own after an
     // update is a worse surprise than one that waits to be asked.
     bool  susp = false, trail = false;
+    // The blue line painted on the track ground in the 3D view (coachline.h). Off until asked for.
+    bool  ground = false;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
     // The map and the suspension bars by their top-left corner. They used to be nailed to the
@@ -227,6 +229,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.setup   = flag("setup", true);
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
+    s.ground  = flag("ground", false);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
     s.map_x   = fraction("map_x", kMapDefaultX);
@@ -419,6 +422,9 @@ public:
             s.len    = coachcue::F32(r + 4);
             s.radius = coachcue::U32(r) == 0 ? 0.0f : coachcue::F32(r + 8);
             if (!std::isfinite(s.len) || s.len < 0 || !std::isfinite(s.radius)) return clear(), false;
+            // The segment's start height (the SDK's m_fHeight, offset 24), for the ground line.
+            s.h = stride >= 28 ? coachcue::F32(r + 24) : 0.0f;
+            if (!std::isfinite(s.h)) s.h = 0.0f;
             s.x = x, s.y = y, s.heading = h, s.from = total;
             AdvanceAlongArc(x, y, h, s.radius, s.len);
             total += s.len;
@@ -454,6 +460,22 @@ public:
     Pt lo() const { return min_; }
     Pt hi() const { return max_; }
 
+    /// Centreline height at lap position `pos` (0..1), interpolated between segment starts. Not
+    /// the surface under a line that leaves the centreline (camber, berms, jumps' landings):
+    /// coachline.h treats it as the baseline and says so. False with no track.
+    bool height_at_lap(float pos, float& y) const {
+        if (!ready() || !std::isfinite(pos)) return false;
+        float c = std::fmod(sf_ + pos * total_, total_);
+        if (c < 0) c += total_;
+        auto it = std::upper_bound(segs_.begin(), segs_.end(), c, [](float v, const Seg& s) { return v < s.from; });
+        const size_t i = size_t((it == segs_.begin() ? it : it - 1) - segs_.begin());
+        const Seg&   a = segs_[i];
+        const Seg&   b = segs_[(i + 1) % segs_.size()];
+        const float  f = a.len > 0 ? (std::min)(1.0f, (c - a.from) / a.len) : 0.0f;
+        y = a.h + f * (b.h - a.h);
+        return true;
+    }
+
     /// World x/z `m` metres past the line (a lap position times the length).
     bool at(float m, float& x, float& z) const {
         if (!ready() || !std::isfinite(m)) return false;
@@ -465,7 +487,7 @@ public:
 
 private:
     struct Seg {
-        float len = 0, radius = 0, x = 0, y = 0, heading = 0, from = 0;
+        float len = 0, radius = 0, x = 0, y = 0, heading = 0, from = 0, h = 0;
     };
     void centreline_at(float c, float& x, float& y) const {
         auto it = std::upper_bound(segs_.begin(), segs_.end(), c, [](float v, const Seg& s) { return v < s.from; });

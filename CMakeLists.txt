@@ -131,12 +131,13 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 # --- mxbcoach (MXB Coach lap recorder) ------------------------------------------
 # mxbcoach.dlo is a PiBoSo plugin the MXB Coach app installs into <MX Bikes>\plugins\. It
 # records the rider's own telemetry to <save path>\mxbcoach\sessions\*.mxbc for the app to
-# analyse, and shows the app's live cues in practice. Hooks nothing; the file rules live in
+# analyse, and shows the app's live cues in practice. Hooks nothing unless hud.ini says ground=1 (then the GL matrix loads, read-only, for the ground line); the file rules live in
 # src/coachrec.h and the cue rules in src/coachcue.h.
 add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
 # dinput8/dxguid: reading the rider's Sit bind on the controller the game reads it from.
 # winmm: speaking the cues through waveOut.
-target_link_libraries(mxbcoach PRIVATE user32 dinput8 dxguid winmm)
+target_link_libraries(mxbcoach PRIVATE user32 dinput8 dxguid winmm minhook opengl32)
+target_include_directories(mxbcoach PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(mxbcoach PROPERTIES OUTPUT_NAME "mxbcoach" PREFIX "")
 
 # --- offsets invariants test --------------------------------------------------
@@ -296,6 +297,8 @@ add_test(NAME trainer COMMAND trainer_test)
 # the gap to Coach's lap, the track map and where every part goes on screen.
 add_executable(coachhud_test tests/coachhud_test.cpp)
 add_test(NAME coachhud COMMAND coachhud_test)
+add_executable(coachline_test tests/coachline_test.cpp)
+add_test(NAME coachline COMMAND coachline_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

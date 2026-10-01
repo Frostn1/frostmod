@@ -25,9 +25,11 @@
 // MX Bikes only for now. GP Bikes and Kart Racing Pro send different telemetry structs.
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <GL/gl.h>
 #include <mmsystem.h>
 #include <dinput.h>
 #include <xinput.h>
+#include <MinHook.h>
 
 #include <cstdio>
 #include <cstring>
@@ -36,6 +38,7 @@
 #include <vector>
 
 #include "coachcue.h"
+#include "coachline.h"
 #include "coachhud.h"
 #include "coachlog.h"
 #include "coachrec.h"
@@ -69,6 +72,7 @@ constexpr ULONGLONG kPointerHoldMs = 2500;
 
 constexpr size_t kDataSpeed      = 20;
 constexpr size_t kDataPosX       = 24;
+constexpr size_t kDataPosY       = 28;
 constexpr size_t kDataPosZ       = 32;
 constexpr size_t kDataSuspLength = 120;  // f32[2] metres: 0 = front, 1 = rear
 constexpr size_t kDataCrashed    = 136;
@@ -90,6 +94,7 @@ std::string          g_setup;
 bool                 g_practice = false;
 bool                 g_have_sample = false;
 float                g_time = 0, g_pos = 0;
+float g_rider_y = 0;  // the rider's world y, for the ground line's height bias
 coachhud::Pt         g_rider;
 // Which way the bike is pointing, as a world x/z direction, and the point it was last worked
 // out from. The plugin API hands a heading only to the race-position callback, which a rider
@@ -1136,6 +1141,192 @@ void BuildHud() {
     coachhud::Build(v, g_frame);
 }
 
+// ---------------------------------------------------------------------------------------
+// The line to take on the ground (coachline.h; design in DevHub notes/mxb-coach-ground-line-
+// 2026-10-01.md). Read-only: we watch the matrices the game loads into the fixed-function GL
+// pipeline and, at swap time, draw one blue ribbon through them. Nothing in the game is written.
+// Off unless hud.ini says ground=1; nothing is hooked until then.
+
+struct GlCapture {
+    GLenum          mode = GL_MODELVIEW;
+    coachline::Mat4 proj, view;
+    bool            have_proj = false, have_view = false;  // this frame
+    bool            valid = false;                         // last complete, plausible frame
+    coachline::Mat4 vproj, vview;                          // that frame's pair
+    bool            own = false;                           // our own loads, not the game's
+    unsigned        n_load = 0, n_proj = 0, n_view = 0, n_rejected = 0, n_frames = 0, n_valid = 0;
+};
+GlCapture         g_gl;
+coachline::Ribbon g_ribbon;
+bool              g_gl_hooked = false;
+ULONGLONG         g_gl_logged = 0;
+
+using glMatrixMode_t  = void(WINAPI*)(GLenum);
+using glLoadMatrixf_t = void(WINAPI*)(const GLfloat*);
+using glLoadMatrixd_t = void(WINAPI*)(const GLdouble*);
+using wglSwap_t       = BOOL(WINAPI*)(HDC);
+glMatrixMode_t  g_orig_mode  = nullptr;
+glLoadMatrixf_t g_orig_loadf = nullptr;
+glLoadMatrixd_t g_orig_loadd = nullptr;
+wglSwap_t       g_orig_swap  = nullptr;
+
+void GlOffer(const float* m) {
+    if (g_gl.own || !m) return;
+    ++g_gl.n_load;
+    coachline::Mat4 a;
+    std::memcpy(a.m, m, sizeof(a.m));
+    if (g_gl.mode == GL_PROJECTION) {
+        if (coachline::ValidProjection(a)) {
+            // The first perspective projection of the frame is the world pass; later ones
+            // (mirrors, a bike preview) must not replace it.
+            if (!g_gl.have_proj) {
+                g_gl.proj      = a;
+                g_gl.have_proj = true;
+                ++g_gl.n_proj;
+            }
+        } else {
+            ++g_gl.n_rejected;
+        }
+    } else if (g_gl.mode == GL_MODELVIEW && g_gl.have_proj && !g_gl.have_view) {
+        if (coachline::ValidView(a)) {
+            g_gl.view      = a;
+            g_gl.have_view = true;
+            ++g_gl.n_view;
+        } else {
+            ++g_gl.n_rejected;
+        }
+    }
+}
+void WINAPI hkMode(GLenum m) {
+    g_gl.mode = m;
+    g_orig_mode(m);
+}
+void WINAPI hkLoadf(const GLfloat* m) {
+    GlOffer(m);
+    g_orig_loadf(m);
+}
+void WINAPI hkLoadd(const GLdouble* m) {
+    if (m) {
+        float f[16];
+        for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
+        GlOffer(f);
+    }
+    g_orig_loadd(m);
+}
+
+void DrawGroundLine() {
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);  // never stall the render thread
+    if (!lock.owns_lock() || !g_gl.valid || !g_hud_set.ground || !g_hud_set.enabled || !g_practice) return;
+    const std::vector<coachline::Vert>& v = g_ribbon.verts();
+    if (v.size() < 4) return;
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    g_gl.own = true;
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    g_orig_loadf(g_gl.vproj.m);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    g_orig_loadf(g_gl.vview.m);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_FOG);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Depth-tested so hills and the bike hide it; no depth write so it never occludes anything;
+    // polygon offset pulls it toward the camera by a z-fighting margin, not by metres.
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-2.0f, -2.0f);
+    glBegin(GL_TRIANGLE_STRIP);
+    for (const coachline::Vert& p : v) {
+        glColor4f(0.10f, 0.45f, 1.0f, 0.65f * coachline::Fade(p.s));
+        glVertex3f(p.x, p.y, p.z);
+    }
+    glEnd();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    g_gl.own = false;
+    glPopAttrib();
+}
+
+BOOL WINAPI hkSwap(HDC hdc) {
+    try {
+        if (g_gl.have_proj && g_gl.have_view) {
+            std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+            if (lock.owns_lock()) {
+                // The rider's bike has to land in view through this pair, or the convention or
+                // the pass is wrong and the line stays off rather than painting nonsense.
+                g_gl.valid = coachline::PlausibleCapture(g_gl.proj, g_gl.view, g_rider.x, g_rider_y, g_rider.y);
+                if (g_gl.valid) {
+                    g_gl.vproj = g_gl.proj;
+                    g_gl.vview = g_gl.view;
+                    ++g_gl.n_valid;
+                }
+                float      h       = 0;
+                const bool bias_ok = g_track.height_at_lap(g_pos, h);
+                g_ribbon.update(g_ref.points(), g_track, g_pos, bias_ok ? g_rider_y - h : 0.0f);
+            }
+        }
+        ++g_gl.n_frames;
+        DrawGroundLine();
+        g_gl.have_proj = g_gl.have_view = false;
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_gl_logged > 10000) {
+            g_gl_logged = now;
+            std::lock_guard<std::mutex> lock(g_mu);
+            Log("ground", "gl frames=" + std::to_string(g_gl.n_frames) + " loads=" + std::to_string(g_gl.n_load) +
+                              " proj=" + std::to_string(g_gl.n_proj) + " view=" + std::to_string(g_gl.n_view) +
+                              " rejected=" + std::to_string(g_gl.n_rejected) +
+                              " plausible=" + std::to_string(g_gl.n_valid) +
+                              " ribbon=" + std::to_string(g_ribbon.verts().size()) + " verts");
+        }
+    } catch (...) {
+        g_gl.own = false;
+    }
+    return g_orig_swap(hdc);
+}
+
+/// Hooks the GL entry points the first time the ground line is asked for. A failure leaves the
+/// game as it was: no capture, no line, one log line. One attempt per run.
+void InstallGroundHooks() {
+    if (g_gl_hooked) return;
+    g_gl_hooked = true;
+    HMODULE gl  = GetModuleHandleA("opengl32.dll");
+    if (!gl) {
+        Log("ground", "opengl32 not loaded; no ground line");
+        return;
+    }
+    const MH_STATUS st = MH_Initialize();
+    if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("ground", "MinHook failed to initialise; no ground line");
+        return;
+    }
+    struct H {
+        const char* n;
+        void*       d;
+        void**      o;
+    };
+    const H hs[] = {{"glMatrixMode", (void*)&hkMode, (void**)&g_orig_mode},
+                    {"glLoadMatrixf", (void*)&hkLoadf, (void**)&g_orig_loadf},
+                    {"glLoadMatrixd", (void*)&hkLoadd, (void**)&g_orig_loadd},
+                    {"wglSwapBuffers", (void*)&hkSwap, (void**)&g_orig_swap}};
+    int ok = 0;
+    for (const H& h : hs) {
+        void* t = (void*)GetProcAddress(gl, h.n);
+        if (!t || MH_CreateHook(t, h.d, h.o) != MH_OK || MH_EnableHook(t) != MH_OK) {
+            Log("ground", std::string("hook failed: ") + h.n);
+            continue;
+        }
+        ++ok;
+    }
+    Log("ground", std::to_string(ok) + "/4 GL capture hooks installed (read-only)");
+}
+
 }  // namespace
 
 extern "C" {
@@ -1343,6 +1534,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         g_rider       = here;
         g_time        = _fTime;
         g_pos         = _fPos;
+        g_rider_y     = coachcue::F32(b + kDataPosY);
         g_have_sample = true;
         // How much of each shock's travel is in use, and the deepest it has been this stint.
         g_have_susp = g_susp_travel[0] > 0 || g_susp_travel[1] > 0;
@@ -1456,6 +1648,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
             // track rather than at the HUD. MXBMRP3 polls the mouse from its own render path
             // for the same reason, and their drag works.
             PollDrag();
+            if (g_hud_set.ground) InstallGroundHooks();
             BuildHud();
             for (const coachhud::Quad& in : g_frame.quads) {
                 if (quads >= int(coachhud::kMaxQuads)) break;

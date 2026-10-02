@@ -184,7 +184,9 @@ struct Settings {
     // Off by default: they are additions, and a HUD that grows parts on its own after an
     // update is a worse surprise than one that waits to be asked.
     bool  susp = false, trail = false;
-    // The blue line painted on the track ground in the 3D view (coachline.h). Off until asked for.
+    // The blue line painted on the track ground in the 3D view (coachline.h). It follows the
+    // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
+    // the one on the track, and found nothing there when only the map drew it.
     bool  ground = false;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
@@ -229,7 +231,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.setup   = flag("setup", true);
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
-    s.ground  = flag("ground", false);
+    s.ground  = flag("ground", s.trail);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
     s.map_x   = fraction("map_x", kMapDefaultX);

@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-01 — v0.42.0
+
+### Added
+- **MXB Coach draws the line to take on the track itself**, not only on the map: a blue
+  ribbon on the ground for the next 60 m of Coach's line, fading out with distance, red
+  through Coach's braking zones when the cue sheet has them. The bike and the hills hide it
+  the way they hide the track. It comes on with the map's trail (`trail=1`), or on its own
+  with `ground=1` in `hud.ini`; `ground=0` keeps it off.
+- It only draws through the chase and helmet cameras, and only once the game's own camera
+  has been found next to your bike. Anything else (a TV camera, the menus, a replay) and it
+  stays away rather than drawing a line in the wrong place. The Coach log says what it found
+  every ten seconds (`ground:` lines).
+
 ## 2026-09-28 — v0.41.0
 
 ### Added

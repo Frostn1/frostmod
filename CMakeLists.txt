@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.41.0")
+set(FROSTMOD_VERSION "0.42.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -131,7 +131,9 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 # --- mxbcoach (MXB Coach lap recorder) ------------------------------------------
 # mxbcoach.dlo is a PiBoSo plugin the MXB Coach app installs into <MX Bikes>\plugins\. It
 # records the rider's own telemetry to <save path>\mxbcoach\sessions\*.mxbc for the app to
-# analyse, and shows the app's live cues in practice. Hooks nothing unless hud.ini says ground=1 (then the GL matrix loads, read-only, for the ground line); the file rules live in
+# analyse, and shows the app's live cues in practice. Hooks nothing unless the
+# line on the track is on (hud.ini ground=1, or trail=1 with no ground key): then it watches the
+# game's GL matrix calls, read-only, to draw it (src/coachline.h). The file rules live in
 # src/coachrec.h and the cue rules in src/coachcue.h.
 add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
 # dinput8/dxguid: reading the rider's Sit bind on the controller the game reads it from.
@@ -297,7 +299,10 @@ add_test(NAME trainer COMMAND trainer_test)
 # the gap to Coach's lap, the track map and where every part goes on screen.
 add_executable(coachhud_test tests/coachhud_test.cpp)
 add_test(NAME coachhud COMMAND coachhud_test)
+# The ground line: camera capture, projection, height and the ribbon, against known camera poses
+# and Coach's real 755 Compound sheet (tests/data).
 add_executable(coachline_test tests/coachline_test.cpp)
+target_compile_definitions(coachline_test PRIVATE COACHLINE_DATA="${CMAKE_SOURCE_DIR}/tests/data")
 add_test(NAME coachline COMMAND coachline_test)
 
 

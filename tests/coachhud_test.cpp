@@ -273,6 +273,11 @@ static void HudIni() {
     CHECK(s.cue_x == kCueDefaultX && s.cue_y == kCueDefaultY, "the cue box starts where it always was");
     s = ParseSettings("[hud]\nsusp=1\ntrail=1\ncue_x=0.2\ncue_y=0.75\n", false);
     CHECK(s.susp && s.trail, "switched on");
+    // The line on the track follows the trail unless it has a key of its own.
+    CHECK(s.ground, "trail=1 turns the line on the track on too");
+    CHECK(!ParseSettings("", false).ground, "no trail, no line on the track");
+    CHECK(!ParseSettings("[hud]\ntrail=1\nground=0\n", false).ground, "ground=0 keeps it off with the trail on");
+    CHECK(ParseSettings("[hud]\nground=1\n", false).ground, "ground=1 on its own");
     CHECK(std::fabs(s.cue_x - 0.2f) < 1e-6f && std::fabs(s.cue_y - 0.75f) < 1e-6f, "cue at %f %f", s.cue_x, s.cue_y);
     // A value that isn't a fraction keeps the default rather than putting the cue somewhere it
     // can't be read.

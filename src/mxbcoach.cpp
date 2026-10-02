@@ -40,6 +40,7 @@
 #include "coachcue.h"
 #include "coachline.h"
 #include "coachhud.h"
+#include "coachgear.h"
 #include "coachjump.h"
 #include "coachpace.h"
 #include "coachlog.h"
@@ -72,6 +73,7 @@ constexpr float  kDirStepM       = 1.5f;
 /// How long the pointer stays up after the mouse stops moving.
 constexpr ULONGLONG kPointerHoldMs = 2500;
 
+constexpr size_t kDataGear       = 12;  // i32: 0 = neutral, 1.. (SPluginsBikeData_t m_iGear)
 constexpr size_t kDataSpeed      = 20;
 constexpr size_t kDataPosX       = 24;
 constexpr size_t kDataPosY       = 28;
@@ -111,6 +113,14 @@ long                    g_pace_key   = -1;  // what the colours were last made f
 float                   g_pace_phase = 0;   // the rider's metres along Coach's line, for the chevrons
 coachpace::Kind         g_pace_said  = coachpace::NONE;
 bool                    g_pace_grid_lips = false;  // the lips have been looked for on the ground grid
+// Gear hints (coachgear.h): where Coach's lap shifts, the filtered hint, and whether the rider is
+// in the air.
+coachgear::Profile      g_gear_prof;
+coachgear::Filter       g_gear;
+coachgear::Hint         g_gear_hint;
+coachgear::AirTracker   g_air;
+float                   g_gear_t = -1;
+coachgear::Dir          g_gear_said = coachgear::NONE;
 float                   g_line_total  = 0;     // metres round Coach's line, for the snap's bins
 volatile bool           g_dsnap_reset = true;  // the render thread restarts the ground snap
 coachhud::RefLap     g_ref;
@@ -635,6 +645,43 @@ void BuildExtras() {
     if (g_pace_prof.ok())
         Log("pace", std::string("speeds from ") + (g_hud_sheet.drive.empty() ? "the sheet's times" : "DRIV") + ", " +
                         std::to_string(g_pace_prof.lips.size()) + " jump lips");
+    // Gear hints: Coach's shifts from the sheet's GEAR.
+    g_gear_prof = coachgear::BuildProfile(g_hud_sheet.ref, g_hud_sheet.gear, heights, g_hud_sheet.refy);
+    g_gear.reset();
+    g_gear_hint = coachgear::Hint{};
+    g_gear_t    = -1;
+    g_gear_said = coachgear::NONE;
+    Log("gear", g_hud_sheet.gear.empty() ? "no GEAR in the sheet (MXB Coach is older than the gear hints): no gear hints"
+                                         : std::to_string(g_gear_prof.shifts.size()) + " shifts in Coach's lap");
+}
+
+/// Whether gear hints are worked out: asked for, with Coach's gears.
+bool GearOn() { return g_hud_set.enabled && g_hud_set.gear && g_gear_prof.ok(); }
+
+/// One telemetry sample for the gear hints. Under g_mu.
+void GearSample(int gear, float speed, float time, bool crashed) {
+    if (!GearOn()) {
+        g_gear_hint = coachgear::Hint{};
+        g_gear.reset();
+        return;
+    }
+    const float dt = g_gear_t >= 0 && time > g_gear_t && time - g_gear_t < 0.5f ? time - g_gear_t : 0.02f;
+    g_gear_t       = time;
+    float      frac = 0;
+    const int  idx  = coachline::AnchorPoint(g_hud_sheet.ref, g_rider.x, g_rider.y, g_pos, frac);
+    const bool air  = g_air.update(g_have_susp, g_susp[0], g_susp[1], dt);
+    const coachgear::Reading r =
+        coachgear::Read(g_gear_prof, coachgear::PhaseAt(g_gear_prof, g_hud_sheet.ref, idx, frac), gear, speed, crashed, air);
+    g_gear_hint = g_gear.step(r, dt, g_gear_prof.lap_m);
+    if (r.dir != g_gear_said) {
+        g_gear_said = r.dir;
+        if (r.dir != coachgear::NONE) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "%s to %d (gear %d, Coach shifts %.0f m ahead)", r.dir == coachgear::UP ? "up" : "down",
+                          r.target, gear, double(r.ahead_m));
+            Log("gear", b);
+        }
+    }
 }
 
 /// Whether pace hints are drawn: asked for, over the line on the track, with Coach's speeds.
@@ -779,7 +826,7 @@ void LogHudSettings() {
                        " enabled=" + on(s.enabled) + " cue=" + on(s.cue) + " section=" + on(s.section) +
                        " gap=" + on(s.gap) + " stance=" + on(s.stance) + " map=" + on(s.map) +
                        " setup=" + on(s.setup) + " trail=" + on(s.trail) + " ground=" + on(s.ground) +
-                       " pace=" + on(s.pace));
+                       " pace=" + on(s.pace) + " gear=" + on(s.gear));
 }
 
 // At most once a second, from the telemetry callback rather than Draw.
@@ -1307,6 +1354,7 @@ void BuildHud() {
     v.ref       = &g_ref.points();
     v.has_susp  = g_have_susp;
     v.more_speed = PaceOn() && g_pace_hint.more_speed;
+    if (GearOn() && g_gear_hint.level > 0) v.gear_dir = int(g_gear_hint.dir), v.gear_target = g_gear_hint.target;
     for (int i = 0; i < 2; ++i) {
         v.susp[i]     = g_susp[i];
         v.susp_max[i] = g_susp_deep[i];
@@ -2472,6 +2520,10 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         g_draw_verts = g_ribbon.verts();
                         g_draw_marks = pace ? coachpace::Marks(g_draw_verts, g_pace_hint, g_pace_phase)
                                             : std::vector<coachline::Vert>();
+                        if (GearOn() && g_gear_hint.level > 0) {
+                            const std::vector<coachline::Vert> gm = coachgear::Marks(g_draw_verts, g_gear_hint);
+                            g_draw_marks.insert(g_draw_marks.end(), gm.begin(), gm.end());
+                        }
                         draw         = g_draw_verts.size() >= 4;
                         if (!draw) ++g_why[WHY_NO_VERTS];
                         BuildMarks();
@@ -2848,6 +2900,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
             g_susp[i] = coachhud::SuspUsed(coachcue::F32(b + kDataSuspLength + size_t(i) * 4), g_susp_travel[i]);
             if (g_susp[i] > g_susp_deep[i]) g_susp_deep[i] = g_susp[i];
         }
+        GearSample(int(coachcue::U32(b + kDataGear)), speed, _fTime, crashed);
     }
     // Every sample, take back any buffer the device has finished with, so the next cue always
     // finds one free. Reaping only when a cue turned up is what let them run out.

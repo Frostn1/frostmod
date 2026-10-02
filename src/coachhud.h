@@ -37,6 +37,8 @@
 //             (NaN when Coach had no terrain), and the share of the lap airborne from that point
 //             to the next, 0..1. What coachjump.h calls the jumps from.
 //     "REFY"  u32 N, then N f32: the reference lap's own height (the bike's y) at each point
+//     "GEAR"  u32 N (= the point count), then N u8: the reference lap's gear at each point, 0 =
+//             neutral or unknown (coachgear.h turns it into shift hints)
 // Bytes after the chunks are ignored.
 #pragma once
 
@@ -95,6 +97,8 @@ struct Sheet {
     std::vector<float>    air;      // ref.size() x 3, empty without one
     // The reference lap's own height at each point ("REFY"), empty without one.
     std::vector<float>    refy;
+    // The reference lap's gear at each point ("GEAR"), 0 = unknown; empty without one.
+    std::vector<uint8_t>  gear;
 };
 
 /// Text the game can draw: its strings are CP1252, so anything past ASCII becomes one '?' per
@@ -185,6 +189,14 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
                 if (!std::isfinite(y[i]) || std::fabs(y[i]) > 1e5f) ok = false;
             }
             if (ok) s.refy = std::move(y);
+        } else if (std::memcmp(tag, "GEAR", 4) == 0 && len >= 4) {
+            const uint32_t cn = U32(c);
+            if (cn != npts || len < 4 + uint64_t(cn)) continue;
+            std::vector<uint8_t> g(c + 4, c + 4 + cn);
+            bool ok = true;
+            for (uint8_t v : g)
+                if (v > 12) ok = false;  // no bike has that many gears: not a gear sheet
+            if (ok) s.gear = std::move(g);
         } else if (std::memcmp(tag, "DRIV", 4) == 0 && len >= 4) {
             const uint32_t cn = U32(c);
             if (cn != npts || len < 4 + uint64_t(cn) * 12) continue;
@@ -277,6 +289,9 @@ struct Settings {
     // Coach's lap, and "MORE SPEED" before a jump that needs it. Off until asked for; drawn only
     // with the line on the track.
     bool  pace = false;
+    // Gear hints (coachgear.h): an arrow and the gear to be in where Coach's lap shifts, on the
+    // line (with it on) and beside the cue box. Off until asked for.
+    bool  gear = false;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
     // The map and the suspension bars by their top-left corner. They used to be nailed to the
@@ -323,6 +338,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.ground  = flag("ground", s.trail);
     s.jumps   = flag("jumps", true);
     s.pace    = flag("pace", false);
+    s.gear    = flag("gear", false);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
     s.map_x   = fraction("map_x", kMapDefaultX);
@@ -889,6 +905,9 @@ constexpr uint32_t kGreen   = 0xFF5CD65Cu;
 constexpr uint32_t kAmber   = 0xFF5CD6FFu;
 constexpr uint32_t kGrey    = 0xFFB4B4B4u;
 constexpr uint32_t kBlue    = 0xFFFFC04Bu;
+constexpr uint32_t kGearUp   = 0xFFFF73A6u;  // violet, ABGR (coachgear::kUpColour)
+constexpr uint32_t kGearDown = 0xFF1A8CFFu;  // orange (coachgear::kDownColour)
+constexpr float    kGearBadgeW = 0.07f;
 constexpr uint32_t kCyan    = 0xFFFFD933u;  // the pace hints' "faster" colour (coachpace::kSlowColour)
 
 inline uint32_t CueColour(uint8_t kind) {
@@ -1036,6 +1055,9 @@ struct View {
     float                    susp_max[2] = {0, 0};
     // Pace hints: too slow with a jump lip ahead that needs the speed (coachpace::Hint).
     bool                     more_speed = false;
+    // Gear hint (coachgear::Hint): +1 shift up, -1 down, 0 none, and the gear to be in.
+    int                      gear_dir    = 0;
+    int                      gear_target = 0;
 };
 
 /// A motocrosser from its right-hand side, drawn small enough to sit in a corner of the screen:
@@ -1170,6 +1192,35 @@ inline void Build(const View& v, Frame& f) {
         const Box   b  = BoxAt(v.set.row_x - w * 0.5f, v.set.row_y + kRowH + 0.006f, w, kCueSize);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
         Say(f, s, v.set.row_x, b.y0 + (kCueSize - kCueSize * 0.8f) * 0.5f, kCueSize * 0.8f, 1, kCyan);
+    }
+
+    // 4c. The gear hint, beside the cue box: an arrow and the gear to be in.
+    if (v.set.gear && v.gear_dir != 0 && v.gear_target >= 1 && v.gear_target <= 9) {
+        const bool  up  = v.gear_dir > 0;
+        const Box   b   = BoxAt(cue_box.x1 + 0.008f, cue_box.y0, kGearBadgeW, kCueHeight);
+        const uint32_t c = up ? kGearUp : kGearDown;
+        Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
+        // The arrow, a triangle on the left of the badge: tip up for up, tip down for down.
+        const float ax0 = b.x0 + 0.008f, ax1 = ax0 + 0.022f, am = (ax0 + ax1) * 0.5f;
+        const float ay0 = b.y0 + 0.012f, ay1 = b.y1 - 0.012f;
+        if (f.room()) {
+            Quad q;
+            if (up) {
+                q.p[0][0] = am,  q.p[0][1] = ay0;
+                q.p[1][0] = ax0, q.p[1][1] = ay1;
+                q.p[2][0] = ax1, q.p[2][1] = ay1;
+                q.p[3][0] = am,  q.p[3][1] = ay0;
+            } else {
+                q.p[0][0] = ax0, q.p[0][1] = ay0;
+                q.p[1][0] = am,  q.p[1][1] = ay1;
+                q.p[2][0] = am,  q.p[2][1] = ay1;
+                q.p[3][0] = ax1, q.p[3][1] = ay0;
+            }
+            q.color = c;
+            f.quads.push_back(q);
+        }
+        Say(f, std::string(1, char('0' + v.gear_target)), ax1 + (b.x1 - ax1) * 0.5f, b.y0 + (kCueHeight - kCueSize) * 0.5f,
+            kCueSize, 1, c);
     }
 
     // 6. The setup card, while stopped.

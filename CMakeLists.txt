@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.44.1")
+set(FROSTMOD_VERSION "0.45.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -319,6 +319,10 @@ add_executable(coachjump_preview tests/coachjump_preview.cpp)
 # model, jump lips, and the hysteresis that keeps them from flickering on noisy speed.
 add_executable(coachpace_test tests/coachpace_test.cpp)
 add_test(NAME coachpace COMMAND coachpace_test)
+# Gear hints over the ground line: the sheet's GEAR chunk, Coach's shifts, up/down detection and the
+# target gear, the hysteresis, the glyph on the line and the badge beside the cue box.
+add_executable(coachgear_test tests/coachgear_test.cpp)
+add_test(NAME coachgear COMMAND coachgear_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

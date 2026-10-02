@@ -153,11 +153,11 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
         if (len > n - at) break;
         const uint8_t* c = b + at;
         at += len;
-        const size_t np = s.ref.size();
+        const size_t npts = s.ref.size();
         if (std::memcmp(tag, "TRRN", 4) == 0 && len >= 12) {
             const uint32_t cn = U32(c), ck = U32(c + 4);
             const float    st = F32(c + 8);
-            if (cn != np || ck < 2 || ck > 9 || !std::isfinite(st) || st <= 0 || st > 5) continue;
+            if (cn != npts || ck < 2 || ck > 9 || !std::isfinite(st) || st <= 0 || st > 5) continue;
             if (len < 12 + uint64_t(cn) * ck * 4) continue;
             std::vector<float> h(size_t(cn) * ck);
             bool ok = true;
@@ -169,7 +169,7 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
             s.terrain_k = ck, s.terrain_step = st, s.terrain = std::move(h);
         } else if (std::memcmp(tag, "DRIV", 4) == 0 && len >= 4) {
             const uint32_t cn = U32(c);
-            if (cn != np || len < 4 + uint64_t(cn) * 12) continue;
+            if (cn != npts || len < 4 + uint64_t(cn) * 12) continue;
             std::vector<float> d(size_t(cn) * 3);
             bool ok = true;
             for (size_t i = 0; i < d.size(); ++i) {

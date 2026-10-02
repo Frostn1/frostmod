@@ -495,7 +495,9 @@ inline bool ModelviewOffer(ModelviewPick& best, const Mat4& m, float rx, float r
         const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
         if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) continue;
         const float d = std::sqrt(d2);
-        if (best.ok && d >= best.dist) continue;
+        // Nearest wins; within a centimetre (a rotated copy of the same view is exactly as near)
+        // the simpler axes do, so a mesh placed with a quarter turn can't take the lock.
+        if (best.ok && (d > best.dist + 0.01f || (d > best.dist - 0.01f && k >= best.axes))) continue;
         if (AtTheBike(m, rx, ry, rz)) return took;
         best.ok = true, best.view = m, best.axes = k, best.dist = d;
         took    = true;
@@ -674,17 +676,24 @@ inline bool InZone(const std::vector<Zone>& zones, float m, float lap_m) {
 //
 //     tone = 1 - throttle * (1 - brake) + 2 * brake
 //
-// The channels come from the sheet's "DRIV" chunk when it has one (throttle, brake, and speed for
-// the deceleration), otherwise from the lap's own times and positions: accelerating reads as
-// throttle, decelerating as braking. Deceleration counts toward braking either way, so a rider
-// who scrubs speed without much lever still shows yellow. Then the tone is smoothed along the
-// line with a Gaussian (kToneSigmaM), and the ribbon interpolates it between its rows, which GL
-// in turn shades smoothly across each quad.
+// With the sheet's "DRIV" chunk (throttle, brake, speed), coasting is a throttle under
+// kThrottleCoast and full gas from kThrottleOn. Without it there is no throttle channel at all,
+// and Sean's Ridgedale run showed what guessing one does: steady speed read as coasting, so the
+// line went white where the rider was on the gas. So without DRIV the lap's own speed decides
+// only braking; everything that isn't slowing is gas:
+//
+//     tone = min(1, brake / kCoastBand) + 2 * brake
+//
+// Deceleration counts toward braking either way. Then the tone is smoothed along the line with a
+// Gaussian over time as well as distance (kToneSigmaS at the lap's own speed, never under
+// kToneSigmaM), and the ribbon interpolates it between its rows, which GL shades smoothly.
 
 constexpr float kDecelLight  = 1.5f;   // m/s^2: below this, not braking
 constexpr float kDecelHard   = 8.0f;   // m/s^2: and from here, hard on the brakes
-constexpr float kAccelGas    = 0.3f;   // m/s^2: from here, on the gas (without a throttle channel)
-constexpr float kAccelFull   = 2.0f;   // m/s^2: and fully on it
+constexpr float kThrottleCoast = 0.05f; // DRIV throttle: under this, coasting
+constexpr float kThrottleOn    = 0.25f; // and from this, on the gas (0.15 is the middle)
+constexpr float kCoastBand     = 0.15f; // without DRIV: the first part of braking fades gas to white
+constexpr float kToneSigmaS    = 0.12f; // the Gaussian in time: at 30 m/s, 3.6 m
 constexpr float kSpeedWindowM = 4.0f;  // metres either side the speed and its change are taken over
 constexpr float kToneSigmaM  = 1.5f;   // the Gaussian along the line: a fade over 3-5 m
 constexpr float kZoneTone    = 2.0f;   // a braking zone is where the tone reaches yellow
@@ -730,23 +739,26 @@ inline std::vector<float> Tone(const std::vector<coachhud::RefPoint>& ref, const
         ++known;
         const float accel = (v[hi] - v[lo]) / dt;
         auto ramp = [](float x, float a, float b) { return (std::max)(0.0f, (std::min)(1.0f, (x - a) / (b - a))); };
-        float brake    = ramp(-accel, kDecelLight, kDecelHard);
-        float throttle = ramp(accel, kAccelGas, kAccelFull);
+        float brake = ramp(-accel, kDecelLight, kDecelHard);
         if (have_drive) {
-            brake    = (std::max)(brake, drive[i * 3 + 2]);
-            throttle = drive[i * 3 + 1];
+            brake                = (std::max)(brake, drive[i * 3 + 2]);
+            const float throttle = ramp(drive[i * 3 + 1], kThrottleCoast, kThrottleOn);
+            raw[i]               = 1.0f - throttle * (1.0f - brake) + 2.0f * brake;
+        } else {
+            raw[i] = (std::min)(1.0f, brake / kCoastBand) + 2.0f * brake;
         }
-        raw[i] = 1.0f - throttle * (1.0f - brake) + 2.0f * brake;
     }
     if (known < n / 2) return out;
-    // The Gaussian along the line, out to three sigma.
+    // The Gaussian along the line, out to three sigma: sigma the distance covered in kToneSigmaS
+    // at the lap's speed there, so a fast stretch blends over as long a time as a slow one.
     out.assign(n, 1.0f);
     for (size_t i = 0; i < n; ++i) {
-        size_t lo, hi;
-        span(i, 3.0f * kToneSigmaM, lo, hi);
+        const float sigma = (std::max)(kToneSigmaM, (std::min)(4.0f, (v[i] > 0 ? v[i] : 0.0f) * kToneSigmaS));
+        size_t      lo, hi;
+        span(i, 3.0f * sigma, lo, hi);
         float sum = 0, wsum = 0;
         for (size_t k = lo; k <= hi; ++k) {
-            const float d = (s[k] - s[i]) / kToneSigmaM;
+            const float d = (s[k] - s[i]) / sigma;
             const float w = std::exp(-0.5f * d * d);
             sum += w * raw[k], wsum += w;
         }
@@ -804,6 +816,13 @@ inline void ToneColour(float t, float& r, float& g, float& b) {
 /// The line's alpha: readable on dirt without hiding it.
 constexpr float kLineAlpha = 0.7f;
 
+/// Where the colours come from, for the log: "DRIV" (Coach's throttle and brake), "speed" (the
+/// lap's own times), or "cues" (the brake cues alone, when the lap can't say).
+inline const char* ColourSource(const std::vector<coachhud::RefPoint>& ref, const std::vector<float>& drive) {
+    if (drive.size() == ref.size() * 3 && !ref.empty()) return "DRIV";
+    return Tone(ref, drive).empty() ? "cues" : "speed";
+}
+
 /// The line's colour at each of Coach's points, RGBA (4 floats a point), or empty when the lap
 /// can't say. Today the Tone gradient; the one place a different colouring plugs in.
 inline std::vector<float> LineColours(const std::vector<coachhud::RefPoint>& ref, const std::vector<float>& drive = {}) {
@@ -845,16 +864,70 @@ inline bool TerrainAt(const RibbonExtras& ex, size_t i, float off, float& h) {
     return true;
 }
 
-/// The ribbon cache. Rebuilt when the rider has moved kRebuildM along the lap, or the height
-/// offset, the zones or the sheet changed, not per frame; the per-frame cost is one pass.
+/// Where the rider is, to start the ribbon from. Sean's Ridgedale run (v0.43.2): the line
+/// "started on the track, floating, then turned 90 degrees". Coach numbers its points by metres
+/// along the lap it recorded, divided by the track's length, so on a lap ridden longer or shorter
+/// than the centreline the sheet's lap positions drift from the game's - by the end of a lap, tens
+/// of metres. Starting the ribbon at the sheet point with the rider's lap position put it that far
+/// up or down the track, across the corner in front of the rider, with its heights and colours
+/// from the wrong place too. So the ribbon starts at the sheet point nearest the rider's own world
+/// position (among those whose lap position is within kAnchorLap of theirs, so an overpass or a
+/// neighbouring straight can't take it), and its heights, without the track's own ground, are the
+/// rider's own ground plus how the centreline rises from there.
+struct Anchor {
+    float x = NAN, z = NAN;  // the rider, world x/z
+    float ground = NAN;      // the ground under the rider, metres (telemetry y less the bike's height)
+};
+constexpr float kAnchorLap  = 0.25f;  // of a lap, either way
+constexpr float kAnchorMaxM = 30.0f;  // further than this from every point: not on Coach's line
+
+/// The sheet point the ribbon starts from for a rider at (x, z) and lap position `pos`, and how
+/// far along its segment the rider is (0..1). -1 when no point is near enough.
+inline int AnchorPoint(const std::vector<coachhud::RefPoint>& ref, float x, float z, float pos, float& frac) {
+    frac = 0;
+    if (ref.size() < 2 || !std::isfinite(x) || !std::isfinite(z)) return -1;
+    const size_t n    = ref.size();
+    int          best = -1;
+    float        bd   = kAnchorMaxM * kAnchorMaxM;
+    for (size_t i = 0; i < n; ++i) {
+        float dl = std::fabs(ref[i].pos - pos);
+        dl       = (std::min)(dl, 1.0f - dl);
+        if (dl > kAnchorLap) continue;
+        const float d2 = (ref[i].x - x) * (ref[i].x - x) + (ref[i].z - z) * (ref[i].z - z);
+        if (d2 < bd) bd = d2, best = int(i);
+    }
+    if (best < 0) return -1;
+    // The segment the rider is on: from the nearest point forward, or the one before it when the
+    // rider hasn't reached it yet.
+    auto proj = [&](size_t a) {
+        const coachhud::RefPoint& p = ref[a];
+        const coachhud::RefPoint& q = ref[(a + 1) % n];
+        const float dx = q.x - p.x, dz = q.z - p.z, l2 = dx * dx + dz * dz;
+        return l2 > 1e-6f ? ((x - p.x) * dx + (z - p.z) * dz) / l2 : 0.0f;
+    };
+    size_t a = size_t(best);
+    float  f = proj(a);
+    if (f < 0) {
+        const size_t b = (a + n - 1) % n;
+        a              = b;
+        f              = proj(b);
+    }
+    frac = (std::max)(0.0f, (std::min)(1.0f, f));
+    return int(a);
+}
+
+/// The ribbon cache. Rebuilt when the rider has moved kRebuildM, or the height offset, the zones
+/// or the sheet changed, not per frame; the per-frame cost is one pass.
 class Ribbon {
 public:
     /// `ref`: Coach's points (lap position and world x/z). `track`: centreline heights.
     /// `pos`: the rider's lap fraction. `offset`: HeightBias::offset(). `zones`: cue braking
     /// zones, used only when `ex` has no colours. `ex`: the sheet's ground and colours, or null.
+    /// `at`: the rider's world position and ground (Anchor); without it the ribbon starts at the
+    /// rider's lap position and stands on centreline heights, as before.
     /// Returns true when verts() changed.
     bool update(const std::vector<coachhud::RefPoint>& ref, const coachhud::Track& track, float pos, float offset,
-                const std::vector<Zone>& zones = {}, const RibbonExtras* ex = nullptr) {
+                const std::vector<Zone>& zones = {}, const RibbonExtras* ex = nullptr, const Anchor* at = nullptr) {
         if (ref.size() < 2 || !track.ready() || track.length() <= 0 || !std::isfinite(pos) || pos < 0 || pos > 1 ||
             !std::isfinite(offset)) {
             const bool had = !verts_.empty();
@@ -863,13 +936,24 @@ public:
         }
         const float    lapM = track.length();
         const uint32_t ver  = ex ? ex->version : 0;
+        const bool anchored = at && std::isfinite(at->x) && std::isfinite(at->z);
+        const float ground  = anchored && std::isfinite(at->ground) ? at->ground : NAN;
         if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver &&
-            std::fabs(offset - offset_) < 0.1f) {
-            float d = std::fabs(pos - built_for_) * lapM;
-            d       = (std::min)(d, lapM - d);
+            std::fabs(offset - offset_) < 0.1f && (std::isfinite(ground) == std::isfinite(ground_)) &&
+            !(std::isfinite(ground) && std::fabs(ground - ground_) > 0.1f)) {
+            float d;
+            if (anchored) {
+                d = std::hypot(at->x - bx_, at->z - bz_);
+            } else {
+                d = std::fabs(pos - built_for_) * lapM;
+                d = (std::min)(d, lapM - d);
+            }
             if (d < kRebuildM) return false;
         }
         built_for_ = pos;
+        bx_        = anchored ? at->x : NAN;
+        bz_        = anchored ? at->z : NAN;
+        ground_    = ground;
         ref_n_     = ref.size();
         zones_n_   = zones.size();
         ver_       = ver;
@@ -880,20 +964,27 @@ public:
         // Rows every half metre either way: the ground's bumps need them, and so does the colour,
         // which fades over a few metres and must not be stepped.
         const float step    = kStepTerrain;
-        // The segment the rider is on: the last point at or behind them, wrapping the lap.
+        // The segment the rider is on: by where they are when that is known (AnchorPoint), else
+        // the last point at or behind their lap position, wrapping the lap.
         const size_t n  = ref.size();
-        size_t       i0 = 0;
+        float        afrac = 0;
+        const int    ai    = anchored ? AnchorPoint(ref, at->x, at->z, pos, afrac) : -1;
+        size_t       i0    = 0;
         while (i0 < n && ref[i0].pos <= pos) ++i0;
-        size_t i = i0 == 0 ? n - 1 : i0 - 1;
+        size_t i = ai >= 0 ? size_t(ai) : (i0 == 0 ? n - 1 : i0 - 1);
         // Start the walk at the rider, not at the start of their segment.
         float travelled = 0;
-        {
+        float base_h    = 0;
+        if (std::isfinite(ground)) track.height_at_lap(pos, base_h);
+        if (ai >= 0) {
+            travelled = -afrac * std::hypot(ref[(i + 1) % n].x - ref[i].x, ref[(i + 1) % n].z - ref[i].z);
+        } else {
             const coachhud::RefPoint& a = ref[i];
             const coachhud::RefPoint& b = ref[(i + 1) % n];
-            float span = b.pos - a.pos, at = pos - a.pos;
+            float span = b.pos - a.pos, along = pos - a.pos;
             if (span <= 0) span += 1.0f;
-            if (at < 0) at += 1.0f;
-            const float fc = span > 0 ? (std::max)(0.0f, (std::min)(1.0f, at / span)) : 0.0f;
+            if (along < 0) along += 1.0f;
+            const float fc = span > 0 ? (std::max)(0.0f, (std::min)(1.0f, along / span)) : 0.0f;
             travelled      = -fc * std::hypot(b.x - a.x, b.z - a.z);
         }
         float nextRow = 0;
@@ -912,9 +1003,19 @@ public:
                     float       lap = a.pos + fc * ((b.pos >= a.pos ? b.pos : b.pos + 1.0f) - a.pos);
                     lap -= std::floor(lap);
                     float h = 0;
-                    track.height_at_lap(lap, h);
                     const float cx = a.x + fc * dx, cz = a.z + fc * dz;
-                    float       yl = h + offset + kLift, yr = yl;
+                    float       yl, yr;
+                    if (std::isfinite(ground)) {
+                        // The rider's own ground, and the centreline's rise from where they are to
+                        // this row - measured along the game's own lap, not the sheet's.
+                        float lr = pos + nextRow / lapM;
+                        lr -= std::floor(lr);
+                        track.height_at_lap(lr, h);
+                        yl = yr = ground + (h - base_h) + kLiftTerrain;
+                    } else {
+                        track.height_at_lap(lap, h);
+                        yl = yr = h + offset + kLift;
+                    }
                     // On the track's own ground, each edge where the ground is under it: the
                     // ribbon takes the bumps along and the camber across.
                     if (terrain) {
@@ -958,6 +1059,7 @@ public:
 private:
     std::vector<Vert> verts_;
     float             built_for_ = -1.0f, offset_ = 0;
+    float             bx_ = NAN, bz_ = NAN, ground_ = NAN;
     size_t            ref_n_ = 0, zones_n_ = 0;
     uint32_t          ver_ = 0;
 };
@@ -1012,6 +1114,139 @@ inline bool ModelviewFollow(ModelviewPick& best, const Mat4& m, float rx, float 
     if (best.ok && j >= best.jump) return false;
     best.ok = true, best.view = m, best.axes = axes, best.dist = std::sqrt(d2), best.jump = j;
     return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// Snapping to the ground the game drew
+//
+// Without the track's own ground in the sheet, the ribbon's heights are an estimate (the rider's
+// ground plus the centreline's rise), and an estimate is either in the air or under the dirt -
+// where the depth test hides it. So the visible surface is read back: a pixel of the game's depth
+// buffer under the ribbon at a few distances ahead (kSnapAt), unprojected through the camera to
+// the world point the game drew there, compared with the ribbon's own height at that point along
+// it, and the difference smoothed into a correction by distance ahead that every vertex takes.
+
+/// The inverse of a 4x4 (cofactors). False when it is singular.
+inline bool Inverse(const Mat4& a, Mat4& out) {
+    const float* m = a.m;
+    float        inv[16];
+    inv[0]  = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4]  = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8]  = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1]  = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5]  = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9]  = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2]  = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6]  = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3]  = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7]  = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!(std::fabs(det) > 1e-20f) || !std::isfinite(det)) return false;
+    for (int i = 0; i < 16; ++i) out.m[i] = inv[i] / det;
+    return Finite(out.m, 16);
+}
+
+/// GL coordinates back to telemetry: the inverse of Axes::apply.
+inline void Unapply(const Axes& a, float gx, float gy, float gz, float& x, float& y, float& z) {
+    float       t[3] = {0, 0, 0};
+    const float g[3] = {gx, gy, gz};
+    for (int k = 0; k < 3; ++k) t[a.src[k]] = g[k] * a.sgn[k];
+    x = t[0], y = t[1], z = t[2];
+}
+
+/// The telemetry world point drawn at screen fraction (sx, sy) (origin top left) with window
+/// depth `d` (0..1, the default depth range), through projection `p`, view `v` and axes `ax`.
+inline bool Unproject(const Mat4& p, const Mat4& v, const Axes& ax, float sx, float sy, float d, float& x, float& y,
+                      float& z) {
+    Mat4 inv;
+    if (!Inverse(Mul(p, v), inv)) return false;
+    const float nx = sx * 2 - 1, ny = 1 - sy * 2, nz = d * 2 - 1;
+    const float* m  = inv.m;
+    const float  wx = m[0] * nx + m[4] * ny + m[8] * nz + m[12];
+    const float  wy = m[1] * nx + m[5] * ny + m[9] * nz + m[13];
+    const float  wz = m[2] * nx + m[6] * ny + m[10] * nz + m[14];
+    const float  ww = m[3] * nx + m[7] * ny + m[11] * nz + m[15];
+    if (!(std::fabs(ww) > 1e-9f)) return false;
+    Unapply(ax, wx / ww, wy / ww, wz / ww, x, y, z);
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+/// Distances ahead, along the ribbon, the depth buffer is read at.
+constexpr int   kSnapN               = 4;
+constexpr float kSnapAt[kSnapN]      = {6.0f, 12.0f, 20.0f, 32.0f};
+constexpr float kSnapMaxM            = 3.0f;   // a correction bigger than this is something else
+constexpr float kSnapLateralM        = 2.0f;   // the hit must be this close to the line across it
+constexpr float kSnapAlpha           = 0.5f;   // each reading's weight in the correction
+constexpr unsigned kSnapEveryMs      = 200;
+
+/// The height correction by distance ahead.
+class DepthSnap {
+public:
+    void reset() {
+        for (int k = 0; k < kSnapN; ++k) have_[k] = false, corr_[k] = 0;
+    }
+    /// A reading for probe `k`: the game's surface is `dy` above (negative: below) the ribbon.
+    /// False when it is refused as implausible (a bike, a rider, the sky, a far hillside).
+    bool feed(int k, float dy) {
+        if (k < 0 || k >= kSnapN || !std::isfinite(dy) || std::fabs(dy) > kSnapMaxM) return false;
+        corr_[k] = have_[k] ? corr_[k] + kSnapAlpha * (dy - corr_[k]) : dy;
+        have_[k] = true;
+        return true;
+    }
+    bool any() const {
+        for (bool h : have_)
+            if (h) return true;
+        return false;
+    }
+    /// The correction `s` metres ahead: between the probes linearly, flat beyond them, from the
+    /// probes that have a reading.
+    float at(float s) const {
+        int   lo = -1, hi = -1;
+        for (int k = 0; k < kSnapN; ++k) {
+            if (!have_[k]) continue;
+            if (kSnapAt[k] <= s) lo = k;
+            if (kSnapAt[k] >= s && hi < 0) hi = k;
+        }
+        if (lo < 0 && hi < 0) return 0;
+        if (lo < 0) return corr_[hi];
+        if (hi < 0 || hi == lo) return corr_[lo];
+        const float f = (s - kSnapAt[lo]) / (kSnapAt[hi] - kSnapAt[lo]);
+        return corr_[lo] + (corr_[hi] - corr_[lo]) * f;
+    }
+    float value(int k) const { return have_[k] ? corr_[k] : NAN; }
+
+private:
+    bool  have_[kSnapN] = {false, false, false, false};
+    float corr_[kSnapN] = {0, 0, 0, 0};
+};
+
+/// One probe's reading from a depth read back at the ribbon's centre `s` metres ahead: the world
+/// point the game drew there (`hx, hy, hz`), against the ribbon (`verts`, already corrected by
+/// `snap` as drawn). Returns the height difference at the hit's place along the ribbon, or NaN
+/// when the hit isn't the ground beside the line: too far across it, near the rider's bike, or off
+/// the end of the ribbon.
+inline float SnapReading(const std::vector<Vert>& verts, const DepthSnap& snap, float hx, float hy, float hz,
+                         float rider_x, float rider_z) {
+    if (verts.size() < 4) return NAN;
+    if (std::hypot(hx - rider_x, hz - rider_z) < 2.5f) return NAN;  // the bike, or the rider's own legs
+    // The ribbon row nearest the hit, in x/z, and how far across the line the hit is.
+    size_t best = 0;
+    float  bd   = INFINITY;
+    for (size_t i = 0; i + 1 < verts.size(); i += 2) {
+        const float cx = (verts[i].x + verts[i + 1].x) * 0.5f, cz = (verts[i].z + verts[i + 1].z) * 0.5f;
+        const float d2 = (cx - hx) * (cx - hx) + (cz - hz) * (cz - hz);
+        if (d2 < bd) bd = d2, best = i;
+    }
+    if (!(bd <= kSnapLateralM * kSnapLateralM)) return NAN;
+    if (best == 0 || best + 2 >= verts.size()) return NAN;  // at an end: likely past it
+    const float ry = (verts[best].y + verts[best + 1].y) * 0.5f + snap.at(verts[best].s);
+    return hy - ry;
 }
 
 /// One row of the ribbon on screen, for the tests and the offline preview: both edges, how far

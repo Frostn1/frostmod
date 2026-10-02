@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-02 — v0.43.3
+
+### Fixed
+- **The line no longer swings across the track.** It started from where Coach's sheet said you
+  were along the lap, and on a lap ridden longer or shorter than the track's centreline that is
+  tens of metres off by the end of a lap (49 m on a 6% longer lap), so the line appeared across
+  the corner ahead, turned 90 degrees, with its colours and heights from the wrong place. It now
+  starts from where you actually are and runs along Coach's line from there.
+- **It sits on the dirt even without the track's ground in the sheet.** It stands on your own
+  ground and follows the centreline's rise from there, then reads what the game drew under it a
+  few times a second and moves onto that surface, so it neither floats nor sinks out of sight.
+- **Gas is green.** Without Coach's throttle and brake in the sheet, steady speed read as
+  coasting; now anything that isn't slowing is gas. With them, coasting is a throttle under
+  about 15%. The blend runs over time as well as distance.
+- **The camera lock can't settle on a rotated copy of the view.** On a tie, the plain axes win.
+- The log now says whether the sheet carries the track's ground and why not (`ground: sheet
+  terrain=...`), where the colours come from (`ground: colours: source=DRIV|speed|cues`), and
+  the 10 s line counts picked and drawn frames for those 10 s, with the ground snap's state.
+
 ## 2026-10-02 — v0.43.2
 
 ### Fixed

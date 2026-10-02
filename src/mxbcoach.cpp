@@ -563,10 +563,23 @@ void BuildExtras() {
     }
     // The one line to change for a different colouring: any function giving RGBA per point.
     g_extras.rgba = coachline::LineColours(g_hud_sheet.ref, g_hud_sheet.drive);
-    if (!g_hud_sheet.ref.empty())
-        Log("ground", "sheet: " + std::string(g_extras.terrain_k ? "track ground under the line" : "no track ground (centreline heights)") +
-                          ", " + (g_hud_sheet.drive.empty() ? "colour from the lap's own times" : "colour from Coach's throttle, brake and speed") +
-                          ", " + std::to_string(coachline::ToneZones(g_hud_sheet.ref, coachline::Tone(g_hud_sheet.ref, g_hud_sheet.drive)).size()) + " braking zones");
+    if (!g_hud_sheet.ref.empty()) {
+        // Whether the line can lie on the track's own ground, and if not, why: the one thing a
+        // rider seeing it float needs to know. MXB Coach writes TRRN from v0.43.2's sheet format
+        // on, and only when it found the track's terrain and the laps sat steadily on it.
+        Log("ground", std::string("sheet terrain=") + (g_extras.terrain_k ? "yes" : "no") +
+                          (g_extras.terrain_k
+                               ? " (the track's own ground under the line)"
+                               : g_hud_sheet.drive.empty()
+                                     ? " (an older sheet: Coach rewrites it after your first whole lap here; until then "
+                                       "the line stands on your own ground and snaps to what the game draws)"
+                                     : " (Coach couldn't use this track's terrain; the line stands on your own ground "
+                                       "and snaps to what the game draws)"));
+        Log("ground", std::string("colours: source=") + coachline::ColourSource(g_hud_sheet.ref, g_hud_sheet.drive) +
+                          ", " +
+                          std::to_string(coachline::ToneZones(g_hud_sheet.ref, coachline::Tone(g_hud_sheet.ref, g_hud_sheet.drive)).size()) +
+                          " braking zones");
+    }
 }
 
 void LoadHud(bool quiet = false) {
@@ -1200,6 +1213,13 @@ coachline::ModelviewPick g_mv_best;  // this frame's best modelview camera
 coachline::AxesLock      g_mv_lock;
 unsigned                 g_mv_loads = 0;
 coachline::CameraFollow  g_follow;
+// The correction from the game's own depth under the line (coachline::DepthSnap). Render thread
+// only; a new event or stint asks for a reset through the flag.
+coachline::DepthSnap     g_dsnap;
+ULONGLONG                g_dsnap_ms = 0;
+volatile bool            g_dsnap_reset = true;
+unsigned                 g_dsnap_reads = 0, g_dsnap_used = 0;
+unsigned                 g_prev_picked = 0, g_prev_drawn = 0;  // for the 10 s line's deltas
 ULONGLONG                g_frame_ms = 0;  // this frame's time, set at each swap
 // The last camera drawn through, to carry a frame without one (CameraFollow's stale window).
 struct LastCam {
@@ -1800,6 +1820,47 @@ void DepthProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const 
     }
 }
 
+/// Reads the game's depth under the ribbon at coachline::kSnapAt metres ahead and feeds the
+/// correction (coachline::DepthSnap). Inside the draw's glPushAttrib; skipped while a pixel-pack
+/// buffer is bound, since the read would land in it.
+void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_dsnap_ms < coachline::kSnapEveryMs || g_draw_verts.size() < 8) return;
+    g_dsnap_ms = now;
+    GLint pack = 0;
+    glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack);
+    if (glGetError() == GL_NO_ERROR && pack != 0) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] <= 0 || vp[3] <= 0) return;
+    glReadBuffer(GL_BACK);
+    const std::vector<coachline::Vert>& v = g_draw_verts;
+    for (int k = 0; k < coachline::kSnapN; ++k) {
+        size_t row = 0;
+        float  bd  = INFINITY;
+        for (size_t i = 0; i + 1 < v.size(); i += 2)
+            if (std::fabs(v[i].s - coachline::kSnapAt[k]) < bd) bd = std::fabs(v[i].s - coachline::kSnapAt[k]), row = i;
+        if (bd > 2.0f) continue;
+        const float cx = (v[row].x + v[row + 1].x) * 0.5f, cz = (v[row].z + v[row + 1].z) * 0.5f;
+        const float cy = (v[row].y + v[row + 1].y) * 0.5f + g_dsnap.at(v[row].s);
+        const coachline::Screen sc = coachline::Project(proj, view, cx, cy, cz, ax);
+        if (!sc.ok || sc.x < 0 || sc.x > 1 || sc.y < 0 || sc.y > 1) continue;
+        float d = 1.0f;
+        glReadPixels(vp[0] + GLint(sc.x * float(vp[2])), vp[1] + GLint((1.0f - sc.y) * float(vp[3])), 1, 1,
+                     GL_DEPTH_COMPONENT, GL_FLOAT, &d);
+        if (glGetError() != GL_NO_ERROR || !(d > 1e-6f && d < 0.999999f)) continue;
+        ++g_dsnap_reads;
+        float hx, hy, hz;
+        if (!coachline::Unproject(proj, view, ax, sc.x, sc.y, d, hx, hy, hz)) continue;
+        const float dy = coachline::SnapReading(v, g_dsnap, hx, hy, hz, g_snap[0], g_snap[2]);
+        if (std::isfinite(dy)) {
+            // The reading is against the ribbon as drawn, so it adds to the correction there.
+            const float cur = g_dsnap.at(coachline::kSnapAt[k]);
+            if (g_dsnap.feed(k, cur + dy)) ++g_dsnap_used;
+        }
+    }
+}
+
 /// The ribbon through the game's camera, in the window's framebuffer. On the render thread.
 void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Mat4& model,
                     const coachline::Axes& ax, bool depth_ok) {
@@ -1835,6 +1896,12 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     if (g_use_program && program) g_use_program(0);
     if (depth_ok) DepthProbe(proj, coachline::Mul(view, model), ax);
+    if (g_dsnap_reset) {
+        g_dsnap.reset();
+        g_dsnap_reset = false;
+    }
+    // Without the track's own ground, snap to what the game drew, a few times a second.
+    if (depth_ok && g_depth != DEPTH_NONE && !g_extras.terrain_k) SnapProbe(proj, coachline::Mul(view, model), ax);
     g_orig_mode(GL_PROJECTION);
     glPushMatrix();
     g_orig_loadf(proj.m);
@@ -1875,7 +1942,8 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
     for (const coachline::Vert& p : v) {
         glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3] * coachline::Fade(p.s));
         float gx, gy, gz;
-        ax.apply(p.x, p.y, p.z, gx, gy, gz);
+        const float y = g_extras.terrain_k ? p.y : p.y + g_dsnap.at(p.s);
+        ax.apply(p.x, y, p.z, gx, gy, gz);
         glVertex3f(gx, gy, gz);
     }
     glEnd();
@@ -2036,7 +2104,20 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         const std::vector<coachline::Zone> zones =
                             g_cues.active() && lapM > 0 ? coachline::BrakeZones(g_cues.sheet(), lapM)
                                                         : std::vector<coachline::Zone>();
-                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones, &g_extras);
+                        // From where the rider is, on their own ground (Anchor), not from the
+                        // sheet's lap position, which drifts from the game's on a long or short lap.
+                        coachline::Anchor at;
+                        at.x      = g_rider.x;
+                        at.z      = g_rider.y;
+                        // The ground under the rider: the centreline there plus how far the bike
+                        // has ridden above it lately (HeightBias, seconds long), less the bike's
+                        // own height. Steady through bumps and jumps, where the bike's own height
+                        // would bob; the depth snap then takes it onto what the game drew.
+                        float centre = 0;
+                        at.ground = g_height.samples() > 0 && g_track.height_at_lap(g_pos, centre)
+                                        ? centre + g_height.gap() - coachline::kOriginGuess
+                                        : g_rider_y - coachline::kOriginGuess;
+                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones, &g_extras, &at);
                         g_draw_verts = g_ribbon.verts();
                         draw         = g_draw_verts.size() >= 4;
                         if (!draw) ++g_why[WHY_NO_VERTS];
@@ -2049,8 +2130,18 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                       " uniforms=" + std::to_string(g_ups_total) +
                                       " modelview_loads=" + std::to_string(g_mv_loads) +
                                       " camera=" + SourceName(g_source) +
-                                      " picked=" + std::to_string(g_u_picked) +
-                                      " drawn=" + std::to_string(g_gl.n_drawn) +
+                                      " picked=" + std::to_string(g_u_picked - g_prev_picked) +
+                                      " drawn=" + std::to_string(g_gl.n_drawn - g_prev_drawn) + " (last 10 s)" +
+                                      " snap=" + [] {
+                                          std::string o;
+                                          for (int k = 0; k < coachline::kSnapN; ++k) {
+                                              char b[24];
+                                              std::snprintf(b, sizeof(b), "%s%.2f", k ? "," : "", double(g_dsnap.value(k)));
+                                              o += b;
+                                          }
+                                          return o + " reads=" + std::to_string(g_dsnap_reads) +
+                                                 " used=" + std::to_string(g_dsnap_used);
+                                      }() +
                                       " draw_errors=" + std::to_string(g_gl.n_draw_errors) +
                                       " depth=" + std::to_string(int(g_depth)) +
                                       " height_gap=" + std::to_string(g_height.gap()) +
@@ -2061,6 +2152,8 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     for (int w = 0; w < WHY_COUNT; ++w)
                         if (g_why[w]) why += std::string(" ") + kWhyName[w] + "=" + std::to_string(g_why[w]);
                     Log("ground", "not drawn:" + (why.empty() ? std::string(" none") : why) + " (stale_redraw drew from the last camera)");
+                    g_prev_picked = g_u_picked;
+                    g_prev_drawn  = g_gl.n_drawn;
                     std::fill(std::begin(g_why), std::end(g_why), 0u);
                 }
             }
@@ -2232,6 +2325,7 @@ __declspec(dllexport) void EventDeinit() {
     g_ukey.reset();
     g_mv_lock.reset();
     g_follow.reset();
+    g_dsnap_reset = true;
     g_last_cam.ok = false;
     g_cam_since = 0;
     g_depth = DEPTH_NONE;
@@ -2272,6 +2366,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     g_stop.reset();
     g_have_sample = false;
     g_cam_since   = 0;
+    g_dsnap_reset = true;
     // The bottomed marks belong to the stint, not to the session.
     g_susp[0] = g_susp[1] = g_susp_deep[0] = g_susp_deep[1] = 0;
     g_have_susp = false;

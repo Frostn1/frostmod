@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-01 — v0.43.0
+
+### Changed
+- **Synced paints no longer refresh while you ride.** MXB App's paint sync used to make
+  FrostMod rebuild the paint lists and repaint every rider the moment a paint arrived, up to
+  three times per sync, on track. That stalls the frame the network shares, which froze or
+  dropped riders. Now a refresh waits for a moment where a hitch costs nothing: the join's own
+  loading screen (at most once per join), the pits, or the menus. Asks that arrive together are
+  one refresh. MXB App's full content reload waits for the pits the same way.
+- New command `paints_staged` (MXB App's paint sync): repaints only riders whose paint was
+  missing, plus anyone who arrived while the lists were rebuilt, instead of every rider.
+  `refresh_paints` (your own look) still repaints everyone, and now also waits while riding.
+
+### Diagnostics
+- `[paintgate]` lines: when a join starts (the connection dialog), phase changes (menu, joining,
+  pits, riding), when `EventInit` names the server, when a refresh runs, and what it cost
+  (`[paintgate] cost:` - total, longest frame, and the paint pass).
+- `[paintscan]` lines count the game's own paint-folder scans apart from FrostMod's, with the
+  time since the join started. One join answers whether the game rescans paints on its own.
+
 ## 2026-10-01 — v0.42.1
 
 ### Fixed

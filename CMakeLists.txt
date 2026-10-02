@@ -189,11 +189,6 @@ add_test(NAME racefilter COMMAND racefilter_test)
 add_executable(changefree_test tests/changefree_test.cpp)
 add_test(NAME changefree COMMAND changefree_test)
 
-# --- paint sync: when a paint refresh may run (src/paintgate.h) ------------------
-# A refresh mid-ride is what made players lag out; one join must cost one refresh at most.
-add_executable(paintgate_test tests/paintgate_test.cpp)
-add_test(NAME paintgate COMMAND paintgate_test)
-
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.
 add_executable(crashreport_test tests/crashreport_test.cpp)

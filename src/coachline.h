@@ -21,14 +21,20 @@
 // glFrustum followed directly by a rigid glMultMatrix on GL_PROJECTION; a perspective
 // glLoadMatrix on GL_PROJECTION followed by one is accepted too, should a build switch to it.
 //
+// The view is everything multiplied onto GL_PROJECTION after the frustum (glMultMatrix,
+// glTranslate, glRotate, glScale) until the game leaves GL_PROJECTION: v0.42.0 took only the
+// first glMultMatrix, which a camera assembled from a rotation and then a translation defeats.
+//
 // A candidate is only trusted when (1) its aspect matches the window's, which rules out the cube
 // faces and any mirror or preview, and (2) the camera it implies sits within kMaxCamDist of the
-// rider's own bike, which rules out a wrong convention, a wrong pass and the TV/free cameras. A
-// frame without such a camera draws nothing.
+// rider's own bike under some fixed relation between the GL axes and the telemetry axes, the
+// same relation kLockFrames frames running (AxesLock). That rules out a wrong pass and the
+// TV/free cameras, and finds the axes rather than assuming them. Without it nothing is drawn.
 #pragma once
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include "coachcue.h"
@@ -123,14 +129,65 @@ inline void CameraPos(const Mat4& v, float& x, float& y, float& z) {
     z = -(m[8] * m[12] + m[9] * m[13] + m[10] * m[14]);
 }
 
-/// How the game's GL world relates to the telemetry world (x east, y up, z north). Tried in
-/// order; the first that puts the camera next to the rider's bike is the one in use. A flip is
-/// applied to telemetry coordinates before they go through the game's matrices.
-struct Flip {
-    float sx = 1, sz = 1;
+/// glTranslate / glRotate / glScale, as the GL 1.1 spec defines them, so a camera built from
+/// them on GL_PROJECTION is followed as faithfully as one handed over whole.
+inline Mat4 Translate(float x, float y, float z) {
+    Mat4 t;
+    t.m[12] = x, t.m[13] = y, t.m[14] = z;
+    return t;
+}
+inline Mat4 Scale(float x, float y, float z) {
+    Mat4 s;
+    s.m[0] = x, s.m[5] = y, s.m[10] = z;
+    return s;
+}
+inline Mat4 Rotate(float deg, float x, float y, float z) {
+    Mat4        r;
+    const float len = std::sqrt(x * x + y * y + z * z);
+    if (!(len > 0) || !std::isfinite(deg)) return r;
+    x /= len, y /= len, z /= len;
+    const float a = deg * 0.017453292f, c = std::cos(a), s = std::sin(a), k = 1 - c;
+    r.m[0] = x * x * k + c, r.m[4] = x * y * k - z * s, r.m[8] = x * z * k + y * s;
+    r.m[1] = y * x * k + z * s, r.m[5] = y * y * k + c, r.m[9] = y * z * k - x * s;
+    r.m[2] = x * z * k - y * s, r.m[6] = y * z * k + x * s, r.m[10] = z * z * k + c;
+    return r;
+}
+
+/// How the game's GL world relates to the telemetry world (x east, y up, z north): GL axis i is
+/// telemetry axis src[i] times sgn[i]. All 48 signed permutations are tried, the identity first,
+/// so a y-up/z-up swap or a mirrored axis is found rather than assumed away. The first build
+/// tried three of them and v0.42.0 in the game picked none.
+struct Axes {
+    int   src[3] = {0, 1, 2};
+    float sgn[3] = {1, 1, 1};
+    void apply(float x, float y, float z, float& gx, float& gy, float& gz) const {
+        const float t[3] = {x, y, z};
+        gx = sgn[0] * t[src[0]], gy = sgn[1] * t[src[1]], gz = sgn[2] * t[src[2]];
+    }
 };
-constexpr Flip kFlips[]  = {{1, 1}, {1, -1}, {-1, 1}};
-constexpr int  kNumFlips = 3;
+constexpr int kNumAxes = 48;
+/// The i-th signed permutation: identity first, then the sign flips of the identity, then the
+/// other orders.
+inline Axes AxesAt(int i) {
+    static const int perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}};
+    Axes a;
+    const int p = i / 8, s = i % 8;
+    for (int k = 0; k < 3; ++k) {
+        a.src[k] = perms[p][k];
+        a.sgn[k] = (s >> k) & 1 ? -1.0f : 1.0f;
+    }
+    return a;
+}
+/// "x,y,z" or "-z,y,x": which telemetry axis feeds each GL axis, for the log.
+inline std::string AxesName(const Axes& a) {
+    std::string s;
+    for (int k = 0; k < 3; ++k) {
+        if (k) s += ',';
+        if (a.sgn[k] < 0) s += '-';
+        s += char('x' + a.src[k]);
+    }
+    return s;
+}
 
 struct Screen {
     float x = 0, y = 0;   // 0..1, origin top left
@@ -140,9 +197,9 @@ struct Screen {
 
 /// Telemetry world to screen fractions through projection `p` and view `v`. After MXBMRP3's
 /// worldToScreen, but through the game's own matrices instead of a camera model of our own.
-inline Screen Project(const Mat4& p, const Mat4& v, float x, float y, float z, Flip fl = {}) {
+inline Screen Project(const Mat4& p, const Mat4& v, float x, float y, float z, const Axes& ax = {}) {
     Screen s;
-    x *= fl.sx, z *= fl.sz;
+    ax.apply(x, y, z, x, y, z);
     const float* a  = v.m;
     const float  ex = a[0] * x + a[4] * y + a[8] * z + a[12];
     const float  ey = a[1] * x + a[5] * y + a[9] * z + a[13];
@@ -163,21 +220,31 @@ inline Screen Project(const Mat4& p, const Mat4& v, float x, float y, float z, F
 /// The chase and helmet cameras ride with the bike; the TV and free cameras do not, and a wrong
 /// convention or pass puts the "camera" somewhere unrelated. Either way: no line.
 constexpr float kMaxCamDist = 25.0f;
+/// Frames in a row the same axes must win before they are trusted, and then kept for the event.
+constexpr int kLockFrames = 30;
 
-/// A projection and view pair seen this frame, in the order the game issued them.
+/// A projection and view pair seen this frame, in the order the game issued them, with what the
+/// diagnostic wants to know about how it was built.
 struct Candidate {
     Mat4 proj, view;
+    int  ops = 0;      // matrix calls that built the view after the projection
+    int  n_mv = 0;     // GL_MODELVIEW loads seen after it, up to 4, by their translation
+    float mv[4][3] = {};
 };
 
-/// Which candidate, if any, is the camera the rider is looking through, and under which flip.
-/// `aspect`: the window's width over height. Among those that pass, the last one issued wins: a
-/// depth pre-pass and the colour pass share a camera, and anything else drawn in perspective (a
-/// cube face, a preview) has already been ruled out by its aspect or its distance.
+/// Which candidate, if any, is the camera the rider is looking through, and under which axes.
+/// `aspect`: the window's width over height. `locked`: the axes already settled on, or -1 to
+/// try them all. The simplest axes that put a camera within kMaxCamDist of the bike win (the
+/// identity before a flip, a flip before a swap), and among cameras, the last one issued (a
+/// depth pre-pass and the colour pass share one). Nearest-wins would let a wrong swap beat the
+/// right axes whenever the bike happens to sit near the world's origin.
 struct Pick {
-    int  index = -1;
-    Flip flip;
+    int   index = -1;
+    int   axes  = -1;
+    float dist  = 0;
 };
-inline Pick PickCamera(const std::vector<Candidate>& cands, float aspect, float rx, float ry, float rz) {
+inline Pick PickCamera(const std::vector<Candidate>& cands, float aspect, float rx, float ry, float rz,
+                       int locked = -1) {
     Pick out;
     if (!(aspect > 0) || !std::isfinite(rx) || !std::isfinite(ry) || !std::isfinite(rz)) return out;
     for (size_t i = 0; i < cands.size(); ++i) {
@@ -186,18 +253,49 @@ inline Pick PickCamera(const std::vector<Candidate>& cands, float aspect, float 
         if (std::fabs(Aspect(c.proj) - aspect) > aspect * 0.08f) continue;
         float cx, cy, cz;
         CameraPos(c.view, cx, cy, cz);
-        for (int k = 0; k < kNumFlips; ++k) {
-            const Flip  f  = kFlips[k];
-            const float dx = cx - rx * f.sx, dy = cy - ry, dz = cz - rz * f.sz;
-            if (dx * dx + dy * dy + dz * dz <= kMaxCamDist * kMaxCamDist) {
+        const int from = locked >= 0 ? locked : 0, to = locked >= 0 ? locked + 1 : kNumAxes;
+        for (int k = from; k < to; ++k) {
+            if (out.axes >= 0 && k > out.axes) break;
+            float gx, gy, gz;
+            AxesAt(k).apply(rx, ry, rz, gx, gy, gz);
+            const float d2 = (cx - gx) * (cx - gx) + (cy - gy) * (cy - gy) + (cz - gz) * (cz - gz);
+            if (d2 <= kMaxCamDist * kMaxCamDist) {
                 out.index = int(i);
-                out.flip  = f;
+                out.axes  = k;
+                out.dist  = std::sqrt(d2);
                 break;
             }
         }
     }
     return out;
 }
+
+/// Settles the axes: the same ones must win kLockFrames frames running, and are then kept until
+/// reset (a new event). Until then nothing is drawn, so one lucky frame cannot paint a line in
+/// the wrong world.
+class AxesLock {
+public:
+    void reset() { last_ = -1, streak_ = 0, locked_ = -1; }
+    /// This frame's winner, or -1 for none. Returns true the frame the lock is taken.
+    bool vote(int axes) {
+        if (locked_ >= 0) return false;
+        if (axes < 0) {
+            streak_ = 0;
+            return false;
+        }
+        streak_ = axes == last_ ? streak_ + 1 : 1;
+        last_   = axes;
+        if (streak_ >= kLockFrames) {
+            locked_ = axes;
+            return true;
+        }
+        return false;
+    }
+    int locked() const { return locked_; }
+
+private:
+    int last_ = -1, streak_ = 0, locked_ = -1;
+};
 
 // ---------------------------------------------------------------------------------------
 // Height
@@ -393,7 +491,8 @@ struct ScreenRow {
     float  s, alpha;
     bool   brake;
 };
-inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, Flip fl, const std::vector<Vert>& vs) {
+inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, const Axes& fl,
+                                            const std::vector<Vert>& vs) {
     std::vector<ScreenRow> out;
     for (size_t i = 0; i + 1 < vs.size(); i += 2) {
         ScreenRow row;

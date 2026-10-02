@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-02 — v0.44.0
+
+### Added
+- **Jump calls on the line.** Where Coach's lap jumped, the line now shows a white bar across it
+  at the lip, a faint box where the lap landed with a dotted arc of its flight between, and a
+  label standing over the lip, readable from 30-50 m: **SINGLE**, **DOUBLE**, **TRIPLE** or
+  **QUAD** by how many jump faces the flight cleared, **JUMP ON** / **JUMP OFF** for landing on or
+  leaving a table top, and **ROLL** where the lap stayed on the ground over a big face. Under it,
+  the speed the lap took off at (`45 KMH`).
+- The faces are counted on the track's own ground under the line (the sheet's TRRN). With the
+  matching MXB Coach the sheet also carries where the lap was in the air (new `AIRH` chunk);
+  an older sheet with the ground but not the air gets its flights predicted from each lip's
+  angle and the lap's speed there, and no ROLL calls.
+- A HUD option, `jumps` in `hud.ini` (on by default, shown only with the line on the track);
+  MXB Coach lists it as "Jump calls on the line". The log says how many calls a sheet gave and
+  where they came from (`jumps: 6 calls from the lap's air: DOUBLE=2 ...`).
+
 ## 2026-10-02 — v0.43.3
 
 ### Fixed

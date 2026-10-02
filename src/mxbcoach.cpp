@@ -40,6 +40,7 @@
 #include "coachcue.h"
 #include "coachline.h"
 #include "coachhud.h"
+#include "coachjump.h"
 #include "coachlog.h"
 #include "coachrec.h"
 #include "coachvoice.h"
@@ -1986,6 +1987,102 @@ const char* SourceName(int s) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Jump calls on the line (coachjump.h): the calls are made once a sheet, from its terrain, its
+// air and its speed, and drawn as extra quads (coachmark.h) after the ribbon, on the ribbon as
+// built. Kept apart from the ribbon's own draw so the two can change independently.
+std::vector<coachjump::Call>  g_jump_calls;
+uint32_t                      g_jump_ver = 0;
+std::vector<coachmark::Quad>  g_marks;  // this frame's, built under the lock, drawn outside it
+
+/// This frame's marks for the calls ahead of the rider. Under g_mu, after the ribbon is built.
+void BuildMarks() {
+    g_marks.clear();
+    if (g_jump_ver != g_extras.version) {
+        g_jump_ver                    = g_extras.version;
+        const coachjump::Line line    = coachjump::MakeLine(g_hud_sheet);
+        g_jump_calls                  = coachjump::Calls(line);
+        if (!g_hud_sheet.ref.empty()) Log("jumps", coachjump::Summary(line, g_jump_calls));
+    }
+    if (!g_hud_set.jumps || g_jump_calls.empty() || g_draw_verts.size() < 4) return;
+    float     frac = 0;
+    const int ai   = coachline::AnchorPoint(g_hud_sheet.ref, g_rider.x, g_rider.y, g_pos, frac);
+    coachjump::Marks(g_marks, g_jump_calls, coachjump::AheadOf(g_hud_sheet.ref, ai, frac, coachline::kAhead + 10.0f),
+                     g_draw_verts);
+}
+
+/// The marks through the same camera as the ribbon, with the same ground correction. On the
+/// render thread, right after DrawGroundLine, with the game's state saved and put back the same way.
+void DrawMarks(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Mat4& model,
+               const coachline::Axes& ax, bool depth_ok) {
+    if (g_marks.empty()) return;
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    GLint program = 0, active = GLint(kGlTexture0);
+    if (g_use_program) glGetIntegerv(kGlCurrentProgram, &program);
+    if (g_active_texture) glGetIntegerv(kGlActiveTexture, &active);
+    glGetError();
+    const GLenum mode = g_gl.mode;
+    g_gl.own          = true;
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    if (g_use_program && program) g_use_program(0);
+    g_orig_mode(GL_PROJECTION);
+    glPushMatrix();
+    g_orig_loadf(proj.m);
+    g_orig_multf(view.m);
+    g_orig_mode(GL_MODELVIEW);
+    glPushMatrix();
+    g_orig_loadf(model.m);
+    for (int u = 0; u < (g_active_texture ? 4 : 1); ++u) {
+        if (g_active_texture) g_active_texture(kGlTexture0 + GLenum(u));
+        glDisable(GL_TEXTURE_2D);
+    }
+    if (g_active_texture) g_active_texture(kGlTexture0);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_FOG);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    if (g_depth == DEPTH_NONE || !depth_ok) {
+        glDisable(GL_DEPTH_TEST);
+    } else {
+        // Tested like the ribbon, pulled a little further so a bar lying on it wins.
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(g_depth == DEPTH_GEQUAL ? GL_GEQUAL : GL_LEQUAL);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(g_depth == DEPTH_GEQUAL ? 3.0f : -3.0f, g_depth == DEPTH_GEQUAL ? 40.0f : -40.0f);
+    }
+    const bool on_ground = g_extras.terrain_k != 0;  // as the ribbon: no snap on the track's own ground
+    glBegin(GL_QUADS);
+    for (const coachmark::Quad& q : g_marks) {
+        const float dy = on_ground ? 0.0f : g_dsnap.at(q.s);
+        if (!std::isfinite(dy)) continue;
+        glColor4f(q.rgba[0], q.rgba[1], q.rgba[2], q.rgba[3]);
+        for (int c = 0; c < 4; ++c) {
+            float gx, gy, gz;
+            ax.apply(q.p[c][0], q.p[c][1] + dy, q.p[c][2], gx, gy, gz);
+            glVertex3f(gx, gy, gz);
+        }
+    }
+    glEnd();
+    g_orig_mode(GL_MODELVIEW);
+    glPopMatrix();
+    g_orig_mode(GL_PROJECTION);
+    glPopMatrix();
+    if (g_use_program && program) g_use_program(GLuint(program));
+    if (g_active_texture) g_active_texture(GLenum(active));
+    glPopAttrib();
+    g_gl.mode = mode;
+    g_gl.own  = false;
+    while (glGetError() != GL_NO_ERROR) {
+    }
+}
+
 BOOL WINAPI hkSwap(HDC hdc) {
     try {
         if (!g_gl.thread) g_gl.thread = GetCurrentThreadId();
@@ -2121,6 +2218,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         g_draw_verts = g_ribbon.verts();
                         draw         = g_draw_verts.size() >= 4;
                         if (!draw) ++g_why[WHY_NO_VERTS];
+                        BuildMarks();
                     }
                 }
                 // Every 10 s while it is on: where the camera came from, and what was drawn.
@@ -2158,6 +2256,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                 }
             }
             if (draw) DrawGroundLine(proj, view, model, ax, depth_ok);
+            if (draw) DrawMarks(proj, view, model, ax, depth_ok);
         }
     } catch (...) {
         g_gl.own = false;

@@ -60,6 +60,15 @@ static std::vector<uint8_t> Write(const Sheet& s) {
         o.str(sec.tip);
     }
     o.u32(s.flags);
+    if (!s.chan.empty()) {
+        o.raw("CHAN", 4);
+        o.u32(uint32_t(s.chan.size()));
+        for (const Chan& c : s.chan) {
+            o.f32(c.speed);
+            o.f32(c.throttle);
+            o.f32(c.brake);
+        }
+    }
     return o.b;
 }
 
@@ -147,6 +156,25 @@ static void RefusesWhatTheAppDoesNotWrite() {
     std::vector<uint8_t> more = ok;
     more.push_back(0xEE);
     CHECK(Load(more, s), "bytes after the flags are ignored");
+}
+
+static void Channels() {
+    Sheet s, w = SteadyLap();
+    CHECK(Load(Write(w), s) && s.chan.empty(), "an old sheet has no channels and still loads");
+    for (size_t i = 0; i < w.ref.size(); ++i) w.chan.push_back({10.0f + i, i % 2 ? 1.0f : 0.0f, 0.25f});
+    std::vector<uint8_t> b = Write(w);
+    CHECK(Load(b, s) && s.ref.size() == 101 && s.chan.size() == 101, "channels load");
+    CHECK(s.chan[3].speed == 13.0f && s.chan[3].throttle == 1.0f && s.chan[4].throttle == 0.0f && s.chan[3].brake == 0.25f,
+          "values");
+    CHECK(s.flags == 0 && s.sections.empty(), "the rest of the sheet is unchanged");
+    std::vector<uint8_t> cut(b.begin(), b.end() - 5);
+    CHECK(Load(cut, s) && s.chan.empty() && s.ref.size() == 101, "a cut block is dropped, not the sheet");
+    Sheet bad = w;
+    bad.chan[7].throttle = 1.5f;
+    CHECK(Load(Write(bad), s) && s.chan.empty(), "an out-of-range value drops the block");
+    bad = w;
+    bad.chan.pop_back();
+    CHECK(Load(Write(bad), s) && s.chan.empty(), "a count that is not the point count drops the block");
 }
 
 static void TextIsMadeSafeToDraw() {
@@ -704,6 +732,7 @@ static void DraggingAPart() {
 int main() {
     TheBytesAreExact();
     RefusesWhatTheAppDoesNotWrite();
+    Channels();
     TextIsMadeSafeToDraw();
     NamesAndFits();
     TheGapToCoachsLap();

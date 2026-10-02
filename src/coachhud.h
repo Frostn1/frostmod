@@ -25,7 +25,11 @@
 //               u8 name length, name bytes, u8 tip length, tip bytes (ASCII; anything else
 //               shows as '?')
 //   then u32    flags: bit 0 = the setup card asks for a sag measurement
-// Bytes after the flags are ignored.
+// Bytes after the flags are ignored, except an optional channel block (written by newer
+// MXB Coach, version stays 1 so old plugins skip it as trailing bytes):
+//   then char[4] "CHAN", u32 M (must equal N), M x 12: f32 speed m/s, f32 throttle 0..1,
+//               f32 brake 0..1 (front and rear, the larger of the two), one per reference
+//               point in the same order. A missing or malformed block leaves Sheet::chan empty.
 #pragma once
 
 #include <algorithm>
@@ -63,6 +67,11 @@ struct RefPoint {
     float pos = 0, t = 0, x = 0, z = 0;
 };
 
+// The reference lap's inputs at one RefPoint.
+struct Chan {
+    float speed = 0, throttle = 0, brake = 0;
+};
+
 struct Section {
     float       start_m = 0, end_m = 0;
     std::string name, tip;
@@ -71,6 +80,7 @@ struct Section {
 struct Sheet {
     float                 track_len = 0;
     std::vector<RefPoint> ref;
+    std::vector<Chan>     chan;      // empty (an old sheet) or one per ref point
     std::vector<Section>  sections;  // by start
     uint32_t              flags = 0;
 };
@@ -129,6 +139,23 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
     }
     if (n - at < 4) return false;
     s.flags = U32(b + at);
+    at += 4;
+    // Optional channels: all or nothing, so a damaged block falls back like an old sheet.
+    if (n - at >= 8 && std::memcmp(b + at, "CHAN", 4) == 0 && U32(b + at + 4) == np && np > 0 &&
+        (n - at - 8) / 12 >= np) {
+        std::vector<Chan> ch;
+        size_t            c = at + 8;
+        for (uint32_t i = 0; i < np; ++i, c += 12) {
+            Chan k{F32(b + c), F32(b + c + 4), F32(b + c + 8)};
+            if (!std::isfinite(k.speed) || !std::isfinite(k.throttle) || !std::isfinite(k.brake) || k.speed < 0 ||
+                k.throttle < 0 || k.throttle > 1 || k.brake < 0 || k.brake > 1) {
+                ch.clear();
+                break;
+            }
+            ch.push_back(k);
+        }
+        s.chan = std::move(ch);
+    }
     std::stable_sort(s.sections.begin(), s.sections.end(),
                      [](const Section& x, const Section& y) { return x.start_m < y.start_m; });
     out = std::move(s);

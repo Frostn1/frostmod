@@ -546,7 +546,7 @@ Rules the plugin enforces:
   in any order.
 - **Text:** at most 255 bytes each. Anything past ASCII shows as one `?` per character,
   because the game draws CP1252, so write plain ASCII.
-- **Trailing bytes:** anything after the flags is ignored.
+- **Trailing bytes:** anything after the flags is ignored, except an optional channel block: `"CHAN"`, `u32` M (= N), then M x (`f32` speed m/s, `f32` throttle 0..1, `f32` brake 0..1, larger of front/rear), one per reference point. Absent or malformed means no channels (old sheets); the version stays 1.
 
 The 80-byte example in `tests/coachhud_test.cpp` (`TheBytesAreExact`) is laid out byte by byte:
 1650 m, two points, one section `Whoops` / `Stand up` from 100 to 200 m, and the sag flag.

@@ -33,6 +33,9 @@
 //             -(K-1)/2*step on the right to +(K-1)/2*step on the left (left = the line's
 //             direction turned 90 degrees anticlockwise seen from above, x/z). NaN off the grid.
 //     "DRIV"  u32 N, then N x 3 f32: speed m/s, throttle 0..1, brake 0..1 (the harder of the two)
+//     "AIRH"  u32 N, then N x 3 f32: the bike's world y m, its height above the track's own ground
+//             (NaN when Coach had no terrain), and the share of the lap airborne from that point
+//             to the next, 0..1. What coachjump.h calls the jumps from.
 //     "REFY"  u32 N, then N f32: the reference lap's own height (the bike's y) at each point
 // Bytes after the chunks are ignored.
 #pragma once
@@ -88,6 +91,8 @@ struct Sheet {
     std::vector<float>    terrain;  // ref.size() x terrain_k
     // Speed, throttle and brake at each point ("DRIV"), empty without one.
     std::vector<float>    drive;    // ref.size() x 3
+    // The bike's height, its height above the ground and how airborne, at each point ("AIRH").
+    std::vector<float>    air;      // ref.size() x 3, empty without one
     // The reference lap's own height at each point ("REFY"), empty without one.
     std::vector<float>    refy;
 };
@@ -190,6 +195,20 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
                 if (!std::isfinite(d[i]) || d[i] < -1e-3f || d[i] > 200.0f) ok = false;
             }
             if (ok) s.drive = std::move(d);
+        } else if (std::memcmp(tag, "AIRH", 4) == 0 && len >= 4) {
+            const uint32_t cn = U32(c);
+            if (cn != npts || len < 4 + uint64_t(cn) * 12) continue;
+            std::vector<float> d(size_t(cn) * 3);
+            bool ok = true;
+            for (size_t i = 0; i < cn && ok; ++i) {
+                const float y = F32(c + 4 + i * 12), above = F32(c + 8 + i * 12), air = F32(c + 12 + i * 12);
+                // Heights may be unknown (NaN), never absurd; the airborne share is a share.
+                if ((std::isfinite(y) && std::fabs(y) > 1e5f) || (std::isfinite(above) && std::fabs(above) > 1e4f) ||
+                    !std::isfinite(air) || air < 0 || air > 1)
+                    ok = false;
+                d[i * 3] = y, d[i * 3 + 1] = above, d[i * 3 + 2] = air;
+            }
+            if (ok) s.air = std::move(d);
         }
     }
     std::stable_sort(s.sections.begin(), s.sections.end(),
@@ -251,6 +270,9 @@ struct Settings {
     // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
     // the one on the track, and found nothing there when only the map drew it.
     bool  ground = false;
+    // On that line: where to take off, where Coach's lap landed and what the jump is (coachjump.h).
+    // On by default, since it only ever shows on the line the rider already asked for.
+    bool  jumps = true;
     // Pace hints over that line (coachpace.h): chevrons when coming in too fast or too slow for
     // Coach's lap, and "MORE SPEED" before a jump that needs it. Off until asked for; drawn only
     // with the line on the track.
@@ -299,6 +321,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
     s.ground  = flag("ground", s.trail);
+    s.jumps   = flag("jumps", true);
     s.pace    = flag("pace", false);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);

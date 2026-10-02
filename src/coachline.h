@@ -471,6 +471,7 @@ struct ModelviewPick {
     Mat4  view;
     int   axes = -1;
     float dist = 0;
+    float jump = 0;  // from the camera being followed, when one is (CameraFollow)
 };
 
 /// How far from the bike's origin the chase or helmet camera sits, at most, for the modelview
@@ -608,12 +609,14 @@ private:
 struct Vert {
     float x, y, z;  // telemetry world
     float s;        // metres along the line from the rider, for the fade
-    bool  brake;    // in one of Coach's braking zones
+    float heat;     // 0 on the throttle .. 0.5 lifting or light braking .. 1 hard braking
 };
 
-constexpr float kStep         = 2.0f;   // metres between ribbon rows
+constexpr float kStep         = 2.0f;   // metres between ribbon rows, on centreline heights
+constexpr float kStepTerrain  = 0.5f;   // and on the track's own ground, to follow its bumps
 constexpr float kHalfWidth    = 0.35f;  // half the painted line's width
-constexpr float kLift         = 0.06f;  // above the surface; polygon offset does the rest
+constexpr float kLift         = 0.06f;  // above the centreline height; polygon offset does the rest
+constexpr float kLiftTerrain  = 0.02f;  // above the track's own ground: painted on, not floating
 constexpr float kAhead        = 60.0f;  // metres drawn ahead
 constexpr float kFadeNear     = 25.0f;
 constexpr float kFadeFar      = 60.0f;
@@ -632,8 +635,9 @@ struct Zone {
 };
 
 /// Coach's braking zones from its cue sheet: from each BRAKE cue to the next OFF_BRAKES or
-/// THROTTLE cue, at most kMaxBrakeZone long. A sheet without brake cues has none, and the
-/// ribbon is all blue.
+/// THROTTLE cue, at most kMaxBrakeZone long. The fallback when the sheet's lap can't say where
+/// it slowed (Heat below): a sheet carries three or four cues, a lap has a corner every few
+/// seconds.
 inline std::vector<Zone> BrakeZones(const coachcue::Sheet& s, float lap_m) {
     std::vector<Zone> out;
     const size_t n = s.cues.size();
@@ -660,23 +664,163 @@ inline bool InZone(const std::vector<Zone>& zones, float m, float lap_m) {
     return false;
 }
 
+// ---------------------------------------------------------------------------------------
+// Where Coach's lap slowed down
+
+constexpr float kDecelLight = 1.5f;  // m/s^2: below this it is still on the gas, or near enough
+constexpr float kDecelHard  = 8.0f;  // m/s^2: and from here it is hard on the brakes
+constexpr float kHeatWindowM = 4.0f; // metres either side the speed and its change are taken over
+constexpr float kZoneHeat    = 0.5f; // a braking zone is where the heat reaches this
+constexpr float kZoneMinM    = 4.0f; // and stays there this long
+constexpr float kZoneMergeM  = 12.0f;// two zones this close are one corner
+
+/// How hard Coach's lap was slowing at each of its points, 0..1. From the sheet's "DRIV" chunk
+/// when it has one (speed and the brake itself), otherwise from the lap's own points: speed is
+/// distance over time between points kHeatWindowM either side, deceleration the change in that
+/// speed over the time between. Either way smoothed over kHeatWindowM, so the colour runs along
+/// the ribbon instead of flickering from point to point. Empty when the lap can't say (fewer than
+/// a handful of points, or time that doesn't advance).
+inline std::vector<float> Heat(const std::vector<coachhud::RefPoint>& ref, const std::vector<float>& drive = {}) {
+    const size_t n = ref.size();
+    std::vector<float> out;
+    if (n < 8) return out;
+    // Distance along the lap at each point.
+    std::vector<float> s(n, 0.0f);
+    for (size_t i = 1; i < n; ++i) {
+        const float d = std::hypot(ref[i].x - ref[i - 1].x, ref[i].z - ref[i - 1].z);
+        s[i]          = s[i - 1] + (d < kMaxGapM ? d : 0.0f);
+    }
+    if (!(s.back() > 50.0f)) return out;
+    auto span = [&](size_t i, size_t& lo, size_t& hi) {
+        lo = i, hi = i;
+        while (lo > 0 && s[i] - s[lo] < kHeatWindowM) --lo;
+        while (hi + 1 < n && s[hi] - s[i] < kHeatWindowM) ++hi;
+    };
+    const bool have_drive = drive.size() == n * 3;
+    std::vector<float> v(n, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        if (have_drive) {
+            v[i] = drive[i * 3];
+            continue;
+        }
+        size_t lo, hi;
+        span(i, lo, hi);
+        const float dt = ref[hi].t - ref[lo].t;
+        v[i]           = dt > 1e-3f ? (s[hi] - s[lo]) / dt : -1.0f;
+    }
+    std::vector<float> raw(n, 0.0f);
+    size_t             known = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t lo, hi;
+        span(i, lo, hi);
+        const float dt = ref[hi].t - ref[lo].t;
+        if (!(dt > 1e-3f) || v[lo] < 0 || v[hi] < 0) continue;
+        ++known;
+        const float decel = (v[lo] - v[hi]) / dt;
+        float       h     = (decel - kDecelLight) / (kDecelHard - kDecelLight) * 0.75f + (decel > kDecelLight ? 0.25f : 0.0f);
+        if (have_drive) h = (std::max)(h, drive[i * 3 + 2]);  // the brake itself, when Coach sent it
+        raw[i] = (std::max)(0.0f, (std::min)(1.0f, h));
+    }
+    if (known < n / 2) return out;
+    out.assign(n, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        size_t lo, hi;
+        span(i, lo, hi);
+        float sum = 0;
+        for (size_t k = lo; k <= hi; ++k) sum += raw[k];
+        out[i] = sum / float(hi - lo + 1);
+    }
+    return out;
+}
+
+/// The braking zones in a heat profile, as point index ranges [from, to): where the heat holds
+/// kZoneHeat for kZoneMinM, zones closer than kZoneMergeM joined into one corner.
+inline std::vector<std::pair<size_t, size_t>> HeatZones(const std::vector<coachhud::RefPoint>& ref,
+                                                        const std::vector<float>& heat) {
+    std::vector<std::pair<size_t, size_t>> out;
+    if (heat.size() != ref.size()) return out;
+    auto dist = [&](size_t a, size_t b) {
+        float d = 0;
+        for (size_t i = a; i + 1 <= b && i + 1 < ref.size(); ++i) {
+            const float s = std::hypot(ref[i + 1].x - ref[i].x, ref[i + 1].z - ref[i].z);
+            d += s < kMaxGapM ? s : 0.0f;
+        }
+        return d;
+    };
+    for (size_t i = 0; i < heat.size();) {
+        if (heat[i] < kZoneHeat) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < heat.size() && heat[j] >= kZoneHeat) ++j;
+        if (!out.empty() && dist(out.back().second, i) < kZoneMergeM) out.back().second = j;
+        else out.push_back({i, j});
+        i = j;
+    }
+    std::vector<std::pair<size_t, size_t>> kept;
+    for (const auto& z : out)
+        if (dist(z.first, z.second) >= kZoneMinM) kept.push_back(z);
+    return kept;
+}
+
+/// The ribbon's colour: blue on the throttle, through yellow, to red under hard braking.
+inline void HeatColour(float h, float& r, float& g, float& b) {
+    h = (std::max)(0.0f, (std::min)(1.0f, h));
+    if (h < 0.5f) {
+        const float k = h / 0.5f;  // blue (0.10, 0.50, 1.00) to yellow (1.00, 0.85, 0.10)
+        r = 0.10f + 0.90f * k, g = 0.50f + 0.35f * k, b = 1.00f - 0.90f * k;
+    } else {
+        const float k = (h - 0.5f) / 0.5f;  // yellow to red (1.00, 0.20, 0.15)
+        r = 1.0f, g = 0.85f - 0.65f * k, b = 0.10f + 0.05f * k;
+    }
+}
+
+/// What the sheet adds to the ribbon beyond its points: the ground across the line ("TRRN") and
+/// how hard the lap was braking at each point. Built once per sheet; `version` changes with it.
+struct RibbonExtras {
+    uint32_t           version = 0;
+    uint32_t           terrain_k = 0;
+    float              terrain_step = 0;
+    std::vector<float> terrain;  // per point x K, NaN off the grid
+    std::vector<float> heat;     // per point, empty when unknown
+};
+
+/// The track's ground `off` metres to the left of point `i` (negative: right), from its TRRN
+/// row. False off the grid or without one.
+inline bool TerrainAt(const RibbonExtras& ex, size_t i, float off, float& h) {
+    const uint32_t k = ex.terrain_k;
+    if (!k || ex.terrain.size() < (i + 1) * k) return false;
+    float f = off / ex.terrain_step + float(k - 1) * 0.5f;
+    if (f < 0 || f > float(k - 1)) return false;
+    const size_t j  = (std::min)(size_t(f), size_t(k - 2));
+    const float  fr = f - float(j);
+    const float  a = ex.terrain[i * k + j], b = ex.terrain[i * k + j + 1];
+    if (!std::isfinite(a) || !std::isfinite(b)) return false;
+    h = a + (b - a) * fr;
+    return true;
+}
+
 /// The ribbon cache. Rebuilt when the rider has moved kRebuildM along the lap, or the height
-/// offset or the zones changed, not per frame; the per-frame cost is one pass over the strip.
+/// offset, the zones or the sheet changed, not per frame; the per-frame cost is one pass.
 class Ribbon {
 public:
     /// `ref`: Coach's points (lap position and world x/z). `track`: centreline heights.
-    /// `pos`: the rider's lap fraction. `offset`: HeightBias::offset(). `zones`: braking zones.
+    /// `pos`: the rider's lap fraction. `offset`: HeightBias::offset(). `zones`: cue braking
+    /// zones, used only when `ex` has no heat. `ex`: the sheet's ground and heat, or null.
     /// Returns true when verts() changed.
     bool update(const std::vector<coachhud::RefPoint>& ref, const coachhud::Track& track, float pos, float offset,
-                const std::vector<Zone>& zones = {}) {
+                const std::vector<Zone>& zones = {}, const RibbonExtras* ex = nullptr) {
         if (ref.size() < 2 || !track.ready() || track.length() <= 0 || !std::isfinite(pos) || pos < 0 || pos > 1 ||
             !std::isfinite(offset)) {
             const bool had = !verts_.empty();
             clear();
             return had;
         }
-        const float lapM = track.length();
-        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && std::fabs(offset - offset_) < 0.1f) {
+        const float    lapM = track.length();
+        const uint32_t ver  = ex ? ex->version : 0;
+        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver &&
+            std::fabs(offset - offset_) < 0.1f) {
             float d = std::fabs(pos - built_for_) * lapM;
             d       = (std::min)(d, lapM - d);
             if (d < kRebuildM) return false;
@@ -684,8 +828,12 @@ public:
         built_for_ = pos;
         ref_n_     = ref.size();
         zones_n_   = zones.size();
+        ver_       = ver;
         offset_    = offset;
         verts_.clear();
+        const bool  terrain = ex && ex->terrain_k && ex->terrain.size() == ref.size() * ex->terrain_k;
+        const bool  heat    = ex && ex->heat.size() == ref.size();
+        const float step    = terrain ? kStepTerrain : kStep;
         // The segment the rider is on: the last point at or behind them, wrapping the lap.
         const size_t n  = ref.size();
         size_t       i0 = 0;
@@ -704,8 +852,9 @@ public:
         }
         float nextRow = 0;
         for (size_t k = 0; k < n && nextRow <= kAhead; ++k) {
-            const coachhud::RefPoint& a = ref[i];
-            const coachhud::RefPoint& b = ref[(i + 1) % n];
+            const size_t              ib = (i + 1) % n;
+            const coachhud::RefPoint& a  = ref[i];
+            const coachhud::RefPoint& b  = ref[ib];
             const float dx = b.x - a.x, dz = b.z - a.z;
             const float len = std::sqrt(dx * dx + dz * dz);
             // A long jump between points is the sheet's two ends meeting across the infield.
@@ -718,39 +867,105 @@ public:
                     lap -= std::floor(lap);
                     float h = 0;
                     track.height_at_lap(lap, h);
-                    const float cx = a.x + fc * dx, cz = a.z + fc * dz, cy = h + offset + kLift;
-                    const float nx = -tz, nz = tx;  // the perpendicular in x/z (y up)
-                    const bool  br = InZone(zones, lap * lapM, lapM);
-                    verts_.push_back({cx + nx * kHalfWidth, cy, cz + nz * kHalfWidth, nextRow, br});
-                    verts_.push_back({cx - nx * kHalfWidth, cy, cz - nz * kHalfWidth, nextRow, br});
-                    nextRow += kStep;
+                    const float cx = a.x + fc * dx, cz = a.z + fc * dz;
+                    float       yl = h + offset + kLift, yr = yl;
+                    // On the track's own ground, each edge where the ground is under it: the
+                    // ribbon takes the bumps along and the camber across.
+                    if (terrain) {
+                        float la, lb, ra, rb;
+                        if (TerrainAt(*ex, i, kHalfWidth, la) && TerrainAt(*ex, ib, kHalfWidth, lb) &&
+                            TerrainAt(*ex, i, -kHalfWidth, ra) && TerrainAt(*ex, ib, -kHalfWidth, rb)) {
+                            yl = la + (lb - la) * fc + kLiftTerrain;
+                            yr = ra + (rb - ra) * fc + kLiftTerrain;
+                        }
+                    }
+                    const float nx = -tz, nz = tx;  // the left perpendicular in x/z (y up)
+                    float       ht = 0;
+                    if (heat) ht = ex->heat[i] + (ex->heat[ib] - ex->heat[i]) * fc;
+                    else ht = InZone(zones, lap * lapM, lapM) ? 1.0f : 0.0f;
+                    verts_.push_back({cx + nx * kHalfWidth, yl, cz + nz * kHalfWidth, nextRow, ht});
+                    verts_.push_back({cx - nx * kHalfWidth, yr, cz - nz * kHalfWidth, nextRow, ht});
+                    nextRow += step;
                 }
             }
             travelled += len;
-            i = (i + 1) % n;
+            i = ib;
         }
         return true;
     }
-    /// Triangle-strip vertices, two per row (one each side of the line).
+    /// Triangle-strip vertices, two per row (left, then right).
     const std::vector<Vert>& verts() const { return verts_; }
     void clear() {
         verts_.clear();
         built_for_ = -1.0f;
         ref_n_ = zones_n_ = 0;
+        ver_ = 0;
     }
 
 private:
     std::vector<Vert> verts_;
     float             built_for_ = -1.0f, offset_ = 0;
     size_t            ref_n_ = 0, zones_n_ = 0;
+    uint32_t          ver_ = 0;
 };
 
+// ---------------------------------------------------------------------------------------
+// Keeping the camera steady
+//
+// v0.43.1 in the game: the source flapped between "modelview" and "searching" several times a
+// second, and two frames in three that picked a camera drew nothing. A frame without a camera
+// load near the bike (a menu overlay, a frame the track chunk isn't drawn) dropped everything.
+// Now the camera found is followed from frame to frame: a frame's candidate must sit within
+// kJumpM of the last camera to be taken (so a one-frame outlier is never drawn from), a miss is
+// carried for kHoldMs before the search starts over, and the last camera may be redrawn for
+// kStaleMs so a single miss doesn't blink the line.
+constexpr float     kJumpM   = 3.0f;
+constexpr unsigned  kHoldMs  = 500;
+constexpr unsigned  kStaleMs = 100;
+
+class CameraFollow {
+public:
+    void reset() { has_ = false; }
+    /// The last camera's eye to stay near, or null to search freely.
+    const float* anchor(unsigned long long now) const { return holding(now) ? eye_ : nullptr; }
+    bool holding(unsigned long long now) const { return has_ && now - last_ms_ <= kHoldMs; }
+    bool fresh(unsigned long long now) const { return has_ && now - last_ms_ <= kStaleMs; }
+    void hit(const float eye[3], unsigned long long now) {
+        eye_[0] = eye[0], eye_[1] = eye[1], eye_[2] = eye[2];
+        last_ms_ = now;
+        has_     = true;
+    }
+
+private:
+    bool               has_ = false;
+    float              eye_[3] = {0, 0, 0};
+    unsigned long long last_ms_ = 0;
+};
+
+/// ModelviewOffer for a camera that has to stay where the last one was: the eye must also be
+/// within kJumpM of `prev`, and the nearest to it wins.
+inline bool ModelviewFollow(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int axes,
+                            const float prev[3]) {
+    if (!ValidView(m) || axes < 0) return false;
+    float ex, ey, ez;
+    CameraPos(m, ex, ey, ez);
+    const float j2 = (ex - prev[0]) * (ex - prev[0]) + (ey - prev[1]) * (ey - prev[1]) + (ez - prev[2]) * (ez - prev[2]);
+    if (!(j2 <= kJumpM * kJumpM)) return false;
+    float gx, gy, gz;
+    AxesAt(axes).apply(rx, ry, rz, gx, gy, gz);
+    const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
+    if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) return false;
+    const float j = std::sqrt(j2);
+    if (best.ok && j >= best.jump) return false;
+    best.ok = true, best.view = m, best.axes = axes, best.dist = std::sqrt(d2), best.jump = j;
+    return true;
+}
+
 /// One row of the ribbon on screen, for the tests and the offline preview: both edges, how far
-/// along it is and how opaque. Rows behind the camera are left out.
+/// along it is, how opaque and how hot. Rows behind the camera are left out.
 struct ScreenRow {
     Screen l, r;
-    float  s, alpha;
-    bool   brake;
+    float  s, alpha, heat;
 };
 inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, const Axes& fl,
                                             const std::vector<Vert>& vs) {
@@ -761,7 +976,7 @@ inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, const 
         row.r     = Project(p, v, vs[i + 1].x, vs[i + 1].y, vs[i + 1].z, fl);
         row.s     = vs[i].s;
         row.alpha = Fade(vs[i].s);
-        row.brake = vs[i].brake;
+        row.heat  = vs[i].heat;
         if (row.l.ok && row.r.ok) out.push_back(row);
     }
     return out;

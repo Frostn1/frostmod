@@ -25,7 +25,15 @@
 //               u8 name length, name bytes, u8 tip length, tip bytes (ASCII; anything else
 //               shows as '?')
 //   then u32    flags: bit 0 = the setup card asks for a sag measurement
-// Bytes after the flags are ignored.
+//   then, optionally, chunks: char[4] tag, u32 payload bytes, payload. A plugin that predates a
+//   tag skips it by its length (one that predates chunks ignores everything after the flags), and
+//   a malformed chunk is dropped without costing the sheet:
+//     "TRRN"  u32 N (= the point count), u32 K (2..9), f32 step m, then N x K f32: the track's
+//             own ground height (its .trh) at K offsets across the line at each point, from
+//             -(K-1)/2*step on the right to +(K-1)/2*step on the left (left = the line's
+//             direction turned 90 degrees anticlockwise seen from above, x/z). NaN off the grid.
+//     "DRIV"  u32 N, then N x 3 f32: speed m/s, throttle 0..1, brake 0..1 (the harder of the two)
+// Bytes after the chunks are ignored.
 #pragma once
 
 #include <algorithm>
@@ -73,6 +81,12 @@ struct Sheet {
     std::vector<RefPoint> ref;
     std::vector<Section>  sections;  // by start
     uint32_t              flags = 0;
+    // The ground across the line at each point ("TRRN"), empty without one.
+    uint32_t              terrain_k    = 0;
+    float                 terrain_step = 0;
+    std::vector<float>    terrain;  // ref.size() x terrain_k
+    // Speed, throttle and brake at each point ("DRIV"), empty without one.
+    std::vector<float>    drive;    // ref.size() x 3
 };
 
 /// Text the game can draw: its strings are CP1252, so anything past ASCII becomes one '?' per
@@ -129,6 +143,42 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
     }
     if (n - at < 4) return false;
     s.flags = U32(b + at);
+    at += 4;
+    // The chunks. Each is bounds-checked against its own length; one that doesn't fit, or says
+    // something the rest of the sheet contradicts, is skipped and the sheet stands.
+    while (n - at >= 8) {
+        const uint8_t* tag = b + at;
+        const uint32_t len = U32(b + at + 4);
+        at += 8;
+        if (len > n - at) break;
+        const uint8_t* c = b + at;
+        at += len;
+        const size_t np = s.ref.size();
+        if (std::memcmp(tag, "TRRN", 4) == 0 && len >= 12) {
+            const uint32_t cn = U32(c), ck = U32(c + 4);
+            const float    st = F32(c + 8);
+            if (cn != np || ck < 2 || ck > 9 || !std::isfinite(st) || st <= 0 || st > 5) continue;
+            if (len < 12 + uint64_t(cn) * ck * 4) continue;
+            std::vector<float> h(size_t(cn) * ck);
+            bool ok = true;
+            for (size_t i = 0; i < h.size(); ++i) {
+                h[i] = F32(c + 12 + i * 4);
+                if (std::isfinite(h[i]) && std::fabs(h[i]) > 1e5f) ok = false;  // NaN is allowed: off the grid
+            }
+            if (!ok) continue;
+            s.terrain_k = ck, s.terrain_step = st, s.terrain = std::move(h);
+        } else if (std::memcmp(tag, "DRIV", 4) == 0 && len >= 4) {
+            const uint32_t cn = U32(c);
+            if (cn != np || len < 4 + uint64_t(cn) * 12) continue;
+            std::vector<float> d(size_t(cn) * 3);
+            bool ok = true;
+            for (size_t i = 0; i < d.size(); ++i) {
+                d[i] = F32(c + 4 + i * 4);
+                if (!std::isfinite(d[i]) || d[i] < -1e-3f || d[i] > 200.0f) ok = false;
+            }
+            if (ok) s.drive = std::move(d);
+        }
+    }
     std::stable_sort(s.sections.begin(), s.sections.end(),
                      [](const Section& x, const Section& y) { return x.start_m < y.start_m; });
     out = std::move(s);

@@ -157,7 +157,8 @@ static void RenderPreview(const char* path, const Mat4& p, const Mat4& v, const 
         const ScreenRow& a  = rows[i];
         const ScreenRow& b  = rows[i + 1];
         const float      al = 0.70f * (a.alpha + b.alpha) * 0.5f;
-        const float cr = a.brake ? 1.0f : 0.10f, cg = a.brake ? 0.22f : 0.50f, cb = a.brake ? 0.18f : 1.0f;
+        float cr, cg, cb;
+        HeatColour(a.heat, cr, cg, cb);
         img.tri(X(a.l), Y(a.l), X(a.r), Y(a.r), X(b.l), Y(b.l), cr, cg, cb, al);
         img.tri(X(a.r), Y(a.r), X(b.r), Y(b.r), X(b.l), Y(b.l), cr, cg, cb, al);
     }
@@ -555,7 +556,7 @@ int main(int argc, char** argv) {
     CHECK(zones.size() == 1 && zones[0].from_m == 90.0f && zones[0].to_m == 100.0f, "one 10 m zone");
     CHECK(rb.update(ref, track, 0.20f, 1.0f, zones), "zones rebuild");
     size_t braking = 0;
-    for (const Vert& x : rb.verts()) braking += x.brake ? 1 : 0;
+    for (const Vert& x : rb.verts()) braking += x.heat > 0.5f ? 1 : 0;
     CHECK(braking >= 8 && braking <= 14, "about 10 m of the ribbon is a braking zone: %zu verts", braking);
     const std::vector<coachhud::RefPoint> none;
     rb.update(none, track, 0.2f, 0.0f);
@@ -628,6 +629,149 @@ int main(int argc, char** argv) {
             CHECK(rows.back().alpha == 0.0f && rows.front().alpha == 1.0f, "faded out by 60 m");
         }
         if (argc > 1) RenderPreview(argv[1], p, cam, rv, at.x, bike_y, at.z, ground);
+    }
+
+    // --- Lying on the track's own ground ("TRRN") --------------------------------------------
+    // A bumpy heightfield: whoops 5 m apart along x, a 1-in-5 camber across z, a 2 m swell. Coach
+    // samples it at five offsets across the line at each point; the ribbon must lie on it.
+    {
+        auto H = [](float x, float z) {
+            return 3.0f + 0.35f * std::sin(x / 5.0f * 6.2831853f) + 0.2f * z + 2.0f * std::sin(x / 120.0f);
+        };
+        std::vector<unsigned char> sg(28, 0);
+        PutF(&sg[4], 400.0f);
+        coachhud::Track flat;
+        CHECK(flat.build(1, sg.data(), 28, nullptr), "a one-segment track");
+        std::vector<coachhud::RefPoint> line;
+        for (int i = 0; i <= 400; ++i) {
+            coachhud::RefPoint r;
+            r.pos = float(i) / 400.0f * 0.999f;
+            r.t   = float(i) * 0.05f;
+            r.x   = float(i);  // a straight east, a metre a point
+            r.z   = 10.0f;
+            line.push_back(r);
+        }
+        RibbonExtras ex;
+        ex.version = 1, ex.terrain_k = 5, ex.terrain_step = 0.5f;
+        for (const auto& r : line)
+            for (int j = 0; j < 5; ++j) {
+                const float off = (float(j) - 2.0f) * 0.5f;  // + is left: travelling east, left is +z
+                ex.terrain.push_back(H(r.x, r.z + off));
+            }
+        Ribbon tr;
+        CHECK(tr.update(line, flat, 0.1f, 0.0f, {}, &ex), "a ribbon on the track's ground");
+        const auto& tv = tr.verts();
+        CHECK(tv.size() == 2 * size_t(kAhead / kStepTerrain + 1), "rows every half metre: %zu verts", tv.size());
+        float worst = 0;
+        for (const Vert& x : tv) worst = (std::max)(worst, std::fabs(x.y - (H(x.x, x.z) + kLiftTerrain)));
+        // Within what a metre between samples can show of 5 m whoops (0.35 m high: 7 cm at most).
+        CHECK(worst < 0.08f, "every vertex sits on the ground plus the lift, worst off by %f m", worst);
+        bool camber = true;
+        for (size_t i = 0; i + 1 < tv.size(); i += 2)
+            if (!(tv[i].y > tv[i + 1].y)) camber = false;  // left (+z) is the higher side of this camber
+        CHECK(camber, "and it leans with the camber across");
+        // A sheet with the chunks: read; a chunk that claims more than is there: ignored.
+        coachhud::Sheet sh;
+        std::vector<unsigned char> b;
+        auto put = [&b](const void* p, size_t n) {
+            b.insert(b.end(), static_cast<const unsigned char*>(p), static_cast<const unsigned char*>(p) + n);
+        };
+        auto u32 = [&](uint32_t v) { put(&v, 4); };
+        auto f32 = [&](float v) { put(&v, 4); };
+        put("MXHD", 4), u32(1), f32(400.0f), u32(3);
+        for (int i = 0; i < 3; ++i) f32(float(i) * 0.3f), f32(float(i)), f32(float(i)), f32(0);
+        u32(0), u32(0);  // no sections, no flags
+        const size_t trrn = b.size();
+        put("TRRN", 4), u32(12 + 3 * 2 * 4), u32(3), u32(2), f32(0.5f);
+        for (int i = 0; i < 6; ++i) f32(1.5f);
+        put("DRIV", 4), u32(4 + 3 * 12), u32(3);
+        for (int i = 0; i < 3; ++i) f32(10), f32(1), f32(0);
+        put("JUNK", 4), u32(9999);
+        CHECK(coachhud::Parse(b.data(), b.size(), sh) && sh.terrain_k == 2 && sh.terrain.size() == 6 &&
+                  sh.drive.size() == 9,
+              "TRRN and DRIV chunks read, a bad trailing chunk ignored");
+        b[trrn + 8] = 9;  // TRRN's N no longer the point count
+        coachhud::Sheet sh2;
+        CHECK(coachhud::Parse(b.data(), b.size(), sh2) && sh2.terrain.empty() && sh2.ref.size() == 3 &&
+                  sh2.drive.size() == 9,
+              "a TRRN that disagrees with the points is dropped, the sheet kept");
+    }
+
+    // --- Keeping the camera steady -----------------------------------------------------------
+    {
+        CameraFollow f;
+        const float eye[3] = {100, 5, -50};
+        f.hit(eye, 1000);
+        bool held = true, fresh_ok = true;
+        for (int miss = 1; miss <= 10; ++miss) {  // ten missed frames at 100 fps
+            held = held && f.holding(1000ull + unsigned(miss) * 10);
+            if (miss * 10 <= int(kStaleMs)) fresh_ok = fresh_ok && f.fresh(1000ull + unsigned(miss) * 10);
+        }
+        CHECK(held && fresh_ok, "the lock survives ten missed frames");
+        CHECK(f.holding(1000ull + kHoldMs) && !f.holding(1000ull + kHoldMs + 1), "and lets go after %u ms", kHoldMs);
+        CHECK(f.anchor(1200) != nullptr && f.anchor(1000ull + kHoldMs + 50) == nullptr, "searching freely once let go");
+        // A frame with the real camera 0.4 m on and an outlier 8 m off, both near the bike: the
+        // outlier is never taken while the camera is being followed.
+        const float bx = 104, by = 3.5f, bz = 50;  // telemetry; GL = x, y, -z
+        Axes gl;
+        gl.sgn[2] = -1;
+        const int gi = FallbackAxes();
+        float gx, gy, gz;
+        gl.apply(bx + 8, by, bz, gx, gy, gz);
+        const Mat4 real    = LookAt(100.4f, 5, -50, gx, gy, gz);
+        const Mat4 outlier = LookAt(108, 5, -54, gx, gy, gz);
+        ModelviewPick best;
+        ModelviewFollow(best, outlier, bx, by, bz, gi, eye);
+        CHECK(!best.ok, "a one-frame outlier 8 m from the camera is ignored");
+        ModelviewFollow(best, real, bx, by, bz, gi, eye);
+        ModelviewFollow(best, outlier, bx, by, bz, gi, eye);
+        CHECK(best.ok && std::fabs(best.jump - 0.4f) < 0.01f, "the camera that moved 0.4 m is followed: %f", best.jump);
+    }
+
+    // --- Where Coach's lap braked, on the real 755 sheet ------------------------------------
+    {
+        coachhud::Sheet sh;
+        const std::vector<unsigned char> f =
+            ReadFile(std::string(COACHLINE_DATA) + "/755_Compound.MX2OEM_2023_KTM_250_SX-F.hud");
+        CHECK(!f.empty() && coachhud::Parse(f.data(), f.size(), sh), "the 755 sheet");
+        const std::vector<float> heat = Heat(sh.ref, sh.drive);
+        CHECK(heat.size() == sh.ref.size(), "heat from the lap's own times");
+        const auto zones = HeatZones(sh.ref, heat);
+        std::printf("755 Compound: %zu braking zones per lap\n", zones.size());
+        CHECK(zones.size() >= 8 && zones.size() <= 30, "a braking zone per corner or so: %zu", zones.size());
+        size_t hot = 0;
+        for (float h : heat) hot += h >= kZoneHeat ? 1 : 0;
+        CHECK(hot > heat.size() / 20 && hot < heat.size() / 2, "between 5%% and 50%% of the lap braking: %zu of %zu",
+              hot, heat.size());
+        if (argc > 2 && !sh.ref.empty()) {
+            // Top-down, north up: the lap coloured by heat, a white ring where each zone starts.
+            float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+            for (const auto& r : sh.ref) {
+                x0 = (std::min)(x0, r.x), x1 = (std::max)(x1, r.x);
+                z0 = (std::min)(z0, r.z), z1 = (std::max)(z1, r.z);
+            }
+            Image img(1200, 1200);
+            for (float& c : img.rgb) c = 0.13f;
+            const float sc = 1100.0f / (std::max)(x1 - x0, z1 - z0);
+            auto X = [&](float x) { return 50.0f + (x - x0) * sc; };
+            auto Y = [&](float z) { return 1150.0f - (z - z0) * sc; };
+            for (size_t i = 0; i + 1 < sh.ref.size(); ++i) {
+                float r, g, bl;
+                HeatColour(heat[i], r, g, bl);
+                const float ax = X(sh.ref[i].x), ay = Y(sh.ref[i].z), bx2 = X(sh.ref[i + 1].x), by2 = Y(sh.ref[i + 1].z);
+                const float dx = bx2 - ax, dy = by2 - ay, l = std::hypot(dx, dy);
+                if (l < 1e-3f || l > 60) continue;
+                const float nx = -dy / l * 3.5f, ny = dx / l * 3.5f;
+                img.tri(ax + nx, ay + ny, ax - nx, ay - ny, bx2 + nx, by2 + ny, r, g, bl, 1);
+                img.tri(ax - nx, ay - ny, bx2 - nx, by2 - ny, bx2 + nx, by2 + ny, r, g, bl, 1);
+            }
+            for (const auto& z : zones)
+                for (int dy = -7; dy <= 7; ++dy)
+                    for (int dx = -7; dx <= 7; ++dx)
+                        if (dx * dx + dy * dy <= 49 && dx * dx + dy * dy >= 25)
+                            img.blend(int(X(sh.ref[z.first].x)) + dx, int(Y(sh.ref[z.first].z)) + dy, 1, 1, 1, 1);
+            if (img.save(argv[2])) std::printf("brake map written to %s\n", argv[2]);
+        }
     }
 
     if (g_failures) {

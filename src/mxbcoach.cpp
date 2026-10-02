@@ -85,6 +85,8 @@ constexpr size_t kEventSuspMaxTravel = 332;
 // The HUD (coachhud.h).
 std::string          g_plugins;  // the folder this .dlo was loaded from
 coachhud::Sheet      g_hud_sheet;
+// What the sheet adds to the line on the track: the ground across it and where its lap braked.
+coachline::RibbonExtras g_extras;
 coachhud::RefLap     g_ref;
 coachhud::LapClock   g_clock;
 coachhud::StopWatch  g_stop;
@@ -548,6 +550,24 @@ std::string g_hud_file;
 std::string g_hud_seen;
 ULONGLONG   g_hud_looked = 0;
 
+/// The line's extras from the sheet just loaded: its TRRN ground, and the heat of its lap (from
+/// its DRIV chunk, or its own times and positions).
+void BuildExtras() {
+    const uint32_t ver = g_extras.version + 1;
+    g_extras           = coachline::RibbonExtras{};
+    g_extras.version   = ver;
+    if (!g_hud_sheet.terrain.empty()) {
+        g_extras.terrain_k    = g_hud_sheet.terrain_k;
+        g_extras.terrain_step = g_hud_sheet.terrain_step;
+        g_extras.terrain      = g_hud_sheet.terrain;
+    }
+    g_extras.heat = coachline::Heat(g_hud_sheet.ref, g_hud_sheet.drive);
+    if (!g_hud_sheet.ref.empty())
+        Log("ground", "sheet: " + std::string(g_extras.terrain_k ? "track ground under the line" : "no track ground (centreline heights)") +
+                          ", " + (g_hud_sheet.drive.empty() ? "braking from the lap's own times" : "braking from Coach's speed and brake") +
+                          ", " + std::to_string(coachline::HeatZones(g_hud_sheet.ref, g_extras.heat).size()) + " braking zones");
+}
+
 void LoadHud(bool quiet = false) {
     g_hud_seen = DiskStamp(coachhud::HudNames(g_event));
     coachhud::Sheet found;
@@ -571,6 +591,7 @@ void LoadHud(bool quiet = false) {
     g_hud_sheet = std::move(found);
     g_hud_file  = taken;
     g_ref.load(g_hud_sheet.ref);
+    BuildExtras();
     // Without a sheet the map, the stance and the setup card still draw; only the gap, the
     // ghost and the section tips need one, so this is a note rather than a failure.
     if (!quiet) {
@@ -1177,6 +1198,18 @@ float                    g_snap[3] = {NAN, NAN, NAN};  // the bike, as of the la
 coachline::ModelviewPick g_mv_best;  // this frame's best modelview camera
 coachline::AxesLock      g_mv_lock;
 unsigned                 g_mv_loads = 0;
+coachline::CameraFollow  g_follow;
+ULONGLONG                g_frame_ms = 0;  // this frame's time, set at each swap
+// The last camera drawn through, to carry a frame without one (CameraFollow's stale window).
+struct LastCam {
+    bool            ok = false;
+    coachline::Mat4 proj, view, model;
+    int             axes = 0;
+} g_last_cam;
+// Why a frame with a camera drew nothing, counted and logged every 10 s.
+enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_COUNT };
+const char* const kWhyName[WHY_COUNT] = {"no_ribbon", "offscreen_fbo", "core_profile", "gl_error", "stale_redraw", "held_no_draw"};
+unsigned g_why[WHY_COUNT] = {};
 ULONGLONG                g_cam_since = 0;  // when a camera was last found (or the search began)
 int                      g_source    = 0;  // 0 none, 1 uniform, 2 modelview, 3 fallback
 coachline::Ribbon     g_ribbon;
@@ -1269,7 +1302,11 @@ void GlModelLoaded(const float* m) {
     if (std::isfinite(g_snap[0])) {
         coachline::Mat4 a;
         std::memcpy(a.m, m, sizeof(a.m));
-        coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked());
+        // Following a camera already found: only one next to it, so a one-frame outlier is
+        // never taken. Searching: the nearest to the bike.
+        const float* prev = g_mv_lock.locked() >= 0 ? g_follow.anchor(g_frame_ms) : nullptr;
+        if (prev) coachline::ModelviewFollow(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), prev);
+        else coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked());
     }
     if (g_gl.cands.empty() || g_diag_left <= 0) return;
     coachline::Candidate& c = g_gl.cands.back();
@@ -1773,14 +1810,20 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         g_active_texture = reinterpret_cast<glActiveTexture_t>(wglGetProcAddress("glActiveTexture"));
     }
     // A core-profile context has no fixed-function pipeline to draw this way.
-    if (g_profile > 0 && (g_profile & 1) && !(g_profile & 2)) return;
+    if (g_profile > 0 && (g_profile & 1) && !(g_profile & 2)) {
+        ++g_why[WHY_CORE];
+        return;
+    }
     while (glGetError() != GL_NO_ERROR) {
     }
     // Drawing into an offscreen target would paint the line into a reflection or a post-process
     // input. Only the window itself. (A GL too old to know the query errors, and has no FBOs.)
     GLint fbo = 0;
     glGetIntegerv(kGlDrawFramebufferBinding, &fbo);
-    if (glGetError() == GL_NO_ERROR && fbo != 0) return;
+    if (glGetError() == GL_NO_ERROR && fbo != 0) {
+        ++g_why[WHY_FBO];
+        return;
+    }
     GLint program = 0, active = GLint(kGlTexture0);
     if (g_use_program) glGetIntegerv(kGlCurrentProgram, &program);
     if (g_active_texture) glGetIntegerv(kGlActiveTexture, &active);
@@ -1821,13 +1864,17 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(g_depth == DEPTH_GEQUAL ? GL_GEQUAL : GL_LEQUAL);
         glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(g_depth == DEPTH_GEQUAL ? 2.0f : -2.0f, g_depth == DEPTH_GEQUAL ? 4.0f : -4.0f);
+        // On the track's own ground the ribbon sits 2 cm up and needs only a nudge to win the
+        // depth test: painted on the dirt, not floating over it. On centreline heights, more.
+        const float pull = g_extras.terrain_k ? 1.0f : 2.0f;
+        glPolygonOffset(g_depth == DEPTH_GEQUAL ? pull : -pull, g_depth == DEPTH_GEQUAL ? 2.0f * pull : -2.0f * pull);
     }
     glBegin(GL_TRIANGLE_STRIP);
     for (const coachline::Vert& p : v) {
         const float a = 0.70f * coachline::Fade(p.s);
-        if (p.brake) glColor4f(1.0f, 0.22f, 0.18f, a);
-        else glColor4f(0.10f, 0.50f, 1.0f, a);
+        float r, g, bl;
+        coachline::HeatColour(p.heat, r, g, bl);
+        glColor4f(r, g, bl, a);
         float gx, gy, gz;
         ax.apply(p.x, p.y, p.z, gx, gy, gz);
         glVertex3f(gx, gy, gz);
@@ -1846,7 +1893,10 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
     while (glGetError() != GL_NO_ERROR) {
     }  // nothing of ours may surface as the game's error
     if (drew == GL_NO_ERROR) ++g_gl.n_drawn;
-    else ++g_gl.n_draw_errors;
+    else {
+        ++g_gl.n_draw_errors;
+        ++g_why[WHY_GL_ERROR];
+    }
 }
 
 /// The fixed-function projection the game set up for the window: the last frustum this frame
@@ -1885,6 +1935,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
             {
                 std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
                 const ULONGLONG              now = GetTickCount64();
+                g_frame_ms                         = now;
                 if (lock.owns_lock() && g_have_sample) {
                     g_snap[0] = g_rider.x, g_snap[1] = g_rider_y, g_snap[2] = g_rider.y;
                 }
@@ -1928,6 +1979,23 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         view   = wp.view;
                         model  = g_mv_best.view;
                         ax     = coachline::AxesAt(g_mv_best.axes);
+                        float eye[3];
+                        coachline::CameraPos(g_mv_best.view, eye[0], eye[1], eye[2]);
+                        g_follow.hit(eye, now);
+                    } else if (g_mv_lock.locked() >= 0 && g_follow.holding(now)) {
+                        // A frame without the camera, inside the hold: still the modelview
+                        // camera. Redrawn from the last one for a few frames so the line doesn't
+                        // blink, then left out until the camera is back - never drawn from a
+                        // different candidate in between.
+                        source = 2;
+                        if (g_follow.fresh(now) && g_last_cam.ok) {
+                            proj = g_last_cam.proj, view = g_last_cam.view, model = g_last_cam.model;
+                            ax   = coachline::AxesAt(g_last_cam.axes);
+                            ++g_why[WHY_STALE];
+                        } else {
+                            ++g_why[WHY_HOLD];
+                            source = -2;  // held, nothing drawn
+                        }
                     } else if (now - g_cam_since > coachline::kFallbackMs &&
                                coachline::OnboardView(g_rider.x, g_rider_y, g_rider.y, g_rider_v[0], g_rider_v[1],
                                                       g_rider_v[2], model)) {
@@ -1945,6 +2013,13 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         ax       = coachline::AxesAt(coachline::FallbackAxes());
                         depth_ok = false;
                     }
+                    if (source > 0 && source != 3 && !(source == 2 && !g_mv_best.ok && pk.index < 0)) {
+                        g_last_cam.ok = true, g_last_cam.proj = proj, g_last_cam.view = view, g_last_cam.model = model;
+                        for (int k = 0; k < coachline::kNumAxes; ++k)
+                            if (coachline::AxesName(coachline::AxesAt(k)) == coachline::AxesName(ax)) g_last_cam.axes = k;
+                    }
+                    const bool held = source == -2;
+                    if (held) source = 2;
                     if (source == 1 || source == 2) g_cam_since = now;
                     if (source != g_source) {
                         Log("ground", std::string("camera=") + SourceName(source));
@@ -1956,15 +2031,16 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         LogUniforms(aspect, pk);
                         LogSources(aspect, have_wp ? &wp : nullptr);
                     }
-                    if (source) {
+                    if (source && !held) {
                         ++g_u_picked;
                         const float lapM = g_track.ready() ? g_track.length() : 0.0f;
                         const std::vector<coachline::Zone> zones =
                             g_cues.active() && lapM > 0 ? coachline::BrakeZones(g_cues.sheet(), lapM)
                                                         : std::vector<coachline::Zone>();
-                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones);
+                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones, &g_extras);
                         g_draw_verts = g_ribbon.verts();
                         draw         = g_draw_verts.size() >= 4;
+                        if (!draw) ++g_why[WHY_NO_VERTS];
                     }
                 }
                 // Every 10 s while it is on: where the camera came from, and what was drawn.
@@ -1981,6 +2057,12 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                       " height_gap=" + std::to_string(g_height.gap()) +
                                       " offset=" + std::to_string(g_height.offset()) +
                                       " ribbon=" + std::to_string(g_ribbon.verts().size()) + " verts");
+                    // Why frames that had a camera drew nothing, since the last line.
+                    std::string why;
+                    for (int w = 0; w < WHY_COUNT; ++w)
+                        if (g_why[w]) why += std::string(" ") + kWhyName[w] + "=" + std::to_string(g_why[w]);
+                    Log("ground", "not drawn:" + (why.empty() ? std::string(" none") : why) + " (stale_redraw drew from the last camera)");
+                    std::fill(std::begin(g_why), std::end(g_why), 0u);
                 }
             }
             if (draw) DrawGroundLine(proj, view, model, ax, depth_ok);
@@ -2142,6 +2224,7 @@ __declspec(dllexport) void EventDeinit() {
     g_cues.clear();
     g_cue_file.clear();
     g_hud_sheet = coachhud::Sheet{};
+    BuildExtras();
     g_hud_file.clear();
     g_ref.load({});
     g_track.clear();
@@ -2149,6 +2232,8 @@ __declspec(dllexport) void EventDeinit() {
     g_ribbon.clear();
     g_ukey.reset();
     g_mv_lock.reset();
+    g_follow.reset();
+    g_last_cam.ok = false;
     g_cam_since = 0;
     g_depth = DEPTH_NONE;
     g_practice = false;

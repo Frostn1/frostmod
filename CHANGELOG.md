@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-02 — v0.43.2
+
+### Fixed
+- **The blue line lies on the dirt instead of floating over it.** With a sheet from the
+  matching MXB Coach, the line follows the track's own ground under each edge, every half
+  metre: over the whoops, up the berms, leaning with the camber, 2 cm up and depth-tested so
+  bikes and the ground in front hide it. Older sheets keep the centreline heights.
+- **No more glitching.** The camera is now followed from frame to frame: a frame without it no
+  longer drops the line (the last camera carries it for a tenth of a second, and the lock holds
+  for half a second), and a different camera for a single frame is never drawn from. The log
+  says every 10 s why any frame with a camera drew nothing (`ground: not drawn: ...`).
+
+### Changed
+- **Every braking zone shows, not just the cue's.** The line is coloured by how hard Coach's lap
+  was slowing: blue on the throttle, yellow when it lifts or brakes lightly, red when it brakes
+  hard, blended along the line. It comes from Coach's speed and brake when the sheet carries
+  them, otherwise from the lap's own times; the cue sheet's brake cues only when neither can
+  say. On 755 Compound that is 13 braking zones a lap.
+
 ## 2026-10-02 — v0.43.1
 
 ### Fixed

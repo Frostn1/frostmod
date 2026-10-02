@@ -157,8 +157,7 @@ static void RenderPreview(const char* path, const Mat4& p, const Mat4& v, const 
         const ScreenRow& a  = rows[i];
         const ScreenRow& b  = rows[i + 1];
         const float      al = 0.70f * (a.alpha + b.alpha) * 0.5f;
-        float cr, cg, cb;
-        HeatColour(a.heat, cr, cg, cb);
+        const float cr = a.rgba[0], cg = a.rgba[1], cb = a.rgba[2];
         img.tri(X(a.l), Y(a.l), X(a.r), Y(a.r), X(b.l), Y(b.l), cr, cg, cb, al);
         img.tri(X(a.r), Y(a.r), X(b.r), Y(b.r), X(b.l), Y(b.l), cr, cg, cb, al);
     }
@@ -170,7 +169,155 @@ static void RenderPreview(const char* path, const Mat4& p, const Mat4& v, const 
     if (img.save(path)) std::printf("preview written to %s\n", path);
 }
 
+// A triangle with a colour per corner, blended across it the way GL's smooth shading does.
+static void Tri3(Image& img, const float* a, const float* b, const float* c, const float* ca, const float* cb,
+                 const float* cc, float alpha) {
+    const int   x0 = (std::max)(0, int(std::floor((std::min)({a[0], b[0], c[0]}))));
+    const int   x1 = (std::min)(img.w - 1, int(std::ceil((std::max)({a[0], b[0], c[0]}))));
+    const int   y0 = (std::max)(0, int(std::floor((std::min)({a[1], b[1], c[1]}))));
+    const int   y1 = (std::min)(img.h - 1, int(std::ceil((std::max)({a[1], b[1], c[1]}))));
+    const float d  = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+    if (std::fabs(d) < 1e-6f) return;
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+            const float px = float(x) + 0.5f, py = float(y) + 0.5f;
+            const float u  = ((b[0] - px) * (c[1] - py) - (c[0] - px) * (b[1] - py)) / d;
+            const float v  = ((c[0] - px) * (a[1] - py) - (a[0] - px) * (c[1] - py)) / d;
+            const float w  = 1 - u - v;
+            if (u < 0 || v < 0 || w < 0) continue;
+            img.blend(x, y, u * ca[0] + v * cb[0] + w * cc[0], u * ca[1] + v * cb[1] + w * cc[1],
+                      u * ca[2] + v * cb[2] + w * cc[2], alpha);
+        }
+}
+
+// A 5x7 pixel font, just the letters the legend uses.
+static const char* Glyph(char ch) {
+    switch (ch) {
+        case 'A': return " ### #   ##   #######   ##   ##   #";
+        case 'B': return "#### #   ##   ##### #   ##   ##### ";
+        case 'C': return " ### #   ##    #    #    #   # ### ";
+        case 'D': return "#### #   ##   ##   ##   ##   ##### ";
+        case 'E': return "######    #    #### #    #    #####";
+        case 'F': return "######    #    #### #    #    #    ";
+        case 'G': return " ### #   ##    # ####   ##   # ####";
+        case 'H': return "#   ##   ##   #######   ##   ##   #";
+        case 'I': return " ###   #    #    #    #    #   ### ";
+        case 'K': return "#   ##  # # #  ##   # #  #  # #   #";
+        case 'L': return "#    #    #    #    #    #    #####";
+        case 'M': return "#   ### ### # ##   ##   ##   ##   #";
+        case 'N': return "#   ###  ## # ##  ###   ##   ##   #";
+        case 'O': return " ### #   ##   ##   ##   ##   # ### ";
+        case 'P': return "#### #   ##   ##### #    #    #    ";
+        case 'R': return "#### #   ##   ##### # #  #  # #   #";
+        case 'S': return " #####    #     ###     #    ##### ";
+        case 'T': return "#####  #    #    #    #    #    #  ";
+        case 'U': return "#   ##   ##   ##   ##   ##   # ### ";
+        case 'V': return "#   ##   ##   ##   ##   # # #   #  ";
+        case 'Y': return "#   ##   # # #   #    #    #    #  ";
+        case 'Z': return "#####    #   #   #   #   #    #####";
+        case '5': return "######    ####     #    ##   # ### ";
+        case '7': return "#####    #   #   #   #    #    #   ";
+        case '-': return "               #####               ";
+        default: return "                                   ";
+    }
+}
+static void Text(Image& img, int x, int y, const char* s, int scale, float r, float g, float b) {
+    for (; *s; ++s, x += 6 * scale) {
+        const char* gl = Glyph(*s);
+        for (int row = 0; row < 7; ++row)
+            for (int col = 0; col < 5; ++col)
+                if (gl[row * 5 + col] == '#')
+                    for (int dy = 0; dy < scale; ++dy)
+                        for (int dx = 0; dx < scale; ++dx) img.blend(x + col * scale + dx, y + row * scale + dy, r, g, b, 1);
+    }
+}
+
+// The lap from above, north up, coloured by its tone with a colour per point blended between,
+// a ring where each braking zone starts, a legend, and a zoomed crop of one transition.
+static void RenderToneMap(const char* path, const coachhud::Sheet& sh, const std::vector<float>& tone,
+                          const std::vector<std::pair<size_t, size_t>>& zones) {
+    Image img(1660, 1200);
+    for (float& c : img.rgb) c = 0.16f;
+    float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+    for (const auto& r : sh.ref) {
+        x0 = (std::min)(x0, r.x), x1 = (std::max)(x1, r.x);
+        z0 = (std::min)(z0, r.z), z1 = (std::max)(z1, r.z);
+    }
+    // Draws the lap into a box: world (cx, cz) at the box centre, `sc` px a metre, `half` the
+    // painted half width in metres.
+    auto draw = [&](float bx, float by, float bw, float bh, float cx, float cz, float sc, float half) {
+        auto P = [&](float x, float z, float out[2]) {
+            out[0] = bx + bw * 0.5f + (x - cx) * sc;
+            out[1] = by + bh * 0.5f - (z - cz) * sc;
+        };
+        for (size_t i = 0; i + 1 < sh.ref.size(); ++i) {
+            const auto& a = sh.ref[i];
+            const auto& c = sh.ref[i + 1];
+            const float dx = c.x - a.x, dz = c.z - a.z, l = std::hypot(dx, dz);
+            if (l < 1e-3f || l > kMaxGapM) continue;
+            const float nx = -dz / l * half, nz = dx / l * half;
+            float pa[2], pb[2], pc[2], pd[2], ca[3], cc[3];
+            P(a.x + nx, a.z + nz, pa), P(a.x - nx, a.z - nz, pb), P(c.x + nx, c.z + nz, pc), P(c.x - nx, c.z - nz, pd);
+            // Only segments wholly inside the box: the crop must not spill onto the map.
+            if ((std::min)({pa[0], pb[0], pc[0], pd[0]}) < bx || (std::max)({pa[0], pb[0], pc[0], pd[0]}) > bx + bw ||
+                (std::min)({pa[1], pb[1], pc[1], pd[1]}) < by || (std::max)({pa[1], pb[1], pc[1], pd[1]}) > by + bh)
+                continue;
+            ToneColour(tone[i], ca[0], ca[1], ca[2]);
+            ToneColour(tone[i + 1], cc[0], cc[1], cc[2]);
+            Tri3(img, pa, pb, pc, ca, ca, cc, 0.95f);
+            Tri3(img, pb, pd, pc, ca, cc, cc, 0.95f);
+        }
+    };
+    const float sc = 1100.0f / (std::max)(x1 - x0, z1 - z0);
+    draw(0, 0, 1200, 1200, (x0 + x1) * 0.5f, (z0 + z1) * 0.5f, sc, 3.5f / sc * 1.0f + 0.35f);
+    auto MX = [&](float x) { return 600.0f + (x - (x0 + x1) * 0.5f) * sc; };
+    auto MY = [&](float z) { return 600.0f - (z - (z0 + z1) * 0.5f) * sc; };
+    for (const auto& z : zones)
+        for (int dy = -8; dy <= 8; ++dy)
+            for (int dx = -8; dx <= 8; ++dx)
+                if (dx * dx + dy * dy <= 64 && dx * dx + dy * dy >= 36)
+                    img.blend(int(MX(sh.ref[z.first].x)) + dx, int(MY(sh.ref[z.first].z)) + dy, 1, 1, 1, 1);
+    // Legend, top right: the gradient bar and the four names under its stops.
+    Text(img, 1250, 30, "755 COMPOUND", 3, 0.9f, 0.9f, 0.9f);
+    for (int x = 0; x < 380; ++x) {
+        float r, g, b;
+        ToneColour(float(x) / 379.0f * 3.0f, r, g, b);
+        for (int y = 0; y < 26; ++y) img.blend(1260 + x, 80 + y, r, g, b, 1);
+    }
+    Text(img, 1252, 116, "GAS", 2, 0.85f, 0.85f, 0.85f);
+    Text(img, 1358, 116, "COAST", 2, 0.85f, 0.85f, 0.85f);
+    Text(img, 1458, 116, "LIGHT", 2, 0.85f, 0.85f, 0.85f);
+    Text(img, 1554, 116, "HEAVY", 2, 0.85f, 0.85f, 0.85f);
+    Text(img, 1458, 138, "BRAKE", 2, 0.85f, 0.85f, 0.85f);
+    Text(img, 1554, 138, "BRAKE", 2, 0.85f, 0.85f, 0.85f);
+    // The zoomed crop: 40 m around the start of the first braking zone, at 9 px a metre and the
+    // ribbon's real 0.7 m width, so the fade between colours is visible at the scale it is drawn.
+    if (!zones.empty()) {
+        const auto& at = sh.ref[zones[0].first];
+        const float zx = 1250, zy = 200, zw = 370, zh = 370, zsc = 9.0f;
+        for (int y = 0; y < int(zh); ++y)
+            for (int x = 0; x < int(zw); ++x) img.blend(int(zx) + x, int(zy) + y, 0.36f, 0.27f, 0.18f, 1);  // dirt
+        draw(zx, zy, zw, zh, at.x, at.z, zsc, kHalfWidth);
+        for (int k = 0; k < int(zw); ++k) {
+            img.blend(int(zx) + k, int(zy), 1, 1, 1, 1), img.blend(int(zx) + k, int(zy + zh), 1, 1, 1, 1);
+        }
+        for (int k = 0; k < int(zh); ++k) {
+            img.blend(int(zx), int(zy) + k, 1, 1, 1, 1), img.blend(int(zx + zw), int(zy) + k, 1, 1, 1, 1);
+        }
+        Text(img, int(zx), int(zy + zh) + 10, "ZOOM - FIRST BRAKE ZONE", 2, 0.85f, 0.85f, 0.85f);
+        // Where the crop is on the map.
+        const float hw = zw / zsc * 0.5f * sc;
+        for (int k = -int(hw); k <= int(hw); ++k) {
+            const float mx = MX(at.x), my = MY(at.z);
+            img.blend(int(mx) + k, int(my - hw), 1, 1, 1, 0.8f), img.blend(int(mx) + k, int(my + hw), 1, 1, 1, 0.8f);
+            img.blend(int(mx - hw), int(my) + k, 1, 1, 1, 0.8f), img.blend(int(mx + hw), int(my) + k, 1, 1, 1, 0.8f);
+        }
+    }
+    if (img.save(path)) std::printf("tone map written to %s\n", path);
+}
+
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     // --- The game's own projection ------------------------------------------------------
     const Mat4 p = GameFrustum();
     CHECK(ValidProjection(p), "the logged world frustum is a perspective");
@@ -534,7 +681,7 @@ int main(int argc, char** argv) {
     Ribbon rb;
     CHECK(rb.update(ref, track, 0.05f, 0.0f), "first update builds");
     const auto& vs = rb.verts();
-    CHECK(vs.size() == 2 * size_t(kAhead / kStep + 1), "rows: %zu verts", vs.size());
+    CHECK(vs.size() == 2 * size_t(kAhead / kStepTerrain + 1), "rows: %zu verts", vs.size());
     CHECK(std::fabs(vs[0].s) < 1e-3f && std::fabs((vs[0].x + vs[1].x) * 0.5f - 20.0f) < 0.5f,
           "starts at the rider, x=%f", vs[0].x);
     bool rising = true, wide = true;
@@ -556,8 +703,8 @@ int main(int argc, char** argv) {
     CHECK(zones.size() == 1 && zones[0].from_m == 90.0f && zones[0].to_m == 100.0f, "one 10 m zone");
     CHECK(rb.update(ref, track, 0.20f, 1.0f, zones), "zones rebuild");
     size_t braking = 0;
-    for (const Vert& x : rb.verts()) braking += x.heat > 0.5f ? 1 : 0;
-    CHECK(braking >= 8 && braking <= 14, "about 10 m of the ribbon is a braking zone: %zu verts", braking);
+    for (const Vert& x : rb.verts()) braking += x.rgba[1] < 0.5f ? 1 : 0;  // red
+    CHECK(braking >= 36 && braking <= 44, "about 10 m of the ribbon is a braking zone: %zu verts", braking);
     const std::vector<coachhud::RefPoint> none;
     rb.update(none, track, 0.2f, 0.0f);
     CHECK(rb.verts().empty(), "no sheet, no line");
@@ -595,7 +742,7 @@ int main(int argc, char** argv) {
         Ribbon r755;
         CHECK(r755.update(sheet.ref, t755, at.pos, hb755.offset()), "a ribbon is built on the real sheet");
         const std::vector<Vert>& rv = r755.verts();
-        CHECK(rv.size() == 2 * size_t(kAhead / kStep + 1), "%zu verts for 60 m at 2 m", rv.size());
+        CHECK(rv.size() == 2 * size_t(kAhead / kStepTerrain + 1), "%zu verts for 60 m at 0.5 m", rv.size());
         // It starts at the bike, lies on the ground (not at the bike's height), and is the
         // painted width all along.
         if (rv.size() >= 2)
@@ -728,50 +875,58 @@ int main(int argc, char** argv) {
         CHECK(best.ok && std::fabs(best.jump - 0.4f) < 0.01f, "the camera that moved 0.4 m is followed: %f", best.jump);
     }
 
-    // --- Where Coach's lap braked, on the real 755 sheet ------------------------------------
+    // --- How Coach's lap was ridden, on the real 755 sheet ----------------------------------
     {
         coachhud::Sheet sh;
         const std::vector<unsigned char> f =
             ReadFile(std::string(COACHLINE_DATA) + "/755_Compound.MX2OEM_2023_KTM_250_SX-F.hud");
         CHECK(!f.empty() && coachhud::Parse(f.data(), f.size(), sh), "the 755 sheet");
-        const std::vector<float> heat = Heat(sh.ref, sh.drive);
-        CHECK(heat.size() == sh.ref.size(), "heat from the lap's own times");
-        const auto zones = HeatZones(sh.ref, heat);
+        const std::vector<float> tone = Tone(sh.ref, sh.drive);
+        CHECK(tone.size() == sh.ref.size(), "a tone from the lap's own times");
+        const auto zones = ToneZones(sh.ref, tone);
         std::printf("755 Compound: %zu braking zones per lap\n", zones.size());
         CHECK(zones.size() >= 8 && zones.size() <= 30, "a braking zone per corner or so: %zu", zones.size());
-        size_t hot = 0;
-        for (float h : heat) hot += h >= kZoneHeat ? 1 : 0;
-        CHECK(hot > heat.size() / 20 && hot < heat.size() / 2, "between 5%% and 50%% of the lap braking: %zu of %zu",
-              hot, heat.size());
-        if (argc > 2 && !sh.ref.empty()) {
-            // Top-down, north up: the lap coloured by heat, a white ring where each zone starts.
-            float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
-            for (const auto& r : sh.ref) {
-                x0 = (std::min)(x0, r.x), x1 = (std::max)(x1, r.x);
-                z0 = (std::min)(z0, r.z), z1 = (std::max)(z1, r.z);
-            }
-            Image img(1200, 1200);
-            for (float& c : img.rgb) c = 0.13f;
-            const float sc = 1100.0f / (std::max)(x1 - x0, z1 - z0);
-            auto X = [&](float x) { return 50.0f + (x - x0) * sc; };
-            auto Y = [&](float z) { return 1150.0f - (z - z0) * sc; };
-            for (size_t i = 0; i + 1 < sh.ref.size(); ++i) {
-                float r, g, bl;
-                HeatColour(heat[i], r, g, bl);
-                const float ax = X(sh.ref[i].x), ay = Y(sh.ref[i].z), bx2 = X(sh.ref[i + 1].x), by2 = Y(sh.ref[i + 1].z);
-                const float dx = bx2 - ax, dy = by2 - ay, l = std::hypot(dx, dy);
-                if (l < 1e-3f || l > 60) continue;
-                const float nx = -dy / l * 3.5f, ny = dx / l * 3.5f;
-                img.tri(ax + nx, ay + ny, ax - nx, ay - ny, bx2 + nx, by2 + ny, r, g, bl, 1);
-                img.tri(ax - nx, ay - ny, bx2 - nx, by2 - ny, bx2 + nx, by2 + ny, r, g, bl, 1);
-            }
-            for (const auto& z : zones)
-                for (int dy = -7; dy <= 7; ++dy)
-                    for (int dx = -7; dx <= 7; ++dx)
-                        if (dx * dx + dy * dy <= 49 && dx * dx + dy * dy >= 25)
-                            img.blend(int(X(sh.ref[z.first].x)) + dx, int(Y(sh.ref[z.first].z)) + dy, 1, 1, 1, 1);
-            if (img.save(argv[2])) std::printf("brake map written to %s\n", argv[2]);
+        size_t gas = 0, coast = 0, light = 0, heavy = 0;
+        for (float t : tone) (t < 0.5f ? gas : t < 1.5f ? coast : t < 2.5f ? light : heavy)++;
+        std::printf("755 Compound: gas %zu, coast %zu, light brake %zu, heavy brake %zu points\n", gas, coast, light, heavy);
+        CHECK(gas > tone.size() / 5, "on the gas for much of the lap: %zu of %zu", gas, tone.size());
+        CHECK(light + heavy > tone.size() / 20 && light + heavy < tone.size() / 2, "braking for 5-50%% of it");
+        // A fade, never a seam: between neighbouring points (about a metre apart) the tone moves
+        // a fraction of a band at most.
+        float steepest = 0;
+        for (size_t i = 1; i < tone.size(); ++i) {
+            const float d = std::hypot(sh.ref[i].x - sh.ref[i - 1].x, sh.ref[i].z - sh.ref[i - 1].z);
+            if (d > 0.2f && d < kMaxGapM) steepest = (std::max)(steepest, std::fabs(tone[i] - tone[i - 1]) / d);
         }
+        CHECK(steepest < 0.75f, "the tone changes by at most %.2f a metre (got %.2f): no seams", 0.75, double(steepest));
+        // And LineColours gives that, as RGBA per point at the line's alpha.
+        const std::vector<float> rgba = LineColours(sh.ref, sh.drive);
+        CHECK(rgba.size() == sh.ref.size() * 4 && rgba[3] == kLineAlpha, "RGBA per point");
+        // The gradient's stops, and that it is continuous between them.
+        float r, g, b, r2, g2, b2;
+        ToneColour(0, r, g, b);
+        CHECK(g > 0.8f && r < 0.3f && b < 0.3f, "0 is green");
+        ToneColour(1, r, g, b);
+        CHECK(r > 0.9f && g > 0.9f && b > 0.9f, "1 is white");
+        ToneColour(2, r, g, b);
+        CHECK(r > 0.9f && g > 0.8f && b < 0.1f, "2 is yellow");
+        ToneColour(3, r, g, b);
+        CHECK(r > 0.9f && g < 0.2f && b < 0.1f, "3 is red");
+        bool smooth = true;
+        for (int k = 0; k < 300; ++k) {
+            ToneColour(k * 0.01f, r, g, b);
+            ToneColour(k * 0.01f + 0.01f, r2, g2, b2);
+            if (std::fabs(r - r2) + std::fabs(g - g2) + std::fabs(b - b2) > 0.05f) smooth = false;
+        }
+        CHECK(smooth, "the gradient has no jumps");
+        // No blue anywhere.
+        bool blue = false;
+        for (int k = 0; k <= 300; ++k) {
+            ToneColour(k * 0.01f, r, g, b);
+            if (b > r && b > g) blue = true;
+        }
+        CHECK(!blue, "no blue in the gradient");
+        if (argc > 2 && !sh.ref.empty()) RenderToneMap(argv[2], sh, tone, zones);
     }
 
     if (g_failures) {

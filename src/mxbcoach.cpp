@@ -550,7 +550,7 @@ std::string g_hud_file;
 std::string g_hud_seen;
 ULONGLONG   g_hud_looked = 0;
 
-/// The line's extras from the sheet just loaded: its TRRN ground, and the heat of its lap (from
+/// The line's extras from the sheet just loaded: its TRRN ground, and the colour of its lap (from
 /// its DRIV chunk, or its own times and positions).
 void BuildExtras() {
     const uint32_t ver = g_extras.version + 1;
@@ -561,11 +561,12 @@ void BuildExtras() {
         g_extras.terrain_step = g_hud_sheet.terrain_step;
         g_extras.terrain      = g_hud_sheet.terrain;
     }
-    g_extras.heat = coachline::Heat(g_hud_sheet.ref, g_hud_sheet.drive);
+    // The one line to change for a different colouring: any function giving RGBA per point.
+    g_extras.rgba = coachline::LineColours(g_hud_sheet.ref, g_hud_sheet.drive);
     if (!g_hud_sheet.ref.empty())
         Log("ground", "sheet: " + std::string(g_extras.terrain_k ? "track ground under the line" : "no track ground (centreline heights)") +
-                          ", " + (g_hud_sheet.drive.empty() ? "braking from the lap's own times" : "braking from Coach's speed and brake") +
-                          ", " + std::to_string(coachline::HeatZones(g_hud_sheet.ref, g_extras.heat).size()) + " braking zones");
+                          ", " + (g_hud_sheet.drive.empty() ? "colour from the lap's own times" : "colour from Coach's throttle, brake and speed") +
+                          ", " + std::to_string(coachline::ToneZones(g_hud_sheet.ref, coachline::Tone(g_hud_sheet.ref, g_hud_sheet.drive)).size()) + " braking zones");
 }
 
 void LoadHud(bool quiet = false) {
@@ -1869,12 +1870,10 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         const float pull = g_extras.terrain_k ? 1.0f : 2.0f;
         glPolygonOffset(g_depth == DEPTH_GEQUAL ? pull : -pull, g_depth == DEPTH_GEQUAL ? 2.0f * pull : -2.0f * pull);
     }
+    glShadeModel(GL_SMOOTH);  // a colour per vertex, blended across each quad: fades, not seams
     glBegin(GL_TRIANGLE_STRIP);
     for (const coachline::Vert& p : v) {
-        const float a = 0.70f * coachline::Fade(p.s);
-        float r, g, bl;
-        coachline::HeatColour(p.heat, r, g, bl);
-        glColor4f(r, g, bl, a);
+        glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3] * coachline::Fade(p.s));
         float gx, gy, gz;
         ax.apply(p.x, p.y, p.z, gx, gy, gz);
         glVertex3f(gx, gy, gz);

@@ -13,11 +13,12 @@
   says every 10 s why any frame with a camera drew nothing (`ground: not drawn: ...`).
 
 ### Changed
-- **Every braking zone shows, not just the cue's.** The line is coloured by how hard Coach's lap
-  was slowing: blue on the throttle, yellow when it lifts or brakes lightly, red when it brakes
-  hard, blended along the line. It comes from Coach's speed and brake when the sheet carries
-  them, otherwise from the lap's own times; the cue sheet's brake cues only when neither can
-  say. On 755 Compound that is 13 braking zones a lap.
+- **The line shows how Coach's lap was ridden, everywhere, not just at the cue.** Green on the
+  gas, white coasting, yellow on light braking, red on heavy braking, fading from one to the
+  next over a few metres with no seams (a colour per point, blended across the ribbon). It
+  comes from Coach's throttle, brake and speed when the sheet carries them, otherwise from the
+  lap's own times; the cue sheet's brake cues only when neither can say. On 755 Compound that
+  is 11 braking zones a lap.
 
 ## 2026-10-02 — v0.43.1
 

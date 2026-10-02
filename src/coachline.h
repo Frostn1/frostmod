@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -295,6 +296,162 @@ public:
 
 private:
     int last_ = -1, streak_ = 0, locked_ = -1;
+};
+
+// ---------------------------------------------------------------------------------------
+// The camera from shader uniforms
+//
+// v0.42.1 in the game (WDR.MX.26.R02): three fixed-function cameras a frame, every one an
+// identity rotation with z flipped, unchanged while the bike moved 70 m. The fixed-function
+// matrices are not the camera; the game hands it to its shaders. So every glUniformMatrix4fv /
+// glProgramUniformMatrix4fv upload is recorded (program, location, matrix), and the camera is
+// the upload whose eye follows the bike:
+//
+//   * a view-projection (or projection-times-view) matrix: perspective in its bottom row. Its
+//     eye is the one point it sends to x = y = w = 0, found by solving three linear equations,
+//     and it can be drawn through as it stands;
+//   * a rigid view matrix: its eye is -R^T t, and it is drawn through with a projection the
+//     same frame uploaded, or the fixed-function frustum.
+//
+// Each upload is read as given and transposed (a shader may multiply row vectors), under all 48
+// axes. The (program, location, layout, axes) that wins kLockFrames frames running is kept for
+// the event.
+
+/// One matrix uniform as uploaded, column-major as glUniformMatrix4fv takes it untransposed.
+struct Upload {
+    uint32_t program  = 0;
+    int32_t  location = -1;
+    Mat4     m;
+};
+
+inline Mat4 Transposed(const Mat4& a) {
+    Mat4 t;
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) t.m[c * 4 + r] = a.m[r * 4 + c];
+    return t;
+}
+
+/// Has a perspective bottom row (it divides by depth): a projection is in it.
+inline bool Perspective(const Mat4& a) {
+    return std::fabs(a.m[3]) + std::fabs(a.m[7]) + std::fabs(a.m[11]) > 1e-3f;
+}
+
+/// The eye of a camera matrix: for a projective one the point sent to x = y = w = 0, for a rigid
+/// one -R^T t. False for anything else (a model matrix with scale, a singular projective one).
+inline bool EyeOf(const Mat4& a, float& x, float& y, float& z, bool& perspective) {
+    const float* m = a.m;
+    if (!Finite(m, 16)) return false;
+    perspective = Perspective(a);
+    if (!perspective) {
+        if (!ValidView(a)) return false;
+        CameraPos(a, x, y, z);
+        return true;
+    }
+    // Rows 0, 1 and 3 of M times (x, y, z, 1) = 0: A e = -b, by Cramer's rule.
+    const float a00 = m[0], a01 = m[4], a02 = m[8], b0 = m[12];
+    const float a10 = m[1], a11 = m[5], a12 = m[9], b1 = m[13];
+    const float a20 = m[3], a21 = m[7], a22 = m[11], b2 = m[15];
+    const float det = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
+    if (!(std::fabs(det) > 1e-12f)) return false;
+    const float r0 = -b0, r1 = -b1, r2 = -b2;
+    x = (r0 * (a11 * a22 - a12 * a21) - a01 * (r1 * a22 - a12 * r2) + a02 * (r1 * a21 - a11 * r2)) / det;
+    y = (a00 * (r1 * a22 - a12 * r2) - r0 * (a10 * a22 - a12 * a20) + a02 * (a10 * r2 - r1 * a20)) / det;
+    z = (a00 * (a11 * r2 - r1 * a21) - a01 * (a10 * r2 - r1 * a20) + r0 * (a10 * a21 - a11 * a20)) / det;
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+/// The helmet camera is the nearest a real camera sits to the bike's origin.
+constexpr float kMinCamDist = 0.3f;
+
+/// Which upload is the camera, read how, under which axes. `key` names it across frames.
+struct UniformPick {
+    int      index = -1;
+    bool     transposed = false, perspective = false;
+    int      axes = -1;
+    float    dist = 0;
+    uint64_t key  = 0;
+};
+
+inline uint64_t UniformKey(uint32_t program, int32_t location, bool transposed, int axes) {
+    return (uint64_t(program) << 32) ^ (uint64_t(uint32_t(location)) << 8) ^ (uint64_t(transposed) << 7) ^
+           uint64_t(axes & 0x7F);
+}
+
+/// A rigid matrix whose translation is the bike's position, under any axes: a model matrix
+/// placing something at the bike, not a view.
+inline bool AtTheBike(const Mat4& m, float rx, float ry, float rz) {
+    for (int k = 0; k < kNumAxes; ++k) {
+        float gx, gy, gz;
+        AxesAt(k).apply(rx, ry, rz, gx, gy, gz);
+        const float tx = m.m[12] - gx, ty = m.m[13] - gy, tz = m.m[14] - gz;
+        if (tx * tx + ty * ty + tz * tz < kMaxCamDist * kMaxCamDist) return true;
+    }
+    return false;
+}
+
+/// The camera among this frame's uploads. Projective matrices first: their eye is the camera
+/// itself, and an object's MVP puts it in that object's own space, near its origin and nowhere
+/// near the bike. Only without one is a rigid view taken, and then not one whose translation is
+/// the bike's position: that is a model matrix at the bike (the bike, its shadow, the rider),
+/// whose -R^T t lands next to the bike under a mirror. Within a kind, the simplest axes first,
+/// then the later upload. `locked`: a key already settled on, or 0 to look at everything.
+inline UniformPick PickUniform(const std::vector<Upload>& ups, float rx, float ry, float rz, uint64_t locked = 0) {
+    UniformPick out;
+    if (!std::isfinite(rx) || !std::isfinite(ry) || !std::isfinite(rz)) return out;
+    for (int pass = 0; pass < 2 && out.index < 0; ++pass) {
+        const bool want_persp = pass == 0;
+        for (size_t i = 0; i < ups.size(); ++i) {
+            for (int t = 0; t < 2; ++t) {
+                const Mat4 m = t ? Transposed(ups[i].m) : ups[i].m;
+                float      ex, ey, ez;
+                bool       persp = false;
+                if (!EyeOf(m, ex, ey, ez, persp) || persp != want_persp) continue;
+                for (int k = 0; k < kNumAxes; ++k) {
+                    if (out.axes >= 0 && k > out.axes) break;
+                    const uint64_t key = UniformKey(ups[i].program, ups[i].location, t != 0, k);
+                    if (locked && key != locked) continue;
+                    float gx, gy, gz;
+                    AxesAt(k).apply(rx, ry, rz, gx, gy, gz);
+                    const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
+                    if (!(d2 <= kMaxCamDist * kMaxCamDist) || d2 < kMinCamDist * kMinCamDist) continue;
+                    if (!persp && AtTheBike(m, rx, ry, rz)) continue;
+                    out.index       = int(i);
+                    out.transposed  = t != 0;
+                    out.perspective = persp;
+                    out.axes        = k;
+                    out.dist        = std::sqrt(d2);
+                    out.key         = key;
+                    break;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/// The same uniform must win kLockFrames frames running; then it is kept until reset.
+class KeyLock {
+public:
+    void reset() { last_ = 0, streak_ = 0, locked_ = 0; }
+    bool vote(uint64_t key) {
+        if (locked_) return false;
+        if (!key) {
+            streak_ = 0;
+            return false;
+        }
+        streak_ = key == last_ ? streak_ + 1 : 1;
+        last_   = key;
+        if (streak_ >= kLockFrames) {
+            locked_ = key;
+            return true;
+        }
+        return false;
+    }
+    uint64_t locked() const { return locked_; }
+
+private:
+    uint64_t last_ = 0, locked_ = 0;
+    int      streak_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------

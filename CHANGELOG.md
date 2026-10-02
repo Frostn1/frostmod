@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-01 — v0.42.2
+
+### Fixed
+- **The blue line on the track takes the camera from the game's shaders.** v0.42.1 showed the
+  game's old-style camera never moves: the real one is handed to the shaders. FrostMod now
+  reads (never changes) the camera matrices the game gives its shaders, keeps the one whose
+  eye follows your bike for 30 frames running, and logs which (`ground: camera locked: ...`).
+- The line is drawn over the scene until FrostMod has looked at the game's depth buffer under
+  it; then the bike and the hills hide it if that buffer holds the scene (`ground: depth at
+  the line ...`).
+- For the first 30 seconds the log lists, once a second, the matrices nearest a camera at your
+  bike (`ground/diag`).
+
 ## 2026-10-01 — v0.42.1
 
 ### Fixed

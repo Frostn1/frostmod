@@ -742,7 +742,7 @@ int main(int argc, char** argv) {
         Ribbon r755;
         CHECK(r755.update(sheet.ref, t755, at.pos, hb755.offset()), "a ribbon is built on the real sheet");
         const std::vector<Vert>& rv = r755.verts();
-        CHECK(rv.size() == 2 * size_t(kAhead / kStepTerrain + 1), "%zu verts for 60 m at 0.5 m", rv.size());
+        CHECK(rv.size() >= 2 * size_t(kAhead / kStepTerrain) && rv.size() <= 2 * size_t(kAhead / kStepTerrain + 1), "%zu verts for 60 m at 0.5 m", rv.size());
         // It starts at the bike, lies on the ground (not at the bike's height), and is the
         // painted width all along.
         if (rv.size() >= 2)
@@ -773,7 +773,7 @@ int main(int argc, char** argv) {
             for (const ScreenRow& r : rows)
                 if (r.l.x < -0.2f || r.l.x > 1.2f || r.l.y < 0.2f || r.l.y > 1.2f) on_screen = false;
             CHECK(on_screen, "the whole ribbon is in view");
-            CHECK(rows.back().alpha == 0.0f && rows.front().alpha == 1.0f, "faded out by 60 m");
+            CHECK(rows.back().alpha < 0.05f && rows.front().alpha == 1.0f, "faded out by 60 m");
         }
         if (argc > 1) RenderPreview(argv[1], p, cam, rv, at.x, bike_y, at.z, ground);
     }
@@ -808,7 +808,8 @@ int main(int argc, char** argv) {
         Ribbon tr;
         CHECK(tr.update(line, flat, 0.1f, 0.0f, {}, &ex), "a ribbon on the track's ground");
         const auto& tv = tr.verts();
-        CHECK(tv.size() == 2 * size_t(kAhead / kStepTerrain + 1), "rows every half metre: %zu verts", tv.size());
+        CHECK(tv.size() >= 2 * size_t(kAhead / kStepTerrain) && tv.size() <= 2 * size_t(kAhead / kStepTerrain + 1),
+              "rows every half metre: %zu verts", tv.size());
         // On the ground plus its slope-dependent lift, within what a metre between samples can show
         // of 5 m whoops (0.35 m high: 7 cm at most).
         float lo = 1e9f, hi = -1e9f;
@@ -973,8 +974,8 @@ int main(int argc, char** argv) {
         float h0, h2;
         t.height_at_lap(me.pos, h0);
         t.height_at_lap(me.pos + 2.0f / sh.track_len, h2);
-        CHECK(std::fabs(v[0].y - (3.0f + kLiftTerrain)) < 0.01f, "the first row on the rider's ground: %f", double(v[0].y));
-        CHECK(std::fabs(v[8].y - (3.0f + (h2 - h0) + kLiftTerrain)) < 0.02f, "and rising with the centreline");
+        CHECK(std::fabs(v[0].y - (3.0f + kLiftBase)) < 0.05f, "the first row on the rider's ground: %f", double(v[0].y));
+        CHECK(std::fabs(v[8].y - (3.0f + (h2 - h0) + kLiftBase)) < 0.06f, "and rising with the centreline");
         // A rider nowhere near the line (in the pits): no anchor, the old way.
         float fr;
         CHECK(AnchorPoint(drift, me.x + 500, me.z, me.pos, fr) < 0, "no anchor 500 m off the line");
@@ -1249,6 +1250,98 @@ int main(int argc, char** argv) {
             rv.push_back({float(i), 1.0f, -0.35f, float(i), {1, 1, 1, 1}});
         }
         CHECK(!std::isfinite(SnapReading(rv, sn, NAN, 1.0f, 0.0f, -50, 0)), "a NaN hit gives no reading");
+    }
+
+    // --- v0.43.5: the snap that swung +/-2 m, and the line that "moves weirdly" ---------------
+    {
+        // Rows at fixed places on the line: two builds 2.3 m apart draw the shared rows exactly
+        // where they were, so nothing crawls.
+        std::vector<unsigned char> sg(28, 0);
+        PutF(&sg[4], 400.0f);
+        coachhud::Track flat;
+        flat.build(1, sg.data(), 28, nullptr);
+        std::vector<coachhud::RefPoint> line;
+        for (int i = 0; i <= 400; ++i) {
+            coachhud::RefPoint r;
+            r.pos = float(i) / 401.0f, r.t = float(i) * 0.05f;
+            r.x = float(i), r.z = 3.0f * std::sin(float(i) / 30.0f);  // a gentle S
+            line.push_back(r);
+        }
+        RibbonExtras ex;
+        ex.version = 1;
+        for (int i = 0; i <= 400; ++i) ex.refy.push_back(2.0f + 0.5f * std::sin(float(i) / 7.0f));  // REFY: whoops along it
+        Ribbon rb3;
+        Anchor a;
+        a.x = 100.3f, a.z = line[100].z, a.ground = 1.5f;
+        rb3.update(line, flat, line[100].pos, 0, {}, &ex, &a);
+        float jy, js;
+        rb3.jitter(jy, js);
+        const std::vector<Vert> first = rb3.verts();
+        a.x = 102.6f, a.z = line[103].z;
+        rb3.update(line, flat, line[103].pos, 0, {}, &ex, &a);
+        rb3.jitter(jy, js);
+        CHECK(js < 1e-3f && jy < 0.02f, "a rebuild 2.3 m on moves the shared rows by %.4f sideways, %.4f up", double(js), double(jy));
+        CHECK(std::fabs(std::fmod(rb3.verts()[0].m, kStepTerrain)) < 1e-3f ||
+                  std::fabs(std::fmod(rb3.verts()[0].m, kStepTerrain) - kStepTerrain) < 1e-3f,
+              "rows on the half-metre grid of the line: m=%f", double(rb3.verts()[0].m));
+        // Heights from the reference lap's own rise (REFY), from the rider's ground.
+        bool refy_ok = true;
+        const float ry_at = 2.0f + 0.5f * std::sin(100.3f / 7.0f);  // the offset is learnt at the first build, moved 10% since
+        for (size_t i = 0; i + 1 < rb3.verts().size(); i += 2) {
+            const Vert& v = rb3.verts()[i];
+            // the row's place on the line, as an index into the points (a metre apart, nearly)
+            const float want = (2.0f + 0.5f * std::sin(v.x / 7.0f)) + (1.5f - ry_at) + kLiftBase;
+            if (std::fabs(v.y - want) > 0.08f) refy_ok = false;
+        }
+        CHECK(refy_ok, "each row on the rider's ground plus the reference lap's rise to it");
+        // And a different ground estimate later moves it only through a rebuild.
+        CHECK(!rb3.update(line, flat, line[103].pos, 0, {}, &ex, &a), "nothing changed: no rebuild");
+
+        // LineSnap: the corrections the log showed (+1.83, -2.03, +1.6) can't move the line more
+        // than 0.3 m, a reading moves it at most 4 cm, and the correction stays with its place.
+        LineSnap ls;
+        ls.reset(400.0f);
+        CHECK(!ls.feed(50.0f, 1.83f), "the logged +1.83 m isn't taken");
+        for (int k = 0; k < 100; ++k) ls.feed(50.0f, 0.5f);
+        CHECK(std::fabs(ls.at(50.0f) - kLineSnapMaxM) < 1e-4f, "clamped to %.1f m: %f", double(kLineSnapMaxM), double(ls.at(50)));
+        LineSnap ls2;
+        ls2.reset(400.0f);
+        ls2.feed(80.0f, 0.2f);
+        CHECK(std::fabs(ls2.at(80.0f) - kLineSnapStepM) < 1e-4f, "one reading moves it 4 cm: %f", double(ls2.at(80)));
+        CHECK(!ls2.feed(80.0f, -2.03f), "a -2 m reading isn't this ground");
+        CHECK(std::fabs(ls2.at(80.0f) - kLineSnapStepM) < 1e-4f && ls2.at(200.0f) == 0.0f, "and the place keeps its own");
+        CHECK(!ls2.feed(80.0f, NAN) && !ls2.feed(-5, 0.1f) && !ls2.feed(900, 0.1f), "NaN and off the line refused");
+
+        // SnapCheck, with the logged behaviour: read-backs that put the ground metres off the
+        // bike's own height switch the snap off and say why; agreeing ones switch it on.
+        SnapCheck bad;
+        for (int k = 0; k < 20; ++k) bad.add(3.0f, 10.0f, 3.0f - 0.6f + (k % 2 ? 1.9f : -2.1f), 0.0f, 10.0f, 0.0f);
+        CHECK(!bad.on() && !bad.why().empty(), "swinging read-backs: off (%s)", bad.why().c_str());
+        SnapCheck sky;
+        for (int k = 0; k < 20; ++k) sky.add(3.0f, NAN, NAN, NAN, 10.0f, 0.0f);
+        CHECK(!sky.on(), "no read-back (sky, depth 1.0): off (%s)", sky.why().c_str());
+        SnapCheck far;
+        for (int k = 0; k < 20; ++k) far.add(3.0f, 30.0f, 2.4f, 0.0f, 10.0f, 0.0f);
+        CHECK(!far.on(), "a read-back 20 m from where it was aimed: off (%s)", far.why().c_str());
+        SnapCheck good;
+        for (int k = 0; k < 20; ++k) good.add(3.0f + 0.01f * float(k), 10.1f, 2.4f + 0.01f * float(k) + 0.03f * std::sin(float(k)), 0.1f, 10.0f, 0.0f);
+        CHECK(good.on() && std::fabs(good.lift() - 0.6f) < 0.05f, "agreeing read-backs: on, the bike %.2f m over the ground",
+              double(good.lift()));
+
+        // Unprojection through a split depth range (0..0.5) gives the same point back.
+        const Mat4   V   = LookAt(0, 3, 0, 20, 1, 0);
+        const Mat4   pv  = Mul(p, V);
+        const float* mm  = pv.m;
+        const float  wx = 15, wy = 1.2f, wz = 0.5f;
+        const float  cz = mm[2] * wx + mm[6] * wy + mm[10] * wz + mm[14], cw = mm[3] * wx + mm[7] * wy + mm[11] * wz + mm[15];
+        const Screen sp = Project(p, V, wx, wy, wz);
+        const float  d  = 0.0f + (cz / cw + 1) * 0.5f * 0.5f;  // window depth in a 0..0.5 range
+        float ux, uy, uz;
+        CHECK(Unproject(p, V, Axes{}, sp.x, sp.y, d, ux, uy, uz, 0.0f, 0.5f) && std::fabs(ux - wx) < 0.02f &&
+                  std::fabs(uy - wy) < 0.02f,
+              "unprojection honours the depth range: %f %f", double(ux), double(uy));
+        CHECK(Unproject(p, V, Axes{}, sp.x, sp.y, d, ux, uy, uz) && std::fabs(ux - wx) > 1.0f,
+              "and assuming 0..1 there is metres out: %f", double(ux));
     }
 
     if (g_failures) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-02 — v0.45.1
+
+### Reverted
+- **Paint sync at join time (v0.43.0) is reverted.** `frostmod.dlo` is back to v0.42.2's paint
+  handling: `refresh_paints` runs when MXB App asks, with no loading-screen/pits gate, the
+  `paints_staged` command is gone, and so are the `[paintgate]` / `[paintscan]` log lines.
+  MXB Coach (`mxbcoach.dlo`) keeps everything through v0.45.0.
+
 ## 2026-10-02 — v0.45.0
 
 ### Added

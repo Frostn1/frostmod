@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-10-02 — v0.44.0
+## 2026-10-02 — v0.44.1
 
 ### Added
 - **Jump calls on the line.** Where Coach's lap jumped, the line now shows a white bar across it
@@ -16,6 +16,41 @@
 - A HUD option, `jumps` in `hud.ini` (on by default, shown only with the line on the track);
   MXB Coach lists it as "Jump calls on the line". The log says how many calls a sheet gave and
   where they came from (`jumps: 6 calls from the lap's air: DOUBLE=2 ...`).
+- Built with v0.44.0's pace hints: both draw over the line, the pace chevrons and the jump marks
+  side by side.
+
+## 2026-10-02 — v0.44.0
+
+### Added
+- **Pace hints on the line on the track** (hud.ini `pace=1`, off until asked for; drawn over the
+  line, so it needs `ground` too). Your speed is compared with Coach's at the same spot and
+  with what is coming up. The line's own colours stay what to do (green gas, white coast,
+  yellow/red brake); the hint is drawn over them:
+  - **Too fast** (8% over Coach, or a braking-distance model saying you would run 4 m or more
+    past his slowest point of the next corner): magenta chevrons on the line ahead point back at
+    you up to the braking point, and its yellow and red come sooner by about that overshoot.
+  - **Too slow** (8% under, never with a braking zone close ahead): cyan chevrons point on and
+    the gas is a brighter green. Before a jump lip that needs speed (found from the track's own
+    ground in the sheet), a cyan gate across the line at the lip and **MORE SPEED** on the HUD.
+  - It doesn't flicker: the comparison is smoothed, a hint needs its threshold held to start and
+    half of it held to end, shows at least a second, and fades in and out.
+- The log says what the hints saw (`pace: too fast (+12% on Coach, overshoot 9 m, ...)`).
+## 2026-10-02 — v0.43.5
+
+### Fixed
+- **No more jumping, sinking or crawling line on tracks without their ground file.** The
+  correction taken from the game's depth swung by two metres: it was kept by distance ahead of
+  you, so the ground slid through it as you rode, and nothing checked the depth reading meant
+  what it was taken to mean. Now it is only used while the ground just ahead of the bike, read
+  back the same way, agrees with the bike's own height; it is kept by place on the line, moves
+  a few centimetres at a time and never more than 30 cm. The log says when it is on or off and
+  why (`ground: snap on|off`).
+- The line stands on Coach's own lap's heights along it when the sheet carries them (a newer
+  MXB Coach), on the centreline's rise otherwise, and its rows sit at fixed places on the line,
+  so a rebuild as you ride draws the same rows in the same places. The log's 10 s line reports
+  the most any of them moved (`jitter dy= shift=`).
+- Depth 1.0 under the line (sky, or a cleared buffer) no longer makes the line draw over
+  everything for a few seconds.
 
 ## 2026-10-02 — v0.43.4
 

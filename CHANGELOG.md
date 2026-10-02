@@ -2,6 +2,9 @@
 
 ## 2026-10-01 — v0.43.0
 
+One version for every binary in this repo: `frostmod.dlo` and `mxbcoach.dlo` both report
+0.43.0. MXB Coach is unchanged from v0.42.2 (below).
+
 ### Changed
 - **Synced paints no longer refresh while you ride.** MXB App's paint sync used to make
   FrostMod rebuild the paint lists and repaint every rider the moment a paint arrived, up to

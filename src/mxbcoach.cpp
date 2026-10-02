@@ -1163,18 +1163,20 @@ struct GlCapture {
     GLenum mode    = GL_MODELVIEW;
     DWORD  thread  = 0;      // the thread that presents frames
     bool   own     = false;  // our own calls, not the game's
-    // A perspective projection waiting for the camera to be multiplied onto it.
-    bool                              pending = false;
-    coachline::Mat4                   pend;
+    // A perspective projection, and everything multiplied onto it since, while the game is
+    // still on GL_PROJECTION: the camera being assembled.
+    bool                              building = false;
+    coachline::Candidate              cur;
     std::vector<coachline::Candidate> cands;  // this frame's
     unsigned n_frustum = 0, n_cands = 0, n_frames = 0, n_picked = 0, n_drawn = 0;
-    int      last_flip = -1;
 };
 GlCapture             g_gl;
 coachline::Ribbon     g_ribbon;
 coachline::HeightBias g_height;
+coachline::AxesLock   g_axes;
 bool                  g_gl_tried = false, g_gl_ok = false;
-ULONGLONG             g_gl_logged = 0;
+ULONGLONG             g_gl_logged = 0, g_diag_ms = 0;
+int                   g_diag_left = 30;  // once a second, for the first 30 s riding with the line on
 // What the render thread draws, copied out under the lock so the draw itself never holds it.
 std::vector<coachline::Vert> g_draw_verts;
 
@@ -1186,6 +1188,12 @@ using glMultMatrixd_t   = void(WINAPI*)(const GLdouble*);
 using glLoadIdentity_t  = void(WINAPI*)();
 using glFrustum_t       = void(WINAPI*)(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
 using glOrtho_t         = void(WINAPI*)(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
+using glTranslatef_t    = void(WINAPI*)(GLfloat, GLfloat, GLfloat);
+using glTranslated_t    = void(WINAPI*)(GLdouble, GLdouble, GLdouble);
+using glRotatef_t       = void(WINAPI*)(GLfloat, GLfloat, GLfloat, GLfloat);
+using glRotated_t       = void(WINAPI*)(GLdouble, GLdouble, GLdouble, GLdouble);
+using glScalef_t        = void(WINAPI*)(GLfloat, GLfloat, GLfloat);
+using glScaled_t        = void(WINAPI*)(GLdouble, GLdouble, GLdouble);
 using wglSwap_t         = BOOL(WINAPI*)(HDC);
 using glUseProgram_t    = void(WINAPI*)(GLuint);
 using glActiveTexture_t = void(WINAPI*)(GLenum);
@@ -1197,6 +1205,12 @@ glMultMatrixd_t   g_orig_multd     = nullptr;
 glLoadIdentity_t  g_orig_identity  = nullptr;
 glFrustum_t       g_orig_frustum   = nullptr;
 glOrtho_t         g_orig_ortho     = nullptr;
+glTranslatef_t    g_orig_translatef = nullptr;
+glTranslated_t    g_orig_translated = nullptr;
+glRotatef_t       g_orig_rotatef   = nullptr;
+glRotated_t       g_orig_rotated   = nullptr;
+glScalef_t        g_orig_scalef    = nullptr;
+glScaled_t        g_orig_scaled    = nullptr;
 wglSwap_t         g_orig_swap      = nullptr;
 glUseProgram_t    g_use_program    = nullptr;
 glActiveTexture_t g_active_texture = nullptr;
@@ -1209,46 +1223,76 @@ constexpr GLenum kGlActiveTexture          = 0x84E0;
 constexpr GLenum kGlTexture0               = 0x84C0;
 
 bool GlMine() { return !g_gl.own && g_gl.thread != 0 && GetCurrentThreadId() == g_gl.thread; }
+bool GlProj() { return GlMine() && g_gl.mode == GL_PROJECTION; }
 
+/// The camera being assembled is complete: the game has stopped multiplying onto it.
+void GlFinish() {
+    if (!g_gl.building) return;
+    g_gl.building = false;
+    if (g_gl.cur.ops == 0 || !coachline::ValidView(g_gl.cur.view) || g_gl.cands.size() >= kMaxCandidates) return;
+    g_gl.cands.push_back(g_gl.cur);
+    ++g_gl.n_cands;
+}
+void GlStart(const coachline::Mat4& proj) {
+    GlFinish();
+    g_gl.building = true;
+    g_gl.cur      = coachline::Candidate{};
+    g_gl.cur.proj = proj;
+}
 void GlProjectionLoaded(const float* m) {
+    GlFinish();
     coachline::Mat4 a;
     std::memcpy(a.m, m, sizeof(a.m));
-    g_gl.pending = coachline::ValidProjection(a);
-    if (g_gl.pending) g_gl.pend = a;
+    if (coachline::ValidProjection(a)) GlStart(a);
+}
+void GlProjectionTimes(const coachline::Mat4& m) {
+    if (!g_gl.building) return;
+    g_gl.cur.view = coachline::Mul(g_gl.cur.view, m);
+    ++g_gl.cur.ops;
 }
 void GlProjectionMultiplied(const float* m) {
-    if (!g_gl.pending) return;
-    g_gl.pending = false;
-    coachline::Candidate c;
-    c.proj = g_gl.pend;
-    std::memcpy(c.view.m, m, sizeof(c.view.m));
-    if (!coachline::ValidView(c.view) || g_gl.cands.size() >= kMaxCandidates) return;
-    g_gl.cands.push_back(c);
-    ++g_gl.n_cands;
+    coachline::Mat4 a;
+    std::memcpy(a.m, m, sizeof(a.m));
+    GlProjectionTimes(a);
+}
+/// A model matrix loaded after a camera: kept by its translation, for the diagnostic only.
+void GlModelLoaded(const float* m) {
+    if (g_gl.cands.empty() || g_diag_left <= 0) return;
+    coachline::Candidate& c = g_gl.cands.back();
+    if (c.n_mv >= 4) return;
+    c.mv[c.n_mv][0] = m[12], c.mv[c.n_mv][1] = m[13], c.mv[c.n_mv][2] = m[14];
+    ++c.n_mv;
 }
 
 void WINAPI hkMode(GLenum m) {
-    if (GlMine()) g_gl.mode = m;
+    if (GlMine()) {
+        if (m != GL_PROJECTION) GlFinish();
+        g_gl.mode = m;
+    }
     g_orig_mode(m);
 }
 void WINAPI hkLoadf(const GLfloat* m) {
-    if (m && GlMine() && g_gl.mode == GL_PROJECTION) GlProjectionLoaded(m);
+    if (m && GlMine()) {
+        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(m);
+        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(m);
+    }
     g_orig_loadf(m);
 }
 void WINAPI hkLoadd(const GLdouble* m) {
-    if (m && GlMine() && g_gl.mode == GL_PROJECTION) {
+    if (m && GlMine()) {
         float f[16];
         for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
-        GlProjectionLoaded(f);
+        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(f);
+        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(f);
     }
     g_orig_loadd(m);
 }
 void WINAPI hkMultf(const GLfloat* m) {
-    if (m && GlMine() && g_gl.mode == GL_PROJECTION) GlProjectionMultiplied(m);
+    if (m && GlProj()) GlProjectionMultiplied(m);
     g_orig_multf(m);
 }
 void WINAPI hkMultd(const GLdouble* m) {
-    if (m && GlMine() && g_gl.mode == GL_PROJECTION) {
+    if (m && GlProj()) {
         float f[16];
         for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
         GlProjectionMultiplied(f);
@@ -1256,29 +1300,100 @@ void WINAPI hkMultd(const GLdouble* m) {
     g_orig_multd(m);
 }
 void WINAPI hkIdentity() {
-    // Identity on the projection starts a new one: nothing pending survives it.
-    if (GlMine() && g_gl.mode == GL_PROJECTION) g_gl.pending = false;
+    // Identity on the projection starts a new one.
+    if (GlProj()) GlFinish();
     g_orig_identity();
 }
 void WINAPI hkFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {
-    if (GlMine() && g_gl.mode == GL_PROJECTION) {
+    if (GlProj()) {
         // glFrustum multiplies onto what is there; the game loads identity first, and should it
         // ever stop, the camera-next-to-the-bike test in PickCamera refuses the result.
+        GlFinish();
         coachline::Mat4 p;
-        g_gl.pending = coachline::Frustum(l, r, b, t, n, f, p) && coachline::ValidProjection(p);
-        if (g_gl.pending) g_gl.pend = p;
+        if (coachline::Frustum(l, r, b, t, n, f, p) && coachline::ValidProjection(p)) GlStart(p);
         ++g_gl.n_frustum;
     }
     g_orig_frustum(l, r, b, t, n, f);
 }
 void WINAPI hkOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {
-    if (GlMine() && g_gl.mode == GL_PROJECTION) g_gl.pending = false;
+    if (GlProj()) GlFinish();
     g_orig_ortho(l, r, b, t, n, f);
+}
+void WINAPI hkTranslatef(GLfloat x, GLfloat y, GLfloat z) {
+    if (GlProj()) GlProjectionTimes(coachline::Translate(x, y, z));
+    g_orig_translatef(x, y, z);
+}
+void WINAPI hkTranslated(GLdouble x, GLdouble y, GLdouble z) {
+    if (GlProj()) GlProjectionTimes(coachline::Translate(float(x), float(y), float(z)));
+    g_orig_translated(x, y, z);
+}
+void WINAPI hkRotatef(GLfloat a, GLfloat x, GLfloat y, GLfloat z) {
+    if (GlProj()) GlProjectionTimes(coachline::Rotate(a, x, y, z));
+    g_orig_rotatef(a, x, y, z);
+}
+void WINAPI hkRotated(GLdouble a, GLdouble x, GLdouble y, GLdouble z) {
+    if (GlProj()) GlProjectionTimes(coachline::Rotate(float(a), float(x), float(y), float(z)));
+    g_orig_rotated(a, x, y, z);
+}
+void WINAPI hkScalef(GLfloat x, GLfloat y, GLfloat z) {
+    if (GlProj()) GlProjectionTimes(coachline::Scale(x, y, z));
+    g_orig_scalef(x, y, z);
+}
+void WINAPI hkScaled(GLdouble x, GLdouble y, GLdouble z) {
+    if (GlProj()) GlProjectionTimes(coachline::Scale(float(x), float(y), float(z)));
+    g_orig_scaled(x, y, z);
+}
+
+std::string F3(float a, float b, float c) {
+    char s[96];
+    std::snprintf(s, sizeof(s), "(%.2f, %.2f, %.2f)", double(a), double(b), double(c));
+    return s;
+}
+
+/// Once a second for the first minute: the bike, and every camera this frame with how it was
+/// built, where it puts the camera, how far that is from the bike as it stands and under the
+/// best axes, and the first model translations after it. This is the evidence for whatever
+/// PickCamera does next when it finds nothing. Under g_mu.
+void LogCandidates(float aspect, const coachline::Pick& pick) {
+    Log("ground/diag", "bike " + F3(g_rider.x, g_rider_y, g_rider.y) + " window aspect " + std::to_string(aspect) +
+                           " cameras " + std::to_string(g_gl.cands.size()) +
+                           " picked " + std::to_string(pick.index) + " axes " +
+                           (pick.axes >= 0 ? coachline::AxesName(coachline::AxesAt(pick.axes)) : std::string("-")) +
+                           " lock " +
+                           (g_axes.locked() >= 0 ? coachline::AxesName(coachline::AxesAt(g_axes.locked())) : "-"));
+    for (size_t i = 0; i < g_gl.cands.size() && i < 4; ++i) {
+        const coachline::Candidate& c = g_gl.cands[i];
+        const float* v    = c.view.m;
+        const float  fovy = c.proj.m[5] > 0 ? 2.0f * std::atan(1.0f / c.proj.m[5]) * 57.2957795f : 0.0f;
+        float cx, cy, cz;
+        coachline::CameraPos(c.view, cx, cy, cz);
+        // As loaded, and as if it were the other layout: a transposed upload puts the
+        // translation in the bottom row.
+        const float tx = -(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]);
+        const float ty = -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]);
+        const float tz = -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11]);
+        const float d  = std::sqrt((cx - g_rider.x) * (cx - g_rider.x) + (cy - g_rider_y) * (cy - g_rider_y) +
+                                   (cz - g_rider.y) * (cz - g_rider.y));
+        const coachline::Pick best = coachline::PickCamera({c}, coachline::Aspect(c.proj), g_rider.x, g_rider_y,
+                                                           g_rider.y);
+        char head[200];
+        std::snprintf(head, sizeof(head), "  cam %zu: fovy %.1f aspect %.3f ops %d valid %d rows", i, double(fovy),
+                      double(coachline::Aspect(c.proj)), c.ops, int(coachline::ValidView(c.view)));
+        std::string line = std::string(head) + " r0 " + F3(v[0], v[4], v[8]) + " r1 " + F3(v[1], v[5], v[9]) +
+                           " r2 " + F3(v[2], v[6], v[10]) + " t " + F3(v[12], v[13], v[14]) + " bottom " +
+                           F3(v[3], v[7], v[11]) + " -> cam(col-major) " + F3(cx, cy, cz) + " dist " +
+                           std::to_string(d) + " cam(row-major) " + F3(tx, ty, tz) + " best axes " +
+                           (best.axes >= 0 ? coachline::AxesName(coachline::AxesAt(best.axes)) + " dist " +
+                                                 std::to_string(best.dist)
+                                           : std::string("none within 25 m"));
+        for (int k = 0; k < c.n_mv; ++k) line += " mv" + std::to_string(k) + " " + F3(c.mv[k][0], c.mv[k][1], c.mv[k][2]);
+        Log("ground/diag", line);
+    }
 }
 
 /// The ribbon through the game's own camera, in the window's framebuffer, depth-tested against
 /// the world the game just drew so the bike and the hills hide it. On the render thread.
-void DrawGroundLine(const coachline::Candidate& cam, coachline::Flip fl) {
+void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) {
     const std::vector<coachline::Vert>& v = g_draw_verts;
     if (v.size() < 4) return;
     if (!g_gl_ext_looked) {
@@ -1335,7 +1450,9 @@ void DrawGroundLine(const coachline::Candidate& cam, coachline::Flip fl) {
         const float a = 0.70f * coachline::Fade(p.s);
         if (p.brake) glColor4f(1.0f, 0.22f, 0.18f, a);
         else glColor4f(0.10f, 0.50f, 1.0f, a);
-        glVertex3f(p.x * fl.sx, p.y, p.z * fl.sz);
+        float gx, gy, gz;
+        ax.apply(p.x, p.y, p.z, gx, gy, gz);
+        glVertex3f(gx, gy, gz);
     }
     glEnd();
     g_orig_mode(GL_MODELVIEW);
@@ -1356,24 +1473,34 @@ BOOL WINAPI hkSwap(HDC hdc) {
     try {
         if (!g_gl.thread) g_gl.thread = GetCurrentThreadId();
         if (GetCurrentThreadId() == g_gl.thread && !g_gl.own) {
+            GlFinish();
             ++g_gl.n_frames;
             coachline::Candidate cam;
             coachline::Pick      pick;
             bool                 draw = false;
             {
                 std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+                const ULONGLONG              now = GetTickCount64();
                 if (lock.owns_lock() && g_gl_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
                     g_have_sample && !g_gl.cands.empty()) {
                     RECT       rc{};
-                    const HWND wnd = WindowFromDC(hdc);
-                    if (wnd && GetClientRect(wnd, &rc) && rc.bottom > rc.top) {
-                        const float aspect = float(rc.right - rc.left) / float(rc.bottom - rc.top);
-                        pick = coachline::PickCamera(g_gl.cands, aspect, g_rider.x, g_rider_y, g_rider.y);
+                    float      aspect = 0;
+                    const HWND wnd    = WindowFromDC(hdc);
+                    if (wnd && GetClientRect(wnd, &rc) && rc.bottom > rc.top)
+                        aspect = float(rc.right - rc.left) / float(rc.bottom - rc.top);
+                    pick = coachline::PickCamera(g_gl.cands, aspect, g_rider.x, g_rider_y, g_rider.y, g_axes.locked());
+                    if (g_axes.vote(pick.axes))
+                        Log("ground", "axes locked: GL = telemetry " +
+                                          coachline::AxesName(coachline::AxesAt(pick.axes)) + ", camera " +
+                                          std::to_string(pick.dist) + " m from the bike");
+                    if (g_diag_left > 0 && now - g_diag_ms >= 1000) {
+                        g_diag_ms = now;
+                        --g_diag_left;
+                        LogCandidates(aspect, pick);
                     }
-                    if (pick.index >= 0) {
+                    if (pick.index >= 0 && g_axes.locked() >= 0) {
                         cam = g_gl.cands[size_t(pick.index)];
                         ++g_gl.n_picked;
-                        g_gl.last_flip   = pick.flip.sx < 0 ? 2 : pick.flip.sz < 0 ? 1 : 0;
                         const float lapM = g_track.ready() ? g_track.length() : 0.0f;
                         const std::vector<coachline::Zone> zones =
                             g_cues.active() && lapM > 0 ? coachline::BrakeZones(g_cues.sheet(), lapM)
@@ -1384,30 +1511,29 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     }
                 }
                 // Every 10 s while it is on: the one line that says whether a camera was found,
-                // which way the world is flipped, and where the heights put the ground.
-                const ULONGLONG now = GetTickCount64();
+                // which axes are in use, and where the heights put the ground.
                 if (lock.owns_lock() && g_gl_ok && g_hud_set.ground && now - g_gl_logged > 10000) {
                     g_gl_logged = now;
-                    static const char* const kFlipName[] = {"none", "z", "x"};
                     Log("ground", "frames=" + std::to_string(g_gl.n_frames) +
                                       " frusta=" + std::to_string(g_gl.n_frustum) +
                                       " cameras=" + std::to_string(g_gl.n_cands) +
                                       " picked=" + std::to_string(g_gl.n_picked) +
-                                      " drawn=" + std::to_string(g_gl.n_drawn) + " flip=" +
-                                      (g_gl.last_flip >= 0 ? kFlipName[g_gl.last_flip] : "-") +
+                                      " drawn=" + std::to_string(g_gl.n_drawn) + " axes=" +
+                                      (g_axes.locked() >= 0 ? coachline::AxesName(coachline::AxesAt(g_axes.locked()))
+                                                            : std::string("-")) +
                                       " height_gap=" + std::to_string(g_height.gap()) +
                                       " offset=" + std::to_string(g_height.offset()) +
                                       " ribbon=" + std::to_string(g_ribbon.verts().size()) + " verts");
                 }
             }
-            if (draw) DrawGroundLine(cam, pick.flip);
+            if (draw) DrawGroundLine(cam, coachline::AxesAt(g_axes.locked()));
         }
     } catch (...) {
         g_gl.own = false;
     }
     if (GetCurrentThreadId() == g_gl.thread) {
         g_gl.cands.clear();
-        g_gl.pending = false;
+        g_gl.building = false;
     }
     return g_orig_swap(hdc);
 }
@@ -1442,6 +1568,12 @@ void InstallGroundHooks() {
                     {"glLoadIdentity", (void*)&hkIdentity, (void**)&g_orig_identity},
                     {"glFrustum", (void*)&hkFrustum, (void**)&g_orig_frustum},
                     {"glOrtho", (void*)&hkOrtho, (void**)&g_orig_ortho},
+                    {"glTranslatef", (void*)&hkTranslatef, (void**)&g_orig_translatef},
+                    {"glTranslated", (void*)&hkTranslated, (void**)&g_orig_translated},
+                    {"glRotatef", (void*)&hkRotatef, (void**)&g_orig_rotatef},
+                    {"glRotated", (void*)&hkRotated, (void**)&g_orig_rotated},
+                    {"glScalef", (void*)&hkScalef, (void**)&g_orig_scalef},
+                    {"glScaled", (void*)&hkScaled, (void**)&g_orig_scaled},
                     {"wglSwapBuffers", (void*)&hkSwap, (void**)&g_orig_swap}};
     std::vector<void*> made;
     for (const H& h : hs) {
@@ -1554,6 +1686,7 @@ __declspec(dllexport) void EventDeinit() {
     g_track.clear();
     g_height.reset();
     g_ribbon.clear();
+    g_axes.reset();
     g_practice = false;
     ReleaseDevice();
     StopVoice();

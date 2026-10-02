@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-01 — v0.42.1
+
+### Fixed
+- **The blue line on the track now finds the camera.** In v0.42.0 the game's camera was seen
+  hundreds of times a second but never accepted, so nothing was drawn. The camera is now
+  followed however the game builds it (whole, or turned and then moved), and the way the
+  game's 3D axes line up with the bike's position is worked out on track rather than assumed:
+  once the same answer holds for 30 frames in a row it is kept, and the log says which
+  (`ground: axes locked: ...`).
+- For the first 30 seconds with the line on, the Coach log writes once a second where the bike
+  is and where each camera the game used sits (`ground/diag` lines), so a track where it still
+  does not appear can be fixed from the log alone.
+
 ## 2026-10-01 — v0.42.0
 
 ### Added

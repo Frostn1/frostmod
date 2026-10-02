@@ -7,6 +7,7 @@
 
 #include "../src/coachline.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -149,7 +150,7 @@ static void RenderPreview(const char* path, const Mat4& p, const Mat4& v, const 
             if (grid) r *= 0.82f, g *= 0.82f, b *= 0.82f;
             px[0] = r + (0.70f - r) * haze, px[1] = g + (0.76f - g) * haze, px[2] = b + (0.86f - b) * haze;
         }
-    const std::vector<ScreenRow> rows = ProjectRibbon(p, v, Flip{}, verts);
+    const std::vector<ScreenRow> rows = ProjectRibbon(p, v, Axes{}, verts);
     auto X = [&](const Screen& s) { return s.x * float(img.w); };
     auto Y = [&](const Screen& s) { return s.y * float(img.h); };
     for (size_t i = 0; i + 1 < rows.size(); ++i) {
@@ -246,7 +247,7 @@ int main(int argc, char** argv) {
     frame.push_back({p, LookAt(0, 2.2f, 4, 0, 1, -6)});
     frame.push_back({p, LookAt(0, 2.2f, 4, 0, 1, -6)});
     Pick pk = PickCamera(frame, 2560.0f / 1440.0f, rx, ry, rz);
-    CHECK(pk.index == 7 && pk.flip.sx == 1 && pk.flip.sz == 1, "the world pass is picked, not a cube face: %d",
+    CHECK(pk.index == 7 && pk.axes == 0, "the world pass is picked, not a cube face: %d",
           pk.index);
     CHECK(PickCamera(frame, 4.0f / 3.0f, rx, ry, rz).index < 0, "nothing fits a 4:3 window");
     const std::vector<Candidate> tv = {{p, LookAt(80, 10, 0, 0, 0, 0)}};
@@ -254,7 +255,81 @@ int main(int argc, char** argv) {
     // A world with z mirrored: the camera only sits next to the rider once z is flipped.
     const std::vector<Candidate> flipped = {{p, LookAt(0, 2, -104, 0, 1, -94)}};
     pk = PickCamera(flipped, 16.0f / 9.0f, 0, 0.6f, 100);
-    CHECK(pk.index == 0 && pk.flip.sz == -1 && pk.flip.sx == 1, "a z-mirrored world is recognised");
+    CHECK(pk.index == 0 && pk.axes >= 0 && AxesName(AxesAt(pk.axes)) == "x,y,-z", "a z-mirrored world is recognised: %s",
+          pk.axes >= 0 ? AxesName(AxesAt(pk.axes)).c_str() : "none");
+
+    // --- Real-shaped captures, as the game assembles them on GL_PROJECTION -------------------
+    // The bike where Sean rides, far from the origin; a chase camera 4 m behind and 1.8 m up.
+    {
+        const float bx = 243.7f, by = 12.4f, bz = 131.5f;
+        const float ex = bx - 4.0f, ey = by + 1.8f, ez = bz;  // looking east along +x
+        // (a) The view handed over whole, as gluLookAt builds it.
+        const Mat4 whole = LookAt(ex, ey, ez, bx + 8, by, bz);
+        // (b) The same camera assembled the classic way: rotations, then glTranslate(-eye).
+        //     Pitch down, then yaw so the eye's -z looks along world +x.
+        const float pitch = std::atan2(ey - by, 12.0f) * 57.2957795f;
+        Mat4 built = Mul(Rotate(pitch, 1, 0, 0), Rotate(90.0f, 0, 1, 0));
+        built      = Mul(built, Translate(-ex, -ey, -ez));
+        CHECK(ValidView(built), "a rotate-then-translate camera is rigid");
+        float cx2, cy2, cz2;
+        CameraPos(built, cx2, cy2, cz2);
+        CHECK(std::fabs(cx2 - ex) < 1e-3f && std::fabs(cy2 - ey) < 1e-3f && std::fabs(cz2 - ez) < 1e-3f,
+              "and the camera is read back at the eye: %f %f %f", cx2, cy2, cz2);
+        const Screen ahead = Project(p, built, bx + 8, by, bz);
+        CHECK(ahead.ok && std::fabs(ahead.x - 0.5f) < 1e-3f, "a point dead ahead is centred across, x=%f", ahead.x);
+        // Only the rotation, the translation missed (what v0.42.0 kept): a camera at the origin,
+        // far from the bike, and nothing is picked under any axes.
+        const Mat4 rot_only = Mul(Rotate(pitch, 1, 0, 0), Rotate(90.0f, 0, 1, 0));
+        CHECK(PickCamera({{p, rot_only}}, 16.0f / 9.0f, bx, by, bz).index < 0, "a rotation alone is no camera here");
+        for (const Mat4& view : {whole, built}) {
+            const Pick k = PickCamera({{p, view}}, 2560.0f / 1440.0f, bx, by, bz);
+            CHECK(k.index == 0 && k.axes == 0 && k.dist > 4.0f && k.dist < 4.5f, "picked with plain axes at %f m",
+                  k.dist);
+        }
+        // A z-up GL world: GL (x, y, z) = telemetry (x, -z, y). The same camera, expressed there.
+        Axes zup;
+        zup.src[0] = 0, zup.src[1] = 2, zup.src[2] = 1;
+        zup.sgn[0] = 1, zup.sgn[1] = -1, zup.sgn[2] = 1;
+        float gx, gy, gz, tx, ty, tz;
+        zup.apply(ex, ey, ez, gx, gy, gz);
+        zup.apply(bx + 8, by, bz, tx, ty, tz);
+        // look-at with z up: build it by hand from the y-up LookAt in GL coordinates rotated
+        // -90 degrees about x (y-up to z-up).
+        const Mat4 zview = Mul(LookAt(gx, gz, -gy, tx, tz, -ty), Rotate(-90.0f, 1, 0, 0));
+        float zx, zy, zz;
+        CameraPos(zview, zx, zy, zz);
+        CHECK(std::fabs(zx - gx) < 1e-2f && std::fabs(zy - gy) < 1e-2f && std::fabs(zz - gz) < 1e-2f,
+              "z-up camera at %f %f %f, want %f %f %f", zx, zy, zz, gx, gy, gz);
+        const Pick zk = PickCamera({{p, zview}}, 16.0f / 9.0f, bx, by, bz);
+        CHECK(zk.index == 0 && zk.axes >= 0 && AxesName(AxesAt(zk.axes)) == "x,-z,y", "a z-up world is found: %s",
+              zk.axes >= 0 ? AxesName(AxesAt(zk.axes)).c_str() : "none");
+        if (zk.axes >= 0) {
+            const Screen zs = Project(p, zview, bx + 8, by, bz, AxesAt(zk.axes));
+            CHECK(zs.ok && std::fabs(zs.x - 0.5f) < 1e-3f && std::fabs(zs.y - 0.5f) < 1e-3f,
+                  "and through it the look-at point lands at the centre: %f %f", zs.x, zs.y);
+        }
+        // The lock: thirty frames of the same axes, then kept; a miss in between restarts it.
+        AxesLock lock;
+        bool took = false;
+        for (int f = 0; f < kLockFrames - 1; ++f) took |= lock.vote(0);
+        CHECK(!took && lock.locked() < 0, "not locked before %d frames", kLockFrames);
+        lock.vote(-1);
+        for (int f = 0; f < kLockFrames - 1; ++f) lock.vote(0);
+        CHECK(lock.locked() < 0, "a frame without a camera restarts the count");
+        CHECK(lock.vote(0) && lock.locked() == 0, "locked on the thirtieth");
+        lock.vote(5);
+        CHECK(lock.locked() == 0, "and kept");
+        // With the axes locked, only those are tried.
+        CHECK(PickCamera({{p, zview}}, 16.0f / 9.0f, bx, by, bz, 0).index < 0, "locked to plain axes, a z-up camera is not taken");
+    }
+    // Every signed permutation is distinct and AxesAt(0) is the identity.
+    CHECK(AxesName(AxesAt(0)) == "x,y,z", "identity first");
+    {
+        std::vector<std::string> names;
+        for (int k = 0; k < kNumAxes; ++k) names.push_back(AxesName(AxesAt(k)));
+        std::sort(names.begin(), names.end());
+        CHECK(std::unique(names.begin(), names.end()) == names.end(), "48 distinct axes");
+    }
     CHECK(PickCamera(frame, 16.0f / 9.0f, NAN, 0, 0).index < 0, "no rider, no camera");
     CHECK(PickCamera({}, 16.0f / 9.0f, rx, ry, rz).index < 0, "no candidates, no camera");
 
@@ -371,7 +446,7 @@ int main(int argc, char** argv) {
         CHECK(width_ok, "every row is the painted width");
         // Through the camera: bottom of the screen up toward the horizon, narrowing as it goes,
         // and all of it in view - the sheet's line is where the bike is.
-        const std::vector<ScreenRow> rows = ProjectRibbon(p, cam, pick.flip, rv);
+        const std::vector<ScreenRow> rows = ProjectRibbon(p, cam, AxesAt(pick.axes), rv);
         CHECK(rows.size() == rv.size() / 2, "no row is behind the camera: %zu of %zu", rows.size(), rv.size() / 2);
         if (!rows.empty()) {
             CHECK(rows.front().l.y > 0.6f, "the near end is low on screen, y=%f", rows.front().l.y);

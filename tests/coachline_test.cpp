@@ -322,6 +322,91 @@ int main(int argc, char** argv) {
         // With the axes locked, only those are tried.
         CHECK(PickCamera({{p, zview}}, 16.0f / 9.0f, bx, by, bz, 0).index < 0, "locked to plain axes, a z-up camera is not taken");
     }
+    // --- The camera from a synthetic shader-uniform stream ---------------------------------
+    // What v0.42.1 saw in the game: the fixed-function "camera" is a constant identity with z
+    // flipped while the bike moves. The real one goes to the shaders. One frame's uploads:
+    //   p3/l0  an MVP per object (scenery all over the track; one location, many uploads)
+    //   p7/l1  the bike's model matrix (rigid, at the bike)
+    //   p7/l2  the view-projection
+    //   p9/l4  the view on its own, uploaded row-major (as a row-vector shader would want it)
+    // plus that constant fixed-function matrix, which must never be taken for the camera.
+    {
+        Mat4 P;
+        {
+            const float f = 1.0f / std::tan(30.0f * 0.017453292f), n = 0.1f, fa = 2000.0f;
+            for (float& x : P.m) x = 0;
+            P.m[0] = f / (16.0f / 9.0f), P.m[5] = f, P.m[10] = (fa + n) / (n - fa), P.m[11] = -1;
+            P.m[14] = 2 * fa * n / (n - fa);
+        }
+        Mat4 ffz;  // identity, z flipped: what the fixed-function capture kept finding
+        ffz.m[10] = -1;
+        KeyLock lock;
+        uint64_t first_key = 0;
+        for (int frame = 0; frame < kLockFrames + 5; ++frame) {
+            const float bx = 269.98f + 0.6f * float(frame), by = 2.54f, bz = 117.36f;  // riding east
+            const Mat4  V  = LookAt(bx - 4.0f, by + 1.8f, bz, bx + 8.0f, by, bz);
+            const Mat4  VP = Mul(P, V);
+            std::vector<Upload> ups;
+            for (int o = 0; o < 6; ++o) {
+                const Mat4 M = Translate(100.0f + 40.0f * float(o), 0, 60.0f - 25.0f * float(o));
+                ups.push_back({3, 0, Mul(VP, M)});
+            }
+            ups.push_back({7, 1, Translate(bx, by, bz)});
+            ups.push_back({7, 2, VP});
+            ups.push_back({9, 4, Transposed(V)});
+            ups.push_back({0, 0, ffz});
+            const UniformPick pk = PickUniform(ups, bx, by, bz, lock.locked());
+            if (frame == 0) {
+                CHECK(pk.index == 7 && pk.perspective && !pk.transposed && pk.axes == 0,
+                      "the view-projection is picked: index %d persp %d T %d axes %d", pk.index, int(pk.perspective),
+                      int(pk.transposed), pk.axes);
+                CHECK(std::fabs(pk.dist - std::sqrt(16.0f + 1.8f * 1.8f)) < 0.01f, "its eye is the camera: %f m",
+                      pk.dist);
+                first_key = pk.key;
+                // Drawn through as it stands, it agrees with P then V.
+                const Screen a = Project(VP, Mat4{}, bx + 8, by, bz), b = Project(P, V, bx + 8, by, bz);
+                CHECK(a.ok && std::fabs(a.x - b.x) < 1e-4f && std::fabs(a.y - b.y) < 1e-4f && std::fabs(a.x - 0.5f) < 1e-3f,
+                      "VP projects like P*V: %f %f", a.x, a.y);
+                float ex, ey, ez;
+                bool  persp = false;
+                CHECK(EyeOf(VP, ex, ey, ez, persp) && persp && std::fabs(ex - (bx - 4)) < 0.01f &&
+                          std::fabs(ey - (by + 1.8f)) < 0.01f && std::fabs(ez - bz) < 0.01f,
+                      "the projective eye solve: %f %f %f", ex, ey, ez);
+                CHECK(EyeOf(ffz, ex, ey, ez, persp) && !persp && std::fabs(ex) + std::fabs(ey) + std::fabs(ez) < 1e-4f,
+                      "the constant fixed-function matrix puts its eye at the origin");
+                // Without the view-projection, the row-major view is found, transposed.
+                std::vector<Upload> no_vp(ups.begin(), ups.end());
+                no_vp.erase(no_vp.begin() + 7);
+                const UniformPick v2 = PickUniform(no_vp, bx, by, bz);
+                CHECK(v2.index >= 0 && no_vp[size_t(v2.index)].program == 9 && v2.transposed && !v2.perspective,
+                      "the row-major view is read transposed: index %d", v2.index);
+                // The object MVPs and the bike's model matrix alone give no camera.
+                const std::vector<Upload> junk(ups.begin(), ups.begin() + 7);
+                CHECK(PickUniform(junk, bx, by, bz).index < 0, "scenery MVPs and a model matrix are not a camera");
+            }
+            lock.vote(pk.key);
+            if (frame >= kLockFrames) CHECK(lock.locked() == first_key, "locked on the view-projection's key");
+        }
+        // Once locked, the same key is followed even when another camera-shaped upload appears.
+        // A z-up GL world: the view-projection built in GL (x, -z, y) of the telemetry.
+        const float bx = 300.0f, by = 5.0f, bz = 90.0f;
+        const Mat4  Vz = Mul(LookAt(bx - 4.0f, by + 1.8f, -bz, bx + 8.0f, by, -bz), Rotate(-90.0f, 1, 0, 0));
+        // In GL z-up coordinates the eye is (bx-4, bz, by+1.8): check, then pick.
+        float ex, ey, ez;
+        CameraPos(Vz, ex, ey, ez);
+        CHECK(std::fabs(ex - (bx - 4)) < 0.01f && std::fabs(ey - bz) < 0.02f && std::fabs(ez - (by + 1.8f)) < 0.02f,
+              "z-up eye %f %f %f", ex, ey, ez);
+        const UniformPick zk = PickUniform({{5, 3, Mul(P, Vz)}}, bx, by, bz);
+        CHECK(zk.index == 0 && zk.axes >= 0 && AxesName(AxesAt(zk.axes)) == "x,z,y",
+              "a z-up shader world is found: %s", zk.axes >= 0 ? AxesName(AxesAt(zk.axes)).c_str() : "none");
+        if (zk.axes >= 0) {
+            const Screen zs = Project(Mul(P, Vz), Mat4{}, bx + 8, by, bz, AxesAt(zk.axes));
+            CHECK(zs.ok && std::fabs(zs.x - 0.5f) < 1e-3f && std::fabs(zs.y - 0.5f) < 1e-3f,
+                  "and the look-at point lands centre: %f %f", zs.x, zs.y);
+        }
+        CHECK(PickUniform({{5, 3, Mul(P, Vz)}}, bx, by, bz, first_key).index < 0, "a locked key ignores the rest");
+    }
+
     // Every signed permutation is distinct and AxesAt(0) is the identity.
     CHECK(AxesName(AxesAt(0)) == "x,y,z", "identity first");
     {

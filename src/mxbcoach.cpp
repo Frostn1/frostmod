@@ -1168,12 +1168,11 @@ struct GlCapture {
     bool                              building = false;
     coachline::Candidate              cur;
     std::vector<coachline::Candidate> cands;  // this frame's
-    unsigned n_frustum = 0, n_cands = 0, n_frames = 0, n_picked = 0, n_drawn = 0;
+    unsigned n_frustum = 0, n_cands = 0, n_frames = 0, n_picked = 0, n_drawn = 0, n_draw_errors = 0;
 };
 GlCapture             g_gl;
 coachline::Ribbon     g_ribbon;
 coachline::HeightBias g_height;
-coachline::AxesLock   g_axes;
 bool                  g_gl_tried = false, g_gl_ok = false;
 ULONGLONG             g_gl_logged = 0, g_diag_ms = 0;
 int                   g_diag_left = 30;  // once a second, for the first 30 s riding with the line on
@@ -1350,57 +1349,289 @@ std::string F3(float a, float b, float c) {
     return s;
 }
 
-/// Once a second for the first minute: the bike, and every camera this frame with how it was
-/// built, where it puts the camera, how far that is from the bike as it stands and under the
-/// best axes, and the first model translations after it. This is the evidence for whatever
-/// PickCamera does next when it finds nothing. Under g_mu.
-void LogCandidates(float aspect, const coachline::Pick& pick) {
-    Log("ground/diag", "bike " + F3(g_rider.x, g_rider_y, g_rider.y) + " window aspect " + std::to_string(aspect) +
-                           " cameras " + std::to_string(g_gl.cands.size()) +
-                           " picked " + std::to_string(pick.index) + " axes " +
-                           (pick.axes >= 0 ? coachline::AxesName(coachline::AxesAt(pick.axes)) : std::string("-")) +
-                           " lock " +
-                           (g_axes.locked() >= 0 ? coachline::AxesName(coachline::AxesAt(g_axes.locked())) : "-"));
-    for (size_t i = 0; i < g_gl.cands.size() && i < 4; ++i) {
-        const coachline::Candidate& c = g_gl.cands[i];
-        const float* v    = c.view.m;
-        const float  fovy = c.proj.m[5] > 0 ? 2.0f * std::atan(1.0f / c.proj.m[5]) * 57.2957795f : 0.0f;
-        float cx, cy, cz;
-        coachline::CameraPos(c.view, cx, cy, cz);
-        // As loaded, and as if it were the other layout: a transposed upload puts the
-        // translation in the bottom row.
-        const float tx = -(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]);
-        const float ty = -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]);
-        const float tz = -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11]);
-        const float d  = std::sqrt((cx - g_rider.x) * (cx - g_rider.x) + (cy - g_rider_y) * (cy - g_rider_y) +
-                                   (cz - g_rider.y) * (cz - g_rider.y));
-        const coachline::Pick best = coachline::PickCamera({c}, coachline::Aspect(c.proj), g_rider.x, g_rider_y,
-                                                           g_rider.y);
-        char head[200];
-        std::snprintf(head, sizeof(head), "  cam %zu: fovy %.1f aspect %.3f ops %d valid %d rows", i, double(fovy),
-                      double(coachline::Aspect(c.proj)), c.ops, int(coachline::ValidView(c.view)));
-        std::string line = std::string(head) + " r0 " + F3(v[0], v[4], v[8]) + " r1 " + F3(v[1], v[5], v[9]) +
-                           " r2 " + F3(v[2], v[6], v[10]) + " t " + F3(v[12], v[13], v[14]) + " bottom " +
-                           F3(v[3], v[7], v[11]) + " -> cam(col-major) " + F3(cx, cy, cz) + " dist " +
-                           std::to_string(d) + " cam(row-major) " + F3(tx, ty, tz) + " best axes " +
-                           (best.axes >= 0 ? coachline::AxesName(coachline::AxesAt(best.axes)) + " dist " +
-                                                 std::to_string(best.dist)
-                                           : std::string("none within 25 m"));
-        for (int k = 0; k < c.n_mv; ++k) line += " mv" + std::to_string(k) + " " + F3(c.mv[k][0], c.mv[k][1], c.mv[k][2]);
-        Log("ground/diag", line);
+// ---------------------------------------------------------------------------------------
+// The camera from the shaders' matrix uniforms (coachline.h, "The camera from shader uniforms").
+// The upload entry points are the driver's, reached through wglGetProcAddress with the game's
+// context current, so they are hooked from the first swap rather than at install time. Each
+// hook records and forwards unchanged.
+
+using glUniformMatrix4fv_t        = void(WINAPI*)(GLint, GLsizei, GLboolean, const GLfloat*);
+using glProgramUniformMatrix4fv_t = void(WINAPI*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*);
+glUniformMatrix4fv_t        g_orig_umat4  = nullptr;
+glProgramUniformMatrix4fv_t g_orig_pumat4 = nullptr;
+glUseProgram_t              g_orig_use    = nullptr;
+bool                        g_sh_tried = false, g_sh_ok = false;
+GLuint                      g_program  = 0;  // the game's current program, as glUseProgram set it
+
+// This frame's uploads, the last one per (program, location): a per-object matrix uploaded a
+// thousand times a frame keeps one slot, so the camera is never crowded out.
+constexpr size_t kMaxUploads = 512;
+constexpr size_t kSlots      = 1024;  // open addressing over (program, location)
+std::vector<coachline::Upload> g_ups;
+std::vector<float>             g_ups_dist;  // per upload: how near its eye came to the bike
+float                          g_snap[3] = {NAN, NAN, NAN};  // the bike, as of the last swap
+int32_t                        g_slot[kSlots];
+unsigned                       g_ups_frame = 0, g_ups_total = 0, g_ups_dropped = 0;
+coachline::KeyLock             g_ukey;
+unsigned                       g_u_picked = 0;
+// How the line meets the game's depth buffer: decided by looking at it (DepthProbe). Until then
+// it is drawn over the scene rather than risk a test that hides all of it.
+enum DepthMode { DEPTH_NONE = 0, DEPTH_LEQUAL = 1, DEPTH_GEQUAL = 2 };
+DepthMode g_depth = DEPTH_NONE;
+ULONGLONG g_probe_ms = 0;
+GLint     g_profile = -1;
+
+/// How near this matrix's eye comes to the bike, under either layout and any axes. Infinite for
+/// a matrix that is no camera.
+float EyeDistance(const coachline::Mat4& m) {
+    float best = INFINITY;
+    if (!std::isfinite(g_snap[0])) return best;
+    for (int t = 0; t < 2; ++t) {
+        float ex, ey, ez;
+        bool  persp = false;
+        if (!coachline::EyeOf(t ? coachline::Transposed(m) : m, ex, ey, ez, persp)) continue;
+        for (int k = 0; k < coachline::kNumAxes; ++k) {
+            float gx, gy, gz;
+            coachline::AxesAt(k).apply(g_snap[0], g_snap[1], g_snap[2], gx, gy, gz);
+            const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
+            if (d2 < best) best = d2;
+        }
+    }
+    return best;
+}
+
+void ClearUploads() {
+    g_ups.clear();
+    g_ups_dist.clear();
+    std::fill(std::begin(g_slot), std::end(g_slot), -1);
+}
+
+void RecordUpload(GLuint program, GLint location, GLboolean transpose, const GLfloat* v) {
+    ++g_ups_frame;
+    const uint64_t h   = (uint64_t(program) * 2654435761u) ^ (uint64_t(uint32_t(location)) * 40503u);
+    size_t         at  = size_t(h % kSlots);
+    for (size_t probe = 0; probe < 16; ++probe, at = (at + 1) % kSlots) {
+        const int32_t i = g_slot[at];
+        if (i < 0) {
+            if (g_ups.size() >= kMaxUploads) {
+                ++g_ups_dropped;
+                return;
+            }
+            g_slot[at] = int32_t(g_ups.size());
+            g_ups.push_back({program, location, {}});
+            g_ups_dist.push_back(INFINITY);
+            break;
+        }
+        if (g_ups[size_t(i)].program == program && g_ups[size_t(i)].location == location) break;
+        if (probe == 15) {
+            ++g_ups_dropped;
+            return;
+        }
+    }
+    // Stored the way GL will use it: transpose=GL_TRUE means the caller gave rows. Of the many
+    // uploads one location takes in a frame (a matrix per object), the one whose eye comes
+    // nearest the bike is kept: that is the camera's, if any is.
+    coachline::Mat4 m;
+    std::memcpy(m.m, v, sizeof(m.m));
+    if (transpose) m = coachline::Transposed(m);
+    const size_t i = size_t(g_slot[at]);
+    const float  d = EyeDistance(m);
+    if (d < g_ups_dist[i] || !std::isfinite(g_ups_dist[i])) {
+        g_ups[i].m    = m;
+        g_ups_dist[i] = d;
     }
 }
 
-/// The ribbon through the game's own camera, in the window's framebuffer, depth-tested against
-/// the world the game just drew so the bike and the hills hide it. On the render thread.
-void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) {
+void WINAPI hkUseProgram(GLuint p) {
+    if (GlMine()) g_program = p;
+    g_orig_use(p);
+}
+void WINAPI hkUniformMatrix4fv(GLint loc, GLsizei count, GLboolean transpose, const GLfloat* v) {
+    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUpload(g_program, loc, transpose, v);
+    g_orig_umat4(loc, count, transpose, v);
+}
+void WINAPI hkProgramUniformMatrix4fv(GLuint p, GLint loc, GLsizei count, GLboolean transpose, const GLfloat* v) {
+    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUpload(p, loc, transpose, v);
+    g_orig_pumat4(p, loc, count, transpose, v);
+}
+
+/// From the first swap, on the render thread with the game's context current. Same rule as the
+/// fixed-function hooks: glUniformMatrix4fv must go in or none of them do.
+void InstallShaderHooks() {
+    if (g_sh_tried) return;
+    g_sh_tried = true;
+    std::fill(std::begin(g_slot), std::end(g_slot), -1);
+    g_ups.reserve(kMaxUploads);
+    glGetIntegerv(0x9126 /* GL_CONTEXT_PROFILE_MASK */, &g_profile);
+    if (glGetError() != GL_NO_ERROR) g_profile = -1;
+    struct H {
+        const char* n;
+        void*       d;
+        void**      o;
+        bool        required;
+    };
+    const H hs[] = {{"glUniformMatrix4fv", (void*)&hkUniformMatrix4fv, (void**)&g_orig_umat4, true},
+                    {"glUseProgram", (void*)&hkUseProgram, (void**)&g_orig_use, true},
+                    {"glProgramUniformMatrix4fv", (void*)&hkProgramUniformMatrix4fv, (void**)&g_orig_pumat4, false}};
+    std::vector<void*> made;
+    std::string        names;
+    for (const H& h : hs) {
+        void* t = (void*)wglGetProcAddress(h.n);
+        // wglGetProcAddress reports a missing entry as 0, 1, 2, 3 or -1 on some drivers.
+        if (reinterpret_cast<uintptr_t>(t) <= 3 || t == (void*)-1) t = nullptr;
+        if (t && std::find(made.begin(), made.end(), t) != made.end()) continue;  // an alias
+        if (!t || MH_CreateHook(t, h.d, h.o) != MH_OK) {
+            if (!h.required) continue;
+            Log("ground", std::string("shader hook failed: ") + h.n + "; no ground line");
+            for (void* m : made) MH_RemoveHook(m);
+            return;
+        }
+        made.push_back(t);
+        names += std::string(names.empty() ? "" : " ") + h.n;
+    }
+    for (void* m : made)
+        if (MH_EnableHook(m) != MH_OK) {
+            Log("ground", "shader hooks could not be enabled; no ground line");
+            for (void* r : made) {
+                MH_DisableHook(r);
+                MH_RemoveHook(r);
+            }
+            return;
+        }
+    g_sh_ok       = true;
+    g_use_program = g_orig_use;  // our own program switch must not be recorded as the game's
+    Log("ground", "shader uniform hooks installed (read-only): " + names +
+                      " profile mask " + std::to_string(g_profile));
+}
+
+/// The matrices to draw through for a picked upload: a projective one as it stands (it already
+/// holds the projection), a rigid view with the projection the frame uploaded alongside it, or
+/// failing that the fixed-function frustum. False when there is no projection to use.
+bool DrawMatrices(const coachline::UniformPick& pk, float aspect, coachline::Mat4& proj, coachline::Mat4& view) {
+    const coachline::Upload& u = g_ups[size_t(pk.index)];
+    const coachline::Mat4    m = pk.transposed ? coachline::Transposed(u.m) : u.m;
+    if (pk.perspective) {
+        proj = m;
+        view = coachline::Mat4{};
+        return true;
+    }
+    view       = m;
+    bool found = false;
+    for (const coachline::Upload& o : g_ups)
+        for (int t = 0; t < 2 && !found; ++t) {
+            const coachline::Mat4 p = t ? coachline::Transposed(o.m) : o.m;
+            if (coachline::ValidProjection(p) && std::fabs(coachline::Aspect(p) - aspect) < aspect * 0.08f) {
+                proj  = p;
+                found = true;
+            }
+        }
+    for (size_t i = g_gl.cands.size(); i-- > 0 && !found;)
+        if (std::fabs(coachline::Aspect(g_gl.cands[i].proj) - aspect) < aspect * 0.08f) {
+            proj  = g_gl.cands[i].proj;
+            found = true;
+        }
+    return found;
+}
+
+/// Once a second for the first 30 s: the bike, the upload count, and the eight uploads whose
+/// eye comes nearest the bike under any layout and axes, each with its program, location, kind,
+/// eye and distance. Under g_mu.
+void LogUniforms(float aspect, const coachline::UniformPick& pk) {
+    Log("ground/diag", "bike " + F3(g_rider.x, g_rider_y, g_rider.y) + " aspect " + std::to_string(aspect) +
+                           " uploads/frame " + std::to_string(g_ups_frame) + " distinct " +
+                           std::to_string(g_ups.size()) + " dropped " + std::to_string(g_ups_dropped) +
+                           " ff cameras " + std::to_string(g_gl.cands.size()) + " picked " +
+                           (pk.index >= 0 ? "p" + std::to_string(g_ups[size_t(pk.index)].program) + "/l" +
+                                                std::to_string(g_ups[size_t(pk.index)].location) +
+                                                (pk.transposed ? " T" : "") + " axes " +
+                                                coachline::AxesName(coachline::AxesAt(pk.axes)) + " " +
+                                                std::to_string(pk.dist) + " m"
+                                          : std::string("none")) +
+                           " lock " + (g_ukey.locked() ? "yes" : "no") + " depth " + std::to_string(int(g_depth)));
+    struct Row {
+        float d;
+        size_t i;
+        bool  t, persp;
+        int   axes;
+        float ex, ey, ez;
+    };
+    std::vector<Row> rows;
+    for (size_t i = 0; i < g_ups.size(); ++i)
+        for (int t = 0; t < 2; ++t) {
+            const coachline::Mat4 m = t ? coachline::Transposed(g_ups[i].m) : g_ups[i].m;
+            float ex, ey, ez;
+            bool  persp = false;
+            if (!coachline::EyeOf(m, ex, ey, ez, persp)) continue;
+            Row r{1e30f, i, t != 0, persp, -1, ex, ey, ez};
+            for (int k = 0; k < coachline::kNumAxes; ++k) {
+                float gx, gy, gz;
+                coachline::AxesAt(k).apply(g_rider.x, g_rider_y, g_rider.y, gx, gy, gz);
+                const float d = std::sqrt((ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz));
+                if (d < r.d) r.d = d, r.axes = k;
+            }
+            rows.push_back(r);
+        }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.d < b.d; });
+    for (size_t k = 0; k < rows.size() && k < 8; ++k) {
+        const Row& r = rows[k];
+        const coachline::Upload& u = g_ups[r.i];
+        char head[160];
+        std::snprintf(head, sizeof(head), "  p%u/l%d%s %s eye ", u.program, u.location, r.t ? " T" : "",
+                      r.persp ? "projective" : "rigid");
+        Log("ground/diag", std::string(head) + F3(r.ex, r.ey, r.ez) + " dist " + std::to_string(r.d) + " axes " +
+                               coachline::AxesName(coachline::AxesAt(r.axes)));
+    }
+    if (rows.empty()) Log("ground/diag", "  no upload this frame has a camera's shape");
+}
+
+/// Looks at the game's depth buffer under the ribbon 10 m ahead, once every two seconds: an
+/// empty one (the scene was drawn elsewhere and copied in) means no depth test at all, a full
+/// one is tested against the way the game tests (reversed or not). Inside the draw's
+/// glPushAttrib, so the read buffer it may set is restored.
+void DepthProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_probe_ms < 2000 || g_draw_verts.size() < 12) return;
+    g_probe_ms = now;
+    GLint pack = 0;
+    glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack);
+    if (glGetError() == GL_NO_ERROR && pack != 0) return;  // the read would land in the game's buffer
+    const coachline::Vert& a = g_draw_verts[10];
+    const coachline::Vert& b = g_draw_verts[11];
+    const coachline::Screen s = coachline::Project(proj, view, (a.x + b.x) * 0.5f, a.y, (a.z + b.z) * 0.5f, ax);
+    if (!s.ok || s.x < 0 || s.x > 1 || s.y < 0 || s.y > 1) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] <= 0 || vp[3] <= 0) return;
+    GLint game_func = GL_LESS;
+    glGetIntegerv(GL_DEPTH_FUNC, &game_func);
+    glReadBuffer(GL_BACK);
+    float d = 1.0f;
+    glReadPixels(vp[0] + GLint(s.x * float(vp[2])), vp[1] + GLint((1.0f - s.y) * float(vp[3])), 1, 1,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, &d);
+    if (glGetError() != GL_NO_ERROR) return;
+    const DepthMode was = g_depth;
+    if (!(d > 1e-6f && d < 0.999999f)) g_depth = DEPTH_NONE;
+    else g_depth = game_func == GL_GREATER || game_func == GL_GEQUAL ? DEPTH_GEQUAL : DEPTH_LEQUAL;
+    if (g_depth != was) {
+        std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+        if (lock.owns_lock())
+            Log("ground", "depth at the line " + std::to_string(d) + ", game depth func 0x" +
+                              [&] { char h[16]; std::snprintf(h, sizeof(h), "%X", unsigned(game_func)); return std::string(h); }() +
+                              " -> " + (g_depth == DEPTH_NONE ? "drawn over the scene" : g_depth == DEPTH_LEQUAL ? "depth-tested" : "depth-tested (reversed)"));
+    }
+}
+
+/// The ribbon through the game's camera, in the window's framebuffer. On the render thread.
+void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
     const std::vector<coachline::Vert>& v = g_draw_verts;
     if (v.size() < 4) return;
     if (!g_gl_ext_looked) {
         g_gl_ext_looked  = true;
-        g_use_program    = reinterpret_cast<glUseProgram_t>(wglGetProcAddress("glUseProgram"));
+        if (!g_use_program) g_use_program = reinterpret_cast<glUseProgram_t>(wglGetProcAddress("glUseProgram"));
         g_active_texture = reinterpret_cast<glActiveTexture_t>(wglGetProcAddress("glActiveTexture"));
     }
+    // A core-profile context has no fixed-function pipeline to draw this way.
+    if (g_profile > 0 && (g_profile & 1) && !(g_profile & 2)) return;
     while (glGetError() != GL_NO_ERROR) {
     }
     // Drawing into an offscreen target would paint the line into a reflection or a post-process
@@ -1417,10 +1648,11 @@ void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) 
     g_gl.own          = true;
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     if (g_use_program && program) g_use_program(0);
+    DepthProbe(proj, view, ax);
     g_orig_mode(GL_PROJECTION);
     glPushMatrix();
-    g_orig_loadf(cam.proj.m);
-    g_orig_multf(cam.view.m);
+    g_orig_loadf(proj.m);
+    g_orig_multf(view.m);
     g_orig_mode(GL_MODELVIEW);
     glPushMatrix();
     g_orig_identity();
@@ -1435,16 +1667,20 @@ void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) 
     glDisable(GL_FOG);
     glDisable(GL_ALPHA_TEST);
     glDisable(GL_STENCIL_TEST);
+    glDisable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    // Depth-tested so the bike and the hills hide it; no depth write so it never hides anything;
-    // polygon offset pulls it toward the camera by a z-fighting margin, not by metres.
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(-2.0f, -4.0f);
+    glDepthMask(GL_FALSE);  // it never hides anything
+    if (g_depth == DEPTH_NONE) {
+        glDisable(GL_DEPTH_TEST);
+    } else {
+        // Tested the way the game tests, pulled toward the camera by a z-fighting margin.
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(g_depth == DEPTH_GEQUAL ? GL_GEQUAL : GL_LEQUAL);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(g_depth == DEPTH_GEQUAL ? 2.0f : -2.0f, g_depth == DEPTH_GEQUAL ? 4.0f : -4.0f);
+    }
     glBegin(GL_TRIANGLE_STRIP);
     for (const coachline::Vert& p : v) {
         const float a = 0.70f * coachline::Fade(p.s);
@@ -1455,6 +1691,7 @@ void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) 
         glVertex3f(gx, gy, gz);
     }
     glEnd();
+    const GLenum drew = glGetError();
     g_orig_mode(GL_MODELVIEW);
     glPopMatrix();
     g_orig_mode(GL_PROJECTION);
@@ -1466,7 +1703,8 @@ void DrawGroundLine(const coachline::Candidate& cam, const coachline::Axes& ax) 
     g_gl.own  = false;
     while (glGetError() != GL_NO_ERROR) {
     }  // nothing of ours may surface as the game's error
-    ++g_gl.n_drawn;
+    if (drew == GL_NO_ERROR) ++g_gl.n_drawn;
+    else ++g_gl.n_draw_errors;
 }
 
 BOOL WINAPI hkSwap(HDC hdc) {
@@ -1475,32 +1713,44 @@ BOOL WINAPI hkSwap(HDC hdc) {
         if (GetCurrentThreadId() == g_gl.thread && !g_gl.own) {
             GlFinish();
             ++g_gl.n_frames;
-            coachline::Candidate cam;
-            coachline::Pick      pick;
-            bool                 draw = false;
+            if (g_gl_ok && !g_sh_tried) {
+                std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+                if (lock.owns_lock()) InstallShaderHooks();
+            }
+            coachline::Mat4 proj, view;
+            coachline::Axes ax;
+            bool            draw = false;
             {
                 std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
                 const ULONGLONG              now = GetTickCount64();
-                if (lock.owns_lock() && g_gl_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
-                    g_have_sample && !g_gl.cands.empty()) {
+                if (lock.owns_lock() && g_have_sample) {
+                    g_snap[0] = g_rider.x, g_snap[1] = g_rider_y, g_snap[2] = g_rider.y;
+                }
+                if (lock.owns_lock() && g_gl_ok && g_sh_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
+                    g_have_sample) {
                     RECT       rc{};
                     float      aspect = 0;
                     const HWND wnd    = WindowFromDC(hdc);
                     if (wnd && GetClientRect(wnd, &rc) && rc.bottom > rc.top)
                         aspect = float(rc.right - rc.left) / float(rc.bottom - rc.top);
-                    pick = coachline::PickCamera(g_gl.cands, aspect, g_rider.x, g_rider_y, g_rider.y, g_axes.locked());
-                    if (g_axes.vote(pick.axes))
-                        Log("ground", "axes locked: GL = telemetry " +
-                                          coachline::AxesName(coachline::AxesAt(pick.axes)) + ", camera " +
-                                          std::to_string(pick.dist) + " m from the bike");
+                    const coachline::UniformPick pk =
+                        coachline::PickUniform(g_ups, g_rider.x, g_rider_y, g_rider.y, g_ukey.locked());
+                    if (g_ukey.vote(pk.key)) {
+                        const coachline::Upload& u = g_ups[size_t(pk.index)];
+                        Log("ground", "camera locked: program " + std::to_string(u.program) + " location " +
+                                          std::to_string(u.location) + (pk.transposed ? " transposed" : "") +
+                                          (pk.perspective ? " view-projection" : " view") + ", GL = telemetry " +
+                                          coachline::AxesName(coachline::AxesAt(pk.axes)) + ", eye " +
+                                          std::to_string(pk.dist) + " m from the bike");
+                    }
                     if (g_diag_left > 0 && now - g_diag_ms >= 1000) {
                         g_diag_ms = now;
                         --g_diag_left;
-                        LogCandidates(aspect, pick);
+                        LogUniforms(aspect, pk);
                     }
-                    if (pick.index >= 0 && g_axes.locked() >= 0) {
-                        cam = g_gl.cands[size_t(pick.index)];
-                        ++g_gl.n_picked;
+                    if (pk.index >= 0 && g_ukey.locked() && DrawMatrices(pk, aspect, proj, view)) {
+                        ++g_u_picked;
+                        ax               = coachline::AxesAt(pk.axes);
                         const float lapM = g_track.ready() ? g_track.length() : 0.0f;
                         const std::vector<coachline::Zone> zones =
                             g_cues.active() && lapM > 0 ? coachline::BrakeZones(g_cues.sheet(), lapM)
@@ -1510,23 +1760,22 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         draw         = g_draw_verts.size() >= 4;
                     }
                 }
-                // Every 10 s while it is on: the one line that says whether a camera was found,
-                // which axes are in use, and where the heights put the ground.
+                // Every 10 s while it is on: whether the camera was found, and what was drawn.
                 if (lock.owns_lock() && g_gl_ok && g_hud_set.ground && now - g_gl_logged > 10000) {
                     g_gl_logged = now;
                     Log("ground", "frames=" + std::to_string(g_gl.n_frames) +
-                                      " frusta=" + std::to_string(g_gl.n_frustum) +
-                                      " cameras=" + std::to_string(g_gl.n_cands) +
-                                      " picked=" + std::to_string(g_gl.n_picked) +
-                                      " drawn=" + std::to_string(g_gl.n_drawn) + " axes=" +
-                                      (g_axes.locked() >= 0 ? coachline::AxesName(coachline::AxesAt(g_axes.locked()))
-                                                            : std::string("-")) +
+                                      " uniforms=" + std::to_string(g_ups_total) +
+                                      " camera=" + (g_ukey.locked() ? "locked" : "searching") +
+                                      " picked=" + std::to_string(g_u_picked) +
+                                      " drawn=" + std::to_string(g_gl.n_drawn) +
+                                      " draw_errors=" + std::to_string(g_gl.n_draw_errors) +
+                                      " depth=" + std::to_string(int(g_depth)) +
                                       " height_gap=" + std::to_string(g_height.gap()) +
                                       " offset=" + std::to_string(g_height.offset()) +
                                       " ribbon=" + std::to_string(g_ribbon.verts().size()) + " verts");
                 }
             }
-            if (draw) DrawGroundLine(cam, coachline::AxesAt(g_axes.locked()));
+            if (draw) DrawGroundLine(proj, view, ax);
         }
     } catch (...) {
         g_gl.own = false;
@@ -1534,6 +1783,9 @@ BOOL WINAPI hkSwap(HDC hdc) {
     if (GetCurrentThreadId() == g_gl.thread) {
         g_gl.cands.clear();
         g_gl.building = false;
+        g_ups_total += g_ups_frame;
+        g_ups_frame = 0;
+        ClearUploads();
     }
     return g_orig_swap(hdc);
 }
@@ -1686,7 +1938,8 @@ __declspec(dllexport) void EventDeinit() {
     g_track.clear();
     g_height.reset();
     g_ribbon.clear();
-    g_axes.reset();
+    g_ukey.reset();
+    g_depth = DEPTH_NONE;
     g_practice = false;
     ReleaseDevice();
     StopVoice();

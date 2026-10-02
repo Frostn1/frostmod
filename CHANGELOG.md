@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-02 — v0.44.0
+
+### Added
+- **Pace hints on the line on the track** (hud.ini `pace=1`, off until asked for; drawn over the
+  line, so it needs `ground` too). Your speed is compared with Coach's at the same spot and
+  with what is coming up. The line's own colours stay what to do (green gas, white coast,
+  yellow/red brake); the hint is drawn over them:
+  - **Too fast** (8% over Coach, or a braking-distance model saying you would run 4 m or more
+    past his slowest point of the next corner): magenta chevrons on the line ahead point back at
+    you up to the braking point, and its yellow and red come sooner by about that overshoot.
+  - **Too slow** (8% under, never with a braking zone close ahead): cyan chevrons point on and
+    the gas is a brighter green. Before a jump lip that needs speed (found from the track's own
+    ground in the sheet), a cyan gate across the line at the lip and **MORE SPEED** on the HUD.
+  - It doesn't flicker: the comparison is smoothed, a hint needs its threshold held to start and
+    half of it held to end, shows at least a second, and fades in and out.
+- The log says what the hints saw (`pace: too fast (+12% on Coach, overshoot 9 m, ...)`).
 ## 2026-10-02 — v0.43.5
 
 ### Fixed

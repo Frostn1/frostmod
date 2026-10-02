@@ -251,6 +251,10 @@ struct Settings {
     // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
     // the one on the track, and found nothing there when only the map drew it.
     bool  ground = false;
+    // Pace hints over that line (coachpace.h): chevrons when coming in too fast or too slow for
+    // Coach's lap, and "MORE SPEED" before a jump that needs it. Off until asked for; drawn only
+    // with the line on the track.
+    bool  pace = false;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
     // The map and the suspension bars by their top-left corner. They used to be nailed to the
@@ -295,6 +299,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
     s.ground  = flag("ground", s.trail);
+    s.pace    = flag("pace", false);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
     s.map_x   = fraction("map_x", kMapDefaultX);
@@ -861,6 +866,7 @@ constexpr uint32_t kGreen   = 0xFF5CD65Cu;
 constexpr uint32_t kAmber   = 0xFF5CD6FFu;
 constexpr uint32_t kGrey    = 0xFFB4B4B4u;
 constexpr uint32_t kBlue    = 0xFFFFC04Bu;
+constexpr uint32_t kCyan    = 0xFFFFD933u;  // the pace hints' "faster" colour (coachpace::kSlowColour)
 
 inline uint32_t CueColour(uint8_t kind) {
     switch (kind) {
@@ -1005,6 +1011,8 @@ struct View {
     bool                     has_susp    = false;
     float                    susp[2]     = {0, 0};  // 0 = front, 1 = rear
     float                    susp_max[2] = {0, 0};
+    // Pace hints: too slow with a jump lip ahead that needs the speed (coachpace::Hint).
+    bool                     more_speed = false;
 };
 
 /// A motocrosser from its right-hand side, drawn small enough to sit in a corner of the screen:
@@ -1130,6 +1138,15 @@ inline void Build(const View& v, Frame& f) {
             if (v.conf == stance::CONF_GUESS) c = (c & 0x00FFFFFFu) | 0xA0000000u;
             Say(f, s, x0 + wg + sep, y, kSmallSize, 0, c);
         }
+    }
+
+    // 4b. MORE SPEED, under the gap row, while a jump ahead needs more speed than the rider has.
+    if (v.set.pace && v.set.ground && v.more_speed) {
+        const char* s  = "MORE SPEED";
+        const float w  = TextWidth(std::strlen(s), kCueSize * 0.8f) + 0.02f;
+        const Box   b  = BoxAt(v.set.row_x - w * 0.5f, v.set.row_y + kRowH + 0.006f, w, kCueSize);
+        Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
+        Say(f, s, v.set.row_x, b.y0 + (kCueSize - kCueSize * 0.8f) * 0.5f, kCueSize * 0.8f, 1, kCyan);
     }
 
     // 6. The setup card, while stopped.

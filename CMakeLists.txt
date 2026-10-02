@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.43.5")
+set(FROSTMOD_VERSION "0.44.1")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -309,6 +309,12 @@ add_test(NAME coachhud COMMAND coachhud_test)
 add_executable(coachline_test tests/coachline_test.cpp)
 target_compile_definitions(coachline_test PRIVATE COACHLINE_DATA="${CMAKE_SOURCE_DIR}/tests/data")
 add_test(NAME coachline COMMAND coachline_test)
+# Jump calls on the ground line: rhythm sections counted on synthetic terrain (single, double,
+# triple, quad, on and off a table, rolled), the bars and labels they draw, and the AIRH chunk.
+add_executable(coachjump_test tests/coachjump_test.cpp)
+add_test(NAME coachjump COMMAND coachjump_test)
+# The offline previews of the calls on a real sheet (not a test): built so it can't rot.
+add_executable(coachjump_preview tests/coachjump_preview.cpp)
 # Pace hints over the ground line: too fast / too slow against Coach's lap, the braking-distance
 # model, jump lips, and the hysteresis that keeps them from flickering on noisy speed.
 add_executable(coachpace_test tests/coachpace_test.cpp)

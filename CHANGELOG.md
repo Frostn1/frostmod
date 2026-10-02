@@ -14,6 +14,30 @@
     in the air, as on a jump's face). A hint needs 0.3 s to start, 0.7 s of not being wanted to
     end, shows at least 1.2 s, fades in and out, and goes from up to down only through nothing.
   - The log says what it saw (`gear: up to 4 (gear 2, Coach shifts 30 m ahead)`).
+
+## 2026-10-02 — v0.44.1
+
+### Added
+- **Jump calls on the line.** Where Coach's lap jumped, the line now shows a white bar across it
+  at the lip, a faint box where the lap landed with a dotted arc of its flight between, and a
+  label standing over the lip, readable from 30-50 m, named the way a rider would: **SINGLE**
+  off a real lip, **DOUBLE** over a gap onto a separate landing face, **STEP UP** / **STEP
+  DOWN**, **TABLE** clean over a flat top, **JUMP ON** / **JUMP OFF** when the lap landed on a
+  table or left its top, and in a supercross rhythm lane (three or more crests close together)
+  **SINGLE** / **DOUBLE** / **TRIPLE** / **QUAD** by the crests cleared. **ROLL** where the lap
+  stayed on the ground over a big face. Under it, the speed the lap took off at (`45 KMH`).
+- Hops and skips are not called: under 0.35 s or 5 m in the air, off a lip under 0.5 m, or a
+  short flight (under 0.6 s) off a natural crest rather than a built face.
+- The faces are counted on the track's own ground under the line (the sheet's TRRN). With the
+  matching MXB Coach the sheet also carries where the lap was in the air (new `AIRH` chunk);
+  an older sheet with the ground but not the air gets its flights predicted from each lip's
+  angle and the lap's speed there, and no ROLL calls.
+- A HUD option, `jumps` in `hud.ini` (on by default, shown only with the line on the track);
+  MXB Coach lists it as "Jump calls on the line". The log says how many calls a sheet gave and
+  where they came from (`jumps: 6 calls from the lap's air: DOUBLE=2 ...`).
+- Built with v0.44.0's pace hints: both draw over the line, the pace chevrons and the jump marks
+  side by side.
+
 ## 2026-10-02 — v0.44.0
 
 ### Added

@@ -53,7 +53,6 @@
 #include "session.h"
 #include "changefree.h" // bike change: free the old own-vehicle record
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
-#include "paintgate.h"  // paint sync: when a paint refresh may run (never while riding)
 #include <io.h>         // _finddata64i32_t (the race filter's find hooks)
 #include <memory>
 #include "crashreport.h"
@@ -602,22 +601,11 @@ void RaceFilterTick() {
 // ---------------------------------------------------------------------------
 // hooks that CAPTURE the game's own content-load calls
 // ---------------------------------------------------------------------------
-// Paint-folder scans (ext "pnt"), counted for the [paintscan] line: does joining a server
-// make the game rescan its paints by itself? FrostMod's own refresh is counted apart.
-extern std::atomic<bool> g_reloadActive;
-std::atomic<int> g_pntScans{0}, g_pntScansOurs{0};
-std::atomic<uint64_t> g_pntLastMs{0};
-
 int64_t __fastcall hkScan(void* a0, void* a1, void* a2, void* a3) {
     // This scanner is GENERIC: (status, directory, file-extension, buf). The game
     // calls it for many folders - e.g. ui/str, and mods content with ext "pkz".
     std::string dir = SafeStr(a1);
     std::string ext = SafeStr(a2);
-    if (_stricmp(ext.c_str(), "pnt") == 0) {
-        g_pntScans.fetch_add(1);
-        if (g_reloadActive.load()) g_pntScansOurs.fetch_add(1);
-        g_pntLastMs.store(GetTickCount64());
-    }
 
     // Race mode: arm the find hooks for this scan if the list has a say over the folder.
     RaceFilterPtr rf;
@@ -1271,7 +1259,6 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 void RequestReload();                          // fwd (defined with the reload code below)
 void RequestPaintRefresh();                    // fwd (same place: paint lists only)
 void RequestGearRefresh();                     // fwd (same place: rider gear lists)
-void RequestStagedPaintRefresh();              // fwd (paint sync: missing paints only)
 void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
@@ -2083,13 +2070,6 @@ static void SnapshotMissingPaints();   // live paints, defined after RequestRelo
 static void CheckArrivedGear();       // automatic rider rebuild (RIDER REBUILD)
 static void SnapshotMissingGear();
 static void ApplyArrivedPaints();
-// What a refresh cost, for the [paintgate] summary line: the longest single step is the
-// hitch a player feels (one step per frame), the apply pass is one more frame on its own.
-static double g_refreshLongestMs = 0.0, g_refreshTotalMs = 0.0;
-static double QpcMs(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
-    LARGE_INTEGER hz; QueryPerformanceFrequency(&hz);
-    return 1000.0 * (double)(b.QuadPart - a.QuadPart) / (double)hz.QuadPart;
-}
 static void RunReloadStep(int i) {
     const uintptr_t b = g_base;
     const void* S = (const void*)(b + g_game->reload_str);   // "" (game dir = cwd)
@@ -2119,12 +2099,6 @@ void AdvanceReload() {
         QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&hz);
         // The hitch a player feels is the longest single step (one per frame): measured.
         Log("[reload]   step took %.1f ms", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)hz.QuadPart);
-        {
-            const double ms = QpcMs(t0, t1);
-            if (g_reloadCur == 0) { g_refreshLongestMs = 0.0; g_refreshTotalMs = 0.0; }
-            g_refreshTotalMs += ms;
-            if (ms > g_refreshLongestMs) g_refreshLongestMs = ms;
-        }
         ++g_reloadCur;
         // The overlay's bar is out of the full table's step count; scale a short plan to it.
         g_reloadDone.store(g_reloadPaintsOnly
@@ -2134,15 +2108,7 @@ void AdvanceReload() {
         g_reloadActive.store(false);
         g_reloadPaintsOnly = false;
         Log("[reload] %s done - %d list(s) rebuilt from disk.", g_refreshWhat, g_reloadPlanN);
-        LARGE_INTEGER a0, a1;
-        QueryPerformanceCounter(&a0);
         ApplyArrivedPaints();
-        QueryPerformanceCounter(&a1);
-        // The measured stall, in one line: what the refresh cost across its frames and the
-        // one frame the paint pass took. Grep [paintgate] cost in a player's log.
-        Log("[paintgate] cost: %s - %d list step(s), %.1f ms in all, longest frame %.1f ms; "
-            "paint pass %.1f ms in one frame", g_refreshWhat, g_reloadPlanN, g_refreshTotalMs,
-            g_refreshLongestMs, QpcMs(a0, a1));
         CheckArrivedGear();
         frostmod::crash::Note("%s finished", g_refreshWhat);
         SetStatus(g_refreshWhat, 2500);
@@ -2246,8 +2212,7 @@ void RequestReload() {
 // is dropped too. One sync burst therefore costs one refresh.
 // A partial reload: replay only the given rows of the step table, in the table's own order
 // (a model list before the paint lists that index into it), then the live-paints pass.
-static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what,
-                                  bool reapplyAll = true) {
+static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
     Log("[ui] %s requested", what);
     if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
         Log("[reload] %s not available here - running the full reload instead", what);
@@ -2277,7 +2242,7 @@ static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* 
     }
     g_refreshWhat = what;
     g_reloadPaintsOnly = true;
-    g_reapplyAll = reapplyAll;
+    g_reapplyAll = true;
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
@@ -2288,15 +2253,6 @@ static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* 
 
 void RequestPaintRefresh() {
     RequestPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas), "paint refresh");
-}
-
-// Paint sync's refresh (paints_staged): the same six lists, but only riders whose paint was
-// missing are painted afterwards - plus anyone who arrived while it ran, since the game may
-// have built them from the old list. Riders already showing their paint are not touched,
-// which is most of the per-frame cost of the old refresh (every rider, ~7 reads per bike).
-void RequestStagedPaintRefresh() {
-    RequestPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas),
-                          "paint sync refresh", false);
 }
 
 // Rider gear models arrived or changed (helmets, boots, rider models, protections, helmet
@@ -2337,11 +2293,6 @@ static uint32_t g_paintMissing[mxb::VEHICLE_MAX];
 // number of its named paints that were.
 static bool g_bikePaintPresent[mxb::VEHICLE_MAX];
 static int  g_gearFound[mxb::VEHICLE_MAX][mxb::kGearPartCount];
-// Who held each slot when the reload began (rider name, "" = free). A slot that is live
-// afterwards under another name was built while the lists were being rebuilt, possibly from
-// the old paint list, so every installed part of it is painted (paint sync joins: riders
-// arrive during the loading screen while the refresh runs).
-static char g_snapName[mxb::VEHICLE_MAX][32];
 
 static bool PaintsSupported() {
     // MX only: these are beta21e addresses with no GP Bikes / KRP counterpart yet.
@@ -2456,15 +2407,12 @@ static void SnapshotMissingPaints() {
     memset(g_paintMissing, 0, sizeof(g_paintMissing));
     memset(g_bikePaintPresent, 0, sizeof(g_bikePaintPresent));
     memset(g_gearFound, 0, sizeof(g_gearFound));
-    memset(g_snapName, 0, sizeof(g_snapName));
     if (!PaintsSupported()) { Log("[paint] live paints off on this title/build"); return; }
     int n = 0, riders = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         const uintptr_t v = VehicleAt(i);
         if (SafeReadInt((const int*)v) == 0) continue;
         ++riders;
-        if (!SafeCopyStr((void*)(v + 0x10), g_snapName[i], sizeof(g_snapName[i])) || !g_snapName[i][0])
-            strcpy_s(g_snapName[i], "?");   // live but unnamed: still "was here"
         char bike[32], paint[32];
         if (ReadVehicle(i, bike, paint)) {
             const int idx = BikeIndexOf(bike);
@@ -2614,21 +2562,15 @@ static void ApplyArrivedPaints() {
     const bool all = g_reapplyAll;
     g_reapplyAll = false;
     const char* me = frostmod::crash::TheContext().rider;
-    int applied = 0, reverted = 0, arrivedDuring = 0;
+    int applied = 0, reverted = 0;
     for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
         uint32_t was = g_paintMissing[i];
         g_paintMissing[i] = 0;
-        if (SafeReadInt((const int*)VehicleAt(i)) != 0) {
+        if (all && SafeReadInt((const int*)VehicleAt(i)) != 0) {
             char name[32] = {0};
             SafeCopyStr((void*)(VehicleAt(i) + 0x10), name, sizeof(name));
-            const bool local = me[0] && _stricmp(name, me) == 0;
-            // Built while the lists were being rebuilt: maybe from the old list.
-            const bool arrived = !g_snapName[i][0] ||
-                                 (strcmp(g_snapName[i], "?") != 0 && strcmp(g_snapName[i], name) != 0);
-            if (!local && (all || arrived)) {
+            if (!(me[0] && _stricmp(name, me) == 0))    // never the local rider
                 was = 0xFFFFFFFFu;                     // every part; installed ones only
-                if (arrived && !all) ++arrivedDuring;
-            }
         }
         // Everything is re-read: the rider may have left, or the slot been reused, during
         // the reload, and every list was rebuilt.
@@ -2650,9 +2592,6 @@ static void ApplyArrivedPaints() {
             }
         }
     }
-    if (arrivedDuring)
-        Log("[paint] %d rider(s) arrived while the lists were rebuilt - painted from the new list",
-            arrivedDuring);
     if (applied || reverted) {
         Log("[paint] %d paint(s) applied%s, %d removed paint(s) taken back to stock",
             applied, all ? " (paint refresh: every remote rider)" : "", reverted);
@@ -5169,129 +5108,6 @@ static void MirrorPluginSession() {
     ctx.inSession.store(copy.trackId[0] != 0, std::memory_order_relaxed);
 }
 
-// ===========================================================================
-// PAINT GATE - when a paint refresh may run (src/paintgate.h)
-//
-// Paint sync no longer refreshes the moment a paint lands. The game reads its paint lists
-// once, at boot; joining a server does not rescan them (the six paint loaders' only callers
-// are the boot content init). So MXB App puts the server's paints on disk while the join
-// runs and says `paints_staged`, and the refresh happens where a hitch is invisible: on the
-// join's own loading screen (once), or later in the pits. Never while riding.
-//
-// Everything here reads memory; the only game code it ends up calling is the refresh that
-// was there before (the paint loaders and paint_apply).
-static frostmod::paintgate::Gate g_paintGate;
-static frostmod::paintgate::Phase g_gatePhase = frostmod::paintgate::Phase::Unknown;
-static uint64_t g_joinStartMs = 0;      // when the connection dialog last opened (0 = never)
-static bool g_fullReloadHeld = false;   // an MXB App reload asked for while riding
-
-// MX Bikes only: the page table and vehicle offsets are this title's.
-static bool GateOn() { return PaintsSupported(); }
-
-// The local rider's own "riding" flag, the one 0x5E570 tests before deferring rider builds.
-static bool LocalVehicleRiding() {
-    const int own = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE));
-    if (own < 1 || own > mxb::VEHICLE_MAX) return false;
-    return SafeReadInt((const int*)(VehicleAt(own - 1) + mxb::VEH_RIDING)) != 0;
-}
-
-// The phase from the game's page stack (current layer), and the stack as text for the log.
-static frostmod::paintgate::Phase ReadGatePhase(std::string& pages) {
-    using frostmod::paintgate::PhaseFromPages;
-    const bool riding = LocalVehicleRiding();
-    const int layer = SafeReadInt((const int*)(g_base + mxb::RVA_PAGE_LAYER));
-    if (layer < 1 || layer > 16) return PhaseFromPages(nullptr, -1, riding);
-    const uintptr_t st = g_base + mxb::RVA_PAGE_STACKS + (uintptr_t)(layer - 1) * mxb::PAGE_STACK_STRIDE;
-    const int depth = SafeReadInt((const int*)st);
-    if (depth < 0 || depth > mxb::PAGE_STACK_MAX) return PhaseFromPages(nullptr, -1, riding);
-    char names[mxb::PAGE_STACK_MAX][32] = {};
-    const char* ptrs[mxb::PAGE_STACK_MAX] = {};
-    for (int i = 0; i < depth; ++i) {
-        const int page = SafeReadInt((const int*)(st + 4 + 4 * i));
-        if (page < 1 || page > mxb::PAGE_COUNT) return PhaseFromPages(nullptr, -1, riding);
-        const uintptr_t name = ReadPtr(mxb::RVA_PAGE_TABLE + (uintptr_t)(page - 1) * mxb::PAGE_STRIDE);
-        if (!name || !SafeCopyStr((void*)name, names[i], sizeof(names[i])))
-            return PhaseFromPages(nullptr, -1, riding);
-        ptrs[i] = names[i];
-        if (i) pages += ",";
-        pages += names[i];
-    }
-    return PhaseFromPages(ptrs, depth, riding);
-}
-
-static unsigned long long SinceJoinMs(uint64_t now) {
-    return g_joinStartMs ? (unsigned long long)(now - g_joinStartMs) : 0ull;
-}
-
-// A paint refresh was asked for (MXB App's paints_staged or refresh_paints).
-static void PaintGateRequest(unsigned kind, const char* why) {
-    if (!GateOn()) {   // not MX Bikes: no page table to gate on - as before
-        RequestPaintRefresh();
-        return;
-    }
-    const uint64_t now = GetTickCount64();
-    g_paintGate.Request(kind, now);
-    Log("[paintgate] %s: queued (phase %s%s)", why, frostmod::paintgate::PhaseName(g_gatePhase),
-        g_gatePhase == frostmod::paintgate::Phase::Riding ? " - waits for the pits" : "");
-}
-
-// A full content reload asked for by MXB App: run now, or hold it while riding.
-static void GatedFullReload(const char* why) {
-    if (GateOn() && !frostmod::paintgate::FullReloadMayStart(g_gatePhase)) {
-        if (!g_fullReloadHeld) Log("[paintgate] %s while riding - held for the pits", why);
-        g_fullReloadHeld = true;
-        return;
-    }
-    RequestReload();
-}
-
-// Once a frame, from Tick.
-static void PaintGateTick() {
-    if (!GateOn()) return;
-    using namespace frostmod::paintgate;
-    const uint64_t now = GetTickCount64();
-    std::string pages;
-    const Phase phase = ReadGatePhase(pages);
-    if (phase != g_gatePhase) {
-        if (phase == Phase::Joining && g_gatePhase != Phase::Joining) {
-            g_joinStartMs = now;
-            Log("[paintgate] join started: connection dialog up at tick %llu", (unsigned long long)now);
-        }
-        Log("[paintgate] phase %s -> %s (pages %s) +%llu ms since the join started",
-            PhaseName(g_gatePhase), PhaseName(phase), pages.empty() ? "-" : pages.c_str(),
-            SinceJoinMs(now));
-        g_gatePhase = phase;
-    }
-
-    // The answer to "does a join rescan paints?", one line per burst of paint-folder scans.
-    {
-        static int reported = 0, reportedOurs = 0;
-        const int n = g_pntScans.load(), ours = g_pntScansOurs.load();
-        if (n != reported && now - g_pntLastMs.load() >= 500) {
-            Log("[paintscan] %d paint-folder scan(s): %d by the game itself, %d by FrostMod's "
-                "refresh; phase %s, +%llu ms since the join started (tick %llu)",
-                n - reported, (n - reported) - (ours - reportedOurs), ours - reportedOurs,
-                PhaseName(phase), SinceJoinMs(now), (unsigned long long)now);
-            reported = n;
-            reportedOurs = ours;
-        }
-    }
-
-    if (g_fullReloadHeld && FullReloadMayStart(phase) && !g_reloadActive.load()) {
-        g_fullReloadHeld = false;
-        Log("[paintgate] off the track - running the held reload");
-        RequestReload();
-        return;
-    }
-    const unsigned kinds = g_paintGate.Tick(phase, g_reloadActive.load(), now);
-    if (kinds == kNone) return;
-    Log("[paintgate] refreshing paints now (%s) in phase %s, +%llu ms since the join started",
-        (kinds & kLook) ? ((kinds & kStaged) ? "paint sync + own look" : "own look") : "paint sync",
-        PhaseName(phase), SinceJoinMs(now));
-    if (kinds & kLook) RequestPaintRefresh();   // every remote rider, as the look refresh always did
-    else RequestStagedPaintRefresh();          // only riders missing a paint
-}
-
 void Tick() {
     // Heartbeat: proves the render hook fires. No [tick] line in the log => the game
     // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
@@ -5604,7 +5420,7 @@ void Tick() {
     // Same, driven from the frostmod.exe console (R = reload).
     if (g_reloadEvent && WaitForSingleObject(g_reloadEvent, 0) == WAIT_OBJECT_0) {
         Log("[event] reload signal received from frostmod.exe");
-        GatedFullReload("reload signal");
+        RequestReload();
     }
     if (g_dumpEvent && WaitForSingleObject(g_dumpEvent, 0) == WAIT_OBJECT_0) {
         Log("[srvlist] manual dump (D)"); DumpServerListBlob(true);
@@ -5618,7 +5434,6 @@ void Tick() {
     PollCommandFiles();
 
     DrainGameThreadTasks();
-    PaintGateTick();   // paint sync: start a queued refresh only where it cannot be felt
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 
@@ -6058,7 +5873,7 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // MXB App's Reload button, arriving as a file rather than as the reload event it
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
-        GatedFullReload("reload_mods");
+        RequestReload();
     } else if (verb == "race_filter") {
         // MXB App's Auto race mode wrote (or deleted) frostmod_racemode.txt: re-read it and
         // run the full reload so the game's lists match it - a join from the in-game
@@ -6071,17 +5886,11 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         Log("[cmd] gear refresh requested by MXB App");
         RequestGearRefresh();
     } else if (verb == "refresh_paints") {
-        // The player's own look changed on disk (or an older MXB App's paint sync). The paint
-        // refresh rebuilds only the paint lists and repaints every remote rider - so since
-        // v0.43.0 it waits while the player rides (see PAINT GATE).
+        // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
+        // only the paint lists, and its live-paints pass applies whatever riders on track
+        // were missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
         Log("[cmd] paint refresh requested by MXB App");
-        PaintGateRequest(frostmod::paintgate::kLook, "paint refresh (refresh_paints)");
-    } else if (verb == "paints_staged") {
-        // v0.43.0: MXB App's paint sync has put other riders' paints on disk for the server
-        // being joined (or a rider who joined after us). Refreshed on the join's loading
-        // screen, once, or later in the pits - never while riding (see PAINT GATE).
-        Log("[cmd] paints staged by MXB App's paint sync");
-        PaintGateRequest(frostmod::paintgate::kStaged, "paint sync (paints_staged)");
+        RequestPaintRefresh();
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike
@@ -7192,9 +7001,6 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
     LogCallbackOnce("EventInit", _iDataSize);
-    // Paint sync times its join against this: MXB App learns the server name from here, so
-    // the gap between "join started" and this line is how early it can ask for the paints.
-    Log("[paintgate] EventInit (the server is named) at tick %llu", (unsigned long long)GetTickCount64());
     const PluginAbi* abi = g_abi;
     if (!_pData || _iDataSize < abi->ev_size) {
         Log("[session] EventInit payload too small (%d < %d per %s) - server unknown",

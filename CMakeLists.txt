@@ -309,6 +309,10 @@ add_test(NAME coachhud COMMAND coachhud_test)
 add_executable(coachline_test tests/coachline_test.cpp)
 target_compile_definitions(coachline_test PRIVATE COACHLINE_DATA="${CMAKE_SOURCE_DIR}/tests/data")
 add_test(NAME coachline COMMAND coachline_test)
+# Pace hints over the ground line: too fast / too slow against Coach's lap, the braking-distance
+# model, jump lips, and the hysteresis that keeps them from flickering on noisy speed.
+add_executable(coachpace_test tests/coachpace_test.cpp)
+add_test(NAME coachpace COMMAND coachpace_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

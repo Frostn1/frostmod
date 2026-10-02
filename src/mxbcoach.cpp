@@ -40,6 +40,7 @@
 #include "coachcue.h"
 #include "coachline.h"
 #include "coachhud.h"
+#include "coachpace.h"
 #include "coachlog.h"
 #include "coachrec.h"
 #include "coachvoice.h"
@@ -96,6 +97,18 @@ bool                  g_grid_said_missing = false;
 coachline::RiderState g_rider_state;
 // What the sheet adds to the line on the track: the ground across it and where its lap braked.
 coachline::RibbonExtras g_extras;
+// Pace hints over the line (coachpace.h): Coach's lap as they need it, the filtered hint, and
+// the line's extras with the hint's colours, handed to the ribbon while a hint shows.
+coachpace::Profile      g_pace_prof;
+coachpace::Filter       g_pace;
+coachpace::Hint         g_pace_hint;
+coachline::RibbonExtras g_pace_ex;
+uint32_t                g_pace_ver   = 0;
+int                     g_pace_idx   = -1;
+float                   g_pace_frac  = 0, g_pace_t = -1;
+long                    g_pace_key   = -1;  // what the colours were last made for
+float                   g_pace_phase = 0;   // the rider's metres along Coach's line, for the chevrons
+coachpace::Kind         g_pace_said  = coachpace::NONE;
 coachhud::RefLap     g_ref;
 coachhud::LapClock   g_clock;
 coachhud::StopWatch  g_stop;
@@ -589,6 +602,59 @@ void BuildExtras() {
                           std::to_string(coachline::ToneZones(g_hud_sheet.ref, coachline::Tone(g_hud_sheet.ref, g_hud_sheet.drive)).size()) +
                           " braking zones");
     }
+    // Pace hints: Coach's speeds along the line, and the jump lips from the track's own ground
+    // down the middle of it (none without TRRN).
+    std::vector<float> heights;
+    if (g_extras.terrain_k) {
+        heights.assign(g_hud_sheet.ref.size(), NAN);
+        for (size_t i = 0; i < heights.size(); ++i) coachline::TerrainAt(g_extras, i, 0.0f, heights[i]);
+    }
+    g_pace_prof = coachpace::BuildProfile(g_hud_sheet.ref, g_hud_sheet.drive, heights);
+    g_pace.reset();
+    g_pace_hint = coachpace::Hint{};
+    g_pace_ex   = g_extras;
+    g_pace_key  = -1;
+    g_pace_t    = -1;
+    g_pace_said = coachpace::NONE;
+    if (g_pace_prof.ok())
+        Log("pace", std::string("speeds from ") + (g_hud_sheet.drive.empty() ? "the sheet's times" : "DRIV") + ", " +
+                        std::to_string(g_pace_prof.lips.size()) + " jump lips");
+}
+
+/// Whether pace hints are drawn: asked for, over the line on the track, with Coach's speeds.
+bool PaceOn() { return g_hud_set.enabled && g_hud_set.ground && g_hud_set.pace && g_pace_prof.ok(); }
+
+/// One telemetry sample for the pace hints. Under g_mu.
+void PaceSample(float speed, float time, bool crashed) {
+    if (!PaceOn()) {
+        g_pace_hint = coachpace::Hint{};
+        return;
+    }
+    const float dt = g_pace_t >= 0 && time > g_pace_t && time - g_pace_t < 0.5f ? time - g_pace_t : 0.02f;
+    g_pace_t       = time;
+    g_pace_idx     = coachline::AnchorPoint(g_hud_sheet.ref, g_rider.x, g_rider.y, g_pos, g_pace_frac);
+    const coachpace::Reading r =
+        crashed ? coachpace::Reading{} : coachpace::Read(g_pace_prof, g_pace_idx, g_pace_frac, speed);
+    g_pace_hint  = g_pace.step(r, dt);
+    g_pace_phase = coachpace::PhaseAt(g_pace_prof, g_pace_idx, g_pace_frac);
+    if (g_pace.wanted() != g_pace_said) {
+        g_pace_said = g_pace.wanted();
+        char b[96];
+        std::snprintf(b, sizeof(b), "%s (%+.0f%% on Coach, overshoot %.0f m, corner %.0f m, lip %.0f m)",
+                      g_pace_said == coachpace::FAST ? "too fast" : g_pace_said == coachpace::SLOW ? "too slow" : "on pace",
+                      double(r.rel * 100.0f), double(r.overshoot_m), double(r.brake_m), double(r.lip_m));
+        Log("pace", b);
+    }
+    // The line's colours with the hint, remade only when what they show changed: the strength
+    // in twentieths, the advance in half metres, the point the rider is at.
+    const long key = g_pace_hint.kind == coachpace::NONE
+                         ? 0
+                         : long(g_pace_hint.kind) + 4L * (long(g_pace_hint.level * 20.0f) +
+                                                          32L * (long(g_pace_hint.advance_m * 2.0f) + 64L * (g_pace_idx + 1)));
+    if (key == g_pace_key) return;
+    g_pace_key      = key;
+    g_pace_ex.rgba  = coachpace::Recolour(g_pace_prof, g_extras.rgba, g_pace_idx, g_pace_frac, g_pace_hint);
+    g_pace_ex.version = 0x80000000u | (++g_pace_ver & 0x7FFFFFFFu);
 }
 
 /// `<save>\mxbcoach\cues\<track>.ground`: the track's own ground. Looked for at the event and then
@@ -687,7 +753,8 @@ void LogHudSettings() {
     Log("hud.ini", std::string(g_ini_seen ? "found" : "no file, so every part is on") +
                        " enabled=" + on(s.enabled) + " cue=" + on(s.cue) + " section=" + on(s.section) +
                        " gap=" + on(s.gap) + " stance=" + on(s.stance) + " map=" + on(s.map) +
-                       " setup=" + on(s.setup) + " trail=" + on(s.trail) + " ground=" + on(s.ground));
+                       " setup=" + on(s.setup) + " trail=" + on(s.trail) + " ground=" + on(s.ground) +
+                       " pace=" + on(s.pace));
 }
 
 // At most once a second, from the telemetry callback rather than Draw.
@@ -1214,6 +1281,7 @@ void BuildHud() {
     // Coach's own points for the line to take. Empty without a sheet, and then no trail.
     v.ref       = &g_ref.points();
     v.has_susp  = g_have_susp;
+    v.more_speed = PaceOn() && g_pace_hint.more_speed;
     for (int i = 0; i < 2; ++i) {
         v.susp[i]     = g_susp[i];
         v.susp_max[i] = g_susp_deep[i];
@@ -1287,6 +1355,7 @@ ULONGLONG             g_gl_logged = 0, g_diag_ms = 0;
 int                   g_diag_left = 30;  // once a second, for the first 30 s riding with the line on
 // What the render thread draws, copied out under the lock so the draw itself never holds it.
 std::vector<coachline::Vert> g_draw_verts;
+std::vector<coachline::Vert> g_draw_marks;  // the pace hints' chevrons and gate, as triangles
 
 using glMatrixMode_t    = void(WINAPI*)(GLenum);
 using glLoadMatrixf_t   = void(WINAPI*)(const GLfloat*);
@@ -2003,6 +2072,18 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         glVertex3f(gx, gy, gz);
     }
     glEnd();
+    // The pace hints over it (coachpace::Marks): on the same ground, faded the same way.
+    if (!g_draw_marks.empty()) {
+        glBegin(GL_TRIANGLES);
+        for (const coachline::Vert& p : g_draw_marks) {
+            glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3]);
+            float gx, gy, gz;
+            const float y = g_extras.terrain_k ? p.y : p.y + g_dsnap.at(p.s);
+            ax.apply(p.x, y, p.z, gx, gy, gz);
+            glVertex3f(gx, gy, gz);
+        }
+        glEnd();
+    }
     const GLenum drew = glGetError();
     g_orig_mode(GL_MODELVIEW);
     glPopMatrix();
@@ -2203,8 +2284,13 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         at.ground = g_height.samples() > 0 && g_track.height_at_lap(g_pos, centre)
                                         ? centre + g_height.gap() - coachline::kOriginGuess
                                         : g_rider_y - coachline::kOriginGuess;
-                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones, &g_extras, &at);
+                        // With a pace hint showing, the line's colours carry it (coachpace::Recolour).
+                        const bool pace = PaceOn() && g_pace_hint.kind != coachpace::NONE;
+                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones,
+                                        pace ? &g_pace_ex : &g_extras, &at);
                         g_draw_verts = g_ribbon.verts();
+                        g_draw_marks = pace ? coachpace::Marks(g_draw_verts, g_pace_hint, g_pace_phase)
+                                            : std::vector<coachline::Vert>();
                         draw         = g_draw_verts.size() >= 4;
                         if (!draw) ++g_why[WHY_NO_VERTS];
                     }
@@ -2573,6 +2659,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
             if (a.ok) g_grid.shift(a.dx, a.dz);
         }
         g_have_sample = true;
+        PaceSample(speed, _fTime, crashed);
         // How much of each shock's travel is in use, and the deepest it has been this stint.
         g_have_susp = g_susp_travel[0] > 0 || g_susp_travel[1] > 0;
         for (int i = 0; i < 2; ++i) {

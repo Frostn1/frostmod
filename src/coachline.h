@@ -612,9 +612,13 @@ struct Vert {
     float x, y, z;  // telemetry world
     float s;        // metres along the line from the rider, for the fade
     float rgba[4];  // its colour, from RibbonExtras::rgba (LineColours) or the cue zones
+    float m = 0;    // where on Coach's line it is, metres from the line's first point: fixed in
+                    // the world, so a ground correction or a row stays put as the rider moves
 };
 
 constexpr float kStep         = 2.0f;   // metres between ribbon rows, on centreline heights
+constexpr float kGroundRebuildM = 0.05f; // the rider's ground estimate moving this much rebuilds
+constexpr float kRefOffAlpha    = 0.1f;  // how fast the reference lap's offset to the ground follows
 constexpr float kStepTerrain  = 0.5f;   // and on the track's own ground, to follow its bumps
 constexpr float kHalfWidth    = 0.35f;  // half the painted line's width
 constexpr float kLift         = 0.06f;  // above the centreline height; polygon offset does the rest
@@ -1111,6 +1115,9 @@ struct RibbonExtras {
     // The track's own ground grid (`<track>.ground`), when Coach has written it and it lines up
     // with the rider (AlignCheck); null otherwise. Takes precedence over everything else.
     const GroundGrid*  grid = nullptr;
+    // The reference lap's own height at each point ("REFY": the bike's y as Coach recorded it),
+    // empty without one. Its rise from point to point is the ground's along the line.
+    std::vector<float> refy;
 };
 
 /// The track's ground `off` metres to the left of point `i` (negative: right), from its TRRN
@@ -1204,7 +1211,7 @@ public:
         const float ground  = anchored && std::isfinite(at->ground) ? at->ground : NAN;
         if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver && grid_ == (ex ? ex->grid : nullptr) &&
             std::fabs(offset - offset_) < 0.1f && (std::isfinite(ground) == std::isfinite(ground_)) &&
-            !(std::isfinite(ground) && std::fabs(ground - ground_) > 0.1f)) {
+            !(std::isfinite(ground) && std::fabs(ground - ground_) > kGroundRebuildM)) {
             float d;
             if (anchored) {
                 d = std::hypot(at->x - bx_, at->z - bz_);
@@ -1223,7 +1230,10 @@ public:
         zones_n_   = zones.size();
         ver_       = ver;
         offset_    = offset;
-        verts_.clear();
+        // The rows already drawn, by where they are on the line, to measure how far a rebuild moves
+        // them (jitter(): it should be nothing sideways and centimetres up or down).
+        std::vector<Vert> old;
+        old.swap(verts_);
         const bool  terrain = ex && ex->terrain_k && ex->terrain.size() == ref.size() * ex->terrain_k;
         const bool  coloured = ex && ex->rgba.size() == ref.size() * 4;
         // Rows every half metre either way: the ground's bumps need them, and so does the colour,
@@ -1232,6 +1242,15 @@ public:
         // The segment the rider is on: by where they are when that is known (AnchorPoint), else
         // the last point at or behind their lap position, wrapping the lap.
         const size_t n  = ref.size();
+        // Metres along Coach's line at each point, and round the whole of it.
+        std::vector<float> arc(n, 0.0f);
+        for (size_t k = 1; k < n; ++k) {
+            const float d = std::hypot(ref[k].x - ref[k - 1].x, ref[k].z - ref[k - 1].z);
+            arc[k]        = arc[k - 1] + (d < kMaxGapM ? d : 0.0f);
+        }
+        const float close = std::hypot(ref[0].x - ref[n - 1].x, ref[0].z - ref[n - 1].z);
+        const float total = arc[n - 1] + (close < kMaxGapM ? close : 0.0f);
+        const bool  refh  = ex && ex->refy.size() == n;
         float        afrac = 0;
         const int    ai    = anchored ? AnchorPoint(ref, at->x, at->z, pos, afrac) : -1;
         size_t       i0    = 0;
@@ -1252,7 +1271,24 @@ public:
             const float fc = span > 0 ? (std::max)(0.0f, (std::min)(1.0f, along / span)) : 0.0f;
             travelled      = -fc * std::hypot(b.x - a.x, b.z - a.z);
         }
-        float nextRow  = 0;
+        // The rows sit at fixed places on the line - every `step` metres from its first point - so
+        // a rebuild two metres on draws the same rows where they overlap, rather than new ones
+        // half a step along that sample the ground and the colours somewhere else ("moves weirdly").
+        const float m0      = arc[i] - travelled;
+        float       nextRow = std::ceil(m0 / step - 1e-4f) * step - m0;
+        // The reference lap's height where the rider is, for the rise to each row (REFY).
+        // The reference lap's height is the bike's own, recorded: the ground is it less a steady
+        // offset. That offset is learnt slowly from the rider's ground estimate at each rebuild,
+        // so a rebuild moves the rows by a fraction of how the estimate moved, not all of it.
+        float base_ry = NAN;
+        if (refh && std::isfinite(ground)) {
+            const size_t ib0 = (i + 1) % n;
+            const float  sl  = std::hypot(ref[ib0].x - ref[i].x, ref[ib0].z - ref[i].z);
+            const float  f0  = sl > 1e-3f ? (std::max)(0.0f, (std::min)(1.0f, -travelled / sl)) : 0.0f;
+            base_ry          = ex->refy[i] + (ex->refy[ib0] - ex->refy[i]) * f0;
+            const float want = ground - base_ry;
+            ref_off_         = std::isfinite(ref_off_) && std::fabs(want - ref_off_) < 3.0f ? ref_off_ + kRefOffAlpha * (want - ref_off_) : want;
+        }
         float prev_mid = NAN;  // the ground under the last row's centre, for the slope along
         for (size_t k = 0; k < n && nextRow <= kAhead; ++k) {
             const size_t              ib = (i + 1) % n;
@@ -1271,13 +1307,18 @@ public:
                     float h = 0;
                     const float cx = a.x + fc * dx, cz = a.z + fc * dz;
                     float       yl, yr;
-                    if (std::isfinite(ground)) {
+                    if (std::isfinite(ground) && std::isfinite(base_ry)) {
+                        // The rider's own ground, and how Coach's own lap rose from there to this
+                        // row: the ground along the line itself, not the centreline's.
+                        const float ry = ex->refy[i] + (ex->refy[ib] - ex->refy[i]) * fc;
+                        yl = yr = ry + ref_off_ + kLiftBase;
+                    } else if (std::isfinite(ground)) {
                         // The rider's own ground, and the centreline's rise from where they are to
                         // this row - measured along the game's own lap, not the sheet's.
                         float lr = pos + nextRow / lapM;
                         lr -= std::floor(lr);
                         track.height_at_lap(lr, h);
-                        yl = yr = ground + (h - base_h) + kLiftTerrain;
+                        yl = yr = ground + (h - base_h) + kLiftBase;
                     } else {
                         track.height_at_lap(lap, h);
                         yl = yr = h + offset + kLift;
@@ -1314,20 +1355,41 @@ public:
                         ToneColour(InZone(zones, lap * lapM, lapM) ? 3.0f : 1.0f, col[0], col[1], col[2]);
                         col[3] = kLineAlpha;
                     }
-                    verts_.push_back({cx + nx * kHalfWidth, yl, cz + nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}});
-                    verts_.push_back({cx - nx * kHalfWidth, yr, cz - nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}});
+                    float mm = total > 0 ? std::fmod(m0 + nextRow, total) : m0 + nextRow;
+                    if (mm < 0) mm += total;
+                    verts_.push_back({cx + nx * kHalfWidth, yl, cz + nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}, mm});
+                    verts_.push_back({cx - nx * kHalfWidth, yr, cz - nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}, mm});
                     nextRow += step;
                 }
             }
             travelled += len;
             i = ib;
         }
+        // How far the rows both builds share moved: the jitter a rider sees.
+        if (!old.empty()) {
+            for (size_t a = 0; a + 1 < verts_.size(); a += 2) {
+                const long key = std::lround(verts_[a].m / step);
+                for (size_t b = 0; b + 1 < old.size(); b += 2) {
+                    if (std::lround(old[b].m / step) != key) continue;
+                    max_dy_    = (std::max)(max_dy_, std::fabs(verts_[a].y - old[b].y));
+                    max_shift_ = (std::max)(max_shift_, std::hypot(verts_[a].x - old[b].x, verts_[a].z - old[b].z));
+                    break;
+                }
+            }
+        }
         return true;
     }
     /// Triangle-strip vertices, two per row (left, then right).
     const std::vector<Vert>& verts() const { return verts_; }
+    /// The most any shared row moved up or down, and sideways, between builds since the last
+    /// call; then starts again.
+    void jitter(float& dy, float& shift) {
+        dy = max_dy_, shift = max_shift_;
+        max_dy_ = max_shift_ = 0;
+    }
     void clear() {
         verts_.clear();
+        ref_off_   = NAN;
         built_for_ = -1.0f;
         ref_n_ = zones_n_ = 0;
         ver_ = 0;
@@ -1338,6 +1400,8 @@ private:
     float             built_for_ = -1.0f, offset_ = 0;
     float             bx_ = NAN, bz_ = NAN, ground_ = NAN;
     const GroundGrid* grid_ = nullptr;
+    float             max_dy_ = 0, max_shift_ = 0;
+    float             ref_off_ = NAN;  // the ground under the reference lap's bike, against it
     size_t            ref_n_ = 0, zones_n_ = 0;
     uint32_t          ver_ = 0;
 };
@@ -1441,10 +1505,12 @@ inline void Unapply(const Axes& a, float gx, float gy, float gz, float& x, float
 /// The telemetry world point drawn at screen fraction (sx, sy) (origin top left) with window
 /// depth `d` (0..1, the default depth range), through projection `p`, view `v` and axes `ax`.
 inline bool Unproject(const Mat4& p, const Mat4& v, const Axes& ax, float sx, float sy, float d, float& x, float& y,
-                      float& z) {
+                      float& z, float dnear = 0.0f, float dfar = 1.0f) {
     Mat4 inv;
-    if (!Inverse(Mul(p, v), inv)) return false;
-    const float nx = sx * 2 - 1, ny = 1 - sy * 2, nz = d * 2 - 1;
+    if (!Inverse(Mul(p, v), inv) || !(std::fabs(dfar - dnear) > 1e-6f)) return false;
+    // Window depth back to NDC through the depth range glDepthRange set (0..1 unless the game
+    // splits it between passes).
+    const float nx = sx * 2 - 1, ny = 1 - sy * 2, nz = (d - dnear) / (dfar - dnear) * 2 - 1;
     const float* m  = inv.m;
     const float  wx = m[0] * nx + m[4] * ny + m[8] * nz + m[12];
     const float  wy = m[1] * nx + m[5] * ny + m[9] * nz + m[13];
@@ -1534,6 +1600,149 @@ inline float SnapReading(const std::vector<Vert>& verts, const DepthSnap& snap, 
     if (!(bd <= kSnapLateralM * kSnapLateralM)) return NAN;
     if (best == 0 || best + 2 >= verts.size()) return NAN;  // at an end: likely past it
     const float ry = (verts[best].y + verts[best + 1].y) * 0.5f + snap.at(verts[best].s);
+    return hy - ry;
+}
+
+// ---------------------------------------------------------------------------------------
+// The ground snap, v0.43.5
+//
+// Sean on v0.43.4 (755, no grid): the line "goes through the ground, or jumps very high", and
+// the log's corrections ran to +/-2 m. Two things were wrong. DepthSnap kept its corrections by
+// distance ahead of the rider, so the terrain slid through them as he rode and the same spot on
+// the track got a different correction every rebuild; and nothing checked that a depth reading
+// meant what it was taken to mean (the game may split its depth range between passes, or leave
+// only the near pass in the buffer). Now the corrections are kept by place on Coach's line
+// (LineSnap, bins along it, fixed in the world), move a few centimetres a reading at most, are
+// clamped to +/-0.3 m, and are only taken while SnapCheck finds the depth under the ground just
+// ahead of the bike agreeing with the bike's own height.
+
+constexpr float kLineSnapMaxM  = 0.3f;   // the most the snap may move the line, either way
+constexpr float kLineSnapBinM  = 2.0f;   // one correction per this much of the line
+constexpr float kLineSnapStepM = 0.04f;  // the most one reading moves a bin
+
+class LineSnap {
+public:
+    void reset(float total_m = 0) {
+        total_ = total_m;
+        bins_.assign(total_m > 0 ? size_t(std::ceil(total_m / kLineSnapBinM)) + 1 : 0, NAN);
+    }
+    float total() const { return total_; }
+    /// A reading at `m` metres along the line: the drawn surface is `dy` above the line there.
+    bool feed(float m, float dy) {
+        const long k = bin(m);
+        if (k < 0 || !std::isfinite(dy) || std::fabs(dy) > 3.0f) return false;
+        float& c = bins_[size_t(k)];
+        const float cur = std::isfinite(c) ? c : 0.0f;
+        if (std::fabs(dy) > kLineSnapMaxM + 0.6f && std::fabs(dy - cur) > 0.6f) return false;  // not this ground
+        const float step = (std::max)(-kLineSnapStepM, (std::min)(kLineSnapStepM, 0.25f * (dy - cur)));
+        c                = (std::max)(-kLineSnapMaxM, (std::min)(kLineSnapMaxM, cur + step));
+        return true;
+    }
+    /// The correction at `m`, between bins linearly; 0 where nothing was read.
+    float at(float m) const {
+        if (bins_.empty() || !std::isfinite(m)) return 0;
+        float f = m / kLineSnapBinM;
+        if (f < 0) f = 0;
+        const size_t a = (std::min)(size_t(f), bins_.size() - 1), b = (std::min)(a + 1, bins_.size() - 1);
+        const float  ca = std::isfinite(bins_[a]) ? bins_[a] : 0.0f, cb = std::isfinite(bins_[b]) ? bins_[b] : 0.0f;
+        return ca + (cb - ca) * (f - float(a));
+    }
+    /// The largest correction held, for the log.
+    float largest() const {
+        float l = 0;
+        for (float c : bins_)
+            if (std::isfinite(c)) l = (std::max)(l, std::fabs(c));
+        return l;
+    }
+
+private:
+    long bin(float m) const {
+        if (bins_.empty() || !std::isfinite(m) || m < 0) return -1;
+        const long k = long(std::lround(m / kLineSnapBinM));
+        return k < long(bins_.size()) ? k : -1;
+    }
+    float              total_ = 0;
+    std::vector<float> bins_;
+};
+
+/// Whether depth readings can be trusted: the ground a few metres ahead of the bike, read back
+/// through the same unprojection, has to come out at the bike's own height less its usual height
+/// over the ground (learnt from the first readings, between kCheckLiftLo and kCheckLiftHi) to
+/// within kCheckTolM, and close to where it was looked for. Seven of the last ten checks must
+/// agree, or the snap is off and the line keeps the ground it was built on.
+constexpr float kCheckLiftLo = 0.1f, kCheckLiftHi = 1.4f;
+constexpr float kCheckTolM   = 0.15f;
+constexpr float kCheckNearM  = 2.0f;
+
+class SnapCheck {
+public:
+    void reset() {
+        n_ = 0, hist_ = 0, count_ = 0, lift_ = NAN, warm_.clear();
+        why_ = "no check yet";
+    }
+    /// One check: the bike's y, the read-back hit, and the point the ray was aimed at (x, z).
+    void add(float bike_y, float hx, float hy, float hz, float aim_x, float aim_z) {
+        bool good = false;
+        if (!std::isfinite(hy) || !std::isfinite(hx) || !std::isfinite(hz)) {
+            why_ = "the depth read back gave no point";
+        } else if (std::hypot(hx - aim_x, hz - aim_z) > kCheckNearM) {
+            why_ = "the depth read back lands " + std::to_string(std::hypot(hx - aim_x, hz - aim_z)) +
+                   " m from where it was aimed";
+        } else {
+            const float lift = bike_y - hy;
+            if (!std::isfinite(lift_)) {
+                warm_.push_back(lift);
+                if (warm_.size() >= 5) {
+                    std::vector<float> w = warm_;
+                    std::nth_element(w.begin(), w.begin() + 2, w.end());
+                    if (w[2] >= kCheckLiftLo && w[2] <= kCheckLiftHi) lift_ = w[2];
+                    else why_ = "the ground read back is " + std::to_string(w[2]) + " m under the bike";
+                    warm_.clear();
+                }
+            } else if (std::fabs(lift - lift_) <= kCheckTolM) {
+                good = true;
+            } else {
+                why_ = "the ground read back is " + std::to_string(lift) + " m under the bike, usually " +
+                       std::to_string(lift_);
+            }
+        }
+        hist_  = ((hist_ << 1) | (good ? 1u : 0u)) & 0x3FFu;
+        count_ = (std::min)(10, count_ + 1);
+        ++n_;
+    }
+    bool on() const {
+        int g = 0;
+        for (int k = 0; k < count_; ++k) g += (hist_ >> k) & 1u;
+        return count_ >= 10 && g >= 7;
+    }
+    const std::string& why() const { return why_; }
+    float lift() const { return lift_; }
+
+private:
+    int                n_ = 0, count_ = 0;
+    unsigned           hist_ = 0;
+    float              lift_ = NAN;
+    std::vector<float> warm_;
+    std::string        why_ = "no check yet";
+};
+
+/// One probe's reading against the ribbon, by place on the line: like SnapReading, but returns
+/// the row's place `m` too, and compares with the ribbon as drawn (`snap` applied).
+inline float SnapReadingAt(const std::vector<Vert>& verts, const LineSnap& snap, float hx, float hy, float hz,
+                           float rider_x, float rider_z, float& m) {
+    m = NAN;
+    if (verts.size() < 4 || !std::isfinite(hx) || !std::isfinite(hy) || !std::isfinite(hz)) return NAN;
+    if (std::hypot(hx - rider_x, hz - rider_z) < 2.5f) return NAN;
+    size_t best = 0;
+    float  bd   = INFINITY;
+    for (size_t i = 0; i + 1 < verts.size(); i += 2) {
+        const float cx = (verts[i].x + verts[i + 1].x) * 0.5f, cz = (verts[i].z + verts[i + 1].z) * 0.5f;
+        const float d2 = (cx - hx) * (cx - hx) + (cz - hz) * (cz - hz);
+        if (d2 < bd) bd = d2, best = i;
+    }
+    if (!(bd <= kSnapLateralM * kSnapLateralM) || best == 0 || best + 2 >= verts.size()) return NAN;
+    m              = verts[best].m;
+    const float ry = (verts[best].y + verts[best + 1].y) * 0.5f + snap.at(m);
     return hy - ry;
 }
 

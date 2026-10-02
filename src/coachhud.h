@@ -33,6 +33,7 @@
 //             -(K-1)/2*step on the right to +(K-1)/2*step on the left (left = the line's
 //             direction turned 90 degrees anticlockwise seen from above, x/z). NaN off the grid.
 //     "DRIV"  u32 N, then N x 3 f32: speed m/s, throttle 0..1, brake 0..1 (the harder of the two)
+//     "REFY"  u32 N, then N f32: the reference lap's own height (the bike's y) at each point
 // Bytes after the chunks are ignored.
 #pragma once
 
@@ -87,6 +88,8 @@ struct Sheet {
     std::vector<float>    terrain;  // ref.size() x terrain_k
     // Speed, throttle and brake at each point ("DRIV"), empty without one.
     std::vector<float>    drive;    // ref.size() x 3
+    // The reference lap's own height at each point ("REFY"), empty without one.
+    std::vector<float>    refy;
 };
 
 /// Text the game can draw: its strings are CP1252, so anything past ASCII becomes one '?' per
@@ -167,6 +170,16 @@ inline bool Parse(const uint8_t* b, size_t n, Sheet& out) {
             }
             if (!ok) continue;
             s.terrain_k = ck, s.terrain_step = st, s.terrain = std::move(h);
+        } else if (std::memcmp(tag, "REFY", 4) == 0 && len >= 4) {
+            const uint32_t cn = U32(c);
+            if (cn != npts || len < 4 + uint64_t(cn) * 4) continue;
+            std::vector<float> y(cn);
+            bool ok = true;
+            for (size_t i = 0; i < y.size(); ++i) {
+                y[i] = F32(c + 4 + i * 4);
+                if (!std::isfinite(y[i]) || std::fabs(y[i]) > 1e5f) ok = false;
+            }
+            if (ok) s.refy = std::move(y);
         } else if (std::memcmp(tag, "DRIV", 4) == 0 && len >= 4) {
             const uint32_t cn = U32(c);
             if (cn != npts || len < 4 + uint64_t(cn) * 12) continue;

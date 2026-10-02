@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-02 — v0.43.4
+
+### Fixed
+- **The line lies on the track's own ground from the first second, no laps needed.** MXB Coach
+  now reads the track's height file the moment it sees you ride it and writes it beside the
+  sheets (`<track>.ground`); the line stands on it everywhere, lifted a little more where the
+  ground is steep so it never dips into lips and bumps. FrostMod checks once, from your own
+  riding, that the file lines up with the track and logs it (`ground: trh aligned dx,dz,dy`).
+  Locked (.mxbsecure) tracks can't be read, and there the line snaps to what the game draws.
+- **Crashes.** The line hides while you are down and for a moment after you get up, and after a
+  crash or the game putting you back on the track it starts again from where the bike really
+  is: the camera is found again, the line re-anchored, the ground re-read. It never draws from
+  an old camera after a crash. A camera that drifts away from the bike (the crash camera, a
+  replay view) is let go within 0.3 s.
+- **Blinking.** The line fought the track's own surface for the same pixels; it now sits a few
+  centimetres clear and wins the depth test by a margin. No value that isn't a number can reach
+  the line any more, and the ground snap ignores single bad readings (rain, a rider passing).
+  `snap=nan` in the log only ever meant "no readings": it now says `snap=off` when the line is on
+  the track's own ground and doesn't need one.
+
 ## 2026-10-02 — v0.43.3
 
 ### Fixed

@@ -313,6 +313,10 @@ add_test(NAME coachline COMMAND coachline_test)
 # model, jump lips, and the hysteresis that keeps them from flickering on noisy speed.
 add_executable(coachpace_test tests/coachpace_test.cpp)
 add_test(NAME coachpace COMMAND coachpace_test)
+# Gear hints over the ground line: the sheet's GEAR chunk, Coach's shifts, up/down detection and the
+# target gear, the hysteresis, the glyph on the line and the badge beside the cue box.
+add_executable(coachgear_test tests/coachgear_test.cpp)
+add_test(NAME coachgear COMMAND coachgear_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

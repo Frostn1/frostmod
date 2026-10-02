@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-02 — v0.45.0
+
+### Added
+- **Gear hints** (hud.ini `gear=1`, off until asked for; the sign on the line needs `ground`
+  too, the badge doesn't). MXB Coach now writes the gear its lap was in at every point (a `GEAR`
+  chunk in the `.hud` sheet; an older sheet has none and shows no hints). Where Coach's lap
+  changes gear, and you are in neither of his two gears, an arrow and the gear to be in
+  (**▲3** shift up to 3, **▼2** down to 2) stand on the line 6 m before the shift, and a small
+  badge with the same arrow and number sits beside the cue box. At the shift and for 12 m after
+  it, only his new gear is right, so a rider still in the old one is told to change.
+  - Quiet: nothing while crashed, crawling, in neutral or in the air (unless Coach's own shift is
+    in the air, as on a jump's face). A hint needs 0.3 s to start, 0.7 s of not being wanted to
+    end, shows at least 1.2 s, fades in and out, and goes from up to down only through nothing.
+  - The log says what it saw (`gear: up to 4 (gear 2, Coach shifts 30 m ahead)`).
 ## 2026-10-02 — v0.44.0
 
 ### Added

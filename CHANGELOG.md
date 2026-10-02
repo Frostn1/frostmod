@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-02 — v0.43.5
+
+### Fixed
+- **No more jumping, sinking or crawling line on tracks without their ground file.** The
+  correction taken from the game's depth swung by two metres: it was kept by distance ahead of
+  you, so the ground slid through it as you rode, and nothing checked the depth reading meant
+  what it was taken to mean. Now it is only used while the ground just ahead of the bike, read
+  back the same way, agrees with the bike's own height; it is kept by place on the line, moves
+  a few centimetres at a time and never more than 30 cm. The log says when it is on or off and
+  why (`ground: snap on|off`).
+- The line stands on Coach's own lap's heights along it when the sheet carries them (a newer
+  MXB Coach), on the centreline's rise otherwise, and its rows sit at fixed places on the line,
+  so a rebuild as you ride draws the same rows in the same places. The log's 10 s line reports
+  the most any of them moved (`jitter dy= shift=`).
+- Depth 1.0 under the line (sky, or a cleared buffer) no longer makes the line draw over
+  everything for a few seconds.
+
 ## 2026-10-02 — v0.43.4
 
 ### Fixed

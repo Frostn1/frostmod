@@ -109,6 +109,7 @@ float                   g_pace_frac  = 0, g_pace_t = -1;
 long                    g_pace_key   = -1;  // what the colours were last made for
 float                   g_pace_phase = 0;   // the rider's metres along Coach's line, for the chevrons
 coachpace::Kind         g_pace_said  = coachpace::NONE;
+bool                    g_pace_grid_lips = false;  // the lips have been looked for on the ground grid
 coachhud::RefLap     g_ref;
 coachhud::LapClock   g_clock;
 coachhud::StopWatch  g_stop;
@@ -616,6 +617,7 @@ void BuildExtras() {
     g_pace_key  = -1;
     g_pace_t    = -1;
     g_pace_said = coachpace::NONE;
+    g_pace_grid_lips = false;
     if (g_pace_prof.ok())
         Log("pace", std::string("speeds from ") + (g_hud_sheet.drive.empty() ? "the sheet's times" : "DRIV") + ", " +
                         std::to_string(g_pace_prof.lips.size()) + " jump lips");
@@ -629,6 +631,15 @@ void PaceSample(float speed, float time, bool crashed) {
     if (!PaceOn()) {
         g_pace_hint = coachpace::Hint{};
         return;
+    }
+    // Without TRRN, the jump lips come from the track's own ground grid once it is known to line
+    // up with the track (it arrives after the sheet).
+    if (!g_extras.terrain_k && g_extras.grid && !g_pace_grid_lips) {
+        g_pace_grid_lips = true;
+        std::vector<float> h(g_hud_sheet.ref.size(), NAN);
+        for (size_t i = 0; i < h.size(); ++i) g_extras.grid->at(g_hud_sheet.ref[i].x, g_hud_sheet.ref[i].z, h[i]);
+        g_pace_prof.lips = coachpace::FindLips(g_pace_prof.s, h, g_pace_prof.v);
+        Log("pace", std::to_string(g_pace_prof.lips.size()) + " jump lips from the track's ground grid");
     }
     const float dt = g_pace_t >= 0 && time > g_pace_t && time - g_pace_t < 0.5f ? time - g_pace_t : 0.02f;
     g_pace_t       = time;
@@ -2073,14 +2084,24 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
     }
     glEnd();
     // The pace hints over it (coachpace::Marks): on the same ground, faded the same way.
+    // A triangle with anything that isn't a number in it is left out whole.
     if (!g_draw_marks.empty()) {
         glBegin(GL_TRIANGLES);
-        for (const coachline::Vert& p : g_draw_marks) {
-            glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3]);
-            float gx, gy, gz;
-            const float y = g_extras.terrain_k ? p.y : p.y + g_dsnap.at(p.s);
-            ax.apply(p.x, y, p.z, gx, gy, gz);
-            glVertex3f(gx, gy, gz);
+        for (size_t t = 0; t + 3 <= g_draw_marks.size(); t += 3) {
+            float g[3][3];
+            bool  ok = true;
+            for (int k = 0; k < 3 && ok; ++k) {
+                const coachline::Vert& p = g_draw_marks[t + size_t(k)];
+                const float            y = g_line_on_ground ? p.y : p.y + g_dsnap.at(p.s);
+                ok = std::isfinite(y) && std::isfinite(p.x) && std::isfinite(p.z);
+                if (ok) ax.apply(p.x, y, p.z, g[k][0], g[k][1], g[k][2]);
+            }
+            if (!ok) continue;
+            for (int k = 0; k < 3; ++k) {
+                const coachline::Vert& p = g_draw_marks[t + size_t(k)];
+                glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3]);
+                glVertex3f(g[k][0], g[k][1], g[k][2]);
+            }
         }
         glEnd();
     }
@@ -2286,6 +2307,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                         : g_rider_y - coachline::kOriginGuess;
                         // With a pace hint showing, the line's colours carry it (coachpace::Recolour).
                         const bool pace = PaceOn() && g_pace_hint.kind != coachpace::NONE;
+                        g_pace_ex.grid  = g_extras.grid;  // the same ground under both
                         g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones,
                                         pace ? &g_pace_ex : &g_extras, &at);
                         g_draw_verts = g_ribbon.verts();

@@ -929,6 +929,162 @@ int main(int argc, char** argv) {
         if (argc > 2 && !sh.ref.empty()) RenderToneMap(argv[2], sh, tone, zones);
     }
 
+    // --- Sean's Ridgedale run, replayed (v0.43.2) -------------------------------------------
+    // (1) A sheet whose lap positions have drifted from the game's: Coach numbers its points by
+    //     metres along the lap it recorded over the track's length, so a lap ridden 6% longer than
+    //     the centreline reads 6% ahead by its end. The line "turned 90 degrees": it started where
+    //     the sheet's position said, not where the rider was.
+    {
+        coachhud::Sheet sh;
+        const std::vector<unsigned char> f =
+            ReadFile(std::string(COACHLINE_DATA) + "/755_Compound.MX2OEM_2023_KTM_250_SX-F.hud");
+        CHECK(!f.empty() && coachhud::Parse(f.data(), f.size(), sh), "the 755 sheet");
+        std::vector<coachhud::RefPoint> drift = sh.ref;
+        for (auto& r : drift) r.pos = (std::min)(1.0f, r.pos * 1.06f);
+        coachhud::Track t;
+        CHECK(BuildTrack(t, sh.track_len, 10.0f), "a track for the heights");
+        const size_t k  = 900;  // late in the lap, where the drift is largest
+        const auto&  me = sh.ref[k];
+        Ribbon old_way, new_way;
+        old_way.update(drift, t, me.pos, 0.0f);
+        Anchor at;
+        at.x = me.x, at.z = me.z, at.ground = 3.0f;
+        new_way.update(drift, t, me.pos, 0.0f, {}, nullptr, &at);
+        auto start = [](const Ribbon& r) {
+            const auto& v = r.verts();
+            return std::make_pair((v[0].x + v[1].x) * 0.5f, (v[0].z + v[1].z) * 0.5f);
+        };
+        const auto so = start(old_way), sn = start(new_way);
+        const float off_old = std::hypot(so.first - me.x, so.second - me.z);
+        const float off_new = std::hypot(sn.first - me.x, sn.second - me.z);
+        std::printf("drifted sheet: the ribbon started %.1f m from the rider by lap position, %.2f m by where they are\n",
+                    double(off_old), double(off_new));
+        CHECK(off_old > 20.0f, "the drift is real: %.1f m by lap position", double(off_old));
+        CHECK(off_new < 1.5f, "anchored, it starts at the rider: %.2f m", double(off_new));
+        // And it runs along the line from there: its first rows head where Coach's line heads.
+        const auto& v  = new_way.verts();
+        const float lx = (v[8].x + v[9].x) * 0.5f - sn.first, lz = (v[8].z + v[9].z) * 0.5f - sn.second;
+        const float tx = sh.ref[k + 3].x - me.x, tz = sh.ref[k + 3].z - me.z;
+        const float cosang = (lx * tx + lz * tz) / (std::hypot(lx, lz) * std::hypot(tx, tz));
+        CHECK(cosang > 0.95f, "along the line, not across it: cos %.2f", double(cosang));
+        // Its height is the rider's ground plus the centreline's rise, not the sheet's place's.
+        float h0, h2;
+        t.height_at_lap(me.pos, h0);
+        t.height_at_lap(me.pos + 2.0f / sh.track_len, h2);
+        CHECK(std::fabs(v[0].y - (3.0f + kLiftTerrain)) < 0.01f, "the first row on the rider's ground: %f", double(v[0].y));
+        CHECK(std::fabs(v[8].y - (3.0f + (h2 - h0) + kLiftTerrain)) < 0.02f, "and rising with the centreline");
+        // A rider nowhere near the line (in the pits): no anchor, the old way.
+        float fr;
+        CHECK(AnchorPoint(drift, me.x + 500, me.z, me.pos, fr) < 0, "no anchor 500 m off the line");
+    }
+
+    // (2) The camera lock on Ridgedale: helmet camera, eye 1.63 m over the bike, axes x,y,z. A
+    //     track mesh placed with a quarter turn has a view exactly as near under the rotated axes;
+    //     the lock must take the plain axes, every frame, and never change mid-event.
+    {
+        AxesLock lock;
+        CameraFollow follow;
+        int changes = 0, last = -1;
+        for (int frame = 0; frame < 300; ++frame) {
+            const float bx = 207.45f + 0.3f * float(frame), by = 1.09f, bz = 124.35f;
+            const Mat4  V  = LookAt(bx, by + 1.63f, bz, bx + 10.0f, by, bz);
+            ModelviewPick best;
+            const float*  prev = lock.locked() >= 0 ? follow.anchor(1000ull + unsigned(frame) * 10) : nullptr;
+            for (const Mat4& m : {Mul(V, Rotate(90.0f, 0, 1, 0)), V, Mul(V, Rotate(-90.0f, 0, 1, 0))}) {
+                if (prev) ModelviewFollow(best, m, bx, by, bz, lock.locked(), prev);
+                else ModelviewOffer(best, m, bx, by, bz, lock.locked());
+            }
+            lock.vote(best.ok ? best.axes : -1);
+            if (best.ok) {
+                float e[3];
+                CameraPos(best.view, e[0], e[1], e[2]);
+                follow.hit(e, 1000ull + unsigned(frame) * 10);
+            }
+            if (lock.locked() != last) ++changes, last = lock.locked();
+        }
+        CHECK(lock.locked() == 0, "locked on x,y,z, not a quarter-turned copy: %s",
+              lock.locked() >= 0 ? AxesName(AxesAt(lock.locked())).c_str() : "none");
+        CHECK(changes == 1, "and the axes changed once (the lock), never after: %d", changes);
+    }
+
+    // (3) Snapping to the ground the game drew: a ribbon built a metre under the visible ground.
+    {
+        const float ground = 2.0f;
+        const Mat4  V      = LookAt(0, ground + 1.6f, 0, 20, ground, 0);  // helmet, looking east
+        const Axes  id;
+        // The unprojection undoes the projection.
+        const Screen sp = Project(p, V, 15, ground, 1.0f);
+        float        ux, uy, uz;
+        Mat4         pv = Mul(p, V);
+        const float* m  = pv.m;
+        const float  cz = m[2] * 15 + m[6] * ground + m[10] * 1.0f + m[14], cw = m[3] * 15 + m[7] * ground + m[11] * 1.0f + m[15];
+        CHECK(Unproject(p, V, id, sp.x, sp.y, (cz / cw + 1) * 0.5f, ux, uy, uz) && std::fabs(ux - 15) < 0.01f &&
+                  std::fabs(uy - ground) < 0.01f && std::fabs(uz - 1.0f) < 0.01f,
+              "unproject(project(p)) = p: %f %f %f", double(ux), double(uy), double(uz));
+        // The ribbon, east along z = 0, a metre too low.
+        std::vector<Vert> rv;
+        for (int i = 0; i <= 120; ++i) {
+            const float s = float(i) * 0.5f;
+            rv.push_back({s, ground - 1.0f, kHalfWidth, s, {1, 1, 1, 0.7f}});
+            rv.push_back({s, ground - 1.0f, -kHalfWidth, s, {1, 1, 1, 0.7f}});
+        }
+        DepthSnap snap;
+        for (int iter = 0; iter < 8; ++iter)
+            for (int k = 0; k < kSnapN; ++k) {
+                // Where the game's depth says the ray to the ribbon's centre at kSnapAt[k] meets
+                // the ground plane: the hit, as the depth readback would give it.
+                const float rx = kSnapAt[k], ry = ground - 1.0f + snap.at(kSnapAt[k]);
+                const float ex = 0, ey = ground + 1.6f;
+                const float t  = (ground - ey) / (ry - ey);  // along the ray, where it is at ground height
+                if (!(t > 0)) continue;
+                const float hx = ex + (rx - ex) * t;
+                const float dy = SnapReading(rv, snap, hx, ground, 0.0f, 0.0f, 0.0f);
+                if (std::isfinite(dy)) snap.feed(k, snap.at(kSnapAt[k]) + dy);
+            }
+        CHECK(snap.any(), "the depth gave readings");
+        CHECK(std::fabs(snap.at(12.0f) - 1.0f) < 0.1f && std::fabs(snap.at(32.0f) - 1.0f) < 0.1f,
+              "and the correction lifts the ribbon onto the ground: %f at 12 m, %f at 32 m", double(snap.at(12)),
+              double(snap.at(32)));
+        DepthSnap junk;
+        CHECK(!junk.feed(0, 7.0f) && !junk.any(), "a 7 m reading (a bike, a hillside) is refused");
+        CHECK(!std::isfinite(SnapReading(rv, junk, 1.0f, ground, 0.5f, 0.0f, 0.0f)), "a hit at the rider's bike is refused");
+        CHECK(!std::isfinite(SnapReading(rv, junk, 20.0f, ground, 6.0f, 0.0f, 0.0f)), "a hit 6 m off the line is refused");
+    }
+
+    // (4) Colours: Ridgedale's sheet had no DRIV, and steady speed read as coasting.
+    {
+        std::vector<coachhud::RefPoint> line;
+        float t = 0;
+        for (int i = 0; i <= 600; ++i) {
+            coachhud::RefPoint r;
+            const float x = float(i);
+            // 0-200 m steady 20 m/s, 200-220 m braking hard to 8 m/s (about 8 m/s^2), then
+            // accelerating back.
+            const float v = x < 200 ? 20.0f : x < 220 ? 20.0f - (x - 200) * 0.6f : (std::min)(20.0f, 8.0f + (x - 220) * 0.1f);
+            if (i) t += 1.0f / v;
+            r.pos = x / 601.0f, r.t = t, r.x = x, r.z = 0;
+            line.push_back(r);
+        }
+        const std::vector<float> tone = Tone(line);
+        CHECK(!tone.empty() && tone[100] < 0.1f, "steady speed without DRIV is gas, not coast: %f", double(tone[100]));
+        CHECK(tone[211] > 2.3f, "hard braking is red: %f", double(tone[211]));
+        CHECK(tone[400] < 0.1f, "accelerating is gas: %f", double(tone[400]));
+        CHECK(std::string(ColourSource(line, {})) == "speed", "source=speed without DRIV");
+        // With DRIV: throttle 0.3 is gas, 0.02 is coast, 0.15 halfway; the brake lever is braking.
+        std::vector<float> drive;
+        for (size_t i = 0; i < line.size(); ++i) {
+            const float thr = i < 150 ? 0.3f : i < 300 ? 0.02f : i < 450 ? 0.15f : 0.0f;
+            const float brk = i >= 450 ? 0.8f : 0.0f;
+            drive.insert(drive.end(), {15.0f, thr, brk});
+        }
+        const std::vector<float> dt = Tone(line, drive);
+        CHECK(dt[75] < 0.05f, "throttle 0.3 is gas: %f", double(dt[75]));
+        CHECK(std::fabs(dt[225] - 1.0f) < 0.05f, "throttle 0.02 is coast: %f", double(dt[225]));
+        CHECK(dt[375] > 0.3f && dt[375] < 0.7f, "throttle 0.15 is between: %f", double(dt[375]));
+        CHECK(dt[525] > 2.4f, "the brake at 0.8 is red: %f", double(dt[525]));
+        CHECK(std::string(ColourSource(line, drive)) == "DRIV", "source=DRIV with it");
+    }
+
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

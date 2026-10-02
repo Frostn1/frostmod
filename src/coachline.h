@@ -813,6 +813,267 @@ inline void ToneColour(float t, float& r, float& g, float& b) {
     b = stops[i][2] + (stops[i + 1][2] - stops[i][2]) * f;
 }
 
+// ---------------------------------------------------------------------------------------
+// The track's own ground, from its file
+//
+// MXB Coach reads the track's heightfield (the .trh inside its .pkz, through mxb-content) the
+// moment it sees the track being ridden, and writes it beside the sheets as
+// `<track>.ground`, so the line lies on the dirt from the first second of the first lap, with no
+// lap needed:
+//
+//   0   char[4] "MXGR"
+//   4   u32     version (1)
+//   8   u32     W, columns (2..4096)
+//   12  u32     H, rows (2..4096)
+//   16  f32     step, metres between samples (0.05..10)
+//   20  f32     x0, world x of column 0
+//   24  f32     z0, world z of row 0
+//   28  f32     base height, metres
+//   32  f32     metres per height unit (> 0)
+//   36  W x H   u16 row-major (row = z), height = base + unit * value; 0xFFFF where unknown
+//
+// The grid and the telemetry share the game's world frame; that has been checked against the
+// track's placements and against laps (Coach's ground.rs), and is checked again here, once, from
+// the rider's own samples (AlignCheck), logged as "ground: trh aligned dx,dz,dy".
+
+constexpr char     kGridMagic[4] = {'M', 'X', 'G', 'R'};
+constexpr uint32_t kGridMaxDim   = 4096;
+
+class GroundGrid {
+public:
+    bool ready() const { return w_ >= 2 && h_ >= 2 && !hs_.empty(); }
+    uint32_t width() const { return w_; }
+    uint32_t height() const { return h_; }
+    float    step() const { return step_; }
+    /// A fixed shift found by AlignCheck, applied to every lookup.
+    void shift(float dx, float dz) { dx_ = dx, dz_ = dz; }
+    void clear() {
+        hs_.clear();
+        w_ = h_ = 0;
+        dx_ = dz_ = 0;
+    }
+
+    bool parse(const uint8_t* b, size_t n) {
+        clear();
+        using coachcue::F32;
+        using coachcue::U32;
+        if (!b || n < 36 || std::memcmp(b, kGridMagic, 4) != 0 || U32(b + 4) != 1) return false;
+        const uint32_t w = U32(b + 8), h = U32(b + 12);
+        const float    st = F32(b + 16), x0 = F32(b + 20), z0 = F32(b + 24), base = F32(b + 28), unit = F32(b + 32);
+        if (w < 2 || h < 2 || w > kGridMaxDim || h > kGridMaxDim) return false;
+        if (!std::isfinite(st) || st < 0.05f || st > 10 || !std::isfinite(x0) || !std::isfinite(z0) ||
+            !std::isfinite(base) || !std::isfinite(unit) || !(unit > 0))
+            return false;
+        if (n - 36 < uint64_t(w) * h * 2) return false;
+        hs_.resize(size_t(w) * h);
+        for (size_t i = 0; i < hs_.size(); ++i) {
+            const uint16_t q = uint16_t(b[36 + i * 2] | (b[36 + i * 2 + 1] << 8));
+            hs_[i]           = q == 0xFFFF ? NAN : base + unit * float(q);
+        }
+        w_ = w, h_ = h, step_ = st, x0_ = x0, z0_ = z0;
+        return true;
+    }
+
+    /// The ground at world (x, z), bilinear; false off the grid or where it is unknown.
+    bool at(float x, float z, float& y) const {
+        if (!ready() || !std::isfinite(x) || !std::isfinite(z)) return false;
+        const float gx = (x + dx_ - x0_) / step_, gz = (z + dz_ - z0_) / step_;
+        if (!(gx >= 0) || !(gz >= 0) || gx > float(w_ - 1) || gz > float(h_ - 1)) return false;
+        const uint32_t c0 = (std::min)(uint32_t(gx), w_ - 2), r0 = (std::min)(uint32_t(gz), h_ - 2);
+        const float    fx = gx - float(c0), fz = gz - float(r0);
+        const float    a = hs_[size_t(r0) * w_ + c0], b = hs_[size_t(r0) * w_ + c0 + 1];
+        const float    c = hs_[size_t(r0 + 1) * w_ + c0], d = hs_[size_t(r0 + 1) * w_ + c0 + 1];
+        if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c) || !std::isfinite(d)) return false;
+        const float top = a + (b - a) * fx, bot = c + (d - c) * fx;
+        y               = top + (bot - top) * fz;
+        return true;
+    }
+
+private:
+    uint32_t           w_ = 0, h_ = 0;
+    float              step_ = 1, x0_ = 0, z0_ = 0, dx_ = 0, dz_ = 0;
+    std::vector<float> hs_;
+};
+
+/// The one-time check that the grid and the rider's telemetry share a frame: over a couple of
+/// hundred riding samples, the bike should sit the same height above the grid everywhere. Shifts
+/// of up to kAlignSearchM either way are tried; the steadiest is kept (dx, dz), with the bike's
+/// height above the ground (dy) and how much it wandered (spread). A spread over kAlignMaxSpread
+/// means this grid isn't this track's ground (a renamed folder, a different layout), and the line
+/// goes back to the depth snap.
+constexpr int   kAlignSamples   = 200;
+constexpr int   kAlignSearchM   = 2;
+constexpr float kAlignMaxSpread = 1.2f;
+
+struct Alignment {
+    bool  done = false, ok = false;
+    float dx = 0, dz = 0, dy = 0, spread = 0;
+    int   on_grid = 0;
+};
+
+class AlignCheck {
+public:
+    void reset() {
+        pts_.clear();
+        result_ = Alignment{};
+    }
+    /// One riding sample (not crashed, moving). Returns true the call the verdict is reached.
+    bool add(const GroundGrid& g, float x, float y, float z) {
+        if (result_.done || !g.ready() || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+        pts_.push_back({x, y, z});
+        if (int(pts_.size()) < kAlignSamples) return false;
+        decide(g);
+        return true;
+    }
+    const Alignment& result() const { return result_; }
+
+private:
+    struct P {
+        float x, y, z;
+    };
+    static float Median(std::vector<float>& v) {
+        std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
+        return v[v.size() / 2];
+    }
+    void decide(const GroundGrid& g) {
+        Alignment best;
+        best.done   = true;
+        best.spread = INFINITY;
+        GroundGrid probe = g;
+        for (int dx = -kAlignSearchM; dx <= kAlignSearchM; ++dx)
+            for (int dz = -kAlignSearchM; dz <= kAlignSearchM; ++dz) {
+                probe.shift(float(dx), float(dz));
+                std::vector<float> gaps;
+                for (const P& p : pts_) {
+                    float h;
+                    if (probe.at(p.x, p.z, h)) gaps.push_back(p.y - h);
+                }
+                if (gaps.size() < pts_.size() / 2) continue;
+                const float med = Median(gaps);
+                std::vector<float> dev;
+                for (float v : gaps) dev.push_back(std::fabs(v - med));
+                const float mad = Median(dev);
+                // A shift has to earn its place: the plain frame wins unless another is clearly steadier.
+                const float score = mad + (dx || dz ? 0.05f : 0.0f);
+                if (score < best.spread) {
+                    best.spread  = score;
+                    best.dx = float(dx), best.dz = float(dz), best.dy = med;
+                    best.on_grid = int(gaps.size());
+                }
+            }
+        if (std::isfinite(best.spread) && (best.dx != 0 || best.dz != 0)) best.spread -= 0.05f;
+        best.ok = std::isfinite(best.spread) && best.spread <= kAlignMaxSpread && best.dy > -1.0f && best.dy < 3.0f;
+        result_ = best;
+        pts_.clear();
+        pts_.shrink_to_fit();
+    }
+    std::vector<P> pts_;
+    Alignment      result_;
+};
+
+/// How far above the ground the line is painted: a couple of centimetres on the flat, more where
+/// the ground is steep along or across it, where the grid's metre between samples cuts the tops
+/// off bumps and lips and a flat 2 cm left the ribbon inside them ("glitching through the track").
+constexpr float kLiftBase  = 0.05f;
+constexpr float kLiftSlope = 0.12f;  // extra metres per unit of slope
+constexpr float kLiftMax   = 0.15f;
+inline float LiftFor(float slope_along, float slope_across) {
+    const float s = (std::max)(std::fabs(slope_along), std::fabs(slope_across));
+    return (std::min)(kLiftMax, kLiftBase + kLiftSlope * (std::isfinite(s) ? s : 0.0f));
+}
+
+// ---------------------------------------------------------------------------------------
+// Crashes and resets
+//
+// Sean, v0.43.2: "when I crash it is completely messed up, not aligned anymore, or floating".
+// Down, the camera swings to the crash view (its eye nowhere near where it was), the bike
+// tumbles, and the game then puts rider and bike back on the track, often metres from where they
+// fell. Every one of those broke something the line relies on: the camera being followed, the
+// ribbon cache built from the old position, the ground snap's corrections. RiderState says when
+// the line must be hidden and when everything built from the old position has to be started
+// again (`generation` moves on).
+
+constexpr float    kResetJumpM   = 15.0f;  // a move this far between two samples is the game putting the bike back
+constexpr float    kSettleS      = 0.75f;  // after getting up, this long before the line returns
+constexpr float    kEyeDriftM    = 1.5f;   // the camera's eye this much further from the bike than usual...
+constexpr unsigned kEyeDriftMs   = 300;    // ...for this long, and it is not the camera any more
+
+class RiderState {
+public:
+    enum Phase { RIDING, DOWN, SETTLING };
+    void reset() {
+        phase_ = SETTLING, since_ = -1, have_ = false;
+        ++gen_;
+    }
+    /// One telemetry sample: track time, the crashed flag, world position.
+    void sample(float t, bool crashed, float x, float y, float z) {
+        const bool jump = have_ && std::isfinite(x) &&
+                          std::sqrt((x - x_) * (x - x_) + (y - y_) * (y - y_) + (z - z_) * (z - z_)) > kResetJumpM;
+        have_ = std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+        if (have_) x_ = x, y_ = y, z_ = z;
+        if (crashed) {
+            if (phase_ != DOWN) ++gen_, ++crashes_;
+            phase_ = DOWN;
+            return;
+        }
+        if (jump) {
+            ++gen_, ++resets_;
+            phase_ = SETTLING, since_ = t;
+            return;
+        }
+        if (phase_ == DOWN) phase_ = SETTLING, since_ = t, ++gen_;
+        if (phase_ == SETTLING) {
+            if (since_ < 0 || t < since_) since_ = t;
+            if (t - since_ >= kSettleS) phase_ = RIDING;
+        }
+    }
+    bool     visible() const { return phase_ == RIDING; }
+    Phase    phase() const { return phase_; }
+    /// Moves on at every crash, every getting up and every reset: anything built from the old
+    /// position (the ribbon, the ground snap, the camera being followed) is started again.
+    unsigned generation() const { return gen_; }
+    unsigned crashes() const { return crashes_; }
+    unsigned resets() const { return resets_; }
+
+private:
+    Phase    phase_ = SETTLING;
+    float    since_ = -1, x_ = 0, y_ = 0, z_ = 0;
+    bool     have_ = false;
+    unsigned gen_ = 0, crashes_ = 0, resets_ = 0;
+};
+
+/// The camera's eye against the bike: learns the usual distance (the chase or helmet camera
+/// rides at a steady one) and says when it has been off by more than kEyeDriftM for kEyeDriftMs -
+/// the crash camera, a replay view, or the wrong object followed - so the lock is dropped and found
+/// again rather than drawn through.
+class EyeWatch {
+public:
+    void reset() { n_ = 0, off_since_ = 0, off_ = false; }
+    /// Returns false when the camera should be let go.
+    bool ok(float dist, unsigned long long now) {
+        if (!std::isfinite(dist)) return false;
+        if (n_ < 30) {
+            usual_ = n_ == 0 ? dist : usual_ + (dist - usual_) / float(n_ + 1);
+            ++n_;
+            return true;
+        }
+        if (std::fabs(dist - usual_) > kEyeDriftM) {
+            if (!off_) off_ = true, off_since_ = now;
+            return now - off_since_ < kEyeDriftMs;
+        }
+        off_   = false;
+        usual_ += 0.01f * (dist - usual_);
+        return true;
+    }
+    float usual() const { return usual_; }
+
+private:
+    int                n_ = 0;
+    float              usual_ = 0;
+    bool               off_ = false;
+    unsigned long long off_since_ = 0;
+};
+
 /// The line's alpha: readable on dirt without hiding it.
 constexpr float kLineAlpha = 0.7f;
 
@@ -847,6 +1108,9 @@ struct RibbonExtras {
     // The line's colour at each point, RGBA, 4 floats a point; empty when unknown. Filled by
     // one function (LineColours today), so a better colouring is a one-line swap.
     std::vector<float> rgba;
+    // The track's own ground grid (`<track>.ground`), when Coach has written it and it lines up
+    // with the rider (AlignCheck); null otherwise. Takes precedence over everything else.
+    const GroundGrid*  grid = nullptr;
 };
 
 /// The track's ground `off` metres to the left of point `i` (negative: right), from its TRRN
@@ -938,7 +1202,7 @@ public:
         const uint32_t ver  = ex ? ex->version : 0;
         const bool anchored = at && std::isfinite(at->x) && std::isfinite(at->z);
         const float ground  = anchored && std::isfinite(at->ground) ? at->ground : NAN;
-        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver &&
+        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver && grid_ == (ex ? ex->grid : nullptr) &&
             std::fabs(offset - offset_) < 0.1f && (std::isfinite(ground) == std::isfinite(ground_)) &&
             !(std::isfinite(ground) && std::fabs(ground - ground_) > 0.1f)) {
             float d;
@@ -951,6 +1215,7 @@ public:
             if (d < kRebuildM) return false;
         }
         built_for_ = pos;
+        grid_      = ex ? ex->grid : nullptr;
         bx_        = anchored ? at->x : NAN;
         bz_        = anchored ? at->z : NAN;
         ground_    = ground;
@@ -987,7 +1252,8 @@ public:
             const float fc = span > 0 ? (std::max)(0.0f, (std::min)(1.0f, along / span)) : 0.0f;
             travelled      = -fc * std::hypot(b.x - a.x, b.z - a.z);
         }
-        float nextRow = 0;
+        float nextRow  = 0;
+        float prev_mid = NAN;  // the ground under the last row's centre, for the slope along
         for (size_t k = 0; k < n && nextRow <= kAhead; ++k) {
             const size_t              ib = (i + 1) % n;
             const coachhud::RefPoint& a  = ref[i];
@@ -1016,17 +1282,28 @@ public:
                         track.height_at_lap(lap, h);
                         yl = yr = h + offset + kLift;
                     }
-                    // On the track's own ground, each edge where the ground is under it: the
-                    // ribbon takes the bumps along and the camber across.
-                    if (terrain) {
+                    const float nx = -tz, nz = tx;  // the left perpendicular in x/z (y up)
+                    // On the track's own ground grid: each edge on the ground under it, lifted by
+                    // how steep it is there along and across.
+                    float gl, gr;
+                    if (ex && ex->grid && ex->grid->at(cx + nx * kHalfWidth, cz + nz * kHalfWidth, gl) &&
+                        ex->grid->at(cx - nx * kHalfWidth, cz - nz * kHalfWidth, gr)) {
+                        const float mid   = (gl + gr) * 0.5f;
+                        const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
+                        const float lift  = LiftFor(along, (gl - gr) / (2 * kHalfWidth));
+                        yl = gl + lift, yr = gr + lift;
+                        prev_mid = mid;
+                    } else if (terrain) {
                         float la, lb, ra, rb;
                         if (TerrainAt(*ex, i, kHalfWidth, la) && TerrainAt(*ex, ib, kHalfWidth, lb) &&
                             TerrainAt(*ex, i, -kHalfWidth, ra) && TerrainAt(*ex, ib, -kHalfWidth, rb)) {
-                            yl = la + (lb - la) * fc + kLiftTerrain;
-                            yr = ra + (rb - ra) * fc + kLiftTerrain;
+                            const float l = la + (lb - la) * fc, r = ra + (rb - ra) * fc, mid = (l + r) * 0.5f;
+                            const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
+                            const float lift  = LiftFor(along, (l - r) / (2 * kHalfWidth));
+                            yl = l + lift, yr = r + lift;
+                            prev_mid = mid;
                         }
                     }
-                    const float nx = -tz, nz = tx;  // the left perpendicular in x/z (y up)
                     // The point colours, blended between the two points the row sits between;
                     // without any, the cue zones: white, red inside a brake cue's zone.
                     float col[4];
@@ -1060,6 +1337,7 @@ private:
     std::vector<Vert> verts_;
     float             built_for_ = -1.0f, offset_ = 0;
     float             bx_ = NAN, bz_ = NAN, ground_ = NAN;
+    const GroundGrid* grid_ = nullptr;
     size_t            ref_n_ = 0, zones_n_ = 0;
     uint32_t          ver_ = 0;
 };
@@ -1182,20 +1460,28 @@ constexpr int   kSnapN               = 4;
 constexpr float kSnapAt[kSnapN]      = {6.0f, 12.0f, 20.0f, 32.0f};
 constexpr float kSnapMaxM            = 3.0f;   // a correction bigger than this is something else
 constexpr float kSnapLateralM        = 2.0f;   // the hit must be this close to the line across it
-constexpr float kSnapAlpha           = 0.5f;   // each reading's weight in the correction
+constexpr float kSnapAlpha           = 0.25f;  // each reading's weight: one droplet in the depth can't move it
+constexpr float kSnapJumpM           = 0.6f;   // a reading this far from the correction already held is an outlier
 constexpr unsigned kSnapEveryMs      = 200;
 
 /// The height correction by distance ahead.
 class DepthSnap {
 public:
     void reset() {
-        for (int k = 0; k < kSnapN; ++k) have_[k] = false, corr_[k] = 0;
+        for (int k = 0; k < kSnapN; ++k) have_[k] = false, corr_[k] = 0, outliers_[k] = 0;
     }
     /// A reading for probe `k`: the game's surface is `dy` above (negative: below) the ribbon.
     /// False when it is refused as implausible (a bike, a rider, the sky, a far hillside).
     bool feed(int k, float dy) {
         if (k < 0 || k >= kSnapN || !std::isfinite(dy) || std::fabs(dy) > kSnapMaxM) return false;
+        // Rain, a rider crossing, a flag: a reading far from what is held is ignored, unless the
+        // same far value keeps coming (the ground really is there), which the slow blend follows.
+        if (have_[k] && std::fabs(dy - corr_[k]) > kSnapJumpM) {
+            if (++outliers_[k] < 3) return false;
+        }
+        outliers_[k] = 0;
         corr_[k] = have_[k] ? corr_[k] + kSnapAlpha * (dy - corr_[k]) : dy;
+        corr_[k] = (std::max)(-kSnapMaxM, (std::min)(kSnapMaxM, corr_[k]));
         have_[k] = true;
         return true;
     }
@@ -1207,6 +1493,7 @@ public:
     /// The correction `s` metres ahead: between the probes linearly, flat beyond them, from the
     /// probes that have a reading.
     float at(float s) const {
+        if (!std::isfinite(s)) return 0;
         int   lo = -1, hi = -1;
         for (int k = 0; k < kSnapN; ++k) {
             if (!have_[k]) continue;
@@ -1222,8 +1509,9 @@ public:
     float value(int k) const { return have_[k] ? corr_[k] : NAN; }
 
 private:
-    bool  have_[kSnapN] = {false, false, false, false};
-    float corr_[kSnapN] = {0, 0, 0, 0};
+    bool  have_[kSnapN]     = {false, false, false, false};
+    float corr_[kSnapN]     = {0, 0, 0, 0};
+    int   outliers_[kSnapN] = {0, 0, 0, 0};
 };
 
 /// One probe's reading from a depth read back at the ribbon's centre `s` metres ahead: the world

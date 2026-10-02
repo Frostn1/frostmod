@@ -85,6 +85,15 @@ constexpr size_t kEventSuspMaxTravel = 332;
 // The HUD (coachhud.h).
 std::string          g_plugins;  // the folder this .dlo was loaded from
 coachhud::Sheet      g_hud_sheet;
+// The track's own ground (`<track>.ground`, written by MXB Coach from the .trh), and the one-time
+// check that it lines up with the rider (coachline::AlignCheck).
+coachline::GroundGrid g_grid;
+coachline::AlignCheck g_align;
+std::string           g_grid_name;
+ULONGLONG             g_grid_look_ms = 0;
+bool                  g_grid_said_missing = false;
+// Crashes, getting up and the game putting the bike back (coachline::RiderState).
+coachline::RiderState g_rider_state;
 // What the sheet adds to the line on the track: the ground across it and where its lap braked.
 coachline::RibbonExtras g_extras;
 coachhud::RefLap     g_ref;
@@ -580,6 +589,40 @@ void BuildExtras() {
                           std::to_string(coachline::ToneZones(g_hud_sheet.ref, coachline::Tone(g_hud_sheet.ref, g_hud_sheet.drive)).size()) +
                           " braking zones");
     }
+}
+
+/// `<save>\mxbcoach\cues\<track>.ground`: the track's own ground. Looked for at the event and then
+/// once a second until it is there, since MXB Coach writes it within a second or two of seeing
+/// the track ridden.
+void LoadGround(bool quiet) {
+    g_grid_look_ms = GetTickCount64();
+    if (g_event.track.empty() || g_base.empty()) return;
+    const std::string name = coachcue::SafeName(g_event.track) + ".ground";
+    const std::string path = g_base + "cues\\" + name;
+    FILE*             f    = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        if (!quiet || !g_grid_said_missing)
+            Log("ground", "no track grid (" + name + ") yet: MXB Coach writes it from the track's .trh when it sees "
+                          "the track ridden; a locked (.mxbsecure) track can't be read, and there the line snaps "
+                          "to what the game draws instead");
+        g_grid_said_missing = true;
+        return;
+    }
+    std::vector<uint8_t> buf;
+    uint8_t              chunk[65536];
+    size_t               got;
+    while ((got = std::fread(chunk, 1, sizeof(chunk), f)) > 0 && buf.size() < (64u << 20)) buf.insert(buf.end(), chunk, chunk + got);
+    std::fclose(f);
+    if (!g_grid.parse(buf.data(), buf.size())) {
+        Log("ground", "track grid " + name + " didn't read; the line snaps to what the game draws instead");
+        return;
+    }
+    g_grid_name = name;
+    g_align.reset();
+    char msg[200];
+    std::snprintf(msg, sizeof(msg), "track grid %s: %ux%u at %.2f m, on from the first second; checking it lines up",
+                  name.c_str(), g_grid.width(), g_grid.height(), double(g_grid.step()));
+    Log("ground", msg);
 }
 
 void LoadHud(bool quiet = false) {
@@ -1228,8 +1271,12 @@ struct LastCam {
     int             axes = 0;
 } g_last_cam;
 // Why a frame with a camera drew nothing, counted and logged every 10 s.
-enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_COUNT };
-const char* const kWhyName[WHY_COUNT] = {"no_ribbon", "offscreen_fbo", "core_profile", "gl_error", "stale_redraw", "held_no_draw"};
+enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_DOWN, WHY_EYE, WHY_COUNT };
+const char* const kWhyName[WHY_COUNT] = {"no_ribbon",    "offscreen_fbo", "core_profile", "gl_error",
+                                         "stale_redraw", "held_no_draw",  "rider_down",   "camera_off_bike"};
+coachline::EyeWatch g_eye;
+unsigned            g_seen_gen = 0;
+bool                g_line_on_ground = false;  // the line is on the track's own ground: no snap
 unsigned g_why[WHY_COUNT] = {};
 ULONGLONG                g_cam_since = 0;  // when a camera was last found (or the search began)
 int                      g_source    = 0;  // 0 none, 1 uniform, 2 modelview, 3 fallback
@@ -1901,7 +1948,7 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         g_dsnap_reset = false;
     }
     // Without the track's own ground, snap to what the game drew, a few times a second.
-    if (depth_ok && g_depth != DEPTH_NONE && !g_extras.terrain_k) SnapProbe(proj, coachline::Mul(view, model), ax);
+    if (depth_ok && g_depth != DEPTH_NONE && !g_line_on_ground) SnapProbe(proj, coachline::Mul(view, model), ax);
     g_orig_mode(GL_PROJECTION);
     glPushMatrix();
     g_orig_loadf(proj.m);
@@ -1934,15 +1981,24 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         glEnable(GL_POLYGON_OFFSET_FILL);
         // On the track's own ground the ribbon sits 2 cm up and needs only a nudge to win the
         // depth test: painted on the dirt, not floating over it. On centreline heights, more.
-        const float pull = g_extras.terrain_k ? 1.0f : 2.0f;
-        glPolygonOffset(g_depth == DEPTH_GEQUAL ? pull : -pull, g_depth == DEPTH_GEQUAL ? 2.0f * pull : -2.0f * pull);
+        // A slope factor and a constant big enough to beat the terrain mesh's own small
+        // departures from the track's height file (a few depth units is ~1 cm at 30 m with this
+        // near plane, and the mesh is off by more): the line blinked where they fought.
+        glPolygonOffset(g_depth == DEPTH_GEQUAL ? 2.0f : -2.0f, g_depth == DEPTH_GEQUAL ? 30.0f : -30.0f);
     }
     glShadeModel(GL_SMOOTH);  // a colour per vertex, blended across each quad: fades, not seams
     glBegin(GL_TRIANGLE_STRIP);
-    for (const coachline::Vert& p : v) {
+    // Nothing that isn't a number reaches GL: a vertex with one takes the last good height on
+    // its side of the ribbon, or is left out with the rest of the strip from there.
+    float last_y[2] = {NAN, NAN};
+    for (size_t i = 0; i < v.size(); ++i) {
+        const coachline::Vert& p = v[i];
+        float y = g_line_on_ground ? p.y : p.y + g_dsnap.at(p.s);
+        if (!std::isfinite(y)) y = last_y[i & 1];
+        if (!std::isfinite(y) || !std::isfinite(p.x) || !std::isfinite(p.z)) break;
+        last_y[i & 1] = y;
         glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3] * coachline::Fade(p.s));
         float gx, gy, gz;
-        const float y = g_extras.terrain_k ? p.y : p.y + g_dsnap.at(p.s);
         ax.apply(p.x, y, p.z, gx, gy, gz);
         glVertex3f(gx, gy, gz);
     }
@@ -2085,6 +2141,33 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         for (int k = 0; k < coachline::kNumAxes; ++k)
                             if (coachline::AxesName(coachline::AxesAt(k)) == coachline::AxesName(ax)) g_last_cam.axes = k;
                     }
+                    // The camera being followed must stay where it has been relative to the bike: the
+                    // crash camera, a replay view or a wrong object drifts off, and is let go.
+                    if (source == 2 && g_mv_best.ok && !g_eye.ok(g_mv_best.dist, now)) {
+                        Log("ground", "camera moved off the bike (eye " + std::to_string(g_mv_best.dist) + " m, usually " +
+                                          std::to_string(g_eye.usual()) + " m); finding it again");
+                        g_follow.reset();
+                        g_mv_lock.reset();
+                        g_eye.reset();
+                        g_last_cam.ok = false;
+                        ++g_why[WHY_EYE];
+                        source = 0;
+                    }
+                    // Down, getting up, or put back on the track: hidden, and everything built from
+                    // the old position is started again - the ribbon (re-anchored at the bike's real
+                    // position), the ground snap, the camera being followed. Never a stale camera.
+                    if (g_rider_state.generation() != g_seen_gen) {
+                        g_seen_gen = g_rider_state.generation();
+                        g_follow.reset();
+                        g_last_cam.ok = false;
+                        g_ribbon.clear();
+                        g_dsnap_reset = true;
+                        g_eye.reset();
+                    }
+                    if (!g_rider_state.visible()) {
+                        ++g_why[WHY_DOWN];
+                        source = 0;
+                    }
                     const bool held = source == -2;
                     if (held) source = 2;
                     if (source == 1 || source == 2) g_cam_since = now;
@@ -2098,6 +2181,9 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         LogUniforms(aspect, pk);
                         LogSources(aspect, have_wp ? &wp : nullptr);
                     }
+                    // The track's own grid, once it is known to line up (or until the check says).
+                    g_extras.grid = g_grid.ready() && (!g_align.result().done || g_align.result().ok) ? &g_grid : nullptr;
+                    g_line_on_ground = g_extras.grid != nullptr || g_extras.terrain_k != 0;
                     if (source && !held) {
                         ++g_u_picked;
                         const float lapM = g_track.ready() ? g_track.length() : 0.0f;
@@ -2133,6 +2219,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                       " picked=" + std::to_string(g_u_picked - g_prev_picked) +
                                       " drawn=" + std::to_string(g_gl.n_drawn - g_prev_drawn) + " (last 10 s)" +
                                       " snap=" + [] {
+                                          if (g_line_on_ground) return std::string("off (on the track's own ground)");
                                           std::string o;
                                           for (int k = 0; k < coachline::kSnapN; ++k) {
                                               char b[24];
@@ -2303,6 +2390,10 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     Log("event", coachlog::EventText(g_event.type, g_event.track, g_event.bike, g_event.track_len, g_event.server));
     LoadCues();
     LoadHud();
+    g_grid.clear();
+    g_grid_said_missing = false;
+    LoadGround(false);
+    g_rider_state.reset();
     g_voice.failed = false;
     ReadVoiceSettings(true);
     // Before any stint, only a testing event is practice; a race event waits for its session.
@@ -2316,6 +2407,8 @@ __declspec(dllexport) void EventDeinit() {
     g_cues.clear();
     g_cue_file.clear();
     g_hud_sheet = coachhud::Sheet{};
+    g_grid.clear();
+    g_align.reset();
     BuildExtras();
     g_hud_file.clear();
     g_ref.load({});
@@ -2468,6 +2561,17 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         // learnt while riding. Not while crashed or crawling, when the bike may be in a ditch.
         float centre_h = 0;
         if (!crashed && speed > 3.0f && g_track.height_at_lap(_fPos, centre_h)) g_height.add(g_rider_y - centre_h);
+        g_rider_state.sample(_fTime, crashed, here.x, g_rider_y, here.y);
+        // The one-time check that the track's grid and the telemetry share a frame.
+        if (!crashed && speed > 3.0f && g_grid.ready() && g_align.add(g_grid, here.x, g_rider_y, here.y)) {
+            const coachline::Alignment& a = g_align.result();
+            char msg[220];
+            std::snprintf(msg, sizeof(msg), "trh aligned dx=%.0f dz=%.0f dy=%.2f spread=%.2f (%d samples on the grid)%s",
+                          double(a.dx), double(a.dz), double(a.dy), double(a.spread), a.on_grid,
+                          a.ok ? "" : " - NOT this track's ground; the line snaps to what the game draws instead");
+            Log("ground", msg);
+            if (a.ok) g_grid.shift(a.dx, a.dz);
+        }
         g_have_sample = true;
         // How much of each shock's travel is in use, and the deepest it has been this stint.
         g_have_susp = g_susp_travel[0] > 0 || g_susp_travel[1] > 0;
@@ -2490,6 +2594,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     // Only does anything while a sheet is missing: see coachcue::ShouldLook.
     LookForCues(false);
     LookForHud(false);
+    if (!g_grid.ready() && GetTickCount64() - g_grid_look_ms >= 1000) LoadGround(true);
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries

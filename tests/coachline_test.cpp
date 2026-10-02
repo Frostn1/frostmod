@@ -809,10 +809,12 @@ int main(int argc, char** argv) {
         CHECK(tr.update(line, flat, 0.1f, 0.0f, {}, &ex), "a ribbon on the track's ground");
         const auto& tv = tr.verts();
         CHECK(tv.size() == 2 * size_t(kAhead / kStepTerrain + 1), "rows every half metre: %zu verts", tv.size());
-        float worst = 0;
-        for (const Vert& x : tv) worst = (std::max)(worst, std::fabs(x.y - (H(x.x, x.z) + kLiftTerrain)));
-        // Within what a metre between samples can show of 5 m whoops (0.35 m high: 7 cm at most).
-        CHECK(worst < 0.08f, "every vertex sits on the ground plus the lift, worst off by %f m", worst);
+        // On the ground plus its slope-dependent lift, within what a metre between samples can show
+        // of 5 m whoops (0.35 m high: 7 cm at most).
+        float lo = 1e9f, hi = -1e9f;
+        for (const Vert& x : tv) lo = (std::min)(lo, x.y - H(x.x, x.z)), hi = (std::max)(hi, x.y - H(x.x, x.z));
+        CHECK(lo > kLiftBase - 0.08f && hi < kLiftMax + 0.08f, "every vertex on the ground plus its lift: %f..%f m", double(lo),
+              double(hi));
         bool camber = true;
         for (size_t i = 0; i + 1 < tv.size(); i += 2)
             if (!(tv[i].y > tv[i + 1].y)) camber = false;  // left (+z) is the higher side of this camber
@@ -1083,6 +1085,170 @@ int main(int argc, char** argv) {
         CHECK(dt[375] > 0.3f && dt[375] < 0.7f, "throttle 0.15 is between: %f", double(dt[375]));
         CHECK(dt[525] > 2.4f, "the brake at 0.8 is red: %f", double(dt[525]));
         CHECK(std::string(ColourSource(line, drive)) == "DRIV", "source=DRIV with it");
+    }
+
+    // --- v0.43.4: the track's own ground grid, crashes, and the blinking -----------------------
+    {
+        // A grid file as Coach writes it: 300 x 200 at 1 m, a 3 m swell with whoops on it.
+        auto H = [](float x, float z) {
+            return 5.0f + 3.0f * std::sin(x / 80.0f) + 0.3f * std::sin(x / 4.0f * 6.2831853f) + 0.05f * z;
+        };
+        const uint32_t W = 300, Hn = 200;
+        std::vector<unsigned char> gb;
+        auto put = [&gb](const void* p, size_t n) {
+            gb.insert(gb.end(), static_cast<const unsigned char*>(p), static_cast<const unsigned char*>(p) + n);
+        };
+        auto u32 = [&](uint32_t v) { put(&v, 4); };
+        auto f32 = [&](float v) { put(&v, 4); };
+        put("MXGR", 4), u32(1), u32(W), u32(Hn), f32(1.0f), f32(0), f32(0), f32(0.0f), f32(0.001f);
+        for (uint32_t r = 0; r < Hn; ++r)
+            for (uint32_t c = 0; c < W; ++c) {
+                const uint16_t q = uint16_t(std::lround(H(float(c), float(r)) / 0.001f));
+                put(&q, 2);
+            }
+        GroundGrid grid;
+        CHECK(grid.parse(gb.data(), gb.size()) && grid.ready() && grid.width() == W, "the grid file reads");
+        float g = 0;
+        CHECK(grid.at(100.5f, 50.25f, g) && std::fabs(g - H(100.5f, 50.25f)) < 0.1f, "bilinear (4 m whoops at 1 m samples): %f vs %f", double(g),
+              double(H(100.5f, 50.25f)));
+        CHECK(!grid.at(-1, 5, g) && !grid.at(5, 500, g), "off the grid is unknown");
+        std::vector<unsigned char> bad = gb;
+        bad[4] = 2;
+        GroundGrid g2;
+        CHECK(!g2.parse(bad.data(), bad.size()) && !g2.parse(gb.data(), 100), "a wrong version or a short file is refused");
+
+        // Its alignment with the rider: the bike 0.6 m above the ground, a little noise.
+        AlignCheck al;
+        bool done = false;
+        for (int i = 0; i < kAlignSamples && !done; ++i) {
+            const float x = 20.0f + float(i) * 1.2f, z = 100.0f + 10.0f * std::sin(float(i) * 0.05f);
+            done = al.add(grid, x, H(x, z) + 0.6f + 0.05f * std::sin(float(i)), z);
+        }
+        CHECK(done && al.result().ok && al.result().dx == 0 && al.result().dz == 0 && std::fabs(al.result().dy - 0.6f) < 0.05f,
+              "trh aligned dx=%.0f dz=%.0f dy=%.2f spread=%.2f", double(al.result().dx), double(al.result().dz),
+              double(al.result().dy), double(al.result().spread));
+        // Shifted 2 m in x (a grid whose origin is off by two samples): found and corrected.
+        AlignCheck al2;
+        done = false;
+        for (int i = 0; i < kAlignSamples && !done; ++i) {
+            const float x = 20.0f + float(i) * 1.2f, z = 100.0f;
+            done = al2.add(grid, x, H(x + 2.0f, z) + 0.6f, z);
+        }
+        CHECK(done && al2.result().ok && al2.result().dx == 2.0f, "a 2 m shift is found: dx=%.0f", double(al2.result().dx));
+        // Another track's ground: the bike's height above it wanders by metres.
+        AlignCheck al3;
+        done = false;
+        for (int i = 0; i < kAlignSamples && !done; ++i) {
+            const float x = 20.0f + float(i) * 1.2f, z = 100.0f;
+            done = al3.add(grid, x, 10.0f + 4.0f * std::sin(float(i) * 0.37f), z);
+        }
+        CHECK(done && !al3.result().ok, "the wrong ground is refused: spread %.2f", double(al3.result().spread));
+
+        // The ribbon on the grid: every edge on the ground, lifted by the slope, never under it.
+        std::vector<unsigned char> sg(28, 0);
+        PutF(&sg[4], 300.0f);
+        coachhud::Track flat;
+        flat.build(1, sg.data(), 28, nullptr);
+        std::vector<coachhud::RefPoint> line;
+        for (int i = 0; i <= 290; ++i) {
+            coachhud::RefPoint r;
+            r.pos = float(i) / 291.0f, r.t = float(i) * 0.05f, r.x = float(i) + 2.0f, r.z = 100.0f;
+            line.push_back(r);
+        }
+        RibbonExtras ex;
+        ex.version = 1, ex.grid = &grid;
+        Anchor at;
+        at.x = line[50].x, at.z = 100.0f, at.ground = 0.0f;  // a wrong ground estimate: the grid wins
+        Ribbon rb2;
+        CHECK(rb2.update(line, flat, line[50].pos, 0.0f, {}, &ex, &at), "a ribbon on the grid");
+        float worst_under = 0, worst_over = 0;
+        for (const Vert& x : rb2.verts()) {
+            const float d = x.y - H(x.x, x.z);
+            worst_under   = (std::min)(worst_under, d);
+            worst_over    = (std::max)(worst_over, d);
+        }
+        CHECK(worst_under >= -0.01f, "never under the ground: %f", double(worst_under));
+        CHECK(worst_over <= kLiftMax + 0.02f, "and at most %.2f m over it: %f", double(kLiftMax), double(worst_over));
+        CHECK(LiftFor(0, 0) == kLiftBase && LiftFor(0.5f, 0) > LiftFor(0.1f, 0) && LiftFor(5, 5) == kLiftMax,
+              "more lift where it is steep, capped");
+    }
+
+    // Crashes, replayed: riding, down, sliding, up, then the game putting the bike back 40 m away.
+    {
+        RiderState rs;
+        rs.reset();
+        float t = 0, x = 100, z = 100;
+        auto ride = [&](int n, bool crashed, float dx) {
+            for (int i = 0; i < n; ++i) t += 0.02f, x += dx, rs.sample(t, crashed, x, 2.0f, z);
+        };
+        ride(100, false, 0.4f);
+        CHECK(rs.visible(), "riding: shown");
+        const unsigned g0 = rs.generation();
+        ride(5, true, 0.4f);
+        CHECK(!rs.visible() && rs.phase() == RiderState::DOWN && rs.generation() > g0, "down: hidden, everything restarts");
+        ride(150, true, 0.05f);  // sliding along on the ground
+        CHECK(!rs.visible(), "still hidden while down");
+        const unsigned g1 = rs.generation();
+        ride(10, false, 0.0f);   // up
+        CHECK(!rs.visible() && rs.generation() > g1, "getting up: still hidden, and started again");
+        ride(int(kSettleS / 0.02f) + 2, false, 0.0f);
+        CHECK(rs.visible(), "shown again after %.2f s", double(kSettleS));
+        const unsigned g2 = rs.generation();
+        x -= 40.0f;               // the game puts the bike back on the track
+        ride(1, false, 0.0f);
+        CHECK(!rs.visible() && rs.generation() > g2 && rs.resets() == 1, "a 40 m jump is a reset: hidden, restarted");
+        ride(int(kSettleS / 0.02f) + 2, false, 0.4f);
+        CHECK(rs.visible() && rs.crashes() == 1, "and shown again; one crash, one reset");
+
+        // The camera through it: a helmet camera 1.63 m off the bike; the crash camera 6 m off.
+        EyeWatch ew;
+        bool     ok = true;
+        unsigned long long now = 0;
+        for (int i = 0; i < 100; ++i) ok = ew.ok(1.63f + 0.02f * std::sin(float(i)), now += 10) && ok;
+        CHECK(ok, "the helmet camera is fine");
+        CHECK(ew.ok(6.0f, now += 10) && ew.ok(6.0f, now += 100), "a 0.1 s blip is ridden out");
+        CHECK(ew.ok(1.63f, now += 10), "and forgotten");
+        bool kept = true;
+        for (int i = 0; i < 40; ++i) kept = ew.ok(6.0f, now += 10) && kept;
+        CHECK(!kept, "6 m off for 0.4 s: let go and found again");
+
+        // And after the reset, the ribbon starts at the bike's real place, not where it was.
+        coachhud::Sheet sh;
+        const std::vector<unsigned char> f =
+            ReadFile(std::string(COACHLINE_DATA) + "/755_Compound.MX2OEM_2023_KTM_250_SX-F.hud");
+        if (coachhud::Parse(f.data(), f.size(), sh)) {
+            coachhud::Track tk;
+            BuildTrack(tk, sh.track_len, 10.0f);
+            Ribbon rr;
+            Anchor a1;
+            a1.x = sh.ref[400].x, a1.z = sh.ref[400].z, a1.ground = 2;
+            rr.update(sh.ref, tk, sh.ref[400].pos, 0, {}, nullptr, &a1);
+            rr.clear();  // what a new generation does
+            Anchor a2;
+            a2.x = sh.ref[360].x + 0.5f, a2.z = sh.ref[360].z, a2.ground = 2;  // put back 40 points earlier
+            rr.update(sh.ref, tk, sh.ref[360].pos, 0, {}, nullptr, &a2);
+            const auto& v = rr.verts();
+            CHECK(!v.empty() && std::hypot((v[0].x + v[1].x) * 0.5f - a2.x, (v[0].z + v[1].z) * 0.5f - a2.z) < 1.5f,
+                  "after the reset the ribbon starts at the bike");
+        }
+    }
+
+    // The depth snap's bad samples: NaN, the far plane, a droplet, a single outlier.
+    {
+        DepthSnap sn;
+        CHECK(!sn.feed(0, NAN) && !sn.feed(0, INFINITY) && !sn.any(), "NaN and infinity are refused");
+        CHECK(sn.feed(1, 0.2f), "a good reading");
+        CHECK(!sn.feed(1, 2.5f) && std::fabs(sn.at(12) - 0.2f) < 1e-4f, "a single 2.3 m outlier (rain, a rider) is ignored");
+        CHECK(!sn.feed(1, 9.0f), "and a far-plane hit is out of range");
+        sn.feed(1, 0.25f);
+        CHECK(std::fabs(sn.at(12) - 0.2125f) < 1e-3f, "readings blend slowly: %f", double(sn.at(12)));
+        CHECK(sn.at(NAN) == 0.0f, "no NaN out of it either");
+        std::vector<Vert> rv;
+        for (int i = 0; i <= 40; ++i) {
+            rv.push_back({float(i), 1.0f, 0.35f, float(i), {1, 1, 1, 1}});
+            rv.push_back({float(i), 1.0f, -0.35f, float(i), {1, 1, 1, 1}});
+        }
+        CHECK(!std::isfinite(SnapReading(rv, sn, NAN, 1.0f, 0.0f, -50, 0)), "a NaN hit gives no reading");
     }
 
     if (g_failures) {

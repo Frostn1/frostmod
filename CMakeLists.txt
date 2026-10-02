@@ -309,6 +309,11 @@ add_test(NAME coachhud COMMAND coachhud_test)
 add_executable(coachline_test tests/coachline_test.cpp)
 target_compile_definitions(coachline_test PRIVATE COACHLINE_DATA="${CMAKE_SOURCE_DIR}/tests/data")
 add_test(NAME coachline COMMAND coachline_test)
+# The ground line colours: gas green, coast white, brake yellow to red, blended (src/coachcolor.h).
+add_executable(coachcolor_test tests/coachcolor_test.cpp)
+add_test(NAME coachcolor COMMAND coachcolor_test)
+# Offline renderer: a top-down PNG of the coloured line for a .hud sheet (a tool, not a test).
+add_executable(coachcolor_render tools/coachcolor_render.cpp)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

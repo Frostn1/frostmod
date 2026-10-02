@@ -471,6 +471,7 @@ struct ModelviewPick {
     Mat4  view;
     int   axes = -1;
     float dist = 0;
+    float jump = 0;  // from the camera being followed, when one is (CameraFollow)
 };
 
 /// How far from the bike's origin the chase or helmet camera sits, at most, for the modelview
@@ -608,12 +609,14 @@ private:
 struct Vert {
     float x, y, z;  // telemetry world
     float s;        // metres along the line from the rider, for the fade
-    bool  brake;    // in one of Coach's braking zones
+    float rgba[4];  // its colour, from RibbonExtras::rgba (LineColours) or the cue zones
 };
 
-constexpr float kStep         = 2.0f;   // metres between ribbon rows
+constexpr float kStep         = 2.0f;   // metres between ribbon rows, on centreline heights
+constexpr float kStepTerrain  = 0.5f;   // and on the track's own ground, to follow its bumps
 constexpr float kHalfWidth    = 0.35f;  // half the painted line's width
-constexpr float kLift         = 0.06f;  // above the surface; polygon offset does the rest
+constexpr float kLift         = 0.06f;  // above the centreline height; polygon offset does the rest
+constexpr float kLiftTerrain  = 0.02f;  // above the track's own ground: painted on, not floating
 constexpr float kAhead        = 60.0f;  // metres drawn ahead
 constexpr float kFadeNear     = 25.0f;
 constexpr float kFadeFar      = 60.0f;
@@ -632,8 +635,9 @@ struct Zone {
 };
 
 /// Coach's braking zones from its cue sheet: from each BRAKE cue to the next OFF_BRAKES or
-/// THROTTLE cue, at most kMaxBrakeZone long. A sheet without brake cues has none, and the
-/// ribbon is all blue.
+/// THROTTLE cue, at most kMaxBrakeZone long. The fallback when the sheet's lap can't say where
+/// it slowed (Tone below): a sheet carries three or four cues, a lap has a corner every few
+/// seconds.
 inline std::vector<Zone> BrakeZones(const coachcue::Sheet& s, float lap_m) {
     std::vector<Zone> out;
     const size_t n = s.cues.size();
@@ -660,23 +664,207 @@ inline bool InZone(const std::vector<Zone>& zones, float m, float lap_m) {
     return false;
 }
 
+// ---------------------------------------------------------------------------------------
+// How Coach's lap was ridden along the line: its tone
+//
+// One continuous value per point, 0..3, read off a gradient: 0 green (on the gas), 1 white
+// (coasting: off the gas, off the brakes), 2 yellow (light braking), 3 red (heavy braking).
+// Made from two continuous channels, a throttle weight and a braking intensity, so a change
+// shows as a fade, never a seam:
+//
+//     tone = 1 - throttle * (1 - brake) + 2 * brake
+//
+// The channels come from the sheet's "DRIV" chunk when it has one (throttle, brake, and speed for
+// the deceleration), otherwise from the lap's own times and positions: accelerating reads as
+// throttle, decelerating as braking. Deceleration counts toward braking either way, so a rider
+// who scrubs speed without much lever still shows yellow. Then the tone is smoothed along the
+// line with a Gaussian (kToneSigmaM), and the ribbon interpolates it between its rows, which GL
+// in turn shades smoothly across each quad.
+
+constexpr float kDecelLight  = 1.5f;   // m/s^2: below this, not braking
+constexpr float kDecelHard   = 8.0f;   // m/s^2: and from here, hard on the brakes
+constexpr float kAccelGas    = 0.3f;   // m/s^2: from here, on the gas (without a throttle channel)
+constexpr float kAccelFull   = 2.0f;   // m/s^2: and fully on it
+constexpr float kSpeedWindowM = 4.0f;  // metres either side the speed and its change are taken over
+constexpr float kToneSigmaM  = 1.5f;   // the Gaussian along the line: a fade over 3-5 m
+constexpr float kZoneTone    = 2.0f;   // a braking zone is where the tone reaches yellow
+constexpr float kZoneMinM    = 4.0f;   // and stays there this long
+constexpr float kZoneMergeM  = 12.0f;  // two zones this close are one corner
+
+/// The tone at each of Coach's points, 0..3. Empty when the lap can't say (fewer than a handful
+/// of points, or time that doesn't advance).
+inline std::vector<float> Tone(const std::vector<coachhud::RefPoint>& ref, const std::vector<float>& drive = {}) {
+    const size_t n = ref.size();
+    std::vector<float> out;
+    if (n < 8) return out;
+    std::vector<float> s(n, 0.0f);  // metres along the lap
+    for (size_t i = 1; i < n; ++i) {
+        const float d = std::hypot(ref[i].x - ref[i - 1].x, ref[i].z - ref[i - 1].z);
+        s[i]          = s[i - 1] + (d < kMaxGapM ? d : 0.0f);
+    }
+    if (!(s.back() > 50.0f)) return out;
+    auto span = [&](size_t i, float w, size_t& lo, size_t& hi) {
+        lo = i, hi = i;
+        while (lo > 0 && s[i] - s[lo] < w) --lo;
+        while (hi + 1 < n && s[hi] - s[i] < w) ++hi;
+    };
+    const bool have_drive = drive.size() == n * 3;
+    std::vector<float> v(n, -1.0f);
+    for (size_t i = 0; i < n; ++i) {
+        if (have_drive) {
+            v[i] = drive[i * 3];
+            continue;
+        }
+        size_t lo, hi;
+        span(i, kSpeedWindowM, lo, hi);
+        const float dt = ref[hi].t - ref[lo].t;
+        if (dt > 1e-3f) v[i] = (s[hi] - s[lo]) / dt;
+    }
+    std::vector<float> raw(n, 1.0f);
+    size_t             known = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t lo, hi;
+        span(i, kSpeedWindowM, lo, hi);
+        const float dt = ref[hi].t - ref[lo].t;
+        if (!(dt > 1e-3f) || v[lo] < 0 || v[hi] < 0) continue;
+        ++known;
+        const float accel = (v[hi] - v[lo]) / dt;
+        auto ramp = [](float x, float a, float b) { return (std::max)(0.0f, (std::min)(1.0f, (x - a) / (b - a))); };
+        float brake    = ramp(-accel, kDecelLight, kDecelHard);
+        float throttle = ramp(accel, kAccelGas, kAccelFull);
+        if (have_drive) {
+            brake    = (std::max)(brake, drive[i * 3 + 2]);
+            throttle = drive[i * 3 + 1];
+        }
+        raw[i] = 1.0f - throttle * (1.0f - brake) + 2.0f * brake;
+    }
+    if (known < n / 2) return out;
+    // The Gaussian along the line, out to three sigma.
+    out.assign(n, 1.0f);
+    for (size_t i = 0; i < n; ++i) {
+        size_t lo, hi;
+        span(i, 3.0f * kToneSigmaM, lo, hi);
+        float sum = 0, wsum = 0;
+        for (size_t k = lo; k <= hi; ++k) {
+            const float d = (s[k] - s[i]) / kToneSigmaM;
+            const float w = std::exp(-0.5f * d * d);
+            sum += w * raw[k], wsum += w;
+        }
+        out[i] = wsum > 0 ? sum / wsum : raw[i];
+    }
+    return out;
+}
+
+/// The braking zones in a tone profile, as point index ranges [from, to): where the tone holds
+/// yellow or redder for kZoneMinM, zones closer than kZoneMergeM joined into one corner.
+inline std::vector<std::pair<size_t, size_t>> ToneZones(const std::vector<coachhud::RefPoint>& ref,
+                                                        const std::vector<float>& tone) {
+    std::vector<std::pair<size_t, size_t>> out;
+    if (tone.size() != ref.size()) return out;
+    auto dist = [&](size_t a, size_t b) {
+        float d = 0;
+        for (size_t i = a; i < b && i + 1 < ref.size(); ++i) {
+            const float s = std::hypot(ref[i + 1].x - ref[i].x, ref[i + 1].z - ref[i].z);
+            d += s < kMaxGapM ? s : 0.0f;
+        }
+        return d;
+    };
+    for (size_t i = 0; i < tone.size();) {
+        if (tone[i] < kZoneTone) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < tone.size() && tone[j] >= kZoneTone) ++j;
+        if (!out.empty() && dist(out.back().second, i) < kZoneMergeM) out.back().second = j;
+        else out.push_back({i, j});
+        i = j;
+    }
+    std::vector<std::pair<size_t, size_t>> kept;
+    for (const auto& z : out)
+        if (dist(z.first, z.second) >= kZoneMinM) kept.push_back(z);
+    return kept;
+}
+
+/// The gradient: green, white, yellow, red at tone 0, 1, 2, 3, linear between. Saturated a
+/// little past the pure colours, so they read on brown dirt at the ribbon's 0.7 alpha.
+inline void ToneColour(float t, float& r, float& g, float& b) {
+    static const float stops[4][3] = {{0.15f, 0.85f, 0.20f},   // gas
+                                      {0.97f, 0.97f, 0.97f},   // coast
+                                      {1.00f, 0.86f, 0.05f},   // light brake
+                                      {0.95f, 0.12f, 0.08f}};  // heavy brake
+    t = (std::max)(0.0f, (std::min)(3.0f, t));
+    const int   i = (std::min)(2, int(t));
+    const float f = t - float(i);
+    r = stops[i][0] + (stops[i + 1][0] - stops[i][0]) * f;
+    g = stops[i][1] + (stops[i + 1][1] - stops[i][1]) * f;
+    b = stops[i][2] + (stops[i + 1][2] - stops[i][2]) * f;
+}
+
+/// The line's alpha: readable on dirt without hiding it.
+constexpr float kLineAlpha = 0.7f;
+
+/// The line's colour at each of Coach's points, RGBA (4 floats a point), or empty when the lap
+/// can't say. Today the Tone gradient; the one place a different colouring plugs in.
+inline std::vector<float> LineColours(const std::vector<coachhud::RefPoint>& ref, const std::vector<float>& drive = {}) {
+    const std::vector<float> tone = Tone(ref, drive);
+    std::vector<float>       out;
+    out.reserve(tone.size() * 4);
+    for (float t : tone) {
+        float r, g, b;
+        ToneColour(t, r, g, b);
+        out.insert(out.end(), {r, g, b, kLineAlpha});
+    }
+    return out;
+}
+
+/// What the sheet adds to the ribbon beyond its points: the ground across the line ("TRRN") and
+/// how the lap was ridden at each point (Tone). Built once per sheet; `version` changes with it.
+struct RibbonExtras {
+    uint32_t           version = 0;
+    uint32_t           terrain_k = 0;
+    float              terrain_step = 0;
+    std::vector<float> terrain;  // per point x K, NaN off the grid
+    // The line's colour at each point, RGBA, 4 floats a point; empty when unknown. Filled by
+    // one function (LineColours today), so a better colouring is a one-line swap.
+    std::vector<float> rgba;
+};
+
+/// The track's ground `off` metres to the left of point `i` (negative: right), from its TRRN
+/// row. False off the grid or without one.
+inline bool TerrainAt(const RibbonExtras& ex, size_t i, float off, float& h) {
+    const uint32_t k = ex.terrain_k;
+    if (!k || ex.terrain.size() < (i + 1) * k) return false;
+    float f = off / ex.terrain_step + float(k - 1) * 0.5f;
+    if (f < 0 || f > float(k - 1)) return false;
+    const size_t j  = (std::min)(size_t(f), size_t(k - 2));
+    const float  fr = f - float(j);
+    const float  a = ex.terrain[i * k + j], b = ex.terrain[i * k + j + 1];
+    if (!std::isfinite(a) || !std::isfinite(b)) return false;
+    h = a + (b - a) * fr;
+    return true;
+}
+
 /// The ribbon cache. Rebuilt when the rider has moved kRebuildM along the lap, or the height
-/// offset or the zones changed, not per frame; the per-frame cost is one pass over the strip.
+/// offset, the zones or the sheet changed, not per frame; the per-frame cost is one pass.
 class Ribbon {
 public:
     /// `ref`: Coach's points (lap position and world x/z). `track`: centreline heights.
-    /// `pos`: the rider's lap fraction. `offset`: HeightBias::offset(). `zones`: braking zones.
+    /// `pos`: the rider's lap fraction. `offset`: HeightBias::offset(). `zones`: cue braking
+    /// zones, used only when `ex` has no colours. `ex`: the sheet's ground and colours, or null.
     /// Returns true when verts() changed.
     bool update(const std::vector<coachhud::RefPoint>& ref, const coachhud::Track& track, float pos, float offset,
-                const std::vector<Zone>& zones = {}) {
+                const std::vector<Zone>& zones = {}, const RibbonExtras* ex = nullptr) {
         if (ref.size() < 2 || !track.ready() || track.length() <= 0 || !std::isfinite(pos) || pos < 0 || pos > 1 ||
             !std::isfinite(offset)) {
             const bool had = !verts_.empty();
             clear();
             return had;
         }
-        const float lapM = track.length();
-        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && std::fabs(offset - offset_) < 0.1f) {
+        const float    lapM = track.length();
+        const uint32_t ver  = ex ? ex->version : 0;
+        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver &&
+            std::fabs(offset - offset_) < 0.1f) {
             float d = std::fabs(pos - built_for_) * lapM;
             d       = (std::min)(d, lapM - d);
             if (d < kRebuildM) return false;
@@ -684,8 +872,14 @@ public:
         built_for_ = pos;
         ref_n_     = ref.size();
         zones_n_   = zones.size();
+        ver_       = ver;
         offset_    = offset;
         verts_.clear();
+        const bool  terrain = ex && ex->terrain_k && ex->terrain.size() == ref.size() * ex->terrain_k;
+        const bool  coloured = ex && ex->rgba.size() == ref.size() * 4;
+        // Rows every half metre either way: the ground's bumps need them, and so does the colour,
+        // which fades over a few metres and must not be stepped.
+        const float step    = kStepTerrain;
         // The segment the rider is on: the last point at or behind them, wrapping the lap.
         const size_t n  = ref.size();
         size_t       i0 = 0;
@@ -704,8 +898,9 @@ public:
         }
         float nextRow = 0;
         for (size_t k = 0; k < n && nextRow <= kAhead; ++k) {
-            const coachhud::RefPoint& a = ref[i];
-            const coachhud::RefPoint& b = ref[(i + 1) % n];
+            const size_t              ib = (i + 1) % n;
+            const coachhud::RefPoint& a  = ref[i];
+            const coachhud::RefPoint& b  = ref[ib];
             const float dx = b.x - a.x, dz = b.z - a.z;
             const float len = std::sqrt(dx * dx + dz * dz);
             // A long jump between points is the sheet's two ends meeting across the infield.
@@ -718,39 +913,113 @@ public:
                     lap -= std::floor(lap);
                     float h = 0;
                     track.height_at_lap(lap, h);
-                    const float cx = a.x + fc * dx, cz = a.z + fc * dz, cy = h + offset + kLift;
-                    const float nx = -tz, nz = tx;  // the perpendicular in x/z (y up)
-                    const bool  br = InZone(zones, lap * lapM, lapM);
-                    verts_.push_back({cx + nx * kHalfWidth, cy, cz + nz * kHalfWidth, nextRow, br});
-                    verts_.push_back({cx - nx * kHalfWidth, cy, cz - nz * kHalfWidth, nextRow, br});
-                    nextRow += kStep;
+                    const float cx = a.x + fc * dx, cz = a.z + fc * dz;
+                    float       yl = h + offset + kLift, yr = yl;
+                    // On the track's own ground, each edge where the ground is under it: the
+                    // ribbon takes the bumps along and the camber across.
+                    if (terrain) {
+                        float la, lb, ra, rb;
+                        if (TerrainAt(*ex, i, kHalfWidth, la) && TerrainAt(*ex, ib, kHalfWidth, lb) &&
+                            TerrainAt(*ex, i, -kHalfWidth, ra) && TerrainAt(*ex, ib, -kHalfWidth, rb)) {
+                            yl = la + (lb - la) * fc + kLiftTerrain;
+                            yr = ra + (rb - ra) * fc + kLiftTerrain;
+                        }
+                    }
+                    const float nx = -tz, nz = tx;  // the left perpendicular in x/z (y up)
+                    // The point colours, blended between the two points the row sits between;
+                    // without any, the cue zones: white, red inside a brake cue's zone.
+                    float col[4];
+                    if (coloured) {
+                        for (int c = 0; c < 4; ++c)
+                            col[c] = ex->rgba[i * 4 + c] + (ex->rgba[ib * 4 + c] - ex->rgba[i * 4 + c]) * fc;
+                    } else {
+                        ToneColour(InZone(zones, lap * lapM, lapM) ? 3.0f : 1.0f, col[0], col[1], col[2]);
+                        col[3] = kLineAlpha;
+                    }
+                    verts_.push_back({cx + nx * kHalfWidth, yl, cz + nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}});
+                    verts_.push_back({cx - nx * kHalfWidth, yr, cz - nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}});
+                    nextRow += step;
                 }
             }
             travelled += len;
-            i = (i + 1) % n;
+            i = ib;
         }
         return true;
     }
-    /// Triangle-strip vertices, two per row (one each side of the line).
+    /// Triangle-strip vertices, two per row (left, then right).
     const std::vector<Vert>& verts() const { return verts_; }
     void clear() {
         verts_.clear();
         built_for_ = -1.0f;
         ref_n_ = zones_n_ = 0;
+        ver_ = 0;
     }
 
 private:
     std::vector<Vert> verts_;
     float             built_for_ = -1.0f, offset_ = 0;
     size_t            ref_n_ = 0, zones_n_ = 0;
+    uint32_t          ver_ = 0;
 };
 
+// ---------------------------------------------------------------------------------------
+// Keeping the camera steady
+//
+// v0.43.1 in the game: the source flapped between "modelview" and "searching" several times a
+// second, and two frames in three that picked a camera drew nothing. A frame without a camera
+// load near the bike (a menu overlay, a frame the track chunk isn't drawn) dropped everything.
+// Now the camera found is followed from frame to frame: a frame's candidate must sit within
+// kJumpM of the last camera to be taken (so a one-frame outlier is never drawn from), a miss is
+// carried for kHoldMs before the search starts over, and the last camera may be redrawn for
+// kStaleMs so a single miss doesn't blink the line.
+constexpr float     kJumpM   = 3.0f;
+constexpr unsigned  kHoldMs  = 500;
+constexpr unsigned  kStaleMs = 100;
+
+class CameraFollow {
+public:
+    void reset() { has_ = false; }
+    /// The last camera's eye to stay near, or null to search freely.
+    const float* anchor(unsigned long long now) const { return holding(now) ? eye_ : nullptr; }
+    bool holding(unsigned long long now) const { return has_ && now - last_ms_ <= kHoldMs; }
+    bool fresh(unsigned long long now) const { return has_ && now - last_ms_ <= kStaleMs; }
+    void hit(const float eye[3], unsigned long long now) {
+        eye_[0] = eye[0], eye_[1] = eye[1], eye_[2] = eye[2];
+        last_ms_ = now;
+        has_     = true;
+    }
+
+private:
+    bool               has_ = false;
+    float              eye_[3] = {0, 0, 0};
+    unsigned long long last_ms_ = 0;
+};
+
+/// ModelviewOffer for a camera that has to stay where the last one was: the eye must also be
+/// within kJumpM of `prev`, and the nearest to it wins.
+inline bool ModelviewFollow(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int axes,
+                            const float prev[3]) {
+    if (!ValidView(m) || axes < 0) return false;
+    float ex, ey, ez;
+    CameraPos(m, ex, ey, ez);
+    const float j2 = (ex - prev[0]) * (ex - prev[0]) + (ey - prev[1]) * (ey - prev[1]) + (ez - prev[2]) * (ez - prev[2]);
+    if (!(j2 <= kJumpM * kJumpM)) return false;
+    float gx, gy, gz;
+    AxesAt(axes).apply(rx, ry, rz, gx, gy, gz);
+    const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
+    if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) return false;
+    const float j = std::sqrt(j2);
+    if (best.ok && j >= best.jump) return false;
+    best.ok = true, best.view = m, best.axes = axes, best.dist = std::sqrt(d2), best.jump = j;
+    return true;
+}
+
 /// One row of the ribbon on screen, for the tests and the offline preview: both edges, how far
-/// along it is and how opaque. Rows behind the camera are left out.
+/// along it is, how opaque (the fade) and its colour. Rows behind the camera are left out.
 struct ScreenRow {
     Screen l, r;
     float  s, alpha;
-    bool   brake;
+    float  rgba[4];
 };
 inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, const Axes& fl,
                                             const std::vector<Vert>& vs) {
@@ -761,7 +1030,7 @@ inline std::vector<ScreenRow> ProjectRibbon(const Mat4& p, const Mat4& v, const 
         row.r     = Project(p, v, vs[i + 1].x, vs[i + 1].y, vs[i + 1].z, fl);
         row.s     = vs[i].s;
         row.alpha = Fade(vs[i].s);
-        row.brake = vs[i].brake;
+        for (int c = 0; c < 4; ++c) row.rgba[c] = vs[i].rgba[c];
         if (row.l.ok && row.r.ok) out.push_back(row);
     }
     return out;

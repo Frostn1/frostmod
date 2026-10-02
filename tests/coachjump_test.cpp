@@ -131,7 +131,33 @@ static void TestTable() {
     // Jumped clean over the whole table: one face cleared, a single.
     auto t = [](float s) { return Table(s, 50.0f, 56.0f); };
     const auto over = Jumps(CallsOf(Sheet(150, t, {{50.0f, 61.0f}})));
-    CHECK(over.size() == 1 && over[0].kind == SINGLE, "over the table: %s", over.empty() ? "-" : KindName(over[0].kind));
+    CHECK(over.size() == 1 && over[0].kind == TABLE, "over the table: %s", over.empty() ? "-" : KindName(over[0].kind));
+}
+
+static void TestOutdoor() {
+    auto one = [](const std::vector<Call>& c) { return c.size() == 1 ? KindName(c[0].kind) : "-"; };
+    // A kicker up onto higher ground that goes on: STEP UP.
+    auto up = [](float s) {
+        float h = s < 47 ? 0.0f : s < 50 ? 0.8f * (s - 47) / 3 : s < 60 ? 0.8f - 0.8f * (s - 50) / 10 : 0.0f;
+        if (s >= 55) h = (std::max)(h, (std::min)(2.5f, 2.5f * (s - 55) / 3));
+        return h;
+    };
+    const auto su = Jumps(CallsOf(Sheet(200, up, {{50.0f, 62.0f}})));
+    CHECK(su.size() == 1 && su[0].kind == STEP_UP, "step up: %s", one(su));
+    // Off flat ground onto much lower ground that goes on (no table: it never rose): STEP DOWN.
+    auto down = [](float s) { return s < 50 ? 3.0f : s < 53 ? 3.0f - (s - 50) : 0.0f; };
+    const auto sd = Jumps(CallsOf(Sheet(200, down, {{50.0f, 60.0f}})));
+    CHECK(sd.size() == 1 && sd[0].kind == STEP_DOWN, "step down: %s", one(sd));
+    // A gap jump: a lip, a gap, a separate landing face. DOUBLE, not counted as a rhythm.
+    auto gap = [](float s) { return (std::max)(Mound(s, 50.0f, 2.0f), Mound(s, 64.0f, 2.0f)); };
+    const auto gd = Jumps(CallsOf(Sheet(200, gap, {{50.0f, 67.0f}})));
+    CHECK(gd.size() == 1 && gd[0].kind == DOUBLE, "gap double: %s", one(gd));
+    // Skipping off a gentle roller: 0.3 m of lip, 6 m in the air. Not a jump: nothing called.
+    auto roller = [](float s) { return 0.3f * std::sin((s - 40.0f) / 20.0f * 3.14159f) * (s > 40 && s < 60); };
+    CHECK(Jumps(CallsOf(Sheet(200, roller, {{50.0f, 56.0f}}))).empty(), "a skip off a roller is not called");
+    // A short airtime (0.3 s) off a real lip is a hop too.
+    auto lip = [](float s) { return Mound(s, 50.0f); };
+    CHECK(Jumps(CallsOf(Sheet(200, lip, {{50.0f, 55.0f}}, 18.0f))).empty(), "0.28 s in the air is a hop");
 }
 
 static void TestRoll() {
@@ -328,6 +354,7 @@ static void TestParse() {
 int main() {
     TestRhythm();
     TestTable();
+    TestOutdoor();
     TestRoll();
     TestHopsAndBounces();
     TestPredicted();

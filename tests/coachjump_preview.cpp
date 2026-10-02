@@ -1,7 +1,7 @@
 // Offline previews of the jump calls (src/coachjump.h) on a real Coach sheet, for a person to look
 // at: not a test, and not part of the plugin. Built with the tests so it can't rot.
 //
-//   coachjump_preview <sheet.hud> <grid.bin> <out-prefix>
+//   coachjump_preview <sheet.hud> <grid.bin> <out-prefix> [profile-from-m]
 //   coachjump_preview --synthetic <out-prefix>   a supercross rhythm lane instead
 //
 // `grid.bin` is the track's terrain as MXB Coach reads it (u32 width, u32 height, f32 metres a
@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -194,23 +196,24 @@ static void TopDown(const coachhud::Sheet& sh, const Grid& g, const std::vector<
         img.rect(tx - 4, ty - 4, tx + tw + 4, ty + 7 * px + 4, 0.05f, 0.05f, 0.06f, 0.8f);
         float cr = 1, cg = 1, cb = 1;
         if (c.kind == ROLL) cr = 0.72f, cg = 0.86f;
-        if (c.kind == JUMP_ON || c.kind == JUMP_OFF) cb = 0.35f, cg = 0.88f;
+        if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN) cb = 0.35f, cg = 0.88f;
         img.text(t, tx, ty, px, cr, cg, cb, 1);
     }
     // Title and legend.
     img.rect(0, 0, float(W), 110, 0.06f, 0.06f, 0.07f, 1);
     img.text("755 COMPOUND - JUMP CALLS FROM COACH'S LAP", 24, 18, 4, 1, 1, 1, 1);
-    int k[8] = {};
+    int k[kKinds] = {};
     for (const Call& c : calls) ++k[c.kind];
     std::string legend;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < kKinds; ++i)
         if (k[i]) legend += std::string(legend.empty() ? "" : "   ") + KindName(Kind(i)) + " " + std::to_string(k[i]);
     img.text(legend, 24, 66, 3, 0.8f, 0.85f, 0.9f, 1);
     img.save(out);
 }
 
 // The ground along the line and the lap's flights over the busiest 160 m.
-static void Profile(const coachhud::Sheet& sh, const Line& l, const std::vector<Call>& calls, const std::string& out) {
+static void Profile(const coachhud::Sheet& sh, const Line& l, const std::vector<Call>& calls, const std::string& out,
+                    float from = NAN) {
     if (calls.empty()) return;
     const float span = 160;
     float       best_s = 0;
@@ -220,6 +223,7 @@ static void Profile(const coachhud::Sheet& sh, const Line& l, const std::vector<
         for (const Call& d : calls) n += d.takeoff_s >= c.takeoff_s - 10 && d.takeoff_s < c.takeoff_s - 10 + span;
         if (n > most) most = n, best_s = c.takeoff_s - 10;
     }
+    if (std::isfinite(from)) best_s = from;  // a stretch asked for by name
     const float s0 = best_s, s1 = best_s + span;
     float lo = INFINITY, hi = -INFINITY;
     for (size_t i = 0; i < l.size(); ++i)
@@ -275,7 +279,7 @@ static void Profile(const coachhud::Sheet& sh, const Line& l, const std::vector<
         const float       tw = TextW(t, 3);
         float             cr = 1, cg = 1, cb = 1;
         if (c.kind == ROLL) cr = 0.72f, cg = 0.86f;
-        if (c.kind == JUMP_ON || c.kind == JUMP_OFF) cb = 0.35f, cg = 0.88f;
+        if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN) cb = 0.35f, cg = 0.88f;
         img.text(t, X(c.takeoff_s) - tw * 0.5f, Y(tg) - 70, 3, cr, cg, cb, 1);
         const std::string hint = SpeedHint(c);
         if (!hint.empty()) img.text(hint, X(c.takeoff_s) - TextW(hint, 2) * 0.5f, Y(tg) - 44, 2, 0.8f, 0.8f, 0.8f, 1);
@@ -493,7 +497,7 @@ int main(int argc, char** argv) {
                     double(c.speed * 3.6f));
     const std::string p = argv[3];
     TopDown(sh, g, calls, p + "-topdown.ppm");
-    Profile(sh, l, calls, p + "-profile.ppm");
+    Profile(sh, l, calls, p + "-profile.ppm", argc > 4 ? float(std::atof(argv[4])) : NAN);
     RiderView(sh, g, calls, p + "-rider.ppm");
     return 0;
 }

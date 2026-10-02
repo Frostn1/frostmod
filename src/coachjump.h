@@ -35,7 +35,8 @@
 
 namespace coachjump {
 
-enum Kind { JUMP, SINGLE, DOUBLE, TRIPLE, QUAD, JUMP_ON, JUMP_OFF, ROLL };
+enum Kind { JUMP, SINGLE, DOUBLE, TRIPLE, QUAD, JUMP_ON, JUMP_OFF, ROLL, STEP_UP, STEP_DOWN, TABLE, HOP };
+constexpr int kKinds = 12;
 
 /// What the rider is told over the lip.
 inline const char* KindName(Kind k) {
@@ -47,6 +48,10 @@ inline const char* KindName(Kind k) {
         case JUMP_ON: return "JUMP ON";
         case JUMP_OFF: return "JUMP OFF";
         case ROLL: return "ROLL";
+        case STEP_UP: return "STEP UP";
+        case STEP_DOWN: return "STEP DOWN";
+        case TABLE: return "TABLE";
+        case HOP: return "HOP";
         default: return "JUMP";
     }
 }
@@ -58,8 +63,20 @@ constexpr float kFaceRise   = 0.6f;   // m: a face rises at least this much
 constexpr float kFaceSlope  = 0.15f;  // and on average this steeply (8.5 degrees)
 constexpr float kFaceMaxLen = 25.0f;  // m: and over no longer than this, or it's a hill
 constexpr float kZigM       = 0.3f;   // m: a turn in the ground smaller than this is noise
-constexpr float kMinJumpM   = 4.0f;   // m: a flight shorter than this is a hop, not a jump
-constexpr float kMinAirS    = 0.25f;  // s: and one shorter than this too
+constexpr float kMinJumpM   = 5.0f;   // m: a flight shorter than this is a hop, not a jump
+constexpr float kMinAirS    = 0.35f;  // s: and one shorter than this too
+constexpr float kShortAirS  = 0.6f;   // s: under this, a SINGLE or STEP UP must come off a built face
+constexpr float kMinLipM    = 0.5f;   // m: a lip lower than this over the ground before it is a
+                                      //    roller or a crest skipped off, not a jump
+constexpr float kLipBackM   = 15.0f;  // m: how far back the ground is looked at for that
+constexpr float kLipBend    = 0.12f;  // the slope change over 3 m either side of a natural lip
+constexpr float kSharpBend  = 0.25f;  // and of an edge sharp enough to be one on its own
+constexpr float kSureAirS   = 1.0f;   // s: this long in the air is a jump, lip or no lip
+constexpr float kStepUpM    = 1.0f;   // m: landing this much higher is a STEP UP
+constexpr float kStepDownM  = 1.5f;   // m: and this much lower, off flat ground, a STEP DOWN
+constexpr float kTableTopM  = 4.0f;   // m: a flat top this long after the lip is a table
+constexpr float kTableEndM  = 25.0f;  // m: a plateau that ends within this is a table, not a step
+constexpr float kRhythmGapM = 12.0f;  // m: crests this close, three or more running, are a rhythm
 constexpr float kBounceM    = 2.0f;   // m: back in the air this soon is one jump, bounced
 constexpr float kLipSlackM  = 3.0f;   // m: a crest this far before the takeoff is its lip
 constexpr float kPlateauM   = 3.0f;   // m: a plateau holds its height this long
@@ -249,43 +266,92 @@ inline std::vector<std::pair<size_t, size_t>> AirRuns(const Line& l) {
 /// The lap's speed at point `i`, or NaN.
 inline float SpeedAt(const Line& l, size_t i) { return i < l.speed.size() ? l.speed[i] : NAN; }
 
-/// What a flight from `take` to `land` cleared, by the ground under it.
+/// Whether the crest at `cs` is one of three or more crests running, each within kRhythmGapM
+/// of the next: a supercross rhythm lane, where jumps are counted by the crests they clear.
+inline bool InRhythm(const Line& l, const std::vector<Face>& faces, float cs) {
+    for (size_t k = 0; k < faces.size(); ++k) {
+        size_t j = k;
+        while (j + 1 < faces.size() && l.s[faces[j + 1].crest] - l.s[faces[j].crest] <= kRhythmGapM) ++j;
+        if (j - k + 1 >= 3 && cs >= l.s[faces[k].crest] - kLipSlackM && cs <= l.s[faces[j].crest] + 1.0f) return true;
+        k = j;
+    }
+    return false;
+}
+
+/// What a flight from `take` to `land` was, by the ground under it, the way a rider names it:
+/// - in a rhythm lane, by the crests it cleared: SINGLE, DOUBLE, TRIPLE, QUAD;
+/// - onto a table's top: JUMP ON; off its far end: JUMP OFF; clean over a flat top: TABLE;
+/// - over a gap onto a separate landing face: DOUBLE;
+/// - landing on higher ground: STEP UP; off flat ground onto much lower: STEP DOWN;
+/// - off a lip at least kMinLipM high: SINGLE;
+/// - anything else (a skip off a roller, a hop over a crest) is a HOP, which isn't called.
+/// `count` is the crests cleared, the lip included. JUMP when the ground isn't known.
 inline Kind Classify(const Line& l, const std::vector<Face>& faces, size_t take, size_t land, int& count) {
     count = 0;
     const float st = l.s[take], sl = l.s[land];
-    for (const Face& f : faces)
-        if (l.s[f.crest] >= st - kLipSlackM && l.s[f.crest] <= sl) ++count;
+    int after = 0;
+    for (const Face& f : faces) {
+        const float cs = l.s[f.crest];
+        if (cs >= st - kLipSlackM && cs <= sl) ++count;
+        if (cs > st + 1.0f && cs <= sl) ++after;
+    }
     const float gt = GroundAt(l, st), gl = GroundAt(l, sl);
-    if (std::isfinite(gt) && std::isfinite(gl)) {
-        float low = INFINITY;
-        for (size_t i = take; i <= land; ++i)
-            if (std::isfinite(l.ground[i])) low = (std::min)(low, l.ground[i]);
-        auto flat = [&](float from, float to, float h) {
-            for (float s = from; s <= to + 1e-3f; s += 0.5f) {
-                const float g = GroundAt(l, s);
-                if (!std::isfinite(g) || std::fabs(g - h) > kPlateauTol) return false;
-            }
-            return true;
-        };
-        // Onto a plateau that stands over the ground it cleared: a table's top, or the top of
-        // the next jump.
+    if (!std::isfinite(gt) || !std::isfinite(gl)) return JUMP;
+    auto flat = [&](float from, float to, float h) {
+        for (float s = from; s <= to + 1e-3f; s += 0.5f) {
+            const float g = GroundAt(l, s);
+            if (!std::isfinite(g) || std::fabs(g - h) > kPlateauTol) return false;
+        }
+        return true;
+    };
+    // Where flat ground at height `h` from `s` runs out going `dir`, within `within` metres, by
+    // dropping kStepM below it; NaN when it doesn't.
+    auto drops = [&](float s, float dir, float h, float within) {
+        for (float d = 0.5f; d <= within; d += 0.5f) {
+            const float g = GroundAt(l, s + dir * d);
+            if (!std::isfinite(g)) return false;
+            if (h - g >= kStepM) return true;
+            if (g - h > kPlateauTol) return false;  // it climbs on: a step, not a table
+        }
+        return false;
+    };
+    // Is the takeoff a lip at all? A built face's crest is; otherwise the ground has to bend
+    // over there - climbing into it and falling (or flattening) away after - rather than run on
+    // up or down a hill, which is a skip, not a jump.
+    const float before = GroundAt(l, st - 3.0f), ahead = GroundAt(l, st + 3.0f);
+    const float bend   = std::isfinite(before) && std::isfinite(ahead) ? ((gt - before) - (ahead - gt)) / 3.0f : 0.0f;
+    const bool  lip    = count >= 1 || bend >= kSharpBend || (bend >= kLipBend && gt - before >= kMinLipM * 0.6f);
+    float low = INFINITY;
+    for (size_t i = take; i <= land; ++i)
+        if (std::isfinite(l.ground[i])) low = (std::min)(low, l.ground[i]);
+    // A rhythm lane: counted by the crests cleared.
+    if (InRhythm(l, faces, st)) {
         if (gl - low >= kStepM && flat(sl, sl + kPlateauM, gl)) return JUMP_ON;
-        // Off a plateau, down onto lower ground, clearing nothing after the lip.
-        int after = 0;
-        for (const Face& f : faces)
-            if (l.s[f.crest] > st + 1.0f && l.s[f.crest] <= sl) ++after;
-        if (after == 0 && gt - gl >= kStepM && flat(st - kPlateauM, st, gt)) return JUMP_OFF;
+        count = (std::max)(count, 1);
+        return count == 1 ? SINGLE : count == 2 ? DOUBLE : count == 3 ? TRIPLE : QUAD;
     }
-    // Off ground the terrain knows but no built face (an outdoor kicker, a natural lip): still
-    // one jump. Only without the ground at all is it a plain JUMP.
-    if (count == 0 && std::isfinite(gt)) count = 1;
-    switch (count) {
-        case 0: return JUMP;
-        case 1: return SINGLE;
-        case 2: return DOUBLE;
-        case 3: return TRIPLE;
-        default: return QUAD;
+    // Onto a table's top (a plateau over the ground flown across, ending ahead), or off its end.
+    if (gl - low >= kStepM && flat(sl, sl + kPlateauM, gl) && drops(sl, +1.0f, gl, kTableEndM)) return JUMP_ON;
+    if (after == 0 && gt - gl >= kStepM && flat(st - kPlateauM, st, gt) && drops(st, -1.0f, gt, kTableEndM))
+        return JUMP_OFF;
+    // Anything else needs a lip; a long flight is a jump whatever the ground says about it.
+    if (!lip && l.t[land] - l.t[take] < kSureAirS) return HOP;
+    // Onto higher ground, whatever was crossed on the way up.
+    if (gl - gt >= kStepUpM) return STEP_UP;
+    // Over a gap onto a separate landing face.
+    if (after >= 1) return DOUBLE;
+    // The ground behind the lip, at its lowest.
+    float behind = gt;
+    for (float d = 0.5f; d <= kLipBackM; d += 0.5f) {
+        const float g = GroundAt(l, st - d);
+        if (std::isfinite(g)) behind = (std::min)(behind, g);
     }
+    // Clean over a flat top that stands over the approach: a table, not flat ground.
+    if (gt - behind >= kStepM && flat(st + 1.0f, st + kTableTopM, gt) && gl < gt - kPlateauTol) return TABLE;
+    if (gt - gl >= kStepDownM && flat(st - kPlateauM, st, gt)) return STEP_DOWN;
+    // A lip standing over the ground behind it.
+    if (gt - behind >= kMinLipM || count >= 1) return SINGLE;
+    return HOP;
 }
 
 /// The flight predicted from a lip: launched along the face's last two metres at the lap's speed
@@ -341,6 +407,8 @@ inline std::vector<Call> Calls(const Line& l) {
             if (c.landing_s - c.takeoff_s < kMinJumpM || c.airtime < kMinAirS) continue;
             c.speed = SpeedAt(l, c.takeoff);
             c.kind  = Classify(l, faces, c.takeoff, c.landing, c.faces);
+            // A skip, not a jump: nothing to call. A short flight counts only off a built face.
+            if (c.kind == HOP || (c.airtime < kShortAirS && c.faces == 0 && (c.kind == SINGLE || c.kind == STEP_UP))) continue;
             if (std::isfinite(usual))
                 for (float s = c.takeoff_s; s <= c.landing_s; s += 1.0f) {
                     size_t i = size_t(std::lower_bound(l.s.begin(), l.s.end(), s) - l.s.begin());
@@ -394,6 +462,7 @@ inline std::vector<Call> Calls(const Line& l) {
         c.landing   = (std::min)(c.landing, n - 1);
         c.speed     = SpeedAt(l, c.takeoff);
         c.kind      = Classify(l, faces, c.takeoff, c.landing, c.faces);
+        if (c.kind == HOP) continue;
         done_s      = c.landing_s;
         out.push_back(c);
     }
@@ -417,10 +486,10 @@ inline std::string Summary(const Line& l, const std::vector<Call>& calls) {
                        : l.above.size() == l.size() && !l.above.empty() ? "the lap's height"
                        : !Faces(l).empty() ? "predicted from the lips"
                                            : "none (no terrain under the line)";
-    int k[8] = {};
+    int k[kKinds] = {};
     for (const Call& c : calls) ++k[c.kind];
     std::string out = std::to_string(calls.size()) + " calls from " + from + ":";
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < kKinds; ++i)
         if (k[i]) out += std::string(" ") + KindName(Kind(i)) + "=" + std::to_string(k[i]);
     return out;
 }
@@ -560,7 +629,8 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
             const float dark[4] = {0.0f, 0.0f, 0.0f, 0.6f * la};
             float col[4] = {1.0f, 1.0f, 1.0f, la};
             if (roll) col[0] = 0.72f, col[1] = 0.86f, col[2] = 1.0f;
-            if (c.kind == JUMP_ON || c.kind == JUMP_OFF) col[0] = 1.0f, col[1] = 0.88f, col[2] = 0.35f;
+            if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN)
+                col[0] = 1.0f, col[1] = 0.88f, col[2] = 0.35f;
             coachmark::Text(out, top, shadow, right, kLabelH, dark, st);
             coachmark::Text(out, top, base, right, kLabelH, col, st);
             if (!hint.empty()) {

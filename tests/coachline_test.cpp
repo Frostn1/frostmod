@@ -407,6 +407,88 @@ int main(int argc, char** argv) {
         CHECK(PickUniform({{5, 3, Mul(P, Vz)}}, bx, by, bz, first_key).index < 0, "a locked key ignores the rest");
     }
 
+    // --- The camera baked into the fixed-function modelview loads ---------------------------
+    // What v0.42.2 saw: no matrix uniforms, a projection of frustum times a constant z flip. The
+    // game loads view * model per object; the track's model is the identity, so its load is the
+    // view. One frame: scenery with real model matrices, the bike's own (view * bike model), the
+    // track's (the view), in GL coordinates = telemetry (x, y, -z) (the z flip's partner).
+    {
+        Axes gl;  // x, y, -z
+        gl.sgn[2] = -1;
+        const int gl_idx = FallbackAxes();
+        CHECK(AxesName(AxesAt(gl_idx)) == "x,y,-z", "the right-handed GL world is x,y,-z");
+        AxesLock lock;
+        for (int frame = 0; frame < kLockFrames + 2; ++frame) {
+            const float bx = 269.98f + 0.6f * float(frame), by = 2.54f, bz = 117.36f;  // riding east
+            float ex, ey, ez, tx, ty, tz;
+            gl.apply(bx - 4.0f, by + 1.8f, bz, ex, ey, ez);
+            gl.apply(bx + 8.0f, by, bz, tx, ty, tz);
+            const Mat4 V = LookAt(ex, ey, ez, tx, ty, tz);
+            ModelviewPick best;
+            for (int o = 0; o < 20; ++o)
+                ModelviewOffer(best, Mul(V, Mul(Translate(50.0f * float(o), 0, -30.0f * float(o)), Rotate(37.0f * float(o), 0, 1, 0))),
+                               bx, by, bz, lock.locked());
+            float gx, gy, gz;
+            gl.apply(bx, by, bz, gx, gy, gz);
+            ModelviewOffer(best, Mul(V, Mul(Translate(gx, gy, gz), Rotate(90.0f, 0, 1, 0))), bx, by, bz, lock.locked());
+            ModelviewOffer(best, V, bx, by, bz, lock.locked());  // the track
+            if (frame == 0) {
+                CHECK(best.ok && best.axes == gl_idx && std::fabs(best.dist - std::sqrt(16.0f + 3.24f)) < 0.01f,
+                      "the track's load is the camera, under x,y,-z: axes %s dist %f",
+                      best.axes >= 0 ? AxesName(AxesAt(best.axes)).c_str() : "none", best.dist);
+                // Drawn through the game's projection (frustum * z flip) and that view, a point
+                // on the line ahead lands where the game would put it.
+                Mat4 zf;
+                zf.m[10] = -1;
+                const Screen s1 = Project(Mul(p, zf), best.view, bx + 8, by, bz, AxesAt(best.axes));
+                const Screen s2 = Project(Mul(p, zf), V, tx, ty, tz);
+                CHECK(s1.ok == s2.ok && std::fabs(s1.x - s2.x) < 1e-4f && std::fabs(s1.y - s2.y) < 1e-4f,
+                      "telemetry through the picked axes = GL through the game's matrices");
+            }
+            lock.vote(best.ok ? best.axes : -1);
+        }
+        CHECK(lock.locked() == gl_idx, "and the axes lock");
+        // Scenery alone gives no camera.
+        ModelviewPick none;
+        ModelviewOffer(none, Translate(500, 0, 500), 269.98f, 2.54f, 117.36f);
+        ModelviewOffer(none, Mul(Translate(269.98f, 2.54f, -117.36f), Rotate(30, 0, 1, 0)), 269.98f, 2.54f, 117.36f);
+        CHECK(!none.ok, "a model matrix at the bike, or far off, is not a camera");
+    }
+
+    // --- The fallback helmet camera from the telemetry alone ---------------------------------
+    {
+        const float bx = 269.98f, by = 2.54f, bz = 117.36f;
+        Mat4 ob;
+        CHECK(!OnboardView(bx, by, bz, 0.2f, 0, 0.1f, ob), "too slow to know the heading: no view");
+        // Riding north (+z in telemetry) at 15 m/s on the flat.
+        CHECK(OnboardView(bx, by, bz, 0, 0, 15, ob), "a view while riding");
+        const Axes  gax = AxesAt(FallbackAxes());
+        float ex, ey, ez;
+        CameraPos(ob, ex, ey, ez);
+        CHECK(std::fabs(ex - bx) < 1e-3f && std::fabs(ey - (by + kHeadUp)) < 1e-3f &&
+                  std::fabs(ez - -(bz + kHeadFwd)) < 1e-3f,
+              "the eye sits at the helmet, in GL coordinates: %f %f %f", ex, ey, ez);
+        // A point straight ahead along the travel, tilted kHeadDown below it, is screen centre.
+        const float d = 30.0f, drop = d * std::tan(kHeadDown * 0.017453292f);
+        const Screen c = Project(p, ob, bx, by + kHeadUp - drop, bz + kHeadFwd + d, gax);
+        CHECK(c.ok && std::fabs(c.x - 0.5f) < 1e-3f && std::fabs(c.y - 0.5f) < 1e-3f, "dead ahead is centred: %f %f", c.x,
+              c.y);
+        // East is to the right when facing north, the ground ahead is below centre, behind is culled.
+        CHECK(Project(p, ob, bx + 3, by, bz + 20, gax).x > 0.5f, "east is right when riding north");
+        CHECK(Project(p, ob, bx, by, bz + 5, gax).y > 0.5f, "the ground just ahead is low on screen");
+        CHECK(!Project(p, ob, bx, by, bz - 10, gax).ok, "behind the rider is culled");
+        // Riding east, uphill: the view pitches up with the travel.
+        CHECK(OnboardView(bx, by, bz, 10, 3, 0, ob), "uphill");
+        const Screen up = Project(p, ob, bx + 30, by + kHeadUp + 9.0f - 30.0f * std::tan(kHeadDown * 0.017453292f), bz, gax);
+        CHECK(up.ok && std::fabs(up.x - 0.5f) < 0.01f && std::fabs(up.y - 0.5f) < 0.02f,
+              "riding east up a 3-in-10 slope, the slope ahead is near centre: %f %f", up.x, up.y);
+        CHECK(Project(p, ob, bx + 20, by, bz + 3, gax).x < 0.5f, "north is left when riding east");
+        // The ribbon through the fallback: narrows with distance like any other.
+        const Screen n1 = Project(p, ob, bx + 10, by, bz - kHalfWidth, gax), n2 = Project(p, ob, bx + 10, by, bz + kHalfWidth, gax);
+        const Screen f1 = Project(p, ob, bx + 40, by + 9, bz - kHalfWidth, gax), f2 = Project(p, ob, bx + 40, by + 9, bz + kHalfWidth, gax);
+        CHECK(n1.ok && f1.ok && std::fabs(n2.x - n1.x) > std::fabs(f2.x - f1.x), "and the ribbon narrows ahead");
+    }
+
     // Every signed permutation is distinct and AxesAt(0) is the identity.
     CHECK(AxesName(AxesAt(0)) == "x,y,z", "identity first");
     {

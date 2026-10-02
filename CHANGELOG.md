@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-02 — v0.43.1
+
+### Fixed
+- **The blue line on the track finds MX Bikes' camera where it really is.** The game hands
+  its shaders nothing (v0.42.2 counted zero) and builds each object's position from the camera
+  on the CPU, so the camera is now read (never changed) from those per-object matrices: the
+  track's own one is the camera, and it is kept once it has followed your bike for 30 frames
+  (`ground: camera locked: fixed-function modelview ...`).
+- **A line even when no camera is found.** After two seconds without one, the line is drawn
+  from a helmet view worked out from the bike's own position and direction of travel
+  (`ground: camera=fallback-onboard`). It is an approximation, made for the onboard camera;
+  the chase and TV cameras get no line from it.
+- The log's first 30 seconds now also count every other way the game might pass a camera
+  (`ground/diag entry points: ...`).
+
 ## 2026-10-01 — v0.43.0
 
 One version for every binary in this repo: `frostmod.dlo` and `mxbcoach.dlo` both report

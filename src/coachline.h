@@ -455,6 +455,110 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------
+// The camera from the fixed-function modelview loads
+//
+// v0.42.2 in the game (755 Compound): no matrix uniform at all, and the projection is the
+// frustum times a constant z flip. So the camera is baked into the GL_MODELVIEW matrices the
+// game loads, one per object: each is view * model. For anything placed with an identity model
+// matrix (the track, the terrain) the load *is* the view, and its eye -R^T t is the camera next
+// to the bike. Every rigid modelview load is offered; the frame keeps the one with the simplest
+// axes that put its eye 0.3-25 m from the bike (not one placing something at the bike), and the
+// axes must hold kLockFrames frames running.
+
+/// The best modelview load of a frame so far, by `ModelviewOffer`.
+struct ModelviewPick {
+    bool  ok   = false;
+    Mat4  view;
+    int   axes = -1;
+    float dist = 0;
+};
+
+/// How far from the bike's origin the chase or helmet camera sits, at most, for the modelview
+/// search: tighter than kMaxCamDist, since thousands of scenery loads a frame are offered.
+constexpr float kMaxMvCamDist = 12.0f;
+
+/// Offers one modelview load. `locked`: settled axes, or -1. Returns true when it became the
+/// frame's best: the eye nearest the bike under any axes (0.3-12 m), not a model matrix placing
+/// something at the bike. Nearest, not simplest axes: with thousands of objects a frame, some
+/// object's eye lands within a few metres of a mirrored bike, and only the track's is nearest
+/// frame after frame - which the lock then requires.
+inline bool ModelviewOffer(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int locked = -1) {
+    if (!std::isfinite(rx) || !ValidView(m)) return false;
+    float ex, ey, ez;
+    CameraPos(m, ex, ey, ez);
+    const int from = locked >= 0 ? locked : 0, to = locked >= 0 ? locked + 1 : kNumAxes;
+    bool took = false;
+    for (int k = from; k < to; ++k) {
+        float gx, gy, gz;
+        AxesAt(k).apply(rx, ry, rz, gx, gy, gz);
+        const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
+        if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) continue;
+        const float d = std::sqrt(d2);
+        if (best.ok && d >= best.dist) continue;
+        if (AtTheBike(m, rx, ry, rz)) return took;
+        best.ok = true, best.view = m, best.axes = k, best.dist = d;
+        took    = true;
+    }
+    return took;
+}
+
+// ---------------------------------------------------------------------------------------
+// The fallback camera: no GL at all
+//
+// When no camera has been found for kFallbackMs, the helmet view is built from the plugin's own
+// telemetry: the eye kHeadUp above the bike's origin and kHeadFwd ahead of it, looking along the
+// direction of travel (the velocity, so no yaw or pitch sign convention has to be guessed) tilted
+// kHeadDown below it. It is drawn in a right-handed GL world, telemetry (x, y, -z), through the
+// projection the game set up. An approximation of the onboard camera only: the chase and TV
+// cameras get no line from it, and it is drawn without a depth test, since the game's depth was
+// not made through this camera.
+constexpr float     kHeadUp      = 0.85f;
+constexpr float     kHeadFwd     = 0.15f;
+constexpr float     kHeadDown    = 6.0f;   // degrees below the direction of travel
+constexpr unsigned  kFallbackMs  = 2000;
+
+inline int FallbackAxes() {
+    for (int k = 0; k < kNumAxes; ++k)
+        if (AxesName(AxesAt(k)) == "x,y,-z") return k;
+    return 0;
+}
+
+/// gluLookAt, y up.
+inline Mat4 LookAtGL(float ex, float ey, float ez, float ax, float ay, float az) {
+    float fx = ax - ex, fy = ay - ey, fz = az - ez;
+    const float fl = std::sqrt(fx * fx + fy * fy + fz * fz);
+    Mat4 v;
+    if (!(fl > 1e-6f)) return v;
+    fx /= fl, fy /= fl, fz /= fl;
+    float       sx = -fz, sz = fx;
+    const float sl = std::sqrt(sx * sx + sz * sz);
+    if (!(sl > 1e-6f)) return v;
+    sx /= sl, sz /= sl;
+    const float ux = -sz * fy, uy = sz * fx - sx * fz, uz = sx * fy;
+    v.m[0] = sx, v.m[4] = 0, v.m[8] = sz;
+    v.m[1] = ux, v.m[5] = uy, v.m[9] = uz;
+    v.m[2] = -fx, v.m[6] = -fy, v.m[10] = -fz;
+    v.m[12] = -(sx * ex + sz * ez);
+    v.m[13] = -(ux * ex + uy * ey + uz * ez);
+    v.m[14] = fx * ex + fy * ey + fz * ez;
+    return v;
+}
+
+/// The helmet camera's view, in GL world (telemetry x, y, -z), from the bike's telemetry
+/// position and velocity. False while the bike is too slow to say which way it is going.
+inline bool OnboardView(float bx, float by, float bz, float vx, float vy, float vz, Mat4& view) {
+    const float h = std::sqrt(vx * vx + vz * vz);
+    if (!(h > 1.0f) || !std::isfinite(by) || !std::isfinite(vy)) return false;
+    const float fx = vx / h, fz = vz / h;                  // heading, telemetry x/z
+    const float pitch = std::atan2(vy, h) - kHeadDown * 0.017453292f;
+    const float ex = bx + fx * kHeadFwd, ey = by + kHeadUp, ez = bz + fz * kHeadFwd;
+    const float cp = std::cos(pitch), sp = std::sin(pitch);
+    // To GL: z negated.
+    view = LookAtGL(ex, ey, -ez, ex + fx * cp * 10.0f, ey + sp * 10.0f, -(ez + fz * cp * 10.0f));
+    return ValidView(view);
+}
+
+// ---------------------------------------------------------------------------------------
 // Height
 
 /// The SDK's centreline heights (SPluginsTrackSegment_t::m_fHeight) are the track surface. The

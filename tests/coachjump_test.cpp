@@ -401,6 +401,30 @@ static void TheTextStyles() {
     look = keep;
 }
 
+// A jump call fixed on screen is left off the line and handed over; off, it is neither.
+static void TheCallOnScreen() {
+    const auto verts = StraightRibbon(60.0f);
+    auto two = [](float s) { return (std::max)(Mound(s, 50.0f), Mound(s, 58.0f)); };
+    const coachhud::Sheet sh = Sheet(150, two, {{50.0f, 62.0f}});
+    const auto calls = CallsOf(sh);
+    float frac = 0;
+    const int ai = coachline::AnchorPoint(sh.ref, 20.0f, 0.0f, 20.0f / 150.0f, frac);
+    const std::vector<float> ahead = AheadOf(sh.ref, ai, frac, 70.0f);
+    coachhud::LineLook& look = coachline::Look();
+    const coachhud::LineLook keep = look;
+    std::vector<coachmark::Quad> on_line, fixed, off;
+    ScreenLabel none, got, hidden;
+    Marks(on_line, calls, ahead, verts, true, nullptr, &none);
+    look.jump.screen = true;
+    Marks(fixed, calls, ahead, verts, true, nullptr, &got);
+    look.jump.on = false;
+    Marks(off, calls, ahead, verts, true, nullptr, &hidden);
+    look = keep;
+    CHECK(!none.ok, "on the line nothing is handed over");
+    CHECK(got.ok && !got.top.empty() && got.alpha > 0.9f && std::fabs(got.ahead - 30.0f) < 1e-3f, "the call is handed over: %s at %.1f", got.top.c_str(), got.ahead);
+    CHECK(fixed.size() + 20 < on_line.size() && off.size() == fixed.size() && !hidden.ok, "off the line, and gone when off: %zu %zu %zu", on_line.size(), fixed.size(), off.size());
+}
+
 /// The takeoff bar's world x as the rider rides toward it, with the ribbon rebuilt every two metres
 /// the way the plugin does (rows fixed to the line by `m`, their `s` the distance from the rider at
 /// the rebuild). Returns the spread (max - min) of the bar's position over the ride, in metres, and
@@ -488,6 +512,7 @@ int main() {
     TestMarks();
     TestParse();
     TheTextStyles();
+    TheCallOnScreen();
     TestNoWobble();
     TestNearFade();
     if (g_failures) {

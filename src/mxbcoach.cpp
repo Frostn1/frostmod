@@ -158,6 +158,8 @@ coachhud::StopWatch  g_stop;
 coachhud::Track      g_track;
 coachhud::Settings   g_hud_set;
 coachhud::Frame      g_frame;
+coachjump::ScreenLabel        g_jump_screen;     // the call to show fixed on screen, from the last BuildMarks
+ULONGLONG                     g_jump_screen_ms = 0;  // when it was made: it goes stale a few frames after the line stops drawing
 std::string          g_setup;
 bool                 g_practice = false;
 bool                 g_have_sample = false;
@@ -1111,6 +1113,9 @@ void ApplyLook() {
                   l.text ? 1 : 0, l.text_size,
                   l.text_style == coachhud::TEXT_BOLD ? "bold" : l.text_style == coachhud::TEXT_ITALIC ? "italic" : "block");
     Log("hud.ini", b);
+    std::snprintf(b, sizeof(b), "jump call: on=%d style=%d size x%.2f %s at %.3f,%.3f", l.jump.on ? 1 : 0, l.jump.style,
+                  double(l.jump.size), l.jump.screen ? "fixed on screen" : "on the line", double(l.jump.x), double(l.jump.y));
+    Log("hud.ini", b);
 }
 
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
@@ -1664,6 +1669,13 @@ void BuildHud() {
     v.has_susp  = g_have_susp;
     v.more_speed = PaceOn() && g_pace_hint.more_speed;
     if (GearOn() && g_gear_hint.level > 0) v.gear_dir = int(g_gear_hint.dir), v.gear_target = g_gear_hint.target;
+    // The jump call fixed on screen, while BuildMarks is still making it (it is not, off the line).
+    if (g_jump_screen.ok && GetTickCount64() - g_jump_screen_ms < 250) {
+        v.jump_top   = g_jump_screen.top;
+        v.jump_hint  = g_jump_screen.hint;
+        v.jump_alpha = g_jump_screen.alpha;
+        for (int i = 0; i < 3; ++i) v.jump_rgb[i] = g_jump_screen.rgb[i];
+    }
     for (int i = 0; i < 2; ++i) {
         v.susp[i]     = g_susp[i];
         v.susp_max[i] = g_susp_deep[i];
@@ -2718,8 +2730,11 @@ void BuildMarks() {
     coachjump::Frame fr;
     fr.rider_m = g_rider_m;
     fr.total   = g_arc.total;
-        coachjump::Marks(g_marks, g_jump_calls, coachjump::AheadOf(g_hud_sheet.ref, g_ai, g_afrac, coachline::kAhead + 10.0f),
-                     g_draw_verts, true, &fr);
+    coachjump::ScreenLabel screen;
+    coachjump::Marks(g_marks, g_jump_calls, coachjump::AheadOf(g_hud_sheet.ref, g_ai, g_afrac, coachline::kAhead + 10.0f),
+                     g_draw_verts, true, &fr, &screen);
+    if (screen.ok) g_jump_screen = screen, g_jump_screen_ms = GetTickCount64();
+    else g_jump_screen.ok = false;
 }
 
 /// The marks through the same camera as the ribbon, with the same ground correction. On the

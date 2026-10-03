@@ -742,6 +742,85 @@ static void TheLineLook() {
     CHECK(Abgr(def.slow) == kCyan, "default slow colour is kCyan: %08X", Abgr(def.slow));
 }
 
+// Per-item text look: style, size and place for each text item, today's look when unset.
+static void TextItems() {
+    const Settings def = ParseSettings("", false);
+    CHECK(def.cue_item == TextItem() && def.pace_item == TextItem() && def.look.jump == TextItem(), "defaults are today's");
+    CHECK(def.gear_item.anchor == ANCHOR_LEFT && def.cue_item.style == kStyleAuto && !def.pace_item.placed, "default anchors");
+    // An old hud.ini draws exactly as before: MORE SPEED under the gap row, the badge beside the cue.
+    View v;
+    v.set = def;
+    v.set.ground = true;
+    v.more_speed = true;
+    v.gear_dir = 1, v.gear_target = 3;
+    Frame base;
+    Build(v, base);
+    bool said = false;
+    for (const Text& t : base.texts) said = said || (t.s == "MORE SPEED" && std::fabs(t.x - v.set.row_x) < 1e-5f);
+    CHECK(said, "MORE SPEED in the game's font at the row's centre");
+
+    const Settings s = ParseSettings(
+        "[hud]\npace_x=0.5\npace_y=0.8\npace_style=bold\npace_size=1.5\npace_anchor=left\npace_text=1\n"
+        "gear_badge=0\njump_place=screen\njump_x=0.2\njump_y=0.6\njump_style=italic\njump_size=9\njump_text=1\n"
+        "cue_style=block\ncue_size=1.25\ncue_anchor=right\ncue_x=0.9\ncue_y=0.1\n", false);
+    CHECK(s.pace_item.placed && s.pace_item.x == 0.5f && s.pace_item.y == 0.8f && s.pace_item.style == TEXT_BOLD &&
+              s.pace_item.size == 1.5f && s.pace_item.anchor == ANCHOR_LEFT,
+          "pace item");
+    CHECK(!s.gear_item.on && s.pace_item.on, "the badge off on its own");
+    CHECK(s.look.jump.screen && s.look.jump.placed && s.look.jump.style == TEXT_ITALIC && s.look.jump.size == 3.0f,
+          "jump item (size clamped to 3)");
+    CHECK(s.cue_item.style == TEXT_BLOCK && s.cue_item.size == 1.25f && s.cue_item.anchor == ANCHOR_RIGHT && !s.cue_item.placed,
+          "cue item keeps cue_x/cue_y");
+    CHECK(def.look != s.look, "a changed item is a changed look");
+    const Settings bad = ParseSettings("[hud]\npace_x=0.5\npace_style=gothic\npace_size=huge\njump_place=wall\n", false);
+    CHECK(!bad.pace_item.placed && bad.pace_item.style == kStyleAuto && bad.pace_item.size == 0.0f && !bad.look.jump.screen,
+          "a half position, an unknown style, a bad size: today's look");
+
+    // MORE SPEED placed: bold block quads, the anchor's edge at x, and nothing at the old place.
+    v.set = s;
+    v.set.ground = true;
+    Frame fr;
+    Build(v, fr);
+    bool old_place = false;
+    for (const Text& t : fr.texts) old_place = old_place || t.s == "MORE SPEED";
+    CHECK(!old_place && fr.quads.size() > 40, "block MORE SPEED is quads, not the game's text: %zu", fr.quads.size());
+    float lo = 2.0f, top = 2.0f;
+    for (const Quad& q : fr.quads)
+        if (q.p[0][1] > 0.78f && q.p[0][1] < 0.95f) lo = (std::min)(lo, q.p[0][0]), top = (std::min)(top, q.p[0][1]);
+    CHECK(lo >= 0.5f && lo < 0.55f && top >= 0.8f, "left-anchored at 0.5, 0.8: x %f y %f", lo, top);
+    // The badge off: no gear digit.
+    bool digit = false;
+    for (const Text& t : fr.texts) digit = digit || t.s == "3";
+    CHECK(!digit, "no badge when gear_badge=0");
+    // The jump call fixed on screen, in its place.
+    v.jump_top = "DOUBLE", v.jump_hint = "60 KMH", v.jump_alpha = 1.0f;
+    Frame fj;
+    Build(v, fj);
+    float jx = 2.0f, jy = 2.0f, jx1 = -1.0f;
+    for (const Quad& q : fj.quads)
+        if (q.p[0][1] > 0.58f && q.p[0][1] < 0.75f && q.color != kBacking) jx = (std::min)(jx, q.p[0][0]), jx1 = (std::max)(jx1, q.p[3][0]), jy = (std::min)(jy, q.p[0][1]);
+    CHECK(jx1 > jx && (jx + jx1) * 0.5f > 0.15f && (jx + jx1) * 0.5f < 0.26f && jy >= 0.6f, "jump call centred on 0.2: %f..%f y %f", jx, jx1, jy);
+    // On the line (not on screen) the call is not on the HUD.
+    v.set.look.jump.screen = false;
+    Frame fl;
+    Build(v, fl);
+    bool call = false;
+    for (const Text& t : fl.texts) call = call || t.s == "DOUBLE";
+    CHECK(!call, "on the line the HUD doesn't draw the call");
+
+    // The cue box: anchored right, 1.25 times as big, kept on screen.
+    const Box c = CueBoxFor(s);
+    CHECK(std::fabs((c.x1 - c.x0) - kCueWidth * 1.25f) < 1e-6f && std::fabs(c.x1 - 0.9f) < 1e-6f, "cue box right-anchored at 0.9");
+    Settings m = s;
+    SetPartOrigin(m, PART_CUE, 0.1f, 0.2f);
+    CHECK(std::fabs(CueBoxFor(m).x0 - 0.1f) < 1e-5f && std::fabs(CueBoxFor(m).y0 - 0.2f) < 1e-6f, "dragging puts the box where it was dropped");
+    // A style that can't fit its quads falls back to the game's font instead of dropping the words.
+    Frame full;
+    for (size_t i = 0; i < kMaxQuads - kReserve - 10; ++i) Rect(full, 0, 0, 0.01f, 0.01f, 1);
+    SayStyled(full, "MORE SPEED", 0.5f, 0.5f, 0.03f, 1, 0xFFFFFFFFu, TEXT_BLOCK);
+    CHECK(full.texts.size() == 1 && full.texts[0].s == "MORE SPEED", "falls back to the game's font when the frame is full");
+}
+
 int main() {
     TheBytesAreExact();
     RefusesWhatTheAppDoesNotWrite();
@@ -751,6 +830,7 @@ int main() {
     TheClockRestartsAtTheLine();
     TheGhost();
     HudIni();
+    TextItems();
     TheCueBoxMoves();
     SuspensionTravel();
     TheMap();

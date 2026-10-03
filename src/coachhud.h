@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "coachcue.h"
+#include "coachglyph.h"
 #include "stance.h"
 
 namespace coachhud {
@@ -277,6 +278,26 @@ constexpr float kRowHitW = 0.16f;
 /// strokes, or leaning forward. All three are the same quads; that font can do nothing else.
 enum TextStyle : int { TEXT_BLOCK = 0, TEXT_BOLD = 1, TEXT_ITALIC = 2 };
 
+/// A text item's own look and place (MXB Coach's "Text items"). Every field is optional in hud.ini and
+/// the defaults are today's look, so an older Coach (or none) changes nothing.
+enum Anchor : int { ANCHOR_LEFT = 0, ANCHOR_CENTER = 1, ANCHOR_RIGHT = 2 };
+constexpr int kStyleAuto = -1;  // today's look: the game's font on the HUD, the line's text_style on the line
+struct TextItem {
+    bool  on     = true;
+    int   style  = kStyleAuto;  // kStyleAuto, or a TextStyle (drawn in the block font)
+    float size   = 0.0f;        // 0 = today's size; else times it, 0.5..3
+    bool  placed = false;       // x/y set: absolute screen position; else today's place
+    float x = 0.5f, y = 0.5f;   // screen fractions; y is the top of the text
+    int   anchor = ANCHOR_CENTER;  // which edge of the text x is
+    bool  screen = false;       // the jump call only: fixed on screen at x/y instead of on the line
+
+    bool operator==(const TextItem& o) const {
+        return on == o.on && style == o.style && size == o.size && placed == o.placed && x == o.x && y == o.y &&
+               anchor == o.anchor && screen == o.screen;
+    }
+    bool operator!=(const TextItem& o) const { return !(*this == o); }
+};
+
 /// The look of the line on the ground (coachline.h) and of what is drawn on it, as Coach sets
 /// it in hud.ini. Every key is optional: one that isn't there, or doesn't read, is the look the
 /// line has always had, so an older Coach (or none) changes nothing.
@@ -299,12 +320,15 @@ struct LineLook {
     // line_fade: the line fades out toward the rider so the ruts it runs through stay visible
     // next to the bike: clear at the rider, solid this many metres ahead. 0 = off.
     float near_fade  = 8.0f;
+    // The jump call (SINGLE, DOUBLE, ..., JUMP) and its speed under it: its own style and size,
+    // and on the line at the lip (default) or fixed on screen.
+    TextItem jump;
 
     bool operator==(const LineLook& o) const {
         auto same3 = [](const float* a, const float* b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]; };
         return width == o.width && opacity == o.opacity && same3(gas, o.gas) && same3(coast, o.coast) &&
                same3(light, o.light) && same3(heavy, o.heavy) && same3(fast, o.fast) && same3(slow, o.slow) &&
-               text == o.text && text_size == o.text_size && text_style == o.text_style && near_fade == o.near_fade;
+               text == o.text && text_size == o.text_size && text_style == o.text_style && near_fade == o.near_fade && jump == o.jump;
     }
     bool operator!=(const LineLook& o) const { return !(*this == o); }
 };
@@ -358,6 +382,9 @@ struct Settings {
     float susp_x = kSuspDefaultX, susp_y = kSuspDefaultY;
     // The gap-and-stance line: `row_x` is its centre across, `row_y` its top.
     float row_x  = kRowDefaultX, row_y = kRowDefaultY;
+    // Per-item text look: the cue box (its position is cue_x / cue_y), MORE SPEED and the gear
+    // badge. The jump call's is in `look.jump`, since the line's drawing code reads it from there.
+    TextItem cue_item, pace_item, gear_item;
     // Right-drag a part to move it. On by default - it is how the rider finds out they can.
     bool  move = true;
     LineLook look;
@@ -432,6 +459,29 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     l.text_size = number("text_size", l.text_size, 0.5f, 2.0f);
     const std::string style = stance::IniValue(ini, "hud", "text_style");
     l.text_style = style == "bold" ? TEXT_BOLD : style == "italic" ? TEXT_ITALIC : TEXT_BLOCK;
+    // Text items. `<item>_style` default|block|bold|italic, `_size` 0.5..3, `_x` / `_y` 0..1 (the
+    // text's top), `_anchor` left|center|right (which edge x is). The jump call's `jump_place`
+    // is line (at the lip) or screen. Unset, each is today's look.
+    auto item = [&](TextItem& t, const char* id, const char* on_key, bool on_def, int anchor_def) {
+        const std::string k = id;
+        t.on     = on_key ? flag(on_key, on_def) : on_def;
+        const std::string st = stance::IniValue(ini, "hud", (k + "_style").c_str());
+        t.style  = st == "block" ? TEXT_BLOCK : st == "bold" ? TEXT_BOLD : st == "italic" ? TEXT_ITALIC : kStyleAuto;
+        t.size   = number((k + "_size").c_str(), 0.0f, 0.0f, 3.0f);
+        if (t.size > 0.0f) t.size = (std::max)(0.5f, t.size);
+        const std::string an = stance::IniValue(ini, "hud", (k + "_anchor").c_str());
+        t.anchor = an == "left" ? ANCHOR_LEFT : an == "right" ? ANCHOR_RIGHT : an == "center" ? ANCHOR_CENTER : anchor_def;
+        const float nan = -1.0f;
+        const float x = fraction((k + "_x").c_str(), nan), y = fraction((k + "_y").c_str(), nan);
+        t.placed = x >= 0.0f && y >= 0.0f;
+        if (t.placed) t.x = x, t.y = y;
+    };
+    item(s.cue_item, "cue", nullptr, true, ANCHOR_CENTER);
+    item(s.pace_item, "pace", "pace_text", true, ANCHOR_CENTER);
+    item(s.gear_item, "gear", "gear_badge", true, ANCHOR_LEFT);
+    item(l.jump, "jump", "jump_text", true, ANCHOR_CENTER);
+    l.jump.screen = stance::IniValue(ini, "hud", "jump_place") == "screen";
+    s.cue_item.placed = false;  // the cue's place is cue_x / cue_y, read above
     return s;
 }
 
@@ -798,12 +848,21 @@ constexpr size_t kTrailSegs = 40;
 /// The cue box for a `cue_x` (its centre) and `cue_y` (its top), kept wholly on screen along
 /// with the section line beneath it. A rider who drags it to the edge gets it at the edge, not
 /// half off the screen where the text can't be read.
-inline Box CueBoxAt(float cx, float cy) {
-    const float half = kCueWidth * 0.5f;
-    const float x    = (std::max)(half, (std::min)(cx, 1.0f - half));
-    const float tall = kCueHeight + kCueGap + kSectionHeight;
+///
+/// `scale` is the cue item's size (the box and its text grow together) and `anchor` which edge of
+/// the box `cx` is: the middle (as it always was), the left or the right.
+inline Box CueBoxAt(float cx, float cy, float scale = 1.0f, int anchor = ANCHOR_CENTER) {
+    const float w    = kCueWidth * scale, h = kCueHeight * scale;
+    const float x0   = anchor == ANCHOR_LEFT ? cx : anchor == ANCHOR_RIGHT ? cx - w : cx - w * 0.5f;
+    const float x    = (std::max)(0.0f, (std::min)(x0, 1.0f - w));
+    const float tall = h + kCueGap + kSectionHeight;
     const float y    = (std::max)(0.0f, (std::min)(cy, 1.0f - tall));
-    return {x - half, y, x + half, y + kCueHeight};
+    return {x, y, x + w, y + h};
+}
+/// The cue item's size as a scale of the box: 0 (not set) is the box as it was.
+inline float ItemScale(const TextItem& t) { return t.size > 0.0f ? t.size : 1.0f; }
+inline Box CueBoxFor(const Settings& s) {
+    return CueBoxAt(s.cue_x, s.cue_y, ItemScale(s.cue_item), s.cue_item.anchor);
 }
 
 /// A part of fixed size at the top-left the rider put it, kept wholly on screen. A part
@@ -851,7 +910,7 @@ inline bool PartBox(const Settings& s, Part part, Box& out) {
     switch (part) {
         case PART_CUE:
             if (!s.cue) return false;
-            out = CueBoxAt(s.cue_x, s.cue_y);
+            out = CueBoxFor(s);
             return true;
         case PART_MAP:
             if (!s.map) return false;
@@ -882,12 +941,17 @@ inline Part PartAt(const Settings& s, float x, float y) {
     return PART_NONE;
 }
 
-/// Put a part's top-left corner at (x, y). The cue is stored by the centre of its box, so it
+/// Put a part's top-left corner at (x, y). The cue is stored by the edge its anchor names, so it
 /// is converted; the clamping that keeps a part on screen belongs to the readers, so a value
 /// written here is the one the rider dragged to.
 inline void SetPartOrigin(Settings& s, Part part, float x, float y) {
     switch (part) {
-        case PART_CUE: s.cue_x = x + kCueWidth * 0.5f, s.cue_y = y; break;
+        case PART_CUE: {
+            const float w = kCueWidth * ItemScale(s.cue_item);
+            s.cue_x = s.cue_item.anchor == ANCHOR_LEFT ? x : s.cue_item.anchor == ANCHOR_RIGHT ? x + w : x + w * 0.5f;
+            s.cue_y = y;
+            break;
+        }
         case PART_MAP: s.map_x = x, s.map_y = y; break;
         case PART_SUSP: s.susp_x = x, s.susp_y = y; break;
         // Stored by its centre, like the cue box, and grabbed at the nominal width the hit
@@ -1111,6 +1175,88 @@ inline void Say(Frame& f, std::string s, float x, float y, float size, int justi
     f.texts.push_back(std::move(t));
 }
 
+/// Quads a string takes in the block font (one per lit run of a glyph row).
+inline size_t BlockQuads(const std::string& s) {
+    size_t n = 0;
+    for (char ch : s) {
+        const uint8_t* g = coachglyph::Glyph(ch);
+        if (!g) continue;
+        for (int row = 0; row < 7; ++row)
+            for (int col = 0; col < 5;) {
+                if (!(g[row] & (16 >> col))) {
+                    ++col;
+                    continue;
+                }
+                while (col < 5 && (g[row] & (16 >> col))) ++col;
+                ++n;
+            }
+    }
+    return n;
+}
+
+/// How wide `chars` characters are at `size`, in the style: the game's font, or the block font
+/// whose capitals are three quarters of `size` tall.
+inline float ItemWidth(size_t chars, float size, int style) {
+    if (style == kStyleAuto || chars == 0) return TextWidth(chars, size);
+    const float px = size * 0.75f / 7.0f / kAspect;
+    return (float(chars) * coachglyph::kAdvance - 1) * px;
+}
+
+/// `s` in an item's style. `kStyleAuto` is the game's font (Say). A block style draws the 5 x 7
+/// font as screen quads - bold with fatter strokes, italic leaning - and, when the frame hasn't the
+/// quads to spare (the map's trail uses most of them), falls back to the game's font rather than
+/// drop the words. `x` is the left, middle or right by `justify`; `y` the top of the line.
+inline void SayStyled(Frame& f, const std::string& s, float x, float y, float size, int justify, uint32_t color,
+                      int style) {
+    if (style == kStyleAuto || s.empty()) return Say(f, s, x, y, size, justify, color);
+    const std::string t = s.size() > kMaxChars ? s.substr(0, kMaxChars) : s;
+    if (f.quads.size() + BlockQuads(t) + 4 > (f.reserved ? kMaxQuads : kMaxQuads - kReserve))
+        return Say(f, s, x, y, size, justify, color);
+    const float h = size * 0.75f, py = h / 7.0f, px = py / kAspect;
+    const float w = ItemWidth(t.size(), size, style);
+    const float x0 = justify == 0 ? x : justify == 2 ? x - w : x - w * 0.5f;
+    const float y0 = y + (size - h) * 0.5f;
+    const float fat = style == TEXT_BOLD ? 0.2f * px : 0.0f;
+    const float lean = style == TEXT_ITALIC ? 0.2f / kAspect : 0.0f;  // x shift per unit of y
+    for (size_t i = 0; i < t.size(); ++i) {
+        const uint8_t* g = coachglyph::Glyph(t[i]);
+        if (!g) continue;
+        for (int row = 0; row < 7; ++row) {
+            const float ya = y0 + float(row) * py, yb = ya + py;  // top, bottom (y grows down)
+            for (int col = 0; col < 5;) {
+                if (!(g[row] & (16 >> col))) {
+                    ++col;
+                    continue;
+                }
+                int end = col;
+                while (end < 5 && (g[row] & (16 >> end))) ++end;
+                const float a = x0 + (float(i) * coachglyph::kAdvance + float(col)) * px - fat,
+                            b = x0 + (float(i) * coachglyph::kAdvance + float(end)) * px + fat;
+                // Lean: the top of the glyph shifts right, the bottom left, about the middle row.
+                const float mid = y0 + 3.5f * py;
+                const float st  = lean * (mid - ya), sb = lean * (mid - yb);
+                Quad q;
+                q.p[0][0] = a + st, q.p[0][1] = ya;
+                q.p[1][0] = a + sb, q.p[1][1] = yb;
+                q.p[2][0] = b + sb, q.p[2][1] = yb;
+                q.p[3][0] = b + st, q.p[3][1] = ya;
+                q.color = color;
+                f.quads.push_back(q);
+                col = end;
+            }
+        }
+    }
+}
+
+/// `s` cut to what fits `width` in the style, with "..." when cut (Fit, for either font).
+inline std::string FitStyled(const std::string& s, float size, float width, int style) {
+    if (style == kStyleAuto) return Fit(s, size, width);
+    const float  px  = size * 0.75f / 7.0f / kAspect;
+    const size_t max = (std::min)(kMaxChars, size_t((std::max)(0.0f, (width / px + 1.0f) / float(coachglyph::kAdvance))));
+    if (s.size() <= max) return s;
+    return max > 3 ? s.substr(0, max - 3) + "..." : s.substr(0, max);
+}
+
 /// Everything the frame shows, gathered under the plugin's lock.
 struct View {
     Settings                 set;
@@ -1148,6 +1294,11 @@ struct View {
     // Gear hint (coachgear::Hint): +1 shift up, -1 down, 0 none, and the gear to be in.
     int                      gear_dir    = 0;
     int                      gear_target = 0;
+    // The jump call coming up, when it is shown fixed on screen (LineLook::jump.screen): its two
+    // lines, colour and how solid it is (coachjump::ScreenLabel). Empty top = none.
+    std::string              jump_top, jump_hint;
+    float                    jump_rgb[3] = {1, 1, 1};
+    float                    jump_alpha  = 0;
 };
 
 /// A motocrosser from its right-hand side, drawn small enough to sit in a corner of the screen:
@@ -1236,13 +1387,16 @@ inline void Build(const View& v, Frame& f) {
     if (!v.set.enabled) return;
 
     // 1. The cue, wherever the rider has put the block.
-    const Box cue_box = CueBoxAt(v.set.cue_x, v.set.cue_y);
+    const Box   cue_box = CueBoxFor(v.set);
+    const float cue_k   = ItemScale(v.set.cue_item);
     const float cue_mid = (cue_box.x0 + cue_box.x1) * 0.5f;
     if (v.set.cue && v.cue) {
-        const Box& b = cue_box;
+        const Box&  b  = cue_box;
+        const float cs = kCueSize * cue_k;
+        const int   cst = v.set.cue_item.style;
+        const std::string text = FitStyled(v.cue->text, cs, b.x1 - b.x0, cst);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        Say(f, Fit(v.cue->text, kCueSize, b.x1 - b.x0), cue_mid, b.y0 + (b.y1 - b.y0 - kCueSize) * 0.5f, kCueSize, 1,
-            CueColour(v.cue->kind));
+        SayStyled(f, text, cue_mid, b.y0 + (b.y1 - b.y0 - cs) * 0.5f, cs, 1, CueColour(v.cue->kind), cst);
     }
 
     // 2. The section and its tip, below it.
@@ -1276,26 +1430,62 @@ inline void Build(const View& v, Frame& f) {
     }
 
     // 4b. MORE SPEED, under the gap row, while a jump ahead needs more speed than the rider has.
-    // One of the line's words, so it goes with them (line_text), at their size and in the pace
-    // hints' "faster" colour as the rider set it. The game's font has no bold or italic.
-    if (v.set.pace && v.set.ground && v.more_speed && v.set.look.text) {
-        const char* s  = "MORE SPEED";
-        const float h  = kCueSize * v.set.look.text_size, fs = h * 0.8f;
-        const float w  = TextWidth(std::strlen(s), fs) + 0.02f;
-        const Box   b  = BoxAt(v.set.row_x - w * 0.5f, v.set.row_y + kRowH + 0.006f, w, h);
+    // One of the line's words, so it goes with them (line_text), at its own size (the line's
+    // text_size when it has none) and in the pace hints' "faster" colour as the rider set it.
+    // Its own place when the rider has set one (pace_x / pace_y, by pace_anchor); else under the
+    // gap row, as it always was. The game's font has no bold or italic: a style draws the block font.
+    if (v.set.pace && v.set.pace_item.on && v.set.ground && v.more_speed && v.set.look.text) {
+        const TextItem& it = v.set.pace_item;
+        const std::string s = "MORE SPEED";
+        const float h  = kCueSize * (it.size > 0.0f ? it.size : v.set.look.text_size), fs = h * 0.8f;
+        const float w  = ItemWidth(s.size(), fs, it.style) + 0.02f;
+        const float ax = it.placed ? it.x : v.set.row_x;  // the anchor's edge, a screen fraction
+        const int   an = it.placed ? it.anchor : int(ANCHOR_CENTER);
+        const float bx = an == ANCHOR_LEFT ? ax : an == ANCHOR_RIGHT ? ax - w : ax - w * 0.5f;
+        const Box   b  = BoxAt(bx, it.placed ? it.y : v.set.row_y + kRowH + 0.006f, w, h);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        Say(f, s, v.set.row_x, b.y0 + (h - fs) * 0.5f, fs, 1, Abgr(v.set.look.slow));
+        SayStyled(f, s, (b.x0 + b.x1) * 0.5f, b.y0 + (h - fs) * 0.5f, fs, 1, Abgr(v.set.look.slow), it.style);
+    }
+
+    // 4b'. The jump call, when it is set fixed on screen rather than standing over the lip: the
+    // nearest call ahead, at its own size and place. coachjump::Marks picked it and left it off the
+    // line.
+    if (v.set.jumps && v.set.look.text && v.set.look.jump.on && v.set.look.jump.screen && !v.jump_top.empty() &&
+        v.jump_alpha > 0.0f) {
+        const TextItem& it = v.set.look.jump;
+        const float k    = it.size > 0.0f ? it.size : v.set.look.text_size;
+        const float h    = kCueSize * k, fs = h * 0.8f, hs = fs * 0.6f;
+        const int   st   = it.style;
+        const std::string& hint = v.jump_hint;
+        const float w  = (std::max)(ItemWidth(v.jump_top.size(), fs, st), ItemWidth(hint.size(), hs, st)) + 0.02f;
+        const float bh = h + (hint.empty() ? 0.0f : hs * 1.25f);
+        const float ax = it.placed ? it.x : 0.5f;
+        const float bx = it.anchor == ANCHOR_LEFT ? ax : it.anchor == ANCHOR_RIGHT ? ax - w : ax - w * 0.5f;
+        const Box   b  = BoxAt(bx, it.placed ? it.y : 0.45f, w, bh);
+        const uint32_t a = uint32_t(std::lround((std::max)(0.0f, (std::min)(1.0f, v.jump_alpha)) * 255.0f));
+        const uint32_t back = (uint32_t(std::lround(float(kBacking >> 24) * v.jump_alpha)) << 24);
+        Rect(f, b.x0, b.y0, b.x1, b.y1, back);
+        const uint32_t col = (a << 24) | (Abgr(v.jump_rgb) & 0x00FFFFFFu);
+        const float    mx  = (b.x0 + b.x1) * 0.5f;
+        SayStyled(f, v.jump_top, mx, b.y0 + (h - fs) * 0.5f, fs, 1, col, st);
+        if (!hint.empty())
+            SayStyled(f, hint, mx, b.y0 + h, hs, 1, (uint32_t(std::lround(float(a) * 0.85f)) << 24) | 0x00FFFFFFu, st);
     }
 
     // 4c. The gear hint, beside the cue box: an arrow and the gear to be in.
-    if (v.set.gear && v.gear_dir != 0 && v.gear_target >= 1 && v.gear_target <= 9) {
+    if (v.set.gear && v.set.gear_item.on && v.gear_dir != 0 && v.gear_target >= 1 && v.gear_target <= 9) {
         const bool  up  = v.gear_dir > 0;
-        const Box   b   = BoxAt(cue_box.x1 + 0.008f, cue_box.y0, kGearBadgeW, kCueHeight);
+        const TextItem& it = v.set.gear_item;
+        const float gk = ItemScale(it), gw = kGearBadgeW * gk, gh = kCueHeight * gk;
+        // Beside the cue box, or wherever the rider put it (gear_x / gear_y, by gear_anchor).
+        const float gx = !it.placed ? cue_box.x1 + 0.008f
+                         : it.anchor == ANCHOR_LEFT ? it.x : it.anchor == ANCHOR_RIGHT ? it.x - gw : it.x - gw * 0.5f;
+        const Box   b   = BoxAt(gx, it.placed ? it.y : cue_box.y0, gw, gh);
         const uint32_t c = up ? kGearUp : kGearDown;
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
         // The arrow, a triangle on the left of the badge: tip up for up, tip down for down.
-        const float ax0 = b.x0 + 0.008f, ax1 = ax0 + 0.022f, am = (ax0 + ax1) * 0.5f;
-        const float ay0 = b.y0 + 0.012f, ay1 = b.y1 - 0.012f;
+        const float ax0 = b.x0 + 0.008f * gk, ax1 = ax0 + 0.022f * gk, am = (ax0 + ax1) * 0.5f;
+        const float ay0 = b.y0 + 0.012f * gk, ay1 = b.y1 - 0.012f * gk;
         if (f.room()) {
             Quad q;
             if (up) {
@@ -1312,8 +1502,8 @@ inline void Build(const View& v, Frame& f) {
             q.color = c;
             f.quads.push_back(q);
         }
-        Say(f, std::string(1, char('0' + v.gear_target)), ax1 + (b.x1 - ax1) * 0.5f, b.y0 + (kCueHeight - kCueSize) * 0.5f,
-            kCueSize, 1, c);
+        SayStyled(f, std::string(1, char('0' + v.gear_target)), ax1 + (b.x1 - ax1) * 0.5f,
+                  b.y0 + (gh - kCueSize * gk) * 0.5f, kCueSize * gk, 1, c, it.style);
     }
 
     // 6. The setup card, while stopped.

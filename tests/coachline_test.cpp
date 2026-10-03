@@ -1145,7 +1145,7 @@ int main(int argc, char** argv) {
         }
         CHECK(done && !al3.result().ok, "the wrong ground is refused: spread %.2f", double(al3.result().spread));
 
-        // v0.45.2, Sean's Carson run: a supercross gate past the terrain's edge. The first few
+        // v0.45.3, Sean's Carson run: a supercross gate past the terrain's edge. The first few
         // hundred samples are the run out of the gate, off the grid; they must not count, and the
         // verdict comes from the track proper. (It said "0 samples on the grid - NOT this
         // track's ground" and threw the right grid away.)

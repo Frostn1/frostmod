@@ -1,17 +1,30 @@
 # Changelog
 
-## 2026-10-02 — v0.45.2
+## 2026-10-02 — v0.45.3
 
 ### Fixed
 - **MXB Coach: the track's own ground is no longer thrown away on a supercross track.** The
   check that `<track>.ground` lines up with the rider used the first 200 riding samples, and on
   a supercross track those are all the run out of the gate, which stands past the edge of the
   track's terrain (Steezy Mx - SMX - Carson: a 170 m terrain, the gate at x=193). Only 20 of them
-  landed on the grid, under the half it needs, so the right ground was refused for the session ("0 samples on the grid - NOT
-  this track's ground"). Now only samples on the ground with the grid under them count, a metre
+  landed on the grid, under the half it needs, so the right ground was refused for the session
+  ("0 samples on the grid - NOT this track's ground"). Now only samples on the ground with the grid under them count, a metre
   apart; a grid the laps never land on is still refused, after a minute of riding off it. The log
   line says how many were off it.
 - The gear line no longer blames an old MXB Coach when there is simply no sheet for the track yet.
+
+## 2026-10-02 — v0.45.2
+
+### Fixed
+- **MXB Coach: stutter with the ground line on.** Its depth reads (the snap every 200 ms, the
+  depth-mode probe every 2 s) were synchronous `glReadPixels`, each one a full CPU-GPU pipeline
+  flush: a hitch about five times a second even on a fast PC. They now go into pixel-pack
+  buffers with a fence and are picked up a frame or two later, without ever waiting, and are
+  decided through the camera of the frame they were read on. A GL without buffer objects or
+  fences keeps the old reads, at most once a second. The game's pack buffer binding and pixel
+  store state are left as they were.
+- The camera's axes are no longer looked up by building 96 strings a frame, and a track grid
+  file that doesn't parse is no longer re-read whole every second.
 
 ## 2026-10-02 — v0.45.1
 

@@ -268,3 +268,50 @@ jobs:
             dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
             dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip `
             dist/mxbcoach.dlo --clobber
+
+      # Mirror the same release (same tag, title, notes, assets) to the public release-only
+      # Frostn1/frostmod-releases, so this source repo can go private while every client keeps
+      # an anonymous download. Clients ask the mirror first and fall back to this repo, and
+      # frostmod.exe --update compares tag_name to FROSTMOD_VERSION, so the tag must not change.
+      # FROSTMOD_RELEASE_TOKEN: fine-grained PAT, Contents read/write on frostmod-releases only
+      # (GITHUB_TOKEN can't write to another repo). Without it, or before the mirror repo
+      # exists, this step only logs and skips.
+      - name: Mirror release to Frostn1/frostmod-releases
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.FROSTMOD_RELEASE_TOKEN }}
+          MIRROR: Frostn1/frostmod-releases
+          TAG: ${{ github.event.release.tag_name }}
+          TITLE: ${{ github.event.release.name }}
+          NOTES: ${{ github.event.release.body }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            Write-Host "::notice::FROSTMOD_RELEASE_TOKEN not set; not mirroring to $env:MIRROR."
+            exit 0
+          }
+          gh repo view $env:MIRROR --json name 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::$env:MIRROR not reachable with FROSTMOD_RELEASE_TOKEN; not mirroring."
+            exit 0
+          }
+          $assets = 'frostmod.exe','frostmod.dll','frostmod.dlo','Release.zip',
+                    'frostserver.exe','frostserver.dll','frostserver.dlo','FrostServer.zip',
+                    'mxbcoach.dlo' | ForEach-Object { "dist/$_" }
+          gh release view $env:TAG --repo $env:MIRROR --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            $notesFile = Join-Path $env:RUNNER_TEMP 'mirror-notes.md'
+            $source = "Source build: https://github.com/${{ github.repository }}/releases/tag/$env:TAG"
+            Set-Content -Path $notesFile -Value "$env:NOTES`n`n$source" -Encoding utf8
+            $title = if ($env:TITLE) { $env:TITLE } else { $env:TAG }
+            $flags = @('--title', $title, '--notes-file', $notesFile)
+            if ($env:PRERELEASE -eq 'true') { $flags += '--prerelease' } else { $flags += '--latest' }
+            # The mirror holds no code; its tags point at its default branch (needs one commit,
+            # e.g. the README from `gh repo create --add-readme`).
+            gh release create $env:TAG --repo $env:MIRROR @flags
+            if ($LASTEXITCODE -ne 0) { Write-Error "couldn't create $env:TAG on $env:MIRROR"; exit 1 }
+          }
+          gh release upload $env:TAG --repo $env:MIRROR @assets --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Error "couldn't upload assets to $env:MIRROR"; exit 1 }
+          Write-Host "Mirrored $env:TAG to https://github.com/$env:MIRROR/releases/tag/$env:TAG"

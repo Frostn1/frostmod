@@ -62,10 +62,21 @@
 #include "version.h"    // FROSTMOD_VERSION
 #include "offsets.h"    // GameOffsets / ALL_GAMES (which titles --game accepts)
 
-// Where updates come from (public GitHub Releases).
+// Where updates come from (public GitHub Releases). Asked in order: the public release-only
+// mirror Frostn1/frostmod-releases (same tags, same assets) first, then this source repo, which
+// keeps answering until the mirror has a release. Keep the tags identical in both: --update
+// compares tag_name to FROSTMOD_VERSION.
 #define FROSTMOD_UPDATE_HOST L"api.github.com"
-#define FROSTMOD_UPDATE_PATH L"/repos/Frostn1/frostmod/releases/latest"
-#define FROSTMOD_RELEASES_URL "https://github.com/Frostn1/frostmod/releases/latest"
+struct ReleaseSource { const wchar_t* apiPath; const char* pageUrl; };
+static const ReleaseSource kReleaseSources[] = {
+    { L"/repos/Frostn1/frostmod-releases/releases/latest",
+      "https://github.com/Frostn1/frostmod-releases/releases/latest" },
+    { L"/repos/Frostn1/frostmod/releases/latest",
+      "https://github.com/Frostn1/frostmod/releases/latest" },
+};
+// The release page to point people at: whichever source last answered (mirror by default).
+static const char* g_releasesUrl = kReleaseSources[0].pageUrl;
+#define FROSTMOD_RELEASES_URL g_releasesUrl
 
 // ---------------------------------------------------------------------------
 // graceful shutdown
@@ -342,6 +353,19 @@ static std::string JsonString(const std::string& j, const char* key) {
     return j.substr(p + 1, e - p - 1);
 }
 
+// The latest release's JSON from the first source that has one, or "" if none answered.
+// A missing repo or a repo with no releases answers 404 with a body but no tag_name.
+static std::string LatestReleaseJson() {
+    for (const ReleaseSource& src : kReleaseSources) {
+        std::string body = HttpsGet(FROSTMOD_UPDATE_HOST, src.apiPath);
+        if (!JsonString(body, "tag_name").empty()) {
+            g_releasesUrl = src.pageUrl;
+            return body;
+        }
+    }
+    return "";
+}
+
 // compare dotted versions ("v0.9.3" vs "0.9.2"): >0 if a newer than b.
 static int VersionCompare(const std::string& a, const std::string& b) {
     auto parse = [](const std::string& s, int v[3]) {
@@ -356,7 +380,7 @@ static int VersionCompare(const std::string& a, const std::string& b) {
 }
 
 static void CheckForUpdate() {
-    std::string body = HttpsGet(FROSTMOD_UPDATE_HOST, FROSTMOD_UPDATE_PATH);
+    std::string body = LatestReleaseJson();
     if (body.empty()) return;                        // offline / rate-limited -> silent
     std::string tag = JsonString(body, "tag_name");
     if (tag.empty()) return;
@@ -443,7 +467,7 @@ static bool DownloadToFile(const std::string& url, const std::string& outPath) {
 
 static int DoUpdate() {
     printf("[*] checking for the latest release...\n");
-    std::string body = HttpsGet(FROSTMOD_UPDATE_HOST, FROSTMOD_UPDATE_PATH);
+    std::string body = LatestReleaseJson();
     if (body.empty()) { printf("[!] couldn't reach GitHub (offline?). Try again later.\n"); return 1; }
     std::string tag = JsonString(body, "tag_name");
     if (tag.empty()) { printf("[!] no release found on GitHub.\n"); return 1; }

@@ -316,6 +316,400 @@ static void RenderToneMap(const char* path, const coachhud::Sheet& sh, const std
     if (img.save(path)) std::printf("tone map written to %s\n", path);
 }
 
+// ---------------------------------------------------------------------------------------
+// v0.49.7: the camera through a ride - chase camera, the camera button, the helmet camera with
+// the rider's head looking into the corners, a crash - run through the swap's rules as 0.49.6 had
+// them and as they are now. Sean's own 0.49.5 log (helmet camera, 1h30 on WDR.MX.26.R01) had 39
+// spells of `camera=fallback-onboard` - the line drawn through a view made from the bike's
+// heading, fixed to the screen rather than the track - after `camera_not_where_it_was` refused the
+// true camera mid-corner; the rider's report ("it stopped following the track and locked to the
+// camera") is that view.
+namespace ride {
+
+const float kCx = 300.0f, kCy = 2.0f, kCz = 150.0f, kR = 40.0f, kW = 0.3f;  // a 40 m circle at 12 m/s
+
+// The telemetry world: x east, y up, z north. GL: (x, y, -z).
+static void Gl(const float t[3], float g[3]) { g[0] = t[0], g[1] = t[1], g[2] = -t[2]; }
+
+struct World {
+    float b[3], h[3], s[3];  // bike, heading, right
+};
+static World At(float a) {  // `a`: the angle round the circle
+    World w;
+    w.b[0] = kCx + kR * std::cos(a), w.b[1] = kCy, w.b[2] = kCz + kR * std::sin(a);
+    w.h[0] = -std::sin(a), w.h[1] = 0, w.h[2] = std::cos(a);
+    w.s[0] = std::cos(a), w.s[1] = 0, w.s[2] = std::sin(a);
+    return w;
+}
+static Mat4 View(const float eye[3], const float at[3]) {
+    float e[3], t[3];
+    Gl(eye, e), Gl(at, t);
+    return LookAt(e[0], e[1], e[2], t[0], t[1], t[2]);
+}
+enum Cam { CHASE, ONBOARD, CRASH };
+static Mat4 CamView(Cam c, const World& w, float t) {
+    float eye[3], at[3];
+    if (c == CHASE) {
+        for (int k = 0; k < 3; ++k) eye[k] = w.b[k] - 4.0f * w.h[k], at[k] = w.b[k] + 8.0f * w.h[k];
+        eye[1] += 1.8f;
+    } else if (c == ONBOARD) {
+        // The head: 1.55 m over the bike's origin, a little back, swaying with the lean; looking
+        // into the corners by up to 40 degrees and down 8.
+        const float lean = 0.5f * std::sin(0.9f * t), look = 0.6981f * std::sin(1.7f * t);
+        for (int k = 0; k < 3; ++k) eye[k] = w.b[k] - 0.25f * w.h[k] + lean * w.s[k];
+        eye[1] += 1.55f;
+        const float c0 = std::cos(look), s0 = std::sin(look);
+        for (int k = 0; k < 3; ++k) at[k] = eye[k] + 10.0f * (c0 * w.h[k] + s0 * w.s[k]);
+        at[1] -= 10.0f * std::tan(0.14f);
+    } else {  // the crash camera: off to the side, still
+        eye[0] = kCx + 30, eye[1] = kCy + 6, eye[2] = kCz;
+        for (int k = 0; k < 3; ++k) at[k] = w.b[k];
+    }
+    return View(eye, at);
+}
+/// The frame's modelview loads, in the game's order: scenery with its own model matrices, the bike,
+/// the rider's head, then the track (whose load is the view) three times.
+static std::vector<Mat4> Loads(const Mat4& V, const World& w, float yaw_deg) {
+    std::vector<Mat4> out;
+    for (int i = 0; i < 25; ++i) {
+        const float a = 0.25f * float(i);
+        float       p[3] = {kCx + 55.0f * std::cos(a), kCy, kCz + 55.0f * std::sin(a)}, g[3];
+        Gl(p, g);
+        out.push_back(Mul(V, Mul(Translate(g[0], g[1], g[2]), Rotate(37.0f * float(i), 0, 1, 0))));
+    }
+    float g[3];
+    Gl(w.b, g);
+    out.push_back(Mul(V, Mul(Translate(g[0], g[1], g[2]), Rotate(yaw_deg, 0, 1, 0))));
+    out.push_back(Mul(V, Mul(Translate(g[0], g[1] + 1.5f, g[2]), Rotate(yaw_deg + 20.0f, 0, 1, 0))));
+    for (int i = 0; i < 3; ++i) out.push_back(V);
+    return out;
+}
+static bool Same(const Mat4& a, const Mat4& b) {
+    for (int i = 0; i < 16; ++i)
+        if (std::fabs(a.m[i] - b.m[i]) > 1e-4f) return false;
+    return true;
+}
+
+/// 0.49.6's learnt view, kept here to show what it did: distance and direction always.
+class OldViewRef {
+public:
+    bool known() const { return known_; }
+    void reset() { known_ = false; }
+    bool agrees(const BikeView& b) const {
+        if (!known_) return true;
+        if (!b.ok || std::fabs(b.dist - dist_) > kViewDistTolM) return false;
+        return b.dir[0] * dir_[0] + b.dir[1] * dir_[1] + b.dir[2] * dir_[2] >= kViewAngleCos;
+    }
+    void learn(const BikeView& b) {
+        if (!b.ok || !agrees(b)) return;
+        if (!known_) {
+            known_ = true, dist_ = b.dist;
+            for (int k = 0; k < 3; ++k) dir_[k] = b.dir[k];
+            return;
+        }
+        dist_ += kViewLearn * (b.dist - dist_);
+        float n = 0;
+        for (int k = 0; k < 3; ++k) dir_[k] += kViewLearn * (b.dir[k] - dir_[k]), n += dir_[k] * dir_[k];
+        n = std::sqrt(n);
+        for (int k = 0; k < 3; ++k) dir_[k] /= n;
+    }
+
+private:
+    bool  known_ = false;
+    float dist_ = 0, dir_[3] = {0, 0, 0};
+};
+
+struct Tally {
+    int riding = 0, through_camera = 0, stale = 0, wrong = 0, none = 0, fallback = 0;
+    int view_changes = 0, first_after_change = -1, first_after_crash = -1;
+};
+
+// The timeline: chase until 6 s, the camera button, helmet camera; down at 14 s, up 30 m on at 15.5 s.
+const float kSwitchS = 6.0f, kCrashS = 14.0f, kUpS = 15.5f, kEndS = 24.0f, kDt = 1.0f / 120.0f;
+
+static Tally Run(bool now_rules) {
+    Tally            T;
+    const int        gl_idx = FallbackAxes();
+    AxesLock         lock;
+    CameraFollow     follow;
+    ViewRef          ref;
+    OldViewRef       oref;
+    EyeWatch         eye;
+    Continuity       cont, freec;
+    Relock           relock;
+    bool             want_free = false;
+    unsigned         gen = 0;
+    unsigned long long cam_since = 0, miss = 0;
+    bool             last_ok = false;
+    for (int f = 0;; ++f) {
+        const float t = float(f) * kDt;
+        if (t > kEndS) break;
+        const unsigned long long now = 1000 + (unsigned long long)(t * 1000.0f);
+        const bool visible = t < kCrashS || t >= kUpS + kSettleS;
+        if (f == int(kCrashS / kDt) || f == int(kUpS / kDt)) ++gen;
+        const float a   = kW * t + (t >= kUpS ? 0.75f : 0.0f);  // put back 30 m on
+        const World w   = At(a);
+        const Cam   cam = t < kSwitchS ? CHASE : visible || t >= kUpS ? ONBOARD : CRASH;
+        const Mat4  V   = CamView(cam, w, t);
+        const float bx = w.b[0], by = w.b[1], bz = w.b[2];
+        ModelviewPick best, freep;
+        for (const Mat4& m : Loads(V, w, -a * 57.29578f)) {
+            const float* prev = lock.locked() >= 0 ? follow.anchor(now) : nullptr;
+            if (now_rules) {
+                if (prev) ModelviewFollow(best, m, bx, by, bz, lock.locked(), prev);
+                else ModelviewOffer(best, m, bx, by, bz, lock.locked(), &ref);
+                if (want_free) ModelviewOffer(freep, m, bx, by, bz, lock.locked());
+            } else {
+                // 0.49.6: the learnt view filters every load, following or not.
+                if (oref.known() && lock.locked() >= 0 && !oref.agrees(BikeInView(m, AxesAt(lock.locked()), bx, by, bz))) {
+                    float ex, ey, ez, g[3];
+                    CameraPos(m, ex, ey, ez);
+                    AxesAt(lock.locked()).apply(bx, by, bz, g[0], g[1], g[2]);
+                    const float d = std::sqrt((ex - g[0]) * (ex - g[0]) + (ey - g[1]) * (ey - g[1]) + (ez - g[2]) * (ez - g[2]));
+                    if (ValidView(m) && d <= kMaxMvCamDist && d >= kMinCamDist) ++best.rejected;
+                    continue;
+                }
+                if (prev) ModelviewFollow(best, m, bx, by, bz, lock.locked(), prev);
+                else ModelviewOffer(best, m, bx, by, bz, lock.locked());
+            }
+        }
+        bool fresh = false, drew = false;
+        Mat4 drawn;
+        if (now_rules) {  // as hkSwap, v0.49.7
+            const bool following = lock.locked() >= 0 && follow.holding(now);
+            bool       took_free = false;
+            if (!best.ok && freep.ok && ref.known() && relock.settled(now, visible)) {
+                float e[3], b[3];
+                CameraPos(freep.view, e[0], e[1], e[2]);
+                AxesAt(freep.axes).apply(bx, by, bz, b[0], b[1], b[2]);
+                if (freec.next(e, b) >= kLockFrames && freec.moved_with_bike()) {
+                    ref.reset(), follow.reset(), eye.reset(), cont.reset(), freec.reset();
+                    best = freep, took_free = true;
+                    ++T.view_changes;
+                }
+            } else {
+                freec.reset();
+            }
+            int c = 0;
+            if (best.ok) {
+                float e[3], b[3];
+                CameraPos(best.view, e[0], e[1], e[2]);
+                AxesAt(best.axes).apply(bx, by, bz, b[0], b[1], b[2]);
+                c = cont.next(e, b);
+            } else {
+                cont.reset();
+            }
+            lock.vote(best.ok && c >= 2 ? best.axes : -1);
+            const bool confirmed = best.ok && (following || took_free || c >= kRelockFrames);
+            bool       eye_off   = false;
+            if (lock.locked() >= 0 && confirmed) {
+                fresh = true;
+                float e[3];
+                CameraPos(best.view, e[0], e[1], e[2]);
+                follow.hit(e, now);
+            }
+            if (fresh && !eye.ok(best.dist, now)) eye_off = true, fresh = false;
+            if (!visible) fresh = false;
+            static unsigned seen = 0;
+            if (f == 0) seen = gen;
+            if (gen != seen) seen = gen, follow.reset(), eye.reset(), cont.reset();
+            const RelockStep st = relock.frame(now, visible, gen, fresh, eye_off, ref.known(), lock.locked() >= 0);
+            if (st.forget_view) ref.reset();
+            if (st.drop_follow) follow.reset(), eye.reset(), cont.reset();
+            if (st.drop_lock) lock.reset();
+            if (visible && fresh) ref.learn(BikeInView(best.view, AxesAt(best.axes), bx, by, bz));
+            want_free = !fresh && ref.known();
+            if (fresh) drew = true, drawn = best.view;
+            else if (lock.locked() >= 0 && follow.fresh(now) && last_ok) ++T.stale;
+        } else {  // as hkSwap, v0.49.6
+            lock.vote(best.ok ? best.axes : -1);
+            int source = 0;
+            if (lock.locked() >= 0 && best.ok) {
+                source = 2, fresh = true;
+                float e[3];
+                CameraPos(best.view, e[0], e[1], e[2]);
+                follow.hit(e, now);
+            } else if (lock.locked() >= 0 && follow.holding(now)) {
+                source = 2;
+                if (follow.fresh(now) && last_ok) ++T.stale;
+            } else if (now - cam_since > kFallbackMs && visible) {
+                source = 3;
+                ++T.fallback;
+            }
+            if (fresh && !eye.ok(best.dist, now)) follow.reset(), lock.reset(), eye.reset(), fresh = false, source = 0;
+            static unsigned seen = 0;
+            if (f == 0) seen = gen;
+            if (gen != seen) seen = gen, follow.reset(), eye.reset();
+            if (!visible) fresh = false, source = 0;
+            if (visible && lock.locked() >= 0) {
+                if (best.ok) {
+                    miss = 0;
+                    if (fresh) oref.learn(BikeInView(best.view, AxesAt(best.axes), bx, by, bz));
+                } else if (oref.known() && best.rejected > 0) {
+                    if (!miss) miss = now;
+                    else if (now - miss > kViewGiveUpMs) oref.reset(), follow.reset(), miss = 0;
+                }
+            }
+            if (source == 2) cam_since = now;
+            if (fresh) drew = true, drawn = best.view;
+        }
+        last_ok = drew || (last_ok && follow.fresh(now));
+        (void)gl_idx;
+        if (!visible || t < 1.0f) continue;  // the first lock takes a moment; down, nothing is drawn
+        ++T.riding;
+        if (drew) {
+            if (Same(drawn, V)) {
+                ++T.through_camera;
+                if (t >= kSwitchS && T.first_after_change < 0) T.first_after_change = f - int(kSwitchS / kDt);
+                if (t >= kUpS + kSettleS && T.first_after_crash < 0) T.first_after_crash = f - int((kUpS + kSettleS) / kDt);
+            } else {
+                ++T.wrong;
+            }
+        } else {
+            ++T.none;
+        }
+    }
+    return T;
+}
+
+}  // namespace ride
+
+static void CameraRideTests() {
+    // --- Continuity: one camera moves with the bike; an object's "eye" turns with the object ----
+    {
+        Continuity c;
+        float eye[3], bike[3];
+        int   n = 0;
+        for (int i = 0; i < 60; ++i) {
+            bike[0] = 0.2f * float(i), bike[1] = 2, bike[2] = 0;
+            eye[0] = bike[0] - 4, eye[1] = 3.8f, eye[2] = 0.05f * std::sin(float(i));
+            n = c.next(eye, bike);
+        }
+        CHECK(n == 60 && c.moved_with_bike(), "a chase camera: one camera for 60 frames, moving with the bike (%d)", n);
+        Continuity o;
+        for (int i = 0; i < 60; ++i) {
+            bike[0] = 0.2f * float(i), bike[1] = 2, bike[2] = 0;
+            // The bike's displacement seen through a model matrix turned 90 degrees.
+            eye[0] = -4, eye[1] = 3.8f, eye[2] = 0.2f * float(i);
+            n = o.next(eye, bike);
+        }
+        CHECK(n < 30 && o.take_contradicted(), "an object's eye that does not move with the bike never builds a streak (%d)", n);
+        Continuity j;
+        bike[0] = bike[1] = bike[2] = 0;
+        eye[0] = 4, eye[1] = eye[2] = 0;
+        j.next(eye, bike);
+        eye[0] = 0.8f;
+        CHECK(j.next(eye, bike) == 1, "the eye-to-bike distance jumping 3 m restarts the streak");
+    }
+
+    // --- The learnt view: the direction only for a camera that keeps the bike steady ----------
+    {
+        ViewRef chase, helmet;
+        for (int i = 0; i < 60; ++i) {
+            BikeView b;
+            b.ok = true, b.dist = 4.4f + 0.05f * std::sin(float(i));
+            b.dir[0] = 0, b.dir[1] = -0.4f, b.dir[2] = -0.92f;
+            chase.learn(b);
+            // The helmet camera turns with the head: the bike swings 40 degrees either side in it.
+            const float look = 0.6981f * std::sin(0.3f * float(i));
+            BikeView h;
+            h.ok = true, h.dist = 1.6f + 0.1f * std::sin(float(i));
+            h.dir[0] = std::sin(look) * 0.3f, h.dir[1] = -0.95f, h.dir[2] = std::cos(look) * 0.3f;
+            const float n = std::sqrt(h.dir[0] * h.dir[0] + h.dir[1] * h.dir[1] + h.dir[2] * h.dir[2]);
+            for (float& d : h.dir) d /= n;
+            helmet.learn(h);
+        }
+        CHECK(chase.steady(), "the chase camera holds the bike steady: direction checked (%.1f deg)", double(chase.spread_deg()));
+        CHECK(!helmet.steady() || helmet.spread_deg() < 15.0f, "the helmet camera: %.1f deg, steady=%d", double(helmet.spread_deg()),
+              int(helmet.steady()));
+        BikeView turned;
+        turned.ok = true, turned.dist = 1.6f, turned.dir[0] = 0.6f, turned.dir[1] = -0.8f, turned.dir[2] = 0;
+        CHECK(helmet.agrees(turned) || helmet.steady(), "the helmet camera looking the other way still agrees");
+        turned.dist = 0.7f;
+        CHECK(!helmet.agrees(turned), "but 0.9 m nearer does not (tolerance %.2f m)", double(ViewDistTol(1.6f)));
+        CHECK(std::strcmp(ViewKind(1.6f), "onboard") == 0 && std::strcmp(ViewKind(4.4f), "chase") == 0 &&
+                  std::strcmp(ViewKind(30.0f), "far") == 0,
+              "view kinds");
+    }
+
+    // --- Relock: a camera change forgets the old view; the crash camera does not --------------
+    {
+        Relock r;
+        unsigned long long t = 0;
+        for (; t < 3000; t += 10) r.frame(t, true, 1, true, false, true, true);
+        RelockStep s = r.frame(t, true, 1, false, true, true, true);
+        CHECK(s.why && std::strcmp(s.why, "view_change") == 0 && s.forget_view && s.drop_follow && s.wake && !s.drop_lock,
+              "riding steadily, the eye leaving its distance is the camera button");
+        Relock c;
+        c.frame(0, true, 1, true, false, true, true);
+        c.frame(500, true, 2, false, false, true, true);  // crashed and put back
+        s = c.frame(900, true, 2, false, true, true, true);
+        CHECK(s.why && std::strcmp(s.why, "eye_off_near_crash") == 0 && !s.forget_view,
+              "within 2 s of a reset it is the crash camera: the view is kept for the relock");
+        // 0.48.1 counted the 3 s only while the axes were locked: after the eye watch dropped them,
+        // the old view was kept for ever.
+        Relock u;
+        u.frame(0, true, 1, true, false, true, false);
+        bool forgot = false;
+        for (unsigned long long k = 10; k < 4000 && !forgot; k += 10) forgot = u.frame(k, true, 1, false, false, true, false).forget_view;
+        CHECK(forgot, "no camera for 3 s with a learnt view and no lock: the view is forgotten");
+        Relock l;
+        l.frame(0, true, 1, true, false, false, true);
+        bool dropped = false;
+        for (unsigned long long k = 10; k < 9000 && !dropped; k += 10) dropped = l.frame(k, true, 1, false, false, false, true).drop_lock;
+        CHECK(dropped, "no camera for 8 s with a lock: the lock is dropped and found again");
+        Relock d;
+        bool any = false;
+        for (unsigned long long k = 0; k < 20000; k += 10) any |= d.frame(k, false, 1, false, false, true, true).why != nullptr;
+        CHECK(!any, "down for 20 s: nothing is let go");
+    }
+
+    // --- The main pass: the window's shape, or the widest depth range when nothing has it ------
+    {
+        Mat4 cube, wide, tri;
+        Frustum(-0.1, 0.1, -0.1, 0.1, 0.1, 100.0, cube);              // a square 90-degree cube face
+        Frustum(-0.018, 0.018, -0.010, 0.010, 0.023, 1000.0, wide);  // the world, 16:9
+        Frustum(-0.054, 0.054, -0.010, 0.010, 0.023, 1000.0, tri);   // three 16:9 screens, 5.33
+        CHECK(ValidProjection(tri), "three screens side by side are a camera's shape (aspect %.2f)", double(Aspect(tri)));
+        float n, f;
+        CHECK(NearFar(wide, n, f) && std::fabs(n - 0.023f) < 1e-3f && std::fabs(f - 1000.0f) < 1.0f, "near %f far %f", double(n),
+              double(f));
+        MainPass m;
+        CHECK(!m.is_main(cube, 16.0f / 9.0f) && m.is_main(wide, 16.0f / 9.0f), "16:9 window: the world pass, not the cube");
+        m.frame_end();
+        CHECK(m.ok() && !m.widest(), "and it is known");
+        MainPass s;  // a window reported 1.6 wide while the game renders 16:9
+        bool started = false;
+        for (int i = 0; i < kNoMatchFrames + 2; ++i) {
+            for (int k = 0; k < 6; ++k) s.is_main(cube, 1.6f);
+            s.is_main(wide, 1.6f);
+            started |= s.frame_end();
+        }
+        CHECK(started && s.widest() && std::fabs(s.widest_aspect() - Aspect(wide)) < 1e-3f,
+              "no projection the window's shape: the widest depth range is the main pass (%.2f)", double(s.widest_aspect()));
+        CHECK(s.is_main(wide, 1.6f) && !s.is_main(cube, 1.6f), "the world pass, still not the cube");
+    }
+
+    // --- The ride ----------------------------------------------------------------------------
+    {
+        const ride::Tally o = ride::Run(false), n = ride::Run(true);
+        std::printf("ride 0.49.6: riding %d, through the camera %d, stale %d, none %d, telemetry fallback %d, wrong %d\n",
+                    o.riding, o.through_camera, o.stale, o.none, o.fallback, o.wrong);
+        std::printf("ride 0.49.7: riding %d, through the camera %d, stale %d, none %d, wrong %d, view changes %d, "
+                    "first frame through the helmet camera %d after the button, %d after getting up\n",
+                    n.riding, n.through_camera, n.stale, n.none, n.wrong, n.view_changes, n.first_after_change,
+                    n.first_after_crash);
+        CHECK(o.fallback > 30 && o.none > 5 * n.none, "0.49.6 reproduces it: the helmet camera lost for %d frames, %d of them through the telemetry fallback", o.none, o.fallback);
+        CHECK(n.wrong == 0, "0.49.7 never draws through a matrix that is not the camera (%d)", n.wrong);
+        CHECK(n.view_changes == 1, "the camera button is seen once (%d)", n.view_changes);
+        CHECK(n.first_after_change >= 0 && n.first_after_change < 72, "the helmet camera is taken within 0.6 s of the button (%d frames)",
+              n.first_after_change);
+        CHECK(n.first_after_crash >= 0 && n.first_after_crash < 12, "and again within 0.1 s of riding after the crash (%d frames)",
+              n.first_after_crash);
+        CHECK(n.through_camera > n.riding * 95 / 100, "drawn through the camera in %d of %d riding frames", n.through_camera, n.riding);
+    }
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // --- v0.45.4: depth reads only while riding, at most once a second ---------------------
@@ -1521,6 +1915,8 @@ int main(int argc, char** argv) {
         CHECK(Unproject(p, V, Axes{}, sp.x, sp.y, d, ux, uy, uz) && std::fabs(ux - wx) > 1.0f,
               "and assuming 0..1 there is metres out: %f", double(ux));
     }
+
+    CameraRideTests();
 
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);

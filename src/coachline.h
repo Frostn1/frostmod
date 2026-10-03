@@ -95,7 +95,8 @@ inline bool ValidProjection(const Mat4& p) {
     const float fovy = 2.0f * std::atan(1.0f / m[5]) * 57.2957795f;
     if (fovy < 20.0f || fovy > 140.0f) return false;
     const float aspect = m[5] / m[0];
-    return aspect > 0.5f && aspect < 4.0f;
+    // Up to 8: three 16:9 screens side by side are 5.3, three 21:9 ones 7.1 (v0.49.7; was 4).
+    return aspect > 0.5f && aspect < 8.0f;
 }
 
 /// Width over height of a projection's view (m[5] / m[0]).
@@ -511,27 +512,46 @@ constexpr float kViewDistTolM  = 1.5f;   // the bike's distance from the camera 
 constexpr float kViewAngleCos  = 0.866f; // and its direction by this angle (30 degrees)
 constexpr float kViewLearn     = 0.02f;  // how fast the learnt place follows a camera that agrees
 constexpr unsigned kViewGiveUpMs = 3000; // no load agreeing for this long while riding: it was a different camera
+// v0.49.7: the direction is only a property of a camera that keeps the bike steady in its view (the
+// chase camera looks at it). The helmet camera turns with the rider's head, so the bike's direction
+// in it swings by far more than 30 degrees in a corner: Sean's onboard log (0.49.5) refused the true
+// camera dozens of times a minute (`camera_not_where_it_was`), lost it, and drew the telemetry
+// fallback - a line fixed to the bike's heading, not to the track - in between. The distance is a
+// property of every camera that rides with the bike.
+constexpr float kViewSteady     = 0.03f;  // mean 1 - cos of the bike's direction from its usual one: ~14 deg
+constexpr int   kViewSteadyN    = 30;     // frames learnt before the direction is judged at all
+/// The distance tolerance: 1.5 m for a chase camera, tighter for one next to the rider.
+inline float ViewDistTol(float d) { return (std::min)(kViewDistTolM, 0.3f + 0.25f * d); }
 
 /// Where the drawing camera held the bike, learnt while it drew.
 class ViewRef {
 public:
-    void reset() { known_ = false; }
+    void reset() { known_ = false, n_ = 0, spread_ = 0; }
     bool known() const { return known_; }
+    /// Whether the bike sat in one direction in this camera while it drew (a chase camera); only
+    /// then is the direction part of the check.
+    bool steady() const { return n_ >= kViewSteadyN && spread_ < kViewSteady; }
     bool agrees(const BikeView& b) const {
         if (!known_) return true;
         if (!b.ok) return false;
-        if (std::fabs(b.dist - dist_) > kViewDistTolM) return false;
+        if (std::fabs(b.dist - dist_) > ViewDistTol(dist_)) return false;
+        if (!steady()) return true;
         const float c = b.dir[0] * dir_[0] + b.dir[1] * dir_[1] + b.dir[2] * dir_[2];
         return c >= kViewAngleCos;
     }
     /// A frame the camera drew through, with the rider up and riding.
     void learn(const BikeView& b) {
-        if (!b.ok || !agrees(b)) return;
+        if (!b.ok) return;
         if (!known_) {
-            known_ = true, dist_ = b.dist;
+            known_ = true, dist_ = b.dist, n_ = 1, spread_ = 0;
             for (int k = 0; k < 3; ++k) dir_[k] = b.dir[k];
             return;
         }
+        if (std::fabs(b.dist - dist_) > ViewDistTol(dist_)) return;
+        // How far the direction wanders, measured before anything is refused for it.
+        const float c = b.dir[0] * dir_[0] + b.dir[1] * dir_[1] + b.dir[2] * dir_[2];
+        spread_ += (n_ < kViewSteadyN ? 1.0f / float(n_ + 1) : kViewLearn) * ((1.0f - c) - spread_);
+        ++n_;
         dist_ += kViewLearn * (b.dist - dist_);
         float n = 0;
         for (int k = 0; k < 3; ++k) dir_[k] += kViewLearn * (b.dir[k] - dir_[k]), n += dir_[k] * dir_[k];
@@ -540,10 +560,204 @@ public:
             for (int k = 0; k < 3; ++k) dir_[k] /= n;
     }
     float dist() const { return dist_; }
+    float spread_deg() const { return std::acos((std::max)(-1.0f, (std::min)(1.0f, 1.0f - spread_))) * 57.2957795f; }
 
 private:
     bool  known_ = false;
-    float dist_ = 0, dir_[3] = {0, 0, 0};
+    int   n_ = 0;
+    float dist_ = 0, dir_[3] = {0, 0, 0}, spread_ = 0;
+};
+
+/// Which kind of camera an eye this far from the bike's origin is, for the log. The plugin's bike
+/// position is low in the frame: Sean's helmet eye sits 1.6 m from it, the chase eye 3-5 m.
+inline const char* ViewKind(float eye_dist) {
+    if (!std::isfinite(eye_dist) || eye_dist <= 0) return "none";
+    if (eye_dist < 2.4f) return "onboard";
+    if (eye_dist <= 12.0f) return "chase";
+    return "far";
+}
+
+// ---------------------------------------------------------------------------------------
+// A pick that is one camera across frames (v0.49.7)
+//
+// The axes lock counted 30 frames in which the same *axes* won - not the same camera: the nearest
+// load each frame could be a different object every time. A camera is continuous: its eye stays
+// within kJumpContM of where it was, its distance to the bike changes little frame to frame, and
+// once the bike has moved a few metres the eye has moved with it. A model matrix of something else
+// read as a view has its eye in that object's own space, which turns with the object, not with the
+// bike. The streak restarts on any of these failing.
+constexpr float kJumpContM      = 3.0f;   // eye frame to frame
+constexpr float kDistContM      = 0.5f;   // eye-to-bike distance frame to frame
+constexpr float kWithBikeMinM   = 2.0f;   // the bike has moved this far: the eye must have moved with it
+constexpr int   kContWindow     = 90;     // frames over which "moved with the bike" is measured
+constexpr int   kRelockFrames   = 5;      // a relock with the axes known draws after this many
+class Continuity {
+public:
+    void reset() { n_ = 0; }
+    /// This frame's pick: its eye and the bike, both in GL coordinates. Returns the streak.
+    int next(const float eye[3], const float bike[3]) {
+        const float d = Dist(eye, bike);
+        bool        cont = n_ > 0 && Dist(eye, prev_) <= kJumpContM && std::fabs(d - prev_d_) <= kDistContM;
+        if (cont) {
+            float de[3], db[3];
+            for (int k = 0; k < 3; ++k) de[k] = eye[k] - eye0_[k], db[k] = bike[k] - bike0_[k];
+            const float moved = Len(db);
+            float       off[3] = {de[0] - db[0], de[1] - db[1], de[2] - db[2]};
+            if (moved >= kWithBikeMinM && Len(off) > 0.5f + 0.3f * moved) cont = false, contradicted_ = true;
+            else if (moved >= kWithBikeMinM) moved_ = true;
+        }
+        if (!cont) {
+            n_ = 0, moved_ = false;
+            for (int k = 0; k < 3; ++k) eye0_[k] = eye[k], bike0_[k] = bike[k];
+        } else if (n_ % kContWindow == 0) {
+            for (int k = 0; k < 3; ++k) eye0_[k] = eye[k], bike0_[k] = bike[k];
+        }
+        ++n_;
+        for (int k = 0; k < 3; ++k) prev_[k] = eye[k];
+        prev_d_ = d;
+        return n_;
+    }
+    int  streak() const { return n_; }
+    /// The bike moved kWithBikeMinM in this streak and the eye moved with it.
+    bool moved_with_bike() const { return moved_; }
+    /// Ever broken because the eye did not move with the bike (for the log), and cleared.
+    bool take_contradicted() {
+        const bool c = contradicted_;
+        contradicted_ = false;
+        return c;
+    }
+
+private:
+    static float Len(const float v[3]) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+    static float Dist(const float a[3], const float b[3]) {
+        const float v[3] = {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+        return Len(v);
+    }
+    int   n_ = 0;
+    bool  moved_ = false, contradicted_ = false;
+    float prev_[3] = {0, 0, 0}, prev_d_ = 0, eye0_[3] = {0, 0, 0}, bike0_[3] = {0, 0, 0};
+};
+
+// ---------------------------------------------------------------------------------------
+// When to let a camera go and find one again (v0.49.7)
+//
+// The rules that were spread through the swap, in one place so a test can drive them:
+//   * the eye moves off its usual distance (EyeWatch) while the rider has been up and riding for
+//     kViewSettleMs since the last crash or reset: the rider pressed the camera button. The learnt
+//     view belongs to the old camera and is forgotten, the search wakes, and the new camera is taken
+//     as soon as it is continuous (kRelockFrames). Within kViewSettleMs of a crash it is the crash
+//     camera, and the learnt view is kept so the relock is the camera that was drawing (v0.48.1).
+//   * no camera from GL for kViewGiveUpMs while riding with a learnt view: the view is forgotten.
+//     v0.48.1 only counted this while the axes lock was held, so after the eye watch dropped the
+//     lock the old view was kept for ever and every true load of the new camera refused.
+//   * no camera at all for kLockStaleMs with a lock held: the lock itself is dropped (axes or
+//     uniform taken in a replay, a menu or a wrong object), so it can be found again.
+constexpr unsigned kViewSettleMs = 2000;
+constexpr unsigned kLockStaleMs  = 8000;
+struct RelockStep {
+    bool        forget_view = false, drop_follow = false, drop_lock = false, wake = false;
+    const char* why = nullptr;
+};
+class Relock {
+public:
+    void reset() { have_gen_ = false, miss_ms_ = 0; }
+    /// Once a riding frame. `fresh`: a camera from GL was found this frame (not carried);
+    /// `eye_off`: the eye watch let it go this frame.
+    RelockStep frame(unsigned long long now, bool visible, unsigned gen, bool fresh, bool eye_off, bool view_known,
+                     bool locked) {
+        RelockStep s;
+        if (!have_gen_ || gen != gen_) have_gen_ = true, gen_ = gen, gen_ms_ = now;
+        if (eye_off) {
+            s.drop_follow = true, s.wake = true;
+            if (settled(now, visible)) s.forget_view = view_known, s.why = "view_change";
+            else s.why = "eye_off_near_crash";
+        }
+        if (!visible || fresh) {
+            miss_ms_ = 0;
+            return s;
+        }
+        if (!miss_ms_) miss_ms_ = now;
+        const unsigned long long el = now - miss_ms_;
+        if (view_known && !s.forget_view && el > kViewGiveUpMs) s.forget_view = true, s.wake = true, s.why = "view_unmatched";
+        if (locked && el > kLockStaleMs) {
+            s.drop_lock = s.drop_follow = s.wake = true;
+            s.forget_view = view_known;
+            s.why = "lock_stale";
+            miss_ms_ = now;
+        }
+        return s;
+    }
+    /// Riding, up, and no crash or reset for kViewSettleMs.
+    bool settled(unsigned long long now, bool visible) const {
+        return visible && have_gen_ && now - gen_ms_ >= kViewSettleMs;
+    }
+    unsigned long long missing_ms(unsigned long long now) const { return miss_ms_ ? now - miss_ms_ : 0; }
+
+private:
+    bool               have_gen_ = false;
+    unsigned           gen_ = 0;
+    unsigned long long gen_ms_ = 0, miss_ms_ = 0;
+};
+
+// ---------------------------------------------------------------------------------------
+// Which projection is the world camera's (v0.49.7)
+//
+// The camera's projection was the one whose aspect is within 8% of the window's. A window whose
+// client rectangle is not the shape the game renders (three screens, a scaled or letterboxed
+// render, a capture tool resizing it) matched none, and with no projection no camera was ever
+// taken: the telemetry fallback drew instead. Now a modelview load remembers the projection in
+// effect when it was issued, and when nothing has matched the window for kNoMatchFrames the main
+// pass is the perspective projection with the widest depth range (the world's 1000 m against the
+// environment cube's 100 m).
+constexpr int kNoMatchFrames = 60;
+inline bool NearFar(const Mat4& p, float& n, float& f) {
+    const float a = p.m[10], b = p.m[14];
+    if (!std::isfinite(a) || !std::isfinite(b) || std::fabs(a - 1.0f) < 1e-6f || std::fabs(a + 1.0f) < 1e-6f) return false;
+    n = b / (a - 1.0f), f = b / (a + 1.0f);
+    return std::isfinite(n) && std::isfinite(f) && n > 0 && f > n;
+}
+inline bool AspectMatches(const Mat4& p, float window) {
+    return window > 0 && std::fabs(Aspect(p) - window) < window * 0.08f;
+}
+/// Which projections are the main pass: the window's shape, or, when none has been for a while,
+/// the shape of the widest depth range seen.
+class MainPass {
+public:
+    void reset() { frame_match_ = last_ok_ = false, no_match_ = 0, wide_ratio_ = 0, wide_aspect_ = 0, use_wide_ = 0; }
+    /// A perspective projection the game set up this frame.
+    bool is_main(const Mat4& p, float window) {
+        if (!ValidProjection(p)) return false;
+        float n, f;
+        if (NearFar(p, n, f) && f / n > wide_ratio_) wide_ratio_ = f / n, wide_aspect_ = Aspect(p);
+        if (window <= 0) return true;
+        if (AspectMatches(p, window)) {
+            frame_match_ = true;
+            return true;
+        }
+        return use_wide_ > 0 && std::fabs(Aspect(p) - use_wide_) < use_wide_ * 0.02f;
+    }
+    /// Whether last frame said which projection is the main pass (a match, or the widest rule):
+    /// only then are loads in another pass left out.
+    bool ok() const { return last_ok_; }
+    /// At the swap. Returns true the frame the widest-depth rule starts being used.
+    bool frame_end() {
+        bool started = false;
+        last_ok_     = frame_match_ || use_wide_ > 0;
+        if (frame_match_) no_match_ = 0, use_wide_ = 0;
+        else if (wide_aspect_ > 0 && ++no_match_ >= kNoMatchFrames) {
+            started  = use_wide_ == 0;
+            use_wide_ = wide_aspect_;
+        }
+        frame_match_ = false, wide_ratio_ = 0, wide_aspect_ = 0;
+        return started;
+    }
+    bool  widest() const { return use_wide_ > 0; }
+    float widest_aspect() const { return use_wide_; }
+
+private:
+    bool  frame_match_ = false, last_ok_ = false;
+    int   no_match_ = 0;
+    float wide_ratio_ = 0, wide_aspect_ = 0, use_wide_ = 0;
 };
 
 /// How far from the bike's origin the chase or helmet camera sits, at most, for the modelview

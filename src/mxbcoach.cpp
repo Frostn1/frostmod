@@ -102,17 +102,27 @@ bool                  g_grid_said_missing = false;
 std::string           g_grid_bad;  // the stamp of a grid file that didn't parse, not read again unchanged
 // The game's own ground (coachterrain.h): the game's height query, sampled into a grid in this
 // process and preferred over the `.ground` file. Never written out, logged or sent anywhere.
-coachterrain::game::Terrain  g_terrain;
-int                          g_terrain_state = 0;  // 0 not looked yet, 1 found, -1 off until the game restarts
-coachterrain::Builder        g_live_b;
+// What the render thread reads, under g_mu:
 coachline::GroundGrid        g_live;
 coachline::AlignCheck        g_live_align;
-coachterrain::Header         g_live_hd;            // the slot's heightfield g_live was made from
-int                          g_live_slot     = 0;  // the slot being tried, 0-based
-bool                         g_live_said     = false;
-ULONGLONG                    g_live_t0 = 0, g_live_check_ms = 0;
-double                       g_live_busy_ms  = 0;  // time spent asking the game, for the log
-const coachline::GroundGrid* g_ground_was    = nullptr;  // the ground the line used last frame
+const coachline::GroundGrid* g_ground_was = nullptr;  // the ground the line used last frame
+// The sampler's own: touched only by LiveGroundStep, on the telemetry thread, and never under
+// g_mu. The game's Draw waits on g_mu, so nothing that asks the game anything may hold it (0.46.0
+// held it from the first telemetry tick and the game hung).
+coachterrain::game::Terrain g_terrain;
+int                         g_terrain_state = 0;  // 0 not looked yet, 1 found, -1 off until the game restarts
+coachterrain::Builder       g_live_b;
+coachterrain::Pacer         g_live_pace;
+coachterrain::Header        g_live_hd, g_live_seen;  // what g_live was made from; the last look at the slot
+bool                        g_live_built = false, g_live_said = false;
+bool                        g_live_off = false;  // the watchdog tripped: off for the event
+int                         g_live_slot = 0;     // the slot being tried, 0-based
+ULONGLONG                   g_live_t0 = 0, g_live_check_ms = 0;
+// Asked of the sampler from under g_mu: 1 start again from slot 1 (event start or end), 2 try
+// the next slot (the one sampled is not under the rider).
+std::atomic<int> g_live_req{0};
+// Since when the rider has been riding (on track, moving, not crashed); 0 when not. RunTelemetry.
+ULONGLONG g_ride_since = 0;
 // Crashes, getting up and the game putting the bike back (coachline::RiderState).
 coachline::RiderState g_rider_state;
 // What the sheet adds to the line on the track: the ground across it and where its lap braked.
@@ -791,17 +801,43 @@ void LoadGround(bool quiet) {
     Log("ground", msg);
 }
 
-/// The game's ground, back to nothing: a new event, its end, or the slot changing under it.
+/// The game's ground, back to nothing: a new event or its end. Under g_mu.
 void ResetLiveGround() {
     g_live.clear();
-    g_live_b.reset();
     g_live_align.reset();
-    g_live_slot = 0;
-    g_live_said = false;
+    g_live_req.store(1);
 }
 
 /// The game's ground, once it lines up with the rider (or until the check says).
 bool LiveGroundOn() { return g_live.ready() && (!g_live_align.result().done || g_live_align.result().ok); }
+
+/// A marker kept on disk only while a grid is being asked for (it holds the version, nothing of
+/// the ground). Still there when the game next starts means the game hung or died mid-way: the
+/// sampling then stays off for that version rather than hang it again.
+std::string LiveBusyPath() { return g_base + "terrain.busy"; }
+void        LiveBusy(bool on) {
+    if (!on) {
+        DeleteFileA(LiveBusyPath().c_str());
+        return;
+    }
+    if (std::FILE* f = std::fopen(LiveBusyPath().c_str(), "wb")) {
+        std::fputs(FROSTMOD_VERSION, f);
+        std::fclose(f);
+    }
+}
+/// At startup, under g_mu.
+void LiveBusyCheck() {
+    const std::string was = ReadText(LiveBusyPath());
+    if (was.empty()) return;
+    if (was == FROSTMOD_VERSION) {
+        g_terrain_state = -1;
+        Log("terrain", "off: the last time this version asked the game for its ground it never finished (the game "
+                       "hung or was closed mid-way). The line uses the track's grid file, or snaps to what the game "
+                       "draws. Delete mxbcoach\\terrain.busy to try again");
+        return;
+    }
+    LiveBusy(false);
+}
 
 /// The next slot with a heightfield in it, from `g_live_slot` on; -1 when there is none.
 int NextLiveSlot() {
@@ -810,11 +846,23 @@ int NextLiveSlot() {
     return -1;
 }
 
-/// A slice of the game's ground, from RunTelemetry: the game's own thread, mid-run, the track
-/// loaded. A millisecond and a half of asking a tick, so a 550 m track is done in a few seconds
-/// and no tick is slowed by more than that. Under g_mu.
-void LiveGroundStep() {
-    if (!g_hud_set.enabled || !g_hud_set.ground || !g_practice) return;
+/// What RunTelemetry hands the sampler, read under g_mu.
+struct LiveIn {
+    bool      on        = false;  // asked for, a practice run, telemetry flowing
+    ULONGLONG riding_ms = 0;      // how long the rider has been riding
+};
+/// What a slice hands back, applied under g_mu.
+struct LiveOut {
+    std::vector<std::string> said;
+    bool                     publish = false, clear = false;
+    coachline::GroundGrid    grid;
+};
+
+/// One slice of the game's ground. Not under g_mu (see g_terrain). Only once the rider has been
+/// riding a few seconds and the slot's heightfield has settled; at most a millisecond of asking a
+/// slice and a tenth of wall time, and off for the event if the watchdog trips.
+void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
+    if (!in.on || g_live_off || g_terrain_state < 0 || double(in.riding_ms) < coachterrain::kSettleMs) return;
     if (g_terrain_state == 0) {
         std::string why;
         if (coachterrain::game::Locate(g_terrain, why)) {
@@ -825,21 +873,24 @@ void LiveGroundStep() {
                           "game's own ground, in memory only",
                           size_t(mxb::RVA_TERRAIN_SAMPLE), g_terrain.behind_hook ? " (behind FrostMod's guard)" : "",
                           size_t(mxb::RVA_TRACK_SLOTS));
-            Log("terrain", msg);
+            out.said.push_back(msg);
         } else {
             g_terrain_state = -1;
-            Log("terrain", "off: " + why + ". The line uses the track's grid file, or snaps to what the game draws");
+            out.said.push_back("off: " + why + ". The line uses the track's grid file, or snaps to what the game draws");
+            return;
         }
     }
-    if (g_terrain_state != 1) return;
     const ULONGLONG now = GetTickCount64();
     // Built: still the slot's heightfield? A track reloaded under us is a different one.
-    if (g_live.ready()) {
+    if (g_live_built) {
         if (now - g_live_check_ms < 1000) return;
         g_live_check_ms = now;
         if (coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, g_live_slot)) != g_live_hd) {
-            Log("terrain", "the game's ground changed under the line (track reloaded); sampling it again");
-            ResetLiveGround();
+            out.said.push_back("the game's ground changed under the line (track reloaded); sampling it again");
+            out.clear    = true;
+            g_live_built = false;
+            g_live_slot  = 0;
+            g_live_seen  = {};
         }
         return;
     }
@@ -849,70 +900,136 @@ void LiveGroundStep() {
         const int slot  = NextLiveSlot();
         if (slot < 0) {
             if (!g_live_said)
-                Log("terrain", g_live_slot ? "no other track slot has a heightfield; the line uses the track's grid file, "
-                                             "or snaps to what the game draws"
-                                           : "no heightfield loaded in any track slot yet");
+                out.said.push_back(g_live_slot ? "no other track slot has a heightfield; the line uses the track's grid "
+                                                 "file, or snaps to what the game draws"
+                                               : "no heightfield loaded in any track slot yet");
             g_live_said = true;
             return;
         }
-        g_live_slot = slot;
-        g_live_said = false;
-        g_live_b.start(coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, slot)));
-        const coachterrain::Header& h = g_live_b.header();
-        const coachterrain::Plan&   p = g_live_b.plan();
-        char                        msg[220];
+        g_live_said                   = false;
+        const coachterrain::Header hd = coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, slot));
+        // Settled: the same heightfield on two looks a second apart.
+        if (slot != g_live_slot || hd != g_live_seen) {
+            g_live_slot = slot;
+            g_live_seen = hd;
+            return;
+        }
+        g_live_b.start(hd);
+        const coachterrain::Plan& p = g_live_b.plan();
+        char                      msg[220];
         std::snprintf(msg, sizeof(msg), "sampling the game's ground, slot %d: %dx%d over %.0fx%.0f m, as %ux%u at %.2f m",
-                      slot + 1, h.cols, h.rows, double(h.size_x), double(h.size_z), p.w, p.h, double(p.step));
-        Log("terrain", msg);
-        g_live_t0      = now;
-        g_live_busy_ms = 0;
+                      slot + 1, hd.cols, hd.rows, double(hd.size_x), double(hd.size_z), p.w, p.h, double(p.step));
+        out.said.push_back(msg);
+        g_live_t0 = now;
+        g_live_pace.reset();
+        LiveBusy(true);
+        return;  // the first slice on the next tick, once this line is in the log
     }
     const uint8_t* slot = coachterrain::game::Slot(g_terrain, g_live_slot);
     if (coachterrain::ReadHeader(slot) != g_live_b.header()) {
-        Log("terrain", "the slot's heightfield changed while it was sampled; starting again");
+        out.said.push_back("the slot's heightfield changed while it was sampled; starting again");
         g_live_b.reset();
+        g_live_seen = {};
+        LiveBusy(false);
         return;
     }
     LARGE_INTEGER f, t0, t;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
-    const LONGLONG budget = f.QuadPart * 3 / 2000;  // 1.5 ms
-    const auto     ask    = [&](float x, float z, float& y) { return coachterrain::game::Ask(g_terrain, slot, x, z, y); };
+    const double ms_per_tick = 1000.0 / double(f.QuadPart);
+    const double start_ms    = double(t0.QuadPart) * ms_per_tick;
+    if (!g_live_pace.may_run(start_ms)) return;
+    const LONGLONG cap = LONGLONG(coachterrain::Pacer::kSliceMs / ms_per_tick);
+    const auto     ask = [&](float x, float z, float& y) { return coachterrain::game::Ask(g_terrain, slot, x, z, y); };
     do {
-        g_live_b.run(ask, 256);
+        g_live_b.run(ask, 64);
         QueryPerformanceCounter(&t);
-    } while (g_live_b.state() == coachterrain::Builder::RUNNING && t.QuadPart - t0.QuadPart < budget);
-    g_live_busy_ms += double(t.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
-    char msg[240];
+    } while (g_live_b.state() == coachterrain::Builder::RUNNING && t.QuadPart - t0.QuadPart < cap);
+    const double slice_ms = double(t.QuadPart - t0.QuadPart) * ms_per_tick;
+    char         msg[260];
+    if (!g_live_pace.done(start_ms + slice_ms, slice_ms)) {
+        std::snprintf(msg, sizeof(msg),
+                      "off for this event: the game took %.1f ms to answer one slice (%.0f ms in all), over the "
+                      "watchdog's budget. The line uses the track's grid file, or snaps to what the game draws",
+                      slice_ms, g_live_pace.busy_ms());
+        out.said.push_back(msg);
+        g_live_off = true;
+        g_live_b.reset();
+        LiveBusy(false);
+        return;
+    }
     switch (g_live_b.state()) {
         case coachterrain::Builder::DONE: {
             const double share = 100.0 * double(g_live_b.answered()) / double(g_live_b.total());
             g_live_hd          = g_live_b.header();
-            g_live             = g_live_b.take();
-            g_live_align.reset();
+            out.grid           = g_live_b.take();
+            out.publish        = true;
+            g_live_built       = true;
+            g_live_check_ms    = now;
+            LiveBusy(false);
             std::snprintf(msg, sizeof(msg),
                           "the game's ground is ready: %ux%u at %.2f m, %.1f%% of it answered, after %.1f s (%.0f ms of "
                           "asking); checking it lines up",
-                          g_live.width(), g_live.height(), double(g_live.step()), share, double(now - g_live_t0) / 1000.0,
-                          g_live_busy_ms);
-            Log("terrain", msg);
+                          out.grid.width(), out.grid.height(), double(out.grid.step()), share,
+                          double(now - g_live_t0) / 1000.0, g_live_pace.busy_ms());
+            out.said.push_back(msg);
             break;
         }
         case coachterrain::Builder::FAILED:
             if (g_live_b.asked() < g_live_b.total()) {
-                Log("terrain", "the game's height query faulted; off until the game restarts. The line uses the "
-                               "track's grid file, or snaps to what the game draws");
+                out.said.push_back("the game's height query faulted; off until the game restarts. The line uses the "
+                                   "track's grid file, or snaps to what the game draws");
                 g_terrain_state = -1;
             } else {
                 std::snprintf(msg, sizeof(msg), "slot %d answered too little of its grid to be the track's ground",
                               g_live_slot + 1);
-                Log("terrain", msg);
+                out.said.push_back(msg);
                 ++g_live_slot;
+                g_live_seen = {};
             }
             g_live_b.reset();
+            LiveBusy(false);
             break;
         default: break;
     }
+}
+
+/// The game's ground, from RunTelemetry after it let go of g_mu: the telemetry thread, the one
+/// the physics asks the same question on. g_mu only to hand the grid and the log lines over.
+void LiveGroundStep(const LiveIn& in) {
+    switch (g_live_req.exchange(0)) {
+        case 1:
+            g_live_off  = false;
+            g_live_slot = 0;
+            g_live_pace.reset();
+            if (g_live_b.state() == coachterrain::Builder::RUNNING) LiveBusy(false);
+            g_live_b.reset();
+            g_live_built = g_live_said = false;
+            g_live_seen  = {};
+            break;
+        case 2:
+            if (g_live_built) ++g_live_slot;
+            g_live_b.reset();
+            g_live_built = g_live_said = false;
+            g_live_seen  = {};
+            break;
+        default: break;
+    }
+    LiveOut out;
+    LiveGroundSlice(in, out);
+    if (out.said.empty() && !out.publish && !out.clear) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    // An event that started or ended meanwhile: what was made is not its ground.
+    const bool stale = g_live_req.load() == 1;
+    if (out.clear) {
+        g_live.clear();
+        g_live_align.reset();
+    }
+    if (out.publish && !stale) {
+        g_live = std::move(out.grid);
+        g_live_align.reset();
+    }
+    for (const std::string& m : out.said) Log("terrain", m);
 }
 
 /// The one-time check that the game's ground is under the rider, as for the grid file. Under g_mu.
@@ -928,9 +1045,10 @@ void LiveGroundAlign(float x, float y, float z, bool grounded) {
         g_live.shift(a.dx, a.dz);
         return;
     }
-    const int next = g_live_slot + 1;
-    ResetLiveGround();
-    g_live_slot = next;
+    g_live.clear();
+    g_live_align.reset();
+    int expect = 0;
+    g_live_req.compare_exchange_strong(expect, 2);
 }
 
 void LoadHud(bool quiet = false) {
@@ -2980,6 +3098,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         WriteRecorderInfo();
         ReadHudSettings(true);
         LogHudSettings();
+        LiveBusyCheck();
     }
     dir += "sessions\\";
     CreateDirectoryA(dir.c_str(), nullptr);
@@ -2996,6 +3115,7 @@ __declspec(dllexport) void Shutdown() {
     g_sit.di = nullptr;
     CloseVoice();
     RemoveGroundHooks();
+    LiveBusy(false);  // a clean exit, not a hang
     Log("mxbcoach", "shutting down");
     LogClose();
 }
@@ -3133,7 +3253,8 @@ __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
     g_rec.on_split(_pData, _iDataSize);
 }
 
-__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
+/// RunTelemetry's part under g_mu; hands back what the game's ground needs.
+LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_sample(_pData, _iDataSize, _fTime, _fPos);
     g_others.on_sample(_fTime, _pData, _iDataSize);
@@ -3206,6 +3327,10 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
             if (a.ok) g_grid.shift(a.dx, a.dz);
         }
         if (!crashed && speed > 3.0f) LiveGroundAlign(here.x, g_rider_y, here.y, grounded);
+        if (crashed || speed <= 3.0f)
+            g_ride_since = 0;
+        else if (!g_ride_since)
+            g_ride_since = GetTickCount64();
         g_have_sample = true;
         g_sample_ms   = GetTickCount64();
         PaceSample(speed, _fTime, crashed);
@@ -3232,7 +3357,15 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     LookForCues(false);
     LookForHud(false);
     if (!g_grid.ready() && GetTickCount64() - g_grid_look_ms >= 1000) LoadGround(true);
-    LiveGroundStep();
+    LiveIn live;
+    live.on        = g_hud_set.enabled && g_hud_set.ground && g_practice && g_have_sample;
+    live.riding_ms = g_ride_since ? GetTickCount64() - g_ride_since : 0;
+    return live;
+}
+
+__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
+    // The game's ground outside g_mu: asking the game anything while holding it can stall Draw.
+    LiveGroundStep(RunTelemetryLocked(_pData, _iDataSize, _fTime, _fPos));
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries

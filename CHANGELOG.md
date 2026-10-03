@@ -1,6 +1,20 @@
 # Changelog
 
-## 2026-10-02 — v0.46.2
+## 2026-10-02 - v0.47.0
+
+### Fixed
+- **MXB Coach: the game no longer hangs when the line samples the game's ground (0.46.0).**
+  0.46.0 asked the game's height query from inside RunTelemetry while holding the plugin's lock,
+  from the very first telemetry tick, and located it with GetModuleHandle (the loader's locks)
+  under that lock too; the game's Draw waits on the same lock, and SavageMX hung on the first
+  tick. Now: nothing that asks the game holds the lock; the exe's base comes from the PEB; it
+  starts only after 3 s of riding and once the slot's heightfield reads the same twice a second
+  apart; at most 1 ms of asking a slice and a tenth of wall time; a watchdog turns it off for the
+  event if a slice runs over 8 ms or 2 s in all; and a marker file (version only, no heights)
+  turns it off for good on that version if the game ever hangs or dies mid-way. The line falls
+  back on the track's grid file or the depth snap.
+
+## 2026-10-02 ï¿½ v0.46.2
 
 ### Fixed
 - **MXB Coach: the line no longer climbs rut walls.** The ribbon took each edge's height from

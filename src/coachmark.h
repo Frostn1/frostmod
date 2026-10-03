@@ -37,6 +37,7 @@ struct Spot {
     float yl = 0, yr = 0;       // the left and right edges' heights
     float lx = 0, lz = 0;       // unit left, horizontal
     float fx = 0, fz = 0;       // unit forward, horizontal
+    float hw = coachline::kHalfWidth;  // half the ribbon's width there
 };
 
 /// The ribbon at `s` metres ahead, between the two rows either side of it. Not ok before the
@@ -57,6 +58,7 @@ inline Spot At(const std::vector<coachline::Vert>& v, float s) {
     out.x = (lx + rx) * 0.5f, out.z = (lz + rz) * 0.5f, out.y = (out.yl + out.yr) * 0.5f;
     const float w = std::hypot(lx - rx, lz - rz);
     if (!(w > 1e-4f) || !std::isfinite(out.y)) return out;
+    out.hw = 0.5f * w;
     out.lx = (lx - rx) / w, out.lz = (lz - rz) / w;
     // Left is forward turned a quarter anticlockwise seen from above (coachline: n = (-tz, tx)).
     out.fx = out.lz, out.fz = -out.lx;
@@ -74,7 +76,7 @@ inline bool Flat(std::vector<Quad>& out, const Spot& p, float s, float across, f
     const float cx = p.x + p.lx * across, cz = p.z + p.lz * across;
     // The height across, extended past the ribbon's edges along the same camber.
     auto y_at = [&](float off) {
-        const float half = 0.5f * (std::max)(1e-3f, coachline::kHalfWidth * 2.0f);
+        const float half = (std::max)(1e-3f, p.hw);
         return p.y + (p.yl - p.yr) * 0.5f * (off / half) + lift;
     };
     const float sx[4] = {+1, +1, -1, -1}, sf[4] = {-1, +1, +1, -1};
@@ -139,10 +141,17 @@ inline float TextWidth(const std::string& t, float h) {
 /// `t` standing upright, centred on `base` (the middle of its bottom edge), reading along
 /// `right` (a horizontal unit vector) with `up` straight up, cap height `h`. Each lit run of a
 /// glyph row is one quad. Characters the font lacks are left as a gap.
+///
+/// Drawn in the rider's style (coachline::Look().text_style): bold widens every lit run by a
+/// fifth of a pixel each side, still inside the gap between letters; italic leans each row
+/// forward by a fifth of a pixel per row up. Sizes are the caller's, scaled there.
 inline void Text(std::vector<Quad>& out, const std::string& t, const float base[3], const float right[3], float h,
                  const float rgba[4], float s) {
-    const float px = h / 7.0f;
-    const float x0 = -0.5f * TextWidth(t, h);
+    const float px    = h / 7.0f;
+    const float x0    = -0.5f * TextWidth(t, h);
+    const int   style = coachline::Look().text_style;
+    const float fat   = style == coachhud::TEXT_BOLD ? 0.2f * px : 0.0f;
+    const float lean  = style == coachhud::TEXT_ITALIC ? 0.2f : 0.0f;  // x per unit of height
     for (size_t i = 0; i < t.size(); ++i) {
         const uint8_t* g = Glyph(t[i]);
         if (!g) continue;
@@ -155,9 +164,11 @@ inline void Text(std::vector<Quad>& out, const std::string& t, const float base[
                 }
                 int end = col;
                 while (end < 5 && (g[row] & (16 >> end))) ++end;
-                const float a = x0 + (float(i) * kAdvance + float(col)) * px, b = x0 + (float(i) * kAdvance + float(end)) * px;
+                const float a = x0 + (float(i) * kAdvance + float(col)) * px - fat,
+                            b = x0 + (float(i) * kAdvance + float(end)) * px + fat;
                 Quad q;
-                const float xs[4] = {a, b, b, a}, ys[4] = {y_lo, y_lo, y_hi, y_hi};
+                const float sl = lean * (y_lo - 3.5f * px), sh = lean * (y_hi - 3.5f * px);  // about the middle row
+                const float xs[4] = {a + sl, b + sl, b + sh, a + sh}, ys[4] = {y_lo, y_lo, y_hi, y_hi};
                 for (int c = 0; c < 4; ++c) {
                     q.p[c][0] = base[0] + right[0] * xs[c];
                     q.p[c][1] = base[1] + right[1] * xs[c] + ys[c];

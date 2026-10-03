@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-02 — v0.45.5
+
+### Added
+- **MXB Coach: the line's look is the rider's.** `hud.ini` takes new optional `[hud]` keys, set
+  from MXB Coach's Settings and picked up live (the file is re-read every second):
+  `line_width` (×0.25–3), `line_opacity` (0.1–1), `col_gas`, `col_coast`, `col_light`,
+  `col_heavy` (the line's gradient), `col_fast`, `col_slow` (the pace hints), all `#RRGGBB`;
+  `line_text` (0 hides the jump calls and their speed, the gear sign on the line and MORE SPEED,
+  leaving just the line); `text_size` (×0.5–2); and `text_style` (`block`, `bold` or `italic`:
+  the on-line block font drawn fatter or leaning; the game's own font, used for MORE SPEED, has
+  neither). A key that isn't there is today's look, so an older Coach changes nothing.
+
 ## 2026-10-02 — v0.45.4
 
 ### Fixed

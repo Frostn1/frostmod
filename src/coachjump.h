@@ -617,13 +617,16 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
             }
         }
         // The label over the lip, facing back down the line at the rider coming to it.
-        const float la = std::isfinite(st) ? LabelAlpha(st) : 0.0f;
+        // Not at all with the line's text off (line_text=0), and at the rider's size.
+        const coachhud::LineLook& look = coachline::Look();
+        const float la = std::isfinite(st) && look.text ? LabelAlpha(st) : 0.0f;
         if (la > 0) {
+            const float lh = kLabelH * look.text_size, hh = kHintH * look.text_size;
             const Spot p = At(verts, st);
             if (!p.ok) continue;
             const float right[3] = {-p.lx, 0, -p.lz};  // the rider's right, facing along the line
             const std::string top = Label(c), hint = speed_hint ? SpeedHint(c) : "";
-            const float lift = kLabelLift + (hint.empty() ? 0.0f : kHintH * 1.6f);
+            const float lift = kLabelLift + (hint.empty() ? 0.0f : hh * 1.6f);
             float base[3] = {p.x, p.y + lift, p.z};
             float shadow[3] = {base[0] + p.fx * 0.06f + right[0] * 0.05f, base[1] - 0.05f, base[2] + p.fz * 0.06f + right[2] * 0.05f};
             const float dark[4] = {0.0f, 0.0f, 0.0f, 0.6f * la};
@@ -631,13 +634,13 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
             if (roll) col[0] = 0.72f, col[1] = 0.86f, col[2] = 1.0f;
             if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN)
                 col[0] = 1.0f, col[1] = 0.88f, col[2] = 0.35f;
-            coachmark::Text(out, top, shadow, right, kLabelH, dark, st);
-            coachmark::Text(out, top, base, right, kLabelH, col, st);
+            coachmark::Text(out, top, shadow, right, lh, dark, st);
+            coachmark::Text(out, top, base, right, lh, col, st);
             if (!hint.empty()) {
-                base[1] -= kHintH * 1.6f, shadow[1] -= kHintH * 1.6f;
+                base[1] -= hh * 1.6f, shadow[1] -= hh * 1.6f;
                 const float hc[4] = {1.0f, 1.0f, 1.0f, 0.85f * la};
-                coachmark::Text(out, hint, shadow, right, kHintH, dark, st);
-                coachmark::Text(out, hint, base, right, kHintH, hc, st);
+                coachmark::Text(out, hint, shadow, right, hh, dark, st);
+                coachmark::Text(out, hint, base, right, hh, hc, st);
             }
         }
     }

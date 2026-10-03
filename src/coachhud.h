@@ -54,6 +54,7 @@
 
 #include "coachcue.h"
 #include "coachglyph.h"
+#include "coachperf.h"
 #include "stance.h"
 
 namespace coachhud {
@@ -387,6 +388,8 @@ struct Settings {
     TextItem cue_item, pace_item, gear_item;
     // Right-drag a part to move it. On by default - it is how the rider finds out they can.
     bool  move = true;
+    // safe_mode=auto|1|0 (coachperf.h): auto, the default, turns it on when MXBMRP3 is loaded.
+    coachperf::SafeSetting safe = coachperf::SAFE_AUTO;
     LineLook look;
 };
 
@@ -434,6 +437,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.row_x   = fraction("row_x", kRowDefaultX);
     s.row_y   = fraction("row_y", kRowDefaultY);
     s.move    = flag("move", true);
+    s.safe    = coachperf::ParseSafe(stance::IniValue(ini, "hud", "safe_mode"));
     // The line's look. A number past its range is clamped into it (the rider asked for more or
     // less, and gets the most there is); one that isn't a number is the default.
     auto number = [&](const char* key, float def, float lo, float hi) {

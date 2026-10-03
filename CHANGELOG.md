@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-03 - v0.49.4
+
+MXB Coach with MXBMRP3: the recorder never waits inside the game's frame, its GL hooks do nothing
+outside the 3D pass of a riding frame, and the log says where every frame's time went.
+
+- **Frame report** (`perf` lines every 10 s): swap-to-swap frame time p50/p99/max and frames over
+  50 ms; per hook and callback (QueryPerformanceCounter, plain counters, no locks) count, passthroughs,
+  total and max; each frame over 50 ms with what we did in it (our time, the game's own present, Draw
+  and RunTelemetry, loads, camera state, depth read); `perf/draw`: the Draw callback cadence, which is
+  what MXBMRP3's FPS counter shows; whether MXBMRP3 is loaded; the threads each part runs on.
+- **Never waits.** Draw and RaceTrackPosition try g_mu instead of waiting for RunTelemetry (Draw hands
+  the game last frame's HUD); the log is written by its own thread; the game window and the window
+  aspect are looked up once a second or two instead of every frame.
+- **GL hooks gated.** A modelview load is only looked at in the world pass (perspective projection) of a
+  riding frame with the line on; the HUD pass (ortho), where the engine draws MXBMRP3, is a passthrough.
+  The camera search is bounded: 3 s, then 500 ms every 3 s while nothing is found.
+- **Fewer driver round trips.** Error/framebuffer/program checks once a second by the clock (was every
+  64th frame); one targeted glPushAttrib for the line and the jump calls (was two GL_ALL_ATTRIB_BITS).
+- **`safe_mode=auto|1|0`** in hud.ini, auto = on when MXBMRP3 is loaded: no depth reads, no shader-uniform
+  hooks (glUseProgram stays), no 30 s camera diagnostics, a shorter camera search (1 s, then 250 ms
+  every 5 s).
+- `tests/glhook_bench`: 1200 world loads + 20k HUD primitives a frame, hook overhead 0.49.0 vs 0.49.4.
+
 ## 2026-10-02 - v0.49.3
 
 FrostMod: hands the game's master server list to MXB App.

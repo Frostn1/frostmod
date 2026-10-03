@@ -647,6 +647,48 @@ inline float Fade(float d) {
     return 1.0f - (d - kFadeNear) / (kFadeFar - kFadeNear);
 }
 
+/// The near fade: 0 at the rider (and behind), rising to 1 `near_m` metres ahead, so the ruts the
+/// line runs through stay visible beside the bike. `near_m` <= 0 is off. Smoothed at both ends so
+/// the edge of the fade does not read as a step.
+inline float NearFade(float d, float near_m) {
+    if (!(near_m > 0.0f)) return 1.0f;
+    if (!(d > 0.0f)) return 0.0f;
+    if (d >= near_m) return 1.0f;
+    const float t = d / near_m;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/// Metres along Coach's line at each sheet point, as the ribbon walks it (a jump over
+/// kMaxGapM is not counted), and the total round the whole lap.
+struct Arc {
+    std::vector<float> m;
+    float              total = 0;
+};
+inline Arc ArcOf(const std::vector<coachhud::RefPoint>& ref) {
+    Arc a;
+    a.m.assign(ref.size(), 0.0f);
+    for (size_t k = 1; k < ref.size(); ++k) {
+        const float d = std::hypot(ref[k].x - ref[k - 1].x, ref[k].z - ref[k - 1].z);
+        a.m[k]        = a.m[k - 1] + (d < kMaxGapM ? d : 0.0f);
+    }
+    if (ref.size() >= 2) {
+        const float c = std::hypot(ref[0].x - ref.back().x, ref[0].z - ref.back().z);
+        a.total       = a.m.back() + (c < kMaxGapM ? c : 0.0f);
+    }
+    return a;
+}
+
+/// `m - rider`, round the lap: in (-total/2, total/2].
+inline float WrapAhead(float m, float rider, float total) {
+    float d = m - rider;
+    if (total > 0.0f) {
+        d = std::fmod(d, total);
+        if (d > total * 0.5f) d -= total;
+        else if (d <= -total * 0.5f) d += total;
+    }
+    return d;
+}
+
 struct Zone {
     float from_m, to_m;  // metres from the line; to_m may run past the lap length (wraps)
 };

@@ -401,6 +401,82 @@ static void TheTextStyles() {
     look = keep;
 }
 
+/// The takeoff bar's world x as the rider rides toward it, with the ribbon rebuilt every two metres
+/// the way the plugin does (rows fixed to the line by `m`, their `s` the distance from the rider at
+/// the rebuild). Returns the spread (max - min) of the bar's position over the ride, in metres, and
+/// the standard deviation of the frame-to-frame step less the rider's own.
+struct Wobble {
+    float spread = 0, sd = 0;
+};
+static Wobble BarWobble(bool anchored) {
+    auto two = [](float s) { return (std::max)(Mound(s, 50.0f), Mound(s, 58.0f)); };
+    const coachhud::Sheet sh    = Sheet(150, two, {{50.0f, 62.0f}});
+    const auto            calls = CallsOf(sh);
+    std::vector<float>    xs;
+    float                 built = -1e9f;
+    std::vector<coachline::Vert> verts;
+    for (float rider = 0.0f; rider < 44.0f; rider += 0.2f) {
+        if (rider - built >= 2.0f) {  // a rebuild: rows every half metre from just behind the rider
+            built = rider;
+            verts.clear();
+            const float x0 = std::floor((rider - 1.0f) * 2.0f) / 2.0f;
+            for (float x = x0; x <= rider + 70.0f; x += 0.5f) {
+                const coachline::Vert l = {x, 1.0f, coachline::kHalfWidth, x - rider, {1, 1, 1, 0.7f}, x};
+                const coachline::Vert r = {x, 1.0f, -coachline::kHalfWidth, x - rider, {1, 1, 1, 0.7f}, x};
+                verts.push_back(l);
+                verts.push_back(r);
+            }
+        }
+        float     frac = 0;
+        const int ai   = coachline::AnchorPoint(sh.ref, rider, 0.0f, rider / 150.0f, frac);
+        Frame     fr;
+        fr.rider_m = rider;
+        fr.total   = 150.0f;
+        std::vector<coachmark::Quad> m;
+        Marks(m, calls, AheadOf(sh.ref, ai, frac, 70.0f), verts, true, anchored ? &fr : nullptr);
+        if (m.size() < 2) continue;
+        float cx = 0;
+        for (int c = 0; c < 4; ++c) cx += m[1].p[c][0] * 0.25f;  // the lit bar
+        xs.push_back(cx);
+    }
+    Wobble w;
+    if (xs.empty()) return w;
+    const auto mm = std::minmax_element(xs.begin(), xs.end());
+    w.spread      = *mm.second - *mm.first;
+    float mean = 0;
+    for (float x : xs) mean += x / float(xs.size());
+    float var = 0;
+    for (float x : xs) var += (x - mean) * (x - mean) / float(xs.size());
+    w.sd = std::sqrt(var);
+    return w;
+}
+
+static void TestNoWobble() {
+    const Wobble before = BarWobble(false), after = BarWobble(true);
+    std::printf("takeoff bar position over the approach: placed by distance ahead: spread %.3f m, sd %.3f m;"
+                " placed by metre on the line: spread %.4f m, sd %.4f m\n",
+                before.spread, before.sd, after.spread, after.sd);
+    CHECK(before.spread > 1.0f, "the old placement does wobble (%.3f m)", before.spread);
+    CHECK(after.spread < 0.01f && after.sd < 0.005f, "anchored to its metre on the line: spread %.4f m", after.spread);
+}
+
+static void TestNearFade() {
+    using coachline::NearFade;
+    CHECK(NearFade(-3, 8) == 0 && NearFade(0, 8) == 0, "gone at and behind the rider");
+    CHECK(NearFade(8, 8) == 1 && NearFade(30, 8) == 1, "solid from N metres ahead");
+    CHECK(NearFade(4, 8) > 0.4f && NearFade(4, 8) < 0.6f, "half way at half the distance: %.2f", NearFade(4, 8));
+    float last = -1;
+    bool  up   = true;
+    for (float d = 0; d <= 8; d += 0.25f) {
+        up = up && NearFade(d, 8) >= last;
+        last = NearFade(d, 8);
+    }
+    CHECK(up, "rises steadily");
+    CHECK(NearFade(-3, 0) == 1 && NearFade(0, 0) == 1 && NearFade(2, -1) == 1, "off at 0");
+    CHECK(coachline::WrapAhead(2.0f, 148.0f, 150.0f) > 3.9f && coachline::WrapAhead(2.0f, 148.0f, 150.0f) < 4.1f,
+          "a metre across the start line is ahead");
+}
+
 int main() {
     TestRhythm();
     TestTable();
@@ -412,6 +488,8 @@ int main() {
     TestMarks();
     TestParse();
     TheTextStyles();
+    TestNoWobble();
+    TestNearFade();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;

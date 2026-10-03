@@ -350,7 +350,8 @@ static void TestMarks() {
 
 static void TestHud() {
     coachhud::Settings s = coachhud::ParseSettings("", false);
-    CHECK(!s.pace, "off until asked for");
+    CHECK(s.pace, "on by default");
+    CHECK(!coachhud::ParseSettings("[hud]\npace=0\n", false).pace, "pace=0 turns it off");
     s = coachhud::ParseSettings("[hud]\nground=1\npace=1\n", false);
     CHECK(s.pace && s.ground, "pace=1");
     coachhud::View v;

@@ -429,6 +429,38 @@ constexpr char SIG_TERRAIN_SAMPLE2[] =
     "\x4C\x89\x44\x24\x18\x41\x57\x48\x81\xEC\xC0\x00\x00\x00\x48\x83\xB9\x50\x07"
     "\x00\x00\x00\x44\x0F\x29\x74\x24\x10\x4C\x8B\xFA\x44\x0F\x28\xF3\x4C\x8B\xD9";
 constexpr char SIG_TERRAIN_SAMPLE2_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// ---- the terrain sampler, called rather than guarded: MXB Coach's ground (2026-10-02) ----
+// Read off a running beta21e on a licensed copy (read-only, nothing written), for the Coach's
+// line on tracks it may not read from disk. 0x1F1720 in full:
+//
+//   int32 f(void* track /*rcx*/, float* height /*rdx*/, float normal[3] /*r8*/,
+//           float x /*xmm3*/, float z /*arg5*/)
+//
+// The rdx above is not opaque: it is homed at entry [rsp+0x10] and the success path writes the
+// height through it (0x1F1CB5, `grid * k + track[+0x768] + ...`), then the unit normal through r8
+// (0x1F1CD4..0x1F1CE3, a cross product 0x267AE0 normalised by 0x267C00, both on its own stack).
+// Nothing else in it stores anywhere but its own frame: a pure read of the track. x and z are
+// world x and z, the frame `.ground` is in (MXB Coach's groundgrid.rs: row = z, untransposed).
+//
+// The track objects are not behind a pointer: three slots of a static array, which the bus
+// accessor at 0x1BB570 indexes (`dec ecx; cmp ecx,2; ja; lea rax,[rip+disp]; imul rcx,0x6160`).
+// Decoded from that lea at runtime, as for the GHS table. On a loaded track slots 1 and 2 both
+// carry its grid; slot 3 was empty.
+constexpr uintptr_t RVA_TRACK_SLOT_ACCESSOR = 0x1BB570;
+constexpr uintptr_t RVA_TRACK_SLOTS         = 0x568488;  // .data, what the lea decodes to
+constexpr size_t    TRACK_SLOT_STRIDE       = 0x6160;
+constexpr int       TRACK_SLOT_COUNT        = 3;
+constexpr size_t    TRACK_SLOT_LEA_DISP_OFF = 0x11;  // the lea's disp32
+constexpr size_t    TRACK_SLOT_LEA_END_OFF  = 0x15;  // the instruction after it
+constexpr size_t    OFF_TERRAIN_SIZE_X      = 0x758;
+constexpr size_t    OFF_TERRAIN_SIZE_Z      = 0x75C;
+constexpr size_t    OFF_TERRAIN_ORIGIN_X    = 0x764;
+constexpr size_t    OFF_TERRAIN_ORIGIN_Z    = 0x76C;
+// 37 bytes, the displacement wildcarded. Unique in beta21e's .text.
+constexpr char SIG_TRACK_SLOT_ACCESSOR[] =
+    "\x48\x83\xEC\x58\xFF\xC9\x83\xF9\x02\x77\x56\x48\x63\xC9\x48\x8D\x05\x00\x00\x00\x00"
+    "\x41\xB9\x01\x00\x00\x00\x48\x69\xC9\x60\x61\x00\x00\x48\x03\xC8";
+constexpr char SIG_TRACK_SLOT_ACCESSOR_MASK[] = "xxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxx";
 // Does a function's first bytes look like somebody already detoured it? MinHook writes a
 // `jmp rel32`, or `jmp [rip+disp32]` when the trampoline is out of a 2 GB jump's reach;
 // other injectors use `mov rax, imm64; jmp rax`. Worth asking before the signature check

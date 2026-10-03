@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.45.5")
+set(FROSTMOD_VERSION "0.46.1")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -135,7 +135,7 @@ set_target_properties(frostserver_app PROPERTIES OUTPUT_NAME "frostserver")
 # line on the track is on (hud.ini ground=1, or trail=1 with no ground key): then it watches the
 # game's GL matrix calls, read-only, to draw it (src/coachline.h). The file rules live in
 # src/coachrec.h and the cue rules in src/coachcue.h.
-add_library(mxbcoach SHARED src/mxbcoach.cpp ${MXBCOACH_DLL_RC})
+add_library(mxbcoach SHARED src/mxbcoach.cpp src/coachterrain.cpp ${MXBCOACH_DLL_RC})
 # dinput8/dxguid: reading the rider's Sit bind on the controller the game reads it from.
 # winmm: speaking the cues through waveOut.
 target_link_libraries(mxbcoach PRIVATE user32 dinput8 dxguid winmm minhook opengl32)
@@ -318,6 +318,11 @@ add_test(NAME coachpace COMMAND coachpace_test)
 # target gear, the hysteresis, the glyph on the line and the badge beside the cue box.
 add_executable(coachgear_test tests/coachgear_test.cpp)
 add_test(NAME coachgear COMMAND coachgear_test)
+# The game's own ground under the line (src/coachterrain.h): the signatures and the slot decode
+# on synthetic code bytes, the heightfield header, the sampling plan, and the grid made a slice
+# at a time from a fake height query - answers, misses, a fault. Pure C++; nothing of the game.
+add_executable(coachterrain_test tests/coachterrain_test.cpp)
+add_test(NAME coachterrain COMMAND coachterrain_test)
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

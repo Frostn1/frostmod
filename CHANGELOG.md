@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-10-02 — v0.45.5
+## 2026-10-02 — v0.46.1
 
 ### Added
 - **MXB Coach: the line's look is the rider's.** `hud.ini` takes new optional `[hud]` keys, set
@@ -12,6 +12,22 @@
   the on-line block font drawn fatter or leaning; the game's own font, used for MORE SPEED, has
   neither). A key that isn't there is today's look, so an older Coach changes nothing.
 
+## 2026-10-02 — v0.46.0
+
+### Added
+- **MXB Coach: the ground line on locked and secured tracks.** The line now sits on the game's
+  own ground, whatever the track: `mxbcoach.dlo` asks the game's height query (the sampler
+  FrostMod guards, `mxbikes.exe+0x1F1720`) for the track's ground at every half metre, a
+  millisecond and a half per telemetry tick, so a 550 m track is ready a few seconds into the
+  first stint. It is used ahead of a `<track>.ground` file (it is the surface the physics rides
+  on, and at 0.5 m against the file's ~1 m) and checked against the rider the same way.
+  - Memory only: the grid is never written to disk, logged, or sent to the app, and is dropped
+    at the end of the event. The game is only read: the query writes nothing but its answer.
+  - Only on the build the addresses were read from (beta21e): the query and the accessor the
+    track slots are decoded out of must match their signatures at their addresses exactly.
+    Anything else, or a fault, and the line works as before (the grid file, then the depth snap).
+  - Log: `terrain:` lines say whether it was found, which track slot was sampled, when it was
+    ready and how much answered, and whether it lines up (`game ground aligned ...`).
 ## 2026-10-02 — v0.45.4
 
 ### Fixed

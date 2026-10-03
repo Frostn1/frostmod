@@ -21,6 +21,7 @@
 #include <string>
 #include <deque>
 #include <vector>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <atomic>
@@ -49,6 +50,7 @@
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
+#include "masterlist.h"
 #include "serverfilter.h"
 #include "session.h"
 #include "changefree.h" // bike change: free the old own-vehicle record
@@ -1809,6 +1811,31 @@ bool g_srvVerbose = false;
 // When true, matching rows are actually skipped (hidden) via the game's own row-skip
 // label; when false the hook is a read-only PREVIEW (logs [srv] but hides nothing).
 bool g_sbHideEnabled = true;
+
+// What the game's browser received from the master, handed to MXB App (see masterlist.h).
+// One vector per populate pass; the pass that just ended is published when the next one starts,
+// and only when it differs from the last one written, so a browser sitting still writes nothing.
+static std::vector<frostmod::masterlist::Row> g_mlPass, g_mlLast;
+
+static void MasterListPublish() {
+    if (g_mlPass.empty() || g_mlPass == g_mlLast || !g_logPath[0]) return;
+    std::string path = g_logPath;
+    if (size_t s = path.find_last_of("\\/"); s != std::string::npos) path.resize(s + 1);
+    else path.clear();
+    const std::string tmp = path + "frostmod_masterlist.tmp";
+    path += frostmod::masterlist::kFileName;
+    const uint64_t ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string text = frostmod::masterlist::Serialize(g_mlPass, ms);
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "wb") != 0 || !f) return;
+    const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    fclose(f);
+    if (ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        g_mlLast = g_mlPass;
+        Log("[masterlist] published %zu server(s) for MXB App", g_mlLast.size());
+    }
+}
 
 // The asm stub calls this once per server row at the LOOP TOP (0x0AB960), BEFORE the
 // row is written to the widget (the first setCellText @ 0x0ABA03). Args: index = r14

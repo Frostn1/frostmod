@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-02 — v0.45.3
+
+### Fixed
+- **MXB Coach: v0.45.2 froze the game and made menu clicks wait.** Its asynchronous depth reads
+  (pixel-pack buffers, fences polled from the swap hook) ran on every frame the line had a camera,
+  the pause screen and menus over the track included, read every snap point each time, and never
+  flushed their fences. They are gone: the depth is read with a plain `glReadPixels` again, at
+  most once a second for all probes together, and only while riding (a telemetry sample and an
+  on-track HUD draw both within 300 ms). In a menu, the pause screen or a loading screen the swap
+  hook builds, reads and draws nothing. The snap reads only its check until the check agrees.
+  The v0.45.2 axes lookup and the grid re-read-on-change are kept.
+
 ## 2026-10-02 — v0.45.2
 
 ### Fixed

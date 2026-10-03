@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-02 - v0.49.2
+
+FrostMod: the log, filter and settings no longer move to %TEMP% at game start.
+
+- **Root cause.** The game's `Startup()` re-resolved the log path while the Init thread was writing
+  its load banner. `fopen_s` opens for writing with no sharing, so the probe hit FrostMod's own open
+  handle and fell back to `%TEMP%\frostmod.log`. Everything FrostMod keeps next to its log moved with
+  it: `frostmod_filter.flag` and `frostmod_serverfilter.yaml` (the server filter stayed inert, so cheat
+  servers showed), `frostmod_mods.txt`, the command file. The real log stopped after its banner.
+  Seen on a player's PC in 7 starts on 0.41.0 and 0.45.1 in one day.
+- The log is opened shared (`_fsopen`, `_SH_DENYNO`) with a short retry, so a reader or another
+  thread never makes a write or the path probe fail. Once the path is FrostMod's own folder it never
+  moves again, and the path is changed under the log lock.
+- A fallback to `%TEMP%` is logged with the reason (in both Init and Startup), as are a stand-down
+  (with the named mutex and this copy's path) and a failed Init thread start.
+
 ## 2026-10-02 - v0.49.0
 
 MXB Coach in-game text: a style, size and place for each text item.

@@ -558,11 +558,22 @@ struct Frame {
     float total   = 0;    // metres round the whole lap
 };
 
+/// The nearest call's label, when the rider has it fixed on screen rather than over the lip
+/// (LineLook::jump.screen): Marks leaves it off the line and hands it over for the HUD to draw.
+struct ScreenLabel {
+    bool        ok = false;
+    std::string top, hint;
+    float       rgb[3] = {1, 1, 1};
+    float       alpha  = 0;
+    float       ahead  = 0;  // metres to the lip
+};
+
 /// The marks for the calls ahead of the rider: a bar across the line at each lip, a box where
 /// Coach's lap landed with a faint dotted arc of its flight between, and the label standing over
 /// the lip. `ahead` from AheadOf; `verts` the ribbon as built. Appends to `out`.
 inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& calls, const std::vector<float>& ahead,
-                  const std::vector<coachline::Vert>& verts, bool speed_hint = true, const Frame* fr = nullptr) {
+                  const std::vector<coachline::Vert>& verts, bool speed_hint = true, const Frame* fr = nullptr,
+                  ScreenLabel* screen = nullptr) {
     using coachmark::Flat;
     using coachmark::Spot;
     const size_t first = out.size();
@@ -644,9 +655,25 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
         // The label over the lip, facing back down the line at the rider coming to it.
         // Not at all with the line's text off (line_text=0), and at the rider's size.
         const coachhud::LineLook& look = coachline::Look();
-        const float la = std::isfinite(st) && look.text ? LabelAlpha(st) : 0.0f;
-        if (la > 0) {
-            const float lh = kLabelH * look.text_size, hh = kHintH * look.text_size;
+        // The call has its own style and size (hud.ini jump_style, jump_size), the line's text
+        // style and size when it has none, and can be switched off or fixed on screen.
+        const coachhud::TextItem& item = look.jump;
+        const float la = std::isfinite(st) && look.text && item.on ? LabelAlpha(st) : 0.0f;
+        if (la > 0 && item.screen) {
+            if (screen && (!screen->ok || st < screen->ahead)) {
+                screen->ok    = true;
+                screen->ahead = st;
+                screen->alpha = la;
+                screen->top   = Label(c);
+                screen->hint  = speed_hint ? SpeedHint(c) : "";
+                screen->rgb[0] = roll ? 0.72f : 1.0f, screen->rgb[1] = roll ? 0.86f : 1.0f, screen->rgb[2] = roll ? 1.0f : 1.0f;
+                if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN)
+                    screen->rgb[0] = 1.0f, screen->rgb[1] = 0.88f, screen->rgb[2] = 0.35f;
+            }
+        } else if (la > 0) {
+            const float size = item.size > 0.0f ? item.size : look.text_size;
+            const int   sty  = item.style != coachhud::kStyleAuto ? item.style : look.text_style;
+            const float lh = kLabelH * size, hh = kHintH * size;
             const Spot p = At(verts, st);
             if (!p.ok) continue;
             const float right[3] = {-p.lx, 0, -p.lz};  // the rider's right, facing along the line
@@ -659,13 +686,13 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
             if (roll) col[0] = 0.72f, col[1] = 0.86f, col[2] = 1.0f;
             if (c.kind == JUMP_ON || c.kind == JUMP_OFF || c.kind == TABLE || c.kind == STEP_UP || c.kind == STEP_DOWN)
                 col[0] = 1.0f, col[1] = 0.88f, col[2] = 0.35f;
-            coachmark::Text(out, top, shadow, right, lh, dark, st);
-            coachmark::Text(out, top, base, right, lh, col, st);
+            coachmark::Text(out, top, shadow, right, lh, dark, st, sty);
+            coachmark::Text(out, top, base, right, lh, col, st, sty);
             if (!hint.empty()) {
                 base[1] -= hh * 1.6f, shadow[1] -= hh * 1.6f;
                 const float hc[4] = {1.0f, 1.0f, 1.0f, 0.85f * la};
-                coachmark::Text(out, hint, shadow, right, hh, dark, st);
-                coachmark::Text(out, hint, base, right, hh, hc, st);
+                coachmark::Text(out, hint, shadow, right, hh, dark, st, sty);
+                coachmark::Text(out, hint, base, right, hh, hc, st, sty);
             }
         }
     }

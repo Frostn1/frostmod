@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-02 - v0.49.0
+
+MXB Coach in-game text: a style, size and place for each text item.
+
+- **Per-item look.** The jump call (SINGLE, DOUBLE, ... with its speed), MORE SPEED, the gear badge
+  and the cue box each take `<item>_style` (`default`, `block`, `bold`, `italic`), `<item>_size`
+  (0.5..3, times today's size), `<item>_x` / `<item>_y` (screen fractions 0..1, y the top of the text)
+  and `<item>_anchor` (`left`, `center`, `right`: the edge x is). Items are `jump`, `pace`, `gear`
+  and `cue` (the cue keeps `cue_x` / `cue_y`, and `cue` for on/off); `jump_text`, `pace_text` and
+  `gear_badge` switch each word off on its own. `default` is today's look: the game's font on the HUD,
+  the line's `text_style` on the line. A block style on the HUD draws the 5 x 7 font as screen quads
+  and falls back to the game's font when the frame has no quads to spare.
+- **On the line or fixed on screen.** `jump_place=screen` takes the nearest jump call off the line
+  and draws it at `jump_x` / `jump_y` (middle of the screen, 0.45 down, until set). MORE SPEED and the
+  gear badge stay under the gap row and beside the cue box until their `_x` / `_y` are written.
+- Every key is optional: a hud.ini without them looks exactly as before. Re-read about once a second.
+
 ## 2026-10-02 - v0.48.1
 
 MXB Coach in-game line: a relock after a crash has to be the camera that was drawing.

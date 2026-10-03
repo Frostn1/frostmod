@@ -243,7 +243,20 @@ static void a_made_grid_keeps_the_files_limits() {
     CHECK(!g.at(0.5f, 0.5f, y), "an infinite height is unknown");
 }
 
+static void slices_are_spread_out_and_the_watchdog_trips() {
+    Pacer p;
+    CHECK(p.may_run(0), "the first slice runs");
+    CHECK(p.done(1.0, 1.0), "a 1 ms slice is fine");
+    CHECK(!p.may_run(5.0) && p.may_run(11.0), "the next waits for ten times the slice");
+    CHECK(!p.done(30.0, Pacer::kOverrunMs + 1) && p.tripped() && !p.may_run(1e9), "one slice far over trips it");
+    p.reset();
+    double now = 0;
+    for (int i = 0; i < 2100 && !p.tripped(); ++i) p.done(now += 10, 1.0);
+    CHECK(p.tripped() && p.busy_ms() > Pacer::kTotalMs, "too much asking in all trips it: %.0f ms", p.busy_ms());
+}
+
 int main() {
+    slices_are_spread_out_and_the_watchdog_trips();
     the_sampler_is_recognised_bare_and_behind_the_guard();
     the_slots_come_out_of_the_accessors_own_lea();
     a_slot_is_read_as_the_sampler_reads_it();

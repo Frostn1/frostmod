@@ -196,6 +196,37 @@ private:
     uint64_t              next_ = 0, answered_ = 0;
 };
 
+/// How long the rider must have been riding (on track, moving, not crashed) before the game is
+/// asked anything: the track is loaded and the physics is asking it the same thing by then. And
+/// the slot's heightfield must read the same on two looks a second apart - not one the loader is
+/// still filling in.
+constexpr double kSettleMs = 3000.0;
+
+/// When the next slice may run, and the watchdog over it. A slice is at most kSliceMs of asking,
+/// and slices are spread out to a kDuty share of wall time, so a burst of telemetry calls (the
+/// game catching up after a hitch) cannot add up to a stall. A slice far over its cap (one query
+/// that took far too long) or too much asking in all trips it: off for the event.
+class Pacer {
+public:
+    static constexpr double kSliceMs = 1.0, kDuty = 0.1, kOverrunMs = 8.0, kTotalMs = 2000.0;
+
+    void reset() { *this = Pacer{}; }
+    bool may_run(double now_ms) const { return !tripped_ && now_ms >= next_ms_; }
+    /// A slice of `slice_ms` ended at `now_ms`. False once tripped.
+    bool done(double now_ms, double slice_ms) {
+        busy_ms_ += slice_ms;
+        next_ms_ = now_ms + slice_ms / kDuty;
+        if (slice_ms > kOverrunMs || busy_ms_ > kTotalMs) tripped_ = true;
+        return !tripped_;
+    }
+    bool   tripped() const { return tripped_; }
+    double busy_ms() const { return busy_ms_; }
+
+private:
+    double next_ms_ = 0, busy_ms_ = 0;
+    bool   tripped_ = false;
+};
+
 // ---------------------------------------------------------------------------------------
 // In the game's process (coachterrain.cpp).
 namespace game {

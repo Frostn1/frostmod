@@ -4,6 +4,7 @@
 #include "coachterrain.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <cstdio>
 
@@ -45,7 +46,9 @@ int CallGuarded(SampleFn fn, const void* track, float x, float z, float* y) {
 
 bool Locate(Terrain& t, std::string& why) {
     t = Terrain{};
-    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleA(nullptr));
+    // The exe's base out of the PEB (x64: gs:[0x60], ImageBaseAddress at +0x10), not
+    // GetModuleHandle: that goes through the loader's locks, and this runs on a game thread.
+    const auto* base = *reinterpret_cast<const uint8_t* const*>(__readgsqword(0x60) + 0x10);
     const uint8_t *begin = nullptr, *end = nullptr;
     if (!base || !TextRange(base, begin, end)) {
         why = "can't read the game's sections";

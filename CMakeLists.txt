@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.49.3")
+set(FROSTMOD_VERSION "0.49.4")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -328,6 +328,16 @@ add_test(NAME coachgear COMMAND coachgear_test)
 # at a time from a fake height query - answers, misses, a fault. Pure C++; nothing of the game.
 add_executable(coachterrain_test tests/coachterrain_test.cpp)
 add_test(NAME coachterrain COMMAND coachterrain_test)
+# What the plugin costs the frame (src/coachperf.h): the frame-time histogram and its percentiles,
+# the per-hook counters, the frames-over-50-ms ring, the gate that makes the GL hooks passthroughs
+# outside the world pass of a riding frame, the bounded camera search and hud.ini's safe_mode.
+add_executable(coachperf_test tests/coachperf_test.cpp)
+add_test(NAME coachperf COMMAND coachperf_test)
+# The GL matrix hooks' cost per frame, 0.49.0 against now, under a synthetic 20k-primitive HUD (not
+# a test: timings are the machine's; run it and read the table).
+if(WIN32)
+    add_executable(glhook_bench tests/glhook_bench.cpp)
+endif()
 
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by

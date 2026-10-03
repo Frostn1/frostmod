@@ -33,12 +33,15 @@
 
 #include <cstdio>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "coachcue.h"
+#include "coachperf.h"
 #include "coachline.h"
 #include "coachhud.h"
 #include "coachgear.h"
@@ -249,15 +252,80 @@ std::string ReadText(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------------------
+// What the plugin costs the frame (coachperf.h). Every hook and callback times its own work with
+// QueryPerformanceCounter into a slot of plain counters; the swap hook times the frame and, every
+// 10 s, queues the report. Nothing here locks, allocates or writes a file.
+coachperf::Acc g_perf[coachperf::SLOT_COUNT];
+// QueryPerformanceFrequency as microseconds per tick (fixed at boot; safe to ask at load).
+double g_us_per_tick = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? 1e6 / double(f.QuadPart) : 0.1;
+}();
+
+inline uint64_t PerfNow() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return uint64_t(t.QuadPart);
+}
+/// Times the scope into a slot. Optionally adds the ticks to a per-frame total as well.
+struct PerfScope {
+    int       slot;
+    uint64_t  t0;
+    uint64_t* frame;
+    explicit PerfScope(int s, uint64_t* f = nullptr) : slot(s), t0(PerfNow()), frame(f) {}
+    ~PerfScope() {
+        const uint64_t d = PerfNow() - t0;
+        g_perf[slot].add(d);
+        if (frame) *frame += d;
+    }
+};
+// The render thread's per-frame totals, for the frame-over-50-ms report: written only by the
+// render thread (the hooks and the swap), reset at each swap.
+uint64_t g_frame_ticks[coachperf::SLOT_COUNT] = {};
+uint32_t g_frame_loads = 0, g_frame_offered = 0, g_frame_hud = 0, g_frame_lock_miss = 0;
+bool     g_frame_depth = false;
+// The longest callback since the last swap, from whichever thread ran it.
+std::atomic<uint64_t> g_frame_draw_cb{0}, g_frame_tele_cb{0};
+// The threads each part runs on, for the report: whether Draw and RunTelemetry share the render
+// thread decides whether a lock held by one can stall the other.
+std::atomic<DWORD> g_tid_draw{0}, g_tid_tele{0};
+std::atomic<uint32_t> g_draw_lock_miss{0};
+// MXBMRP3 in this process (its module loaded, not just installed), looked for off the frame path.
+std::atomic<bool> g_mxbmrp3{false};
+std::atomic<bool> g_safe{false};
+void LookForMxbmrp3() { g_mxbmrp3.store(GetModuleHandleA("mxbmrp3.dlo") != nullptr); }
+
+/// Keeps the longest of the values seen in `a` (one writer per atomic in practice).
+inline void KeepMax(std::atomic<uint64_t>& a, uint64_t v) {
+    if (v > a.load(std::memory_order_relaxed)) a.store(v, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------------------
 // The diagnostic log (coachlog.h).
 //
 // One file per run of the game, at <save path>\mxbcoach\mxbcoach.log, so "send me your log"
 // means this session and not a year of them. Every decision the recorder makes about drawing,
 // sheets, practice and sound goes in it: each one used to be invisible, which made a report of
 // "the HUD does not work" impossible to tell apart from "the sheet was for another track".
-// Flushed every line, because the game is often closed by being killed.
-std::FILE* g_log       = nullptr;
-size_t     g_log_bytes = 0;
+// Written by a thread of its own since v0.49.4: Log() only queues the line. A write and an fflush
+// on the game's render or telemetry thread (the swap hook logged camera changes and its 10 s
+// lines from inside the frame, and every callback logged while holding g_mu, which Draw waited
+// on) put the disk in the frame. The writer flushes within a quarter second, because the game is
+// often closed by being killed.
+std::FILE*               g_log       = nullptr;
+size_t                   g_log_bytes = 0;
+std::mutex               g_log_mu;  // guards g_log_q only, held for a push_back or a swap
+std::condition_variable  g_log_cv;
+std::vector<std::string> g_log_q;
+// A Win32 thread, not std::thread: a std::thread still joinable when the DLL's statics are torn
+// down (the game killed or exiting without Shutdown) calls std::terminate.
+HANDLE                   g_log_thread = nullptr;
+bool                     g_log_stop = false;
+// The render thread never waits for g_log_mu: when it is busy its lines wait here (render thread
+// only) and go with its next line.
+std::vector<std::string> g_log_spill;
+DWORD                    g_render_tid = 0;  // the thread that presents frames, once known
 
 std::string LogStamp() {
     SYSTEMTIME t;
@@ -267,24 +335,75 @@ std::string LogStamp() {
     return s;
 }
 
-void Log(const char* tag, const std::string& message) {
-    if (!g_log) return;
-    const std::string line = coachlog::Line(LogStamp(), tag, message);
-    // Full: stop writing rather than grow without limit. The head of the log holds the startup
-    // decisions, which are the ones worth keeping.
-    if (coachlog::ShouldRestart(g_log_bytes, line.size())) return;
-    std::fwrite(line.data(), 1, line.size(), g_log);
-    std::fflush(g_log);
-    g_log_bytes += line.size();
+DWORD WINAPI LogWriter(LPVOID) {
+    std::vector<std::string> batch;
+    for (;;) {
+        bool stop = false;
+        {
+            std::unique_lock<std::mutex> lock(g_log_mu);
+            g_log_cv.wait_for(lock, std::chrono::milliseconds(250), [] { return g_log_stop || !g_log_q.empty(); });
+            batch.swap(g_log_q);
+            stop = g_log_stop;
+        }
+        if (g_log && !batch.empty()) {
+            for (const std::string& line : batch) {
+                // Full: stop writing rather than grow without limit. The head of the log holds the
+                // startup decisions, which are the ones worth keeping.
+                if (coachlog::ShouldRestart(g_log_bytes, line.size())) break;
+                std::fwrite(line.data(), 1, line.size(), g_log);
+                g_log_bytes += line.size();
+            }
+            std::fflush(g_log);
+        }
+        batch.clear();
+        if (stop) return 0;
+    }
 }
 
+void Log(const char* tag, const std::string& message) {
+    if (!g_log) return;
+    std::string line = coachlog::Line(LogStamp(), tag, message);
+    if (g_render_tid && GetCurrentThreadId() == g_render_tid) {
+        std::unique_lock<std::mutex> lock(g_log_mu, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            if (g_log_spill.size() < 256) g_log_spill.push_back(std::move(line));
+            return;
+        }
+        for (std::string& s : g_log_spill) g_log_q.push_back(std::move(s));
+        g_log_spill.clear();
+        g_log_q.push_back(std::move(line));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_log_mu);
+        if (g_log_q.size() < 4096) g_log_q.push_back(std::move(line));
+    }
+}
+
+void LogClose();
 void LogOpen() {
-    if (g_log) std::fclose(g_log);
+    LogClose();
     g_log       = std::fopen((g_base + "mxbcoach.log").c_str(), "wb");
     g_log_bytes = 0;
+    g_log_stop  = false;
+    if (g_log) g_log_thread = CreateThread(nullptr, 0, LogWriter, nullptr, 0, nullptr);
 }
 
 void LogClose() {
+    if (g_log_thread) {
+        {
+            std::lock_guard<std::mutex> lock(g_log_mu);
+            g_log_stop = true;
+        }
+        g_log_cv.notify_all();
+        const bool done = WaitForSingleObject(g_log_thread, 2000) == WAIT_OBJECT_0;
+        CloseHandle(g_log_thread);
+        g_log_thread = nullptr;
+        if (!done) {
+            g_log = nullptr;  // still writing: leave the file to it rather than close it under it
+            return;
+        }
+    }
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
 }
@@ -1118,6 +1237,25 @@ void ApplyLook() {
     Log("hud.ini", b);
 }
 
+/// Safe mode from hud.ini's safe_mode and whether MXBMRP3 is loaded; said in the log whenever it
+/// changes, with what it leaves out. Off the frame path (callbacks only).
+void UpdateSafe() {
+    LookForMxbmrp3();
+    const bool on = coachperf::SafeOn(g_hud_set.safe, g_mxbmrp3.load());
+    static int said = -1;
+    if (int(on) == said) {
+        g_safe.store(on);
+        return;
+    }
+    said = int(on);
+    g_safe.store(on);
+    const char* why = g_hud_set.safe == coachperf::SAFE_ON    ? "safe_mode=1"
+                      : g_hud_set.safe == coachperf::SAFE_OFF ? "safe_mode=0"
+                      : g_mxbmrp3.load()                      ? "safe_mode=auto and MXBMRP3 is loaded"
+                                                              : "safe_mode=auto and MXBMRP3 is not loaded";
+    Log("safe", std::string(on ? "on (" : "off (") + why + ")" + (on ? std::string(": leaves out ") + coachperf::SafeDrops() : ""));
+}
+
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
 // own map, in the same plugins folder, turns ours off unless the file asks for it.
 void ReadHudSettings(bool force) {
@@ -1130,6 +1268,7 @@ void ReadHudSettings(bool force) {
     const bool mxbmrp3 = !g_plugins.empty() && GetFileAttributesA((g_plugins + "mxbmrp3.dlo").c_str()) != INVALID_FILE_ATTRIBUTES;
     g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
     ApplyLook();
+    UpdateSafe();
 }
 
 /// hud.ini as it ended up, since a part switched off looks exactly like a part that is broken.
@@ -1211,6 +1350,13 @@ LeanInput g_lean;
 
 // The game's own top-level window: DirectInput wants one for its cooperative level.
 HWND GameWindow() {
+    // Looked up once every two seconds, not every frame (v0.49.4): PollDrag asks from Draw, and
+    // EnumWindows walks every top-level window on the desktop.
+    static HWND      cached    = nullptr;
+    static ULONGLONG cached_ms = 0;
+    const ULONGLONG  now       = GetTickCount64();
+    if (cached && now - cached_ms < 2000 && IsWindow(cached)) return cached;
+    cached_ms = now;
     struct Find {
         DWORD pid;
         HWND  hwnd;
@@ -1225,6 +1371,7 @@ HWND GameWindow() {
             return FALSE;
         },
         reinterpret_cast<LPARAM>(&f));
+    cached = f.hwnd;
     return f.hwnd;
 }
 
@@ -1717,7 +1864,15 @@ float                    g_snap[3] = {NAN, NAN, NAN};  // the bike, as of the la
 coachline::ModelviewPick g_mv_best;  // this frame's best modelview camera
 coachline::AxesLock      g_mv_lock;
 unsigned                 g_mv_loads = 0;
-bool                     g_mv_wanted = true;  // set at each swap: a menu, pause or loading frame searches nothing
+// Set at each swap: whether the next frame's hooks do anything, and in which pass they are
+// (coachperf::HookGate). A menu, pause or loading frame, a resting search and the HUD pass do nothing.
+coachperf::HookGate      g_gate;
+coachperf::SearchBackoff g_search;  // the camera search, bounded in time
+bool                     g_safe_frame = false;  // safe mode as of the last swap (render thread)
+bool                     g_check_frame = true;  // this frame may ask the driver (glGetError, FBO): once a second
+ULONGLONG                g_check_ms = 0;
+float                    g_aspect = 0;          // the window's, asked once a second
+ULONGLONG                g_aspect_ms = 0;
 coachline::CameraFollow  g_follow;
 coachline::ViewRef       g_view_ref;      // where the drawing camera held the bike: a relock must agree
 ULONGLONG                g_view_miss = 0; // since when no load has agreed with it, while riding
@@ -1758,6 +1913,7 @@ int                   g_diag_left = 30;  // once a second, for the first 30 s ri
 // What the render thread draws, copied out under the lock so the draw itself never holds it.
 std::vector<coachline::Vert> g_draw_verts;
 std::vector<coachline::Vert> g_draw_marks;  // the pace hints' chevrons and gate, as triangles
+std::vector<coachmark::Quad>  g_marks;  // the jump calls' quads, built under the lock, drawn outside it
 
 using glMatrixMode_t    = void(WINAPI*)(GLenum);
 using glLoadMatrixf_t   = void(WINAPI*)(const GLfloat*);
@@ -1806,7 +1962,9 @@ bool GlProj() { return GlMine() && g_gl.mode == GL_PROJECTION; }
 
 // What our own draw asks the driver, kept to a minimum (v0.48.2): see DrawGroundLine.
 int g_fbo_seen = -1;  // -1 not asked yet, 0 the window, 1 an offscreen target
-bool ErrorCheckFrame() { return (g_gl.n_frames & 63) == 0; }
+/// v0.49.4: once a second by the clock, not every 64th frame (twice a second at the 170 fps the
+/// game ran at, with every one of those a driver round trip).
+bool ErrorCheckFrame() { return g_check_frame; }
 void DrainErrors() {
     for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
     }
@@ -1843,10 +2001,24 @@ void GlProjectionMultiplied(const float* m) {
     GlProjectionTimes(a);
 }
 /// A modelview load: offered as the camera (the view is baked into it), and kept by its
-/// translation for the diagnostic.
-void GlModelLoaded(const float* m) {
+/// translation for the diagnostic. Only in the world pass of a riding frame whose search is not
+/// resting (coachperf::HookGate); anywhere else - the HUD pass, where the engine draws MXBMRP3's
+/// primitives, a menu, a search that found nothing - it is counted and passed straight on.
+void GlModelSkipped() {
     ++g_mv_loads;
-    if (!g_mv_wanted) return;
+    ++g_frame_loads;
+    if (!g_gate.world) ++g_frame_hud;
+    g_perf[coachperf::HK_MODELVIEW].skip();
+}
+void GlModelLoaded(const float* m) {
+    if (!g_gate.offer()) {
+        GlModelSkipped();
+        return;
+    }
+    ++g_mv_loads;
+    ++g_frame_loads;
+    PerfScope ps(coachperf::HK_MODELVIEW, &g_frame_ticks[coachperf::HK_MODELVIEW]);
+    ++g_frame_offered;
     if (std::isfinite(g_snap[0])) {
         coachline::Mat4 a;
         std::memcpy(a.m, m, sizeof(a.m));
@@ -1863,6 +2035,10 @@ void GlModelLoaded(const float* m) {
     ++c.n_mv;
 }
 
+// The hooks (v0.49.4): the matrix mode is always followed (one store), the projection is always
+// classified (a handful of calls a frame: it says which pass the frame is in), and everything else
+// - building the frame's cameras, offering modelview loads - only in the world pass of a riding
+// frame (g_gate). In the HUD pass every call is a compare and a jump to the original.
 void WINAPI hkMode(GLenum m) {
     if (GlMine()) {
         if (m != GL_PROJECTION) GlFinish();
@@ -1870,31 +2046,48 @@ void WINAPI hkMode(GLenum m) {
     }
     g_orig_mode(m);
 }
+/// A projection matrix loaded: which pass this is, and, in a live frame, a camera being built.
+void GlProjectionLoadedGated(const float* m) {
+    PerfScope ps(coachperf::HK_PROJ, &g_frame_ticks[coachperf::HK_PROJ]);
+    g_gate.projection(m);
+    if (g_gate.live) GlProjectionLoaded(m);
+    else GlFinish();
+}
 void WINAPI hkLoadf(const GLfloat* m) {
     if (m && GlMine()) {
-        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(m);
-        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(m);
+        if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(m);
+        else if (g_gl.mode == GL_PROJECTION) GlProjectionLoadedGated(m);
     }
     g_orig_loadf(m);
 }
 void WINAPI hkLoadd(const GLdouble* m) {
     if (m && GlMine()) {
-        float f[16];
-        for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
-        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(f);
-        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(f);
+        if (g_gl.mode == GL_PROJECTION || (g_gl.mode == GL_MODELVIEW && g_gate.offer())) {
+            float f[16];
+            for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
+            if (g_gl.mode == GL_PROJECTION) GlProjectionLoadedGated(f);
+            else GlModelLoaded(f);
+        } else if (g_gl.mode == GL_MODELVIEW) {
+            GlModelSkipped();
+        }
     }
     g_orig_loadd(m);
 }
+/// Multiplied onto the projection: a perspective one starts the world pass. (The game's constant
+/// z flip is a scale, which must not be read as an ortho projection, so nothing else changes it.)
+void GlProjectionMultipliedGated(const float* m) {
+    if (coachperf::IsPerspective(m)) g_gate.frustum();
+    if (g_gl.building) GlProjectionMultiplied(m);
+}
 void WINAPI hkMultf(const GLfloat* m) {
-    if (m && GlProj()) GlProjectionMultiplied(m);
+    if (m && GlProj()) GlProjectionMultipliedGated(m);
     g_orig_multf(m);
 }
 void WINAPI hkMultd(const GLdouble* m) {
     if (m && GlProj()) {
         float f[16];
         for (int i = 0; i < 16; ++i) f[i] = float(m[i]);
-        GlProjectionMultiplied(f);
+        GlProjectionMultipliedGated(f);
     }
     g_orig_multd(m);
 }
@@ -1905,41 +2098,48 @@ void WINAPI hkIdentity() {
 }
 void WINAPI hkFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {
     if (GlProj()) {
+        PerfScope ps(coachperf::HK_PROJ, &g_frame_ticks[coachperf::HK_PROJ]);
+        g_gate.frustum();
         // glFrustum multiplies onto what is there; the game loads identity first, and should it
         // ever stop, the camera-next-to-the-bike test in PickCamera refuses the result.
         GlFinish();
         coachline::Mat4 p;
-        if (coachline::Frustum(l, r, b, t, n, f, p) && coachline::ValidProjection(p)) GlStart(p);
+        if (g_gate.live && coachline::Frustum(l, r, b, t, n, f, p) && coachline::ValidProjection(p)) GlStart(p);
         ++g_gl.n_frustum;
     }
     g_orig_frustum(l, r, b, t, n, f);
 }
 void WINAPI hkOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {
-    if (GlProj()) GlFinish();
+    if (GlProj()) {
+        g_gate.ortho();  // the 2D pass: HUDs, MXBMRP3's among them. Passthrough from here.
+        GlFinish();
+    }
     g_orig_ortho(l, r, b, t, n, f);
 }
+// Translate, rotate and scale only matter while a camera is being built on the projection, which
+// only happens in a live frame: `building` first, so every other call is one load and a jump.
 void WINAPI hkTranslatef(GLfloat x, GLfloat y, GLfloat z) {
-    if (GlProj()) GlProjectionTimes(coachline::Translate(x, y, z));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Translate(x, y, z));
     g_orig_translatef(x, y, z);
 }
 void WINAPI hkTranslated(GLdouble x, GLdouble y, GLdouble z) {
-    if (GlProj()) GlProjectionTimes(coachline::Translate(float(x), float(y), float(z)));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Translate(float(x), float(y), float(z)));
     g_orig_translated(x, y, z);
 }
 void WINAPI hkRotatef(GLfloat a, GLfloat x, GLfloat y, GLfloat z) {
-    if (GlProj()) GlProjectionTimes(coachline::Rotate(a, x, y, z));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Rotate(a, x, y, z));
     g_orig_rotatef(a, x, y, z);
 }
 void WINAPI hkRotated(GLdouble a, GLdouble x, GLdouble y, GLdouble z) {
-    if (GlProj()) GlProjectionTimes(coachline::Rotate(float(a), float(x), float(y), float(z)));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Rotate(float(a), float(x), float(y), float(z)));
     g_orig_rotated(a, x, y, z);
 }
 void WINAPI hkScalef(GLfloat x, GLfloat y, GLfloat z) {
-    if (GlProj()) GlProjectionTimes(coachline::Scale(x, y, z));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Scale(x, y, z));
     g_orig_scalef(x, y, z);
 }
 void WINAPI hkScaled(GLdouble x, GLdouble y, GLdouble z) {
-    if (GlProj()) GlProjectionTimes(coachline::Scale(float(x), float(y), float(z)));
+    if (g_gl.building && GlProj()) GlProjectionTimes(coachline::Scale(float(x), float(y), float(z)));
     g_orig_scaled(x, y, z);
 }
 
@@ -1967,6 +2167,7 @@ bool                        g_program_known = false;  // asked the driver once, 
 /// asked afresh when the shader hooks are not in, on the first draw and on every 64th frame.
 GLint KnownProgram() {
     if (g_use_program && (!g_sh_ok || !g_program_known || ErrorCheckFrame())) {
+        // With glUseProgram hooked this is the once-a-second check that nothing slipped past it.
         GLint program = 0;
         glGetIntegerv(kGlCurrentProgram, &program);
         g_program       = GLuint(program);
@@ -2057,12 +2258,21 @@ void WINAPI hkUseProgram(GLuint p) {
     if (GlMine()) g_program = p;
     g_orig_use(p);
 }
+// Uploads are recorded only in the world pass of a live frame, and never in safe mode.
+void RecordUploadGated(GLuint program, GLint loc, GLboolean transpose, const GLfloat* v) {
+    if (!g_gate.offer() || g_safe_frame) {
+        g_perf[coachperf::HK_UNIFORM].skip();
+        return;
+    }
+    PerfScope ps(coachperf::HK_UNIFORM, &g_frame_ticks[coachperf::HK_UNIFORM]);
+    RecordUpload(program, loc, transpose, v);
+}
 void WINAPI hkUniformMatrix4fv(GLint loc, GLsizei count, GLboolean transpose, const GLfloat* v) {
-    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUpload(g_program, loc, transpose, v);
+    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUploadGated(g_program, loc, transpose, v);
     g_orig_umat4(loc, count, transpose, v);
 }
 void WINAPI hkProgramUniformMatrix4fv(GLuint p, GLint loc, GLsizei count, GLboolean transpose, const GLfloat* v) {
-    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUpload(p, loc, transpose, v);
+    if (v && count >= 1 && loc >= 0 && GlMine()) RecordUploadGated(p, loc, transpose, v);
     g_orig_pumat4(p, loc, count, transpose, v);
 }
 
@@ -2118,20 +2328,28 @@ void WINAPI hkUniform4fv(GLint l, GLsizei n, const GLfloat* v) { Count(EP_UNIFOR
 void WINAPI hkLoadTf(const GLfloat* m) {
     if (m && GlMine()) {
         ++g_ep[EP_LOADT_F];
-        const coachline::Mat4 t = coachline::Transposed([&] { coachline::Mat4 a; std::memcpy(a.m, m, sizeof(a.m)); return a; }());
-        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(t.m);
-        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(t.m);
+        if (g_gl.mode == GL_PROJECTION || (g_gl.mode == GL_MODELVIEW && g_gate.offer())) {
+            const coachline::Mat4 t = coachline::Transposed([&] { coachline::Mat4 a; std::memcpy(a.m, m, sizeof(a.m)); return a; }());
+            if (g_gl.mode == GL_PROJECTION) GlProjectionLoadedGated(t.m);
+            else GlModelLoaded(t.m);
+        } else if (g_gl.mode == GL_MODELVIEW) {
+            GlModelSkipped();
+        }
     }
     g_o_loadtf(m);
 }
 void WINAPI hkLoadTd(const GLdouble* m) {
     if (m && GlMine()) {
         ++g_ep[EP_LOADT_D];
-        float f[16];
-        for (int c = 0; c < 4; ++c)
-            for (int r = 0; r < 4; ++r) f[c * 4 + r] = float(m[r * 4 + c]);
-        if (g_gl.mode == GL_PROJECTION) GlProjectionLoaded(f);
-        else if (g_gl.mode == GL_MODELVIEW) GlModelLoaded(f);
+        if (g_gl.mode == GL_PROJECTION || (g_gl.mode == GL_MODELVIEW && g_gate.offer())) {
+            float f[16];
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r) f[c * 4 + r] = float(m[r * 4 + c]);
+            if (g_gl.mode == GL_PROJECTION) GlProjectionLoadedGated(f);
+            else GlModelLoaded(f);
+        } else if (g_gl.mode == GL_MODELVIEW) {
+            GlModelSkipped();
+        }
     }
     g_o_loadtd(m);
 }
@@ -2180,7 +2398,7 @@ void LogSources(float aspect, const coachline::Candidate* wp) {
 
 /// From the first swap, on the render thread with the game's context current. Same rule as the
 /// fixed-function hooks: glUniformMatrix4fv must go in or none of them do.
-void InstallShaderHooks() {
+void InstallShaderHooks(bool safe) {
     if (g_sh_tried) return;
     g_sh_tried = true;
     std::fill(std::begin(g_slot), std::end(g_slot), -1);
@@ -2212,6 +2430,9 @@ void InstallShaderHooks() {
     std::vector<void*> made;
     std::string        names;
     for (const H& h : hs) {
+        // Safe mode: only glUseProgram, so the line's draw knows the game's program without
+        // asking the driver; the uniform capture and the counted entry points stay out.
+        if (safe && h.o != (void**)&g_orig_use) continue;
         void* t = (void*)wglGetProcAddress(h.n);
         // wglGetProcAddress reports a missing entry as 0, 1, 2, 3 or -1 on some drivers, and
         // has nothing for what opengl32.dll exports itself (glGetFloatv and the like).
@@ -2238,8 +2459,9 @@ void InstallShaderHooks() {
         }
     g_sh_ok       = true;
     g_use_program = g_orig_use;  // our own program switch must not be recorded as the game's
-    Log("ground", "shader uniform hooks installed (read-only): " + names +
-                      " profile mask " + std::to_string(g_profile));
+    Log("ground", std::string(safe ? "safe mode: only the program hook installed (read-only): "
+                                   : "shader uniform hooks installed (read-only): ") +
+                      names + " profile mask " + std::to_string(g_profile));
 }
 
 /// The matrices to draw through for a picked upload: a projective one as it stands (it already
@@ -2429,8 +2651,10 @@ void ResolveSnap(const DepthRead& r) {
 }
 
 /// Reads `r`'s pixels from the back buffer, synchronously, and decides them at once.
+unsigned g_read_budget_used = 0;  // reads made, for the frame report
 void ReadNow(DepthRead& r) {
     if (r.n > 0) {
+        ++g_read_budget_used;
         glReadBuffer(GL_BACK);
         while (glGetError() != GL_NO_ERROR) {
         }
@@ -2566,9 +2790,14 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
 
     const GLenum mode = g_gl.mode;
     g_gl.own          = true;
-    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    // Only the state this draw changes (v0.49.4; it was GL_ALL_ATTRIB_BITS, twice a frame with the
+    // marks): enables, blend and colour mask, depth, polygon offset, shade model, the current
+    // colour, the texture units' state and active unit, the matrix mode, and the read buffer a
+    // depth read sets.
+    const bool reads = depth_ok && !g_safe_frame;
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT | GL_LIGHTING_BIT |
+                 GL_CURRENT_BIT | GL_TEXTURE_BIT | GL_TRANSFORM_BIT | (reads ? GL_PIXEL_MODE_BIT : 0));
     if (g_use_program && program) g_use_program(0);
-    if (depth_ok) DepthProbe(proj, coachline::Mul(view, model), ax);
     if (g_dsnap_reset) {
         g_dsnap.reset();
         g_lsnap.reset(g_line_total);
@@ -2577,8 +2806,17 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         g_dsnap_reset = false;
         ++g_snap_gen;  // the snap started again
     }
-    // Without the track's own ground, snap to what the game drew, a few times a second.
-    if (depth_ok && g_depth != DEPTH_NONE && !g_line_on_ground) SnapProbe(proj, coachline::Mul(view, model), ax);
+    // The depth reads stop the CPU until the GPU has drawn the frame so far: budgeted to a few a
+    // second while riding, and none at all in safe mode (the game tests LEQUAL, which is the
+    // default the probe would confirm).
+    if (reads) {
+        PerfScope ps(coachperf::SWAP_DEPTH, &g_frame_ticks[coachperf::SWAP_DEPTH]);
+        const unsigned before = g_read_budget_used;
+        DepthProbe(proj, coachline::Mul(view, model), ax);
+        // Without the track's own ground, snap to what the game drew, a few times a second.
+        if (g_depth != DEPTH_NONE && !g_line_on_ground) SnapProbe(proj, coachline::Mul(view, model), ax);
+        if (g_read_budget_used != before) g_frame_depth = true;
+    }
     g_orig_mode(GL_PROJECTION);
     glPushMatrix();
     g_orig_loadf(proj.m);
@@ -2659,6 +2897,29 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         }
         glEnd();
     }
+    // The jump calls (coachmark.h) in the same state block (they had a glPushAttrib(ALL) of their
+    // own): tested like the ribbon, pulled a little further so a bar lying on it wins.
+    if (!g_marks.empty()) {
+        if (g_depth != DEPTH_NONE && depth_ok)
+            glPolygonOffset(g_depth == DEPTH_GEQUAL ? 3.0f : -3.0f, g_depth == DEPTH_GEQUAL ? 40.0f : -40.0f);
+        const bool on_ground = g_line_on_ground;  // as the ribbon: no snap on the track's own ground
+        glBegin(GL_QUADS);
+        for (const coachmark::Quad& q : g_marks) {
+            // As the ribbon: a mark carries the lap metre it lies at, and takes the correction held
+            // for that place on the line, which does not slide as the rider moves.
+            const float dy = on_ground || (std::isfinite(q.m) && !g_snap_on) ? 0.0f
+                             : std::isfinite(q.m)                           ? g_lsnap.at(q.m)
+                                                                            : g_dsnap.at(q.s);
+            if (!std::isfinite(dy)) continue;
+            glColor4f(q.rgba[0], q.rgba[1], q.rgba[2], q.rgba[3]);
+            for (int c = 0; c < 4; ++c) {
+                float gx, gy, gz;
+                ax.apply(q.p[c][0], q.p[c][1] + dy, q.p[c][2], gx, gy, gz);
+                glVertex3f(gx, gy, gz);
+            }
+        }
+        glEnd();
+    }
     const GLenum drew = check ? glGetError() : GLenum(GL_NO_ERROR);
     g_orig_mode(GL_MODELVIEW);
     glPopMatrix();
@@ -2702,7 +2963,7 @@ const char* SourceName(int s) {
 // built. Kept apart from the ribbon's own draw so the two can change independently.
 std::vector<coachjump::Call>  g_jump_calls;
 uint32_t                      g_jump_ver = 0;
-std::vector<coachmark::Quad>  g_marks;  // this frame's, built under the lock, drawn outside it
+// g_marks: declared with the ribbon's vertices (drawn in the same state block).
 int                           g_ai    = -1;  // the segment the rider is on this frame, and how far along it
 float                         g_afrac = 0;
 
@@ -2737,93 +2998,132 @@ void BuildMarks() {
     else g_jump_screen.ok = false;
 }
 
-/// The marks through the same camera as the ribbon, with the same ground correction. On the
-/// render thread, right after DrawGroundLine, with the game's state saved and put back the same way.
-void DrawMarks(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Mat4& model,
-               const coachline::Axes& ax, bool depth_ok) {
-    if (g_marks.empty()) return;
-    const bool check = ErrorCheckFrame();
-    GLint program = KnownProgram();
-    const GLenum mode = g_gl.mode;
-    g_gl.own          = true;
-    glPushAttrib(GL_ALL_ATTRIB_BITS);
-    if (g_use_program && program) g_use_program(0);
-    g_orig_mode(GL_PROJECTION);
-    glPushMatrix();
-    g_orig_loadf(proj.m);
-    g_orig_multf(view.m);
-    g_orig_mode(GL_MODELVIEW);
-    glPushMatrix();
-    g_orig_loadf(model.m);
-    for (int u = 0; u < (g_active_texture ? 4 : 1); ++u) {
-        if (g_active_texture) g_active_texture(kGlTexture0 + GLenum(u));
-        glDisable(GL_TEXTURE_2D);
+// ---------------------------------------------------------------------------------------
+// The frame report (coachperf.h): frame time at each swap, our share of it, frames over 50 ms
+// with what we were doing in them, and every 10 s one report queued for the log writer.
+
+coachperf::FrameHist g_hist;
+coachperf::SpikeRing g_spikes;
+coachperf::AccSnap   g_perf_prev[coachperf::SLOT_COUNT];
+uint64_t             g_perf_last = 0;       // QPC at the last frame boundary (swap entry, or Draw without hooks)
+uint64_t             g_perf_report_ms = 0;  // when the last report went out
+uint64_t             g_spikes_said = 0;
+uint64_t             g_ours_sum_us = 0, g_ours_max_us = 0;  // our render-thread time per frame, this window
+uint64_t             g_last_present = 0;    // the previous SwapBuffers call, ticks
+int                  g_frame_source = 0;    // the camera source at the last swap
+uint32_t             g_swap_lock_miss = 0;  // this window
+
+void PerfReport(uint64_t now_ms) {
+    const double win_s = g_perf_report_ms ? double(now_ms - g_perf_report_ms) / 1000.0 : 10.0;
+    g_perf_report_ms   = now_ms;
+    const uint64_t n   = g_hist.count();
+    char head[400];
+    std::snprintf(head, sizeof(head),
+                  " | ours on the render thread %.3f ms/frame avg, %.2f ms max | mxbmrp3=%s safe=%s search=%s rests=%llu "
+                  "camera=%s | threads render=%lu draw=%lu telemetry=%lu | lock misses swap=%u draw=%u",
+                  n ? double(g_ours_sum_us) / double(n) / 1000.0 : 0.0, double(g_ours_max_us) / 1000.0,
+                  g_mxbmrp3.load() ? "loaded" : "absent", g_safe.load() ? "on" : "off",
+                  g_search.resting() ? "resting" : g_gate.live ? "live" : "idle", (unsigned long long)g_search.rests(),
+                  SourceName(g_frame_source), (unsigned long)g_gl.thread, (unsigned long)g_tid_draw.load(),
+                  (unsigned long)g_tid_tele.load(), g_swap_lock_miss, g_draw_lock_miss.exchange(0));
+    Log("perf", coachperf::FrameText(g_hist, win_s) + head);
+    std::string slots;
+    for (int s = 0; s < coachperf::SLOT_COUNT; ++s) {
+        const coachperf::AccSnap d = coachperf::Take(g_perf[s], g_perf_prev[s]);
+        if (!d.n && !d.pass) continue;
+        slots += (slots.empty() ? "" : "; ") + coachperf::SlotText(s, d, g_us_per_tick);
     }
-    if (g_active_texture) g_active_texture(kGlTexture0);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_FOG);
-    glDisable(GL_ALPHA_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_SCISSOR_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDepthMask(GL_FALSE);
-    if (g_depth == DEPTH_NONE || !depth_ok) {
-        glDisable(GL_DEPTH_TEST);
-    } else {
-        // Tested like the ribbon, pulled a little further so a bar lying on it wins.
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(g_depth == DEPTH_GEQUAL ? GL_GEQUAL : GL_LEQUAL);
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(g_depth == DEPTH_GEQUAL ? 3.0f : -3.0f, g_depth == DEPTH_GEQUAL ? 40.0f : -40.0f);
-    }
-    const bool on_ground = g_line_on_ground;  // as the ribbon: no snap on the track's own ground
-    glBegin(GL_QUADS);
-    for (const coachmark::Quad& q : g_marks) {
-        // As the ribbon: a mark carries the lap metre it lies at, and takes the correction held
-        // for that place on the line, which does not slide as the rider moves.
-        const float dy = on_ground || (std::isfinite(q.m) && !g_snap_on) ? 0.0f
-                         : std::isfinite(q.m)                           ? g_lsnap.at(q.m)
-                                                                        : g_dsnap.at(q.s);
-        if (!std::isfinite(dy)) continue;
-        glColor4f(q.rgba[0], q.rgba[1], q.rgba[2], q.rgba[3]);
-        for (int c = 0; c < 4; ++c) {
-            float gx, gy, gz;
-            ax.apply(q.p[c][0], q.p[c][1] + dy, q.p[c][2], gx, gy, gz);
-            glVertex3f(gx, gy, gz);
+    Log("perf", "slots: " + (slots.empty() ? std::string("none ran") : slots));
+    const uint64_t spikes = g_spikes.written() - g_spikes_said;
+    g_spikes.each_since(g_spikes_said, [](const coachperf::Spike& s) { Log("perf/spike", coachperf::SpikeText(s)); });
+    if (spikes > uint64_t(coachperf::SpikeRing::kN))
+        Log("perf/spike", "and " + std::to_string(spikes - coachperf::SpikeRing::kN) + " more over 50 ms in this window");
+    g_spikes_said = g_spikes.written();
+    g_hist.reset();
+    g_ours_sum_us = g_ours_max_us = 0;
+    g_swap_lock_miss = 0;
+}
+
+/// One frame boundary at `t` (QPC): the frame that ended is measured, a slow one recorded with
+/// what we did in it, and the per-frame totals start again. Render thread (or Draw, with no hooks).
+void PerfFrame(uint64_t t) {
+    const uint64_t now_ms = GetTickCount64();
+    if (g_perf_last) {
+        const uint64_t frame_us = uint64_t(double(t - g_perf_last) * g_us_per_tick);
+        g_hist.add(frame_us);
+        uint64_t ours = 0, top = 0;
+        int      top_s = -1;
+        for (int s = 0; s < coachperf::SLOT_COUNT; ++s) {
+            if (s == coachperf::SWAP_PRESENT || s == coachperf::CB_TELEMETRY || s == coachperf::CB_OTHER) continue;
+            // swap.depth runs inside swap.draw: a candidate for the top, not counted twice.
+            if (s != coachperf::SWAP_DEPTH) ours += g_frame_ticks[s];
+            if (g_frame_ticks[s] > top) top = g_frame_ticks[s], top_s = s;
+        }
+        const uint64_t ours_us = uint64_t(double(ours) * g_us_per_tick);
+        g_ours_sum_us += ours_us;
+        if (ours_us > g_ours_max_us) g_ours_max_us = ours_us;
+        if (frame_us >= 50000) {
+            coachperf::Spike s;
+            s.at_ms      = now_ms;
+            s.frame_us   = frame_us;
+            s.ours_us    = ours_us;
+            s.top        = top_s;
+            s.top_us     = uint64_t(double(top) * g_us_per_tick);
+            s.present_us = uint64_t(double(g_last_present) * g_us_per_tick);
+            s.loads      = g_frame_loads;
+            s.offered    = g_frame_offered;
+            s.hud_calls  = g_frame_hud;
+            s.draw_cb_us = uint64_t(double(g_frame_draw_cb.load()) * g_us_per_tick);
+            s.tele_cb_us = uint64_t(double(g_frame_tele_cb.load()) * g_us_per_tick);
+            s.lock_miss  = g_frame_lock_miss;
+            s.source     = g_frame_source;
+            s.live       = g_gate.live;
+            s.resting    = g_search.resting();
+            s.depth      = g_frame_depth;
+            g_spikes.add(s);
         }
     }
-    glEnd();
-    g_orig_mode(GL_MODELVIEW);
-    glPopMatrix();
-    g_orig_mode(GL_PROJECTION);
-    glPopMatrix();
-    if (g_use_program && program) g_use_program(GLuint(program));
-    glPopAttrib();
-    g_gl.mode = mode;
-    g_gl.own  = false;
-    if (check) DrainErrors();
+    g_perf_last = t;
+    std::fill(std::begin(g_frame_ticks), std::end(g_frame_ticks), uint64_t(0));
+    g_frame_loads = g_frame_offered = g_frame_hud = g_frame_lock_miss = 0;
+    g_frame_depth = false;
+    g_frame_draw_cb.store(0, std::memory_order_relaxed);
+    g_frame_tele_cb.store(0, std::memory_order_relaxed);
+    if (!g_perf_report_ms) g_perf_report_ms = now_ms;
+    else if (now_ms - g_perf_report_ms >= 10000) PerfReport(now_ms);
 }
 
 BOOL WINAPI hkSwap(HDC hdc) {
+    const uint64_t t_in = PerfNow();
+    if (!g_gl.thread) g_gl.thread = g_render_tid = GetCurrentThreadId();
+    const bool mine = GetCurrentThreadId() == g_gl.thread && !g_gl.own;
     try {
-        if (!g_gl.thread) g_gl.thread = GetCurrentThreadId();
-        if (GetCurrentThreadId() == g_gl.thread && !g_gl.own) {
+        if (mine) {
+            PerfFrame(t_in);
+            // The swap's own work from here to the draw (the report, when one is due, included).
+            const uint64_t  w0  = t_in;
+            const ULONGLONG now = GetTickCount64();
             GlFinish();
             ++g_gl.n_frames;
+            g_safe_frame = g_safe.load(std::memory_order_relaxed);
+            g_search.set_safe(g_safe_frame);
+            // The driver is asked (glGetError, the framebuffer, the program) once a second at most.
+            g_check_frame = now - g_check_ms >= 1000;
+            if (g_check_frame) g_check_ms = now;
             if (g_gl_ok && !g_sh_tried) {
                 std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
-                if (lock.owns_lock()) InstallShaderHooks();
+                if (lock.owns_lock()) InstallShaderHooks(g_safe_frame);
             }
             coachline::Mat4 proj, view, model;
             coachline::Axes ax;
             bool            draw = false, depth_ok = true;
             {
                 std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
-                const ULONGLONG              now = GetTickCount64();
-                g_frame_ms                         = now;
+                g_frame_ms = now;
+                if (!lock.owns_lock()) {
+                    ++g_swap_lock_miss;
+                    ++g_frame_lock_miss;
+                }
                 if (lock.owns_lock() && g_have_sample) {
                     g_snap[0] = g_rider.x, g_snap[1] = g_rider_y, g_snap[2] = g_rider.y;
                 }
@@ -2831,15 +3131,20 @@ BOOL WINAPI hkSwap(HDC hdc) {
                 // built, read or drawn (coachline::Riding).
                 const bool wants = lock.owns_lock() && g_gl_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
                                    g_have_sample && RidingNow(now);
-                // The loads of the next frame are searched only when this one was riding with the line on.
-                g_mv_wanted = wants;
+                // Without the lock this frame knows nothing: the next one does nothing either,
+                // and the search's clock is left as it was.
+                if (!lock.owns_lock()) g_gate.frame(false, false);
                 if (wants) {
                     if (!g_cam_since) g_cam_since = now;
-                    RECT       rc{};
-                    float      aspect = 0;
-                    const HWND wnd    = WindowFromDC(hdc);
-                    if (wnd && GetClientRect(wnd, &rc) && rc.bottom > rc.top)
-                        aspect = float(rc.right - rc.left) / float(rc.bottom - rc.top);
+                    // The window's shape, asked once a second rather than every frame.
+                    if (!g_aspect_ms || now - g_aspect_ms >= 1000) {
+                        g_aspect_ms = now;
+                        RECT       rc{};
+                        const HWND wnd = WindowFromDC(hdc);
+                        if (wnd && GetClientRect(wnd, &rc) && rc.bottom > rc.top)
+                            g_aspect = float(rc.right - rc.left) / float(rc.bottom - rc.top);
+                    }
+                    const float aspect = g_aspect;
                     coachline::Candidate wp;
                     const bool           have_wp = WindowProjection(aspect, wp);
 
@@ -2981,7 +3286,11 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         Log("ground", std::string("camera=") + SourceName(source));
                         g_source = source;
                     }
-                    if (g_diag_left > 0 && now - g_diag_ms >= 1000) {
+                    // The next frame's hooks: live (riding with the line on), and its modelview loads
+                    // looked at while a camera is held or the bounded search is not resting.
+                    g_frame_source = source;
+                    g_gate.frame(true, g_search.frame(now, true, source == 1 || source == 2));
+                    if (!g_safe_frame && g_diag_left > 0 && now - g_diag_ms >= 1000) {
                         g_diag_ms = now;
                         --g_diag_left;
                         LogUniforms(aspect, pk);
@@ -3044,6 +3353,11 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         if (!draw) ++g_why[WHY_NO_VERTS];
                         BuildMarks();
                     }
+                } else if (lock.owns_lock()) {
+                    // Not riding with the line on: the next frame's hooks do nothing at all.
+                    g_search.frame(now, false, false);
+                    g_gate.frame(false, false);
+                    g_frame_source = 0;
                 }
                 // Every 10 s while it is on: where the camera came from, and what was drawn.
                 if (lock.owns_lock() && g_gl_ok && g_hud_set.ground && now - g_gl_logged > 10000) {
@@ -3079,8 +3393,16 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     std::fill(std::begin(g_why), std::end(g_why), 0u);
                 }
             }
-            if (draw) DrawGroundLine(proj, view, model, ax, depth_ok);
-            if (draw) DrawMarks(proj, view, model, ax, depth_ok);
+            {
+                const uint64_t d = PerfNow() - w0;
+                g_perf[coachperf::SWAP_WORK].add(d);
+                g_frame_ticks[coachperf::SWAP_WORK] += d;
+            }
+            if (draw) {
+                // The ribbon and the jump calls in one state block (swap.depth runs inside it).
+                PerfScope ps(coachperf::SWAP_DRAW, &g_frame_ticks[coachperf::SWAP_DRAW]);
+                DrawGroundLine(proj, view, model, ax, depth_ok);
+            }
         }
     } catch (...) {
         g_gl.own = false;
@@ -3089,11 +3411,19 @@ BOOL WINAPI hkSwap(HDC hdc) {
         g_gl.cands.clear();
         g_gl.building = false;
         g_ups_total += g_ups_frame;
+        // The upload table is cleared only when something was put in it: 4 KB a frame otherwise.
+        if (g_ups_frame || !g_ups.empty()) ClearUploads();
         g_ups_frame = 0;
-        ClearUploads();
         g_mv_best = coachline::ModelviewPick{};
     }
-    return g_orig_swap(hdc);
+    // The game's own present, timed: a driver or GPU stall shows here, not as our work.
+    const uint64_t t_present = PerfNow();
+    const BOOL     ok        = g_orig_swap(hdc);
+    if (mine) {
+        g_last_present = PerfNow() - t_present;
+        g_perf[coachperf::SWAP_PRESENT].add(g_last_present);
+    }
+    return ok;
 }
 
 /// Hooks the GL entry points the first time the ground line is asked for. All of them or none:
@@ -3214,6 +3544,7 @@ __declspec(dllexport) void Shutdown() {
 }
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
@@ -3233,6 +3564,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     g_grid_bad.clear();
     LoadGround(false);
     ResetLiveGround();
+    UpdateSafe();  // every plugin is loaded by now: is MXBMRP3 one of them
     g_rider_state.reset();
     g_voice.failed = false;
     ReadVoiceSettings(true);
@@ -3242,6 +3574,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void EventDeinit() {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     g_cues.clear();
@@ -3272,6 +3605,7 @@ __declspec(dllexport) void EventDeinit() {
 
 // _pRaceData: floats, the start/finish line's distance along the centreline first.
 __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment, void* _pRaceData) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_centreline(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize);
     g_track.build(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize, static_cast<const float*>(_pRaceData));
@@ -3280,6 +3614,7 @@ __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment,
 }
 
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_stance_conf = stance::CONF_NONE;
     if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) {
@@ -3310,6 +3645,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void RunDeinit() {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
     g_cues.set_practice(false);
@@ -3325,16 +3661,19 @@ __declspec(dllexport) void RunDeinit() {
 }
 
 __declspec(dllexport) void RunStart() {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_start();
 }
 
 __declspec(dllexport) void RunStop() {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_stop();
 }
 
 __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_lap(_pData, _iDataSize);
     g_cues.on_lap();
@@ -3344,6 +3683,7 @@ __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_split(_pData, _iDataSize);
 }
@@ -3459,23 +3799,31 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
 }
 
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
+    const uint64_t t0 = PerfNow();
+    g_tid_tele.store(GetCurrentThreadId(), std::memory_order_relaxed);
     // The game's ground outside g_mu: asking the game anything while holding it can stall Draw.
     LiveGroundStep(RunTelemetryLocked(_pData, _iDataSize, _fTime, _fPos));
+    const uint64_t d = PerfNow() - t0;
+    g_perf[coachperf::CB_TELEMETRY].add(d);
+    KeepMax(g_frame_tele_cb, d);
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries
 // arrive when the event starts; everything else is written only while one is.
 __declspec(dllexport) void RaceEvent(void*, int) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_others.clear_roster();
 }
 
 __declspec(dllexport) void RaceDeinit() {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_others.clear_roster();
 }
 
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     others::Entry e;
     if (g_others.added(_pData, _iDataSize, e) && g_rec.recording())
@@ -3483,6 +3831,7 @@ __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     others::Entry e;
     if (g_others.removed(_pData, _iDataSize, e) && g_rec.recording())
@@ -3490,14 +3839,18 @@ __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_rec.recording()) return;
+    PerfScope perf_cb(coachperf::CB_OTHER);
+    // Called many times a second on the game's own thread: never waits for g_mu (v0.49.4). A
+    // sample that finds it busy is left out of the recording; the next one is a moment away.
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+    if (!lock.owns_lock() || !g_rec.recording()) return;
     std::vector<uint8_t> p;
     if (g_others.positions(_iNumVehicles, _pArray, _iElemSize, p))
         g_rec.record(coachrec::POSITIONS, p.data(), uint32_t(p.size()));
 }
 
 __declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     std::vector<uint8_t> p;
     if (g_rec.recording() && g_others.lap(_pData, _iDataSize, p))
@@ -3505,6 +3858,7 @@ __declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
 }
 
 __declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     std::vector<uint8_t> p;
     if (g_rec.recording() && g_others.split(_pData, _iDataSize, p))
@@ -3539,9 +3893,48 @@ __declspec(dllexport) int DrawInit(int* _piNumSprites, char** _pszSpriteName, in
 // may throw into the game, so the body is guarded like MXBMRP3's API_GUARD_CATCH.
 __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, int* _piNumString,
                                 void** _ppString) {
-    int quads = 0, strings = 0;
+    const uint64_t t0 = PerfNow();
+    g_tid_draw.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // Without the swap hook (the line off), the frame is measured here instead.
+    if (!g_gl_ok) PerfFrame(t0);
+    // How often the game calls Draw, measured here, on Draw's own thread. It is what MXBMRP3's FPS
+    // counter shows (its PluginThread::requestFrame times the Draw cadence), and the 0.48.2 log
+    // counted ~70 swaps a second while that counter said ~10: the two side by side say whether
+    // the game's frames or only its Draw calls slowed down.
+    {
+        static coachperf::FrameHist dh;
+        static uint64_t             last = 0, report_ms = 0;
+        if (last) dh.add(uint64_t(double(t0 - last) * g_us_per_tick));
+        last                  = t0;
+        const uint64_t now_ms = GetTickCount64();
+        if (!report_ms) report_ms = now_ms;
+        else if (now_ms - report_ms >= 10000) {
+            Log("perf/draw", "Draw callback cadence (what MXBMRP3's FPS shows): " +
+                                 coachperf::FrameText(dh, double(now_ms - report_ms) / 1000.0) + " thread " +
+                                 std::to_string(GetCurrentThreadId()));
+            dh.reset();
+            report_ms = now_ms;
+        }
+    }
+    // v0.49.4: the game's Draw never waits for g_mu. RunTelemetry holds it on the telemetry thread
+    // (file checks, the recorder's writes and flushes, DirectInput polls); when it does, this
+    // frame hands the game last frame's HUD again, which is still in g_quad / g_text.
+    static int last_quads = 0, last_strings = 0;
+    int        quads = 0, strings = 0;
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        g_draw_lock_miss.fetch_add(1, std::memory_order_relaxed);
+        ++g_frame_lock_miss;
+        if (_piNumQuads) *_piNumQuads = last_quads;
+        if (_ppQuad) *_ppQuad = g_quad;
+        if (_piNumString) *_piNumString = last_strings;
+        if (_ppString) *_ppString = g_text;
+        const uint64_t d = PerfNow() - t0;
+        g_perf[coachperf::CB_DRAW].add(d);
+        KeepMax(g_frame_draw_cb, d);
+        return;
+    }
     try {
-        std::lock_guard<std::mutex> lock(g_mu);
         ++g_draw_calls;
         if (_iState == 0) g_track_draw_ms = GetTickCount64();
         if (_iState == 0 && g_practice) {
@@ -3584,10 +3977,16 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
     } catch (...) {
         quads = strings = 0;
     }
+    last_quads   = quads;
+    last_strings = strings;
+    lock.unlock();
     if (_piNumQuads) *_piNumQuads = quads;
     if (_ppQuad) *_ppQuad = g_quad;
     if (_piNumString) *_piNumString = strings;
     if (_ppString) *_ppString = g_text;
+    const uint64_t d = PerfNow() - t0;
+    g_perf[coachperf::CB_DRAW].add(d);
+    KeepMax(g_frame_draw_cb, d);
 }
 
 }  // extern "C"

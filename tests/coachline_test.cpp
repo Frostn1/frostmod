@@ -620,6 +620,86 @@ int main(int argc, char** argv) {
         CHECK(!none.ok, "a model matrix at the bike, or far off, is not a camera");
     }
 
+    // --- v0.48.1: a relock after a crash must be the camera that was drawing -----------------
+    // Sean: after a crash the line stayed misaligned. The search took the load with its eye nearest
+    // the bike, and a scenery object's can be nearer than the chase camera's. The camera that was
+    // drawing held the bike at one distance and in one direction; a relock has to as well.
+    {
+        Axes gl;  // x, y, -z
+        gl.sgn[2] = -1;
+        const int gl_idx = FallbackAxes();
+        // A chase camera 4 m behind and 1.8 m over a bike riding east, as the game builds it.
+        auto chase = [&](float bx, float by, float bz) {
+            float ex, ey, ez, tx, ty, tz;
+            gl.apply(bx - 4.0f, by + 1.8f, bz, ex, ey, ez);
+            gl.apply(bx + 8.0f, by, bz, tx, ty, tz);
+            return LookAt(ex, ey, ez, tx, ty, tz);
+        };
+        // A rigid view of something else whose eye lands `d` metres from the bike: another object's
+        // camera-space matrix, looking away from the bike.
+        auto impostor = [&](float bx, float by, float bz, float d) {
+            float ex, ey, ez, tx, ty, tz;
+            gl.apply(bx, by + 0.4f, bz + d, ex, ey, ez);   // beside the bike
+            gl.apply(bx, by + 0.4f, bz + 3.0f * d, tx, ty, tz);  // looking away, up the side
+            return LookAt(ex, ey, ez, tx, ty, tz);
+        };
+        ViewRef ref;
+        {  // Riding: the chase camera draws, and its view of the bike is learnt.
+            const float bx = 300.0f, by = 2.0f, bz = 150.0f;
+            ModelviewPick best;
+            ModelviewOffer(best, chase(bx, by, bz), bx, by, bz, gl_idx, &ref);
+            CHECK(best.ok && best.rejected == 0, "nothing to compare with yet: the first camera is taken");
+            for (int i = 0; i < 50; ++i) ref.learn(BikeInView(best.view, AxesAt(best.axes), bx, by, bz));
+            CHECK(ref.known() && std::fabs(ref.dist() - std::sqrt(16.0f + 3.24f)) < 0.05f, "learnt %.2f m", ref.dist());
+        }
+        // Crashed, put back 80 m on, riding again. Scenery load first, nearer than the camera.
+        const float nx = 380.0f, ny = 2.6f, nz = 151.0f;
+        ModelviewPick old_way, new_way;
+        for (ModelviewPick* b : {&old_way, &new_way}) {
+            const ViewRef* r = b == &new_way ? &ref : nullptr;
+            ModelviewOffer(*b, impostor(nx, ny, nz, 2.0f), nx, ny, nz, gl_idx, r);
+            ModelviewOffer(*b, chase(nx, ny, nz), nx, ny, nz, gl_idx, r);
+        }
+        CHECK(old_way.ok && old_way.dist < 3.0f, "without the check the nearer wrong load wins (%.2f m)", old_way.dist);
+        CHECK(new_way.ok && std::fabs(new_way.dist - std::sqrt(16.0f + 3.24f)) < 0.01f,
+              "with it the chase camera does (%.2f m)", new_way.dist);
+        CHECK(new_way.rejected >= 1, "and the impostor was counted");
+        // Only impostors: no camera at all, rather than a wrong one.
+        ModelviewPick only_wrong;
+        ModelviewOffer(only_wrong, impostor(nx, ny, nz, 2.0f), nx, ny, nz, gl_idx, &ref);
+        ModelviewOffer(only_wrong, impostor(nx, ny, nz, 3.5f), nx, ny, nz, gl_idx, &ref);
+        CHECK(!only_wrong.ok && only_wrong.rejected == 2, "wrong loads alone give none (%d rejected)", only_wrong.rejected);
+        // Following a camera by continuity is checked the same way.
+        const float prev[3] = {0, 0, 0};
+        float       ex, ey, ez;
+        CameraPos(impostor(nx, ny, nz, 2.0f), ex, ey, ez);
+        const float at[3] = {ex, ey, ez};
+        ModelviewPick followed;
+        CHECK(!ModelviewFollow(followed, impostor(nx, ny, nz, 2.0f), nx, ny, nz, gl_idx, at, &ref) && !followed.ok,
+              "the follower rejects it too");
+        (void)prev;
+        {  // A true camera near a compass heading on a track near the origin was refused as "at the bike".
+            const float cx = 100.0f, cy = 2.5f, cz = 40.0f;
+            ModelviewPick searching, settled;
+            ModelviewOffer(searching, chase(cx, cy, cz), cx, cy, cz);
+            ModelviewOffer(settled, chase(cx, cy, cz), cx, cy, cz, gl_idx);
+            CHECK(!searching.ok, "the search under every axes still sees a model matrix there");
+            CHECK(settled.ok && std::fabs(settled.dist - std::sqrt(16.0f + 3.24f)) < 0.01f, "settled axes: the camera is taken");
+        }
+        // The unit of agreement: distance and direction.
+        BikeView same = BikeInView(chase(nx, ny, nz), AxesAt(gl_idx), nx, ny, nz);
+        CHECK(ref.agrees(same), "the same view agrees");
+        BikeView far = same;
+        far.dist += 2.0f;
+        CHECK(!ref.agrees(far), "2 m further does not");
+        BikeView turned = same;
+        turned.dir[0] = -same.dir[0], turned.dir[1] = -same.dir[1], turned.dir[2] = -same.dir[2];
+        CHECK(!ref.agrees(turned), "the bike behind the camera does not");
+        CHECK(!ref.agrees(BikeView{}), "no view of the bike does not");
+        ref.reset();
+        CHECK(!ref.known() && ref.agrees(turned), "forgotten, anything is taken again");
+    }
+
     // --- The fallback helmet camera from the telemetry alone ---------------------------------
     {
         const float bx = 269.98f, by = 2.54f, bz = 117.36f;

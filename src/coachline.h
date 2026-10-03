@@ -379,8 +379,8 @@ inline uint64_t UniformKey(uint32_t program, int32_t location, bool transposed, 
 
 /// A rigid matrix whose translation is the bike's position, under any axes: a model matrix
 /// placing something at the bike, not a view.
-inline bool AtTheBike(const Mat4& m, float rx, float ry, float rz) {
-    for (int k = 0; k < kNumAxes; ++k) {
+inline bool AtTheBike(const Mat4& m, float rx, float ry, float rz, int only_axes = -1) {
+    for (int k = only_axes >= 0 ? only_axes : 0; k < (only_axes >= 0 ? only_axes + 1 : kNumAxes); ++k) {
         float gx, gy, gz;
         AxesAt(k).apply(rx, ry, rz, gx, gy, gz);
         const float tx = m.m[12] - gx, ty = m.m[13] - gy, tz = m.m[14] - gz;
@@ -472,6 +472,78 @@ struct ModelviewPick {
     int   axes = -1;
     float dist = 0;
     float jump = 0;  // from the camera being followed, when one is (CameraFollow)
+    int   rejected = 0;  // loads that put the eye in range but the bike somewhere the earlier camera didn't
+};
+
+// ---------------------------------------------------------------------------------------
+// Where the bike sits in the camera
+//
+// Sean, v0.48.0: after a crash the line stayed misaligned. The search for the camera after the bike
+// is put back takes the modelview load whose eye is nearest the bike, and nothing said that the one
+// it found was the camera it had before: a scenery or rider object whose eye happens to land near the
+// bike is as near as the chase camera, and the first thing the eye watch then learns is that this is
+// "the usual distance". A chase or helmet camera holds the bike in one place in its view (the same
+// distance, the same direction), whatever the bike does. So that place, learnt from the camera that
+// was drawing, is the check: a load that puts the bike somewhere else is not that camera.
+
+/// The bike's origin in the eye space of a modelview load, through the telemetry axes: its distance
+/// and the unit direction it is seen in.
+struct BikeView {
+    bool  ok = false;
+    float dist = 0;
+    float dir[3] = {0, 0, 0};
+};
+inline BikeView BikeInView(const Mat4& m, const Axes& ax, float rx, float ry, float rz) {
+    BikeView out;
+    float    gx, gy, gz;
+    ax.apply(rx, ry, rz, gx, gy, gz);
+    const float* a = m.m;
+    const float  x = a[0] * gx + a[4] * gy + a[8] * gz + a[12];
+    const float  y = a[1] * gx + a[5] * gy + a[9] * gz + a[13];
+    const float  z = a[2] * gx + a[6] * gy + a[10] * gz + a[14];
+    const float  d = std::sqrt(x * x + y * y + z * z);
+    if (!(d > 1e-3f) || !std::isfinite(d)) return out;
+    out.ok = true, out.dist = d, out.dir[0] = x / d, out.dir[1] = y / d, out.dir[2] = z / d;
+    return out;
+}
+
+constexpr float kViewDistTolM  = 1.5f;   // the bike's distance from the camera may differ this much
+constexpr float kViewAngleCos  = 0.866f; // and its direction by this angle (30 degrees)
+constexpr float kViewLearn     = 0.02f;  // how fast the learnt place follows a camera that agrees
+constexpr unsigned kViewGiveUpMs = 3000; // no load agreeing for this long while riding: it was a different camera
+
+/// Where the drawing camera held the bike, learnt while it drew.
+class ViewRef {
+public:
+    void reset() { known_ = false; }
+    bool known() const { return known_; }
+    bool agrees(const BikeView& b) const {
+        if (!known_) return true;
+        if (!b.ok) return false;
+        if (std::fabs(b.dist - dist_) > kViewDistTolM) return false;
+        const float c = b.dir[0] * dir_[0] + b.dir[1] * dir_[1] + b.dir[2] * dir_[2];
+        return c >= kViewAngleCos;
+    }
+    /// A frame the camera drew through, with the rider up and riding.
+    void learn(const BikeView& b) {
+        if (!b.ok || !agrees(b)) return;
+        if (!known_) {
+            known_ = true, dist_ = b.dist;
+            for (int k = 0; k < 3; ++k) dir_[k] = b.dir[k];
+            return;
+        }
+        dist_ += kViewLearn * (b.dist - dist_);
+        float n = 0;
+        for (int k = 0; k < 3; ++k) dir_[k] += kViewLearn * (b.dir[k] - dir_[k]), n += dir_[k] * dir_[k];
+        n = std::sqrt(n);
+        if (n > 1e-3f)
+            for (int k = 0; k < 3; ++k) dir_[k] /= n;
+    }
+    float dist() const { return dist_; }
+
+private:
+    bool  known_ = false;
+    float dist_ = 0, dir_[3] = {0, 0, 0};
 };
 
 /// How far from the bike's origin the chase or helmet camera sits, at most, for the modelview
@@ -483,7 +555,8 @@ constexpr float kMaxMvCamDist = 12.0f;
 /// something at the bike. Nearest, not simplest axes: with thousands of objects a frame, some
 /// object's eye lands within a few metres of a mirrored bike, and only the track's is nearest
 /// frame after frame - which the lock then requires.
-inline bool ModelviewOffer(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int locked = -1) {
+inline bool ModelviewOffer(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int locked = -1,
+                           const ViewRef* ref = nullptr) {
     if (!std::isfinite(rx) || !ValidView(m)) return false;
     float ex, ey, ez;
     CameraPos(m, ex, ey, ez);
@@ -495,10 +568,19 @@ inline bool ModelviewOffer(ModelviewPick& best, const Mat4& m, float rx, float r
         const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
         if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) continue;
         const float d = std::sqrt(d2);
+        // Once a camera has drawn, only a load that holds the bike where that one did.
+        if (ref && ref->known() && !ref->agrees(BikeInView(m, AxesAt(k), rx, ry, rz))) {
+            ++best.rejected;
+            continue;
+        }
         // Nearest wins; within a centimetre (a rotated copy of the same view is exactly as near)
         // the simpler axes do, so a mesh placed with a quarter turn can't take the lock.
         if (best.ok && (d > best.dist + 0.01f || (d > best.dist - 0.01f && k >= best.axes))) continue;
-        if (AtTheBike(m, rx, ry, rz)) return took;
+        // Under any axes while they are still being found. Once they are settled, under those: a true
+        // camera's translation lands near the bike's coordinates under *some* permutation of them
+        // whenever the heading is near a compass point and the track near the origin, and was
+        // refused for it (Sean's relock after a crash).
+        if (AtTheBike(m, rx, ry, rz, locked)) return took;
         best.ok = true, best.view = m, best.axes = k, best.dist = d;
         took    = true;
     }
@@ -1590,7 +1672,7 @@ private:
 /// ModelviewOffer for a camera that has to stay where the last one was: the eye must also be
 /// within kJumpM of `prev`, and the nearest to it wins.
 inline bool ModelviewFollow(ModelviewPick& best, const Mat4& m, float rx, float ry, float rz, int axes,
-                            const float prev[3]) {
+                            const float prev[3], const ViewRef* ref = nullptr) {
     if (!ValidView(m) || axes < 0) return false;
     float ex, ey, ez;
     CameraPos(m, ex, ey, ez);
@@ -1600,6 +1682,10 @@ inline bool ModelviewFollow(ModelviewPick& best, const Mat4& m, float rx, float 
     AxesAt(axes).apply(rx, ry, rz, gx, gy, gz);
     const float d2 = (ex - gx) * (ex - gx) + (ey - gy) * (ey - gy) + (ez - gz) * (ez - gz);
     if (!(d2 <= kMaxMvCamDist * kMaxMvCamDist) || d2 < kMinCamDist * kMinCamDist) return false;
+    if (ref && ref->known() && !ref->agrees(BikeInView(m, AxesAt(axes), rx, ry, rz))) {
+        ++best.rejected;
+        return false;
+    }
     const float j = std::sqrt(j2);
     if (best.ok && j >= best.jump) return false;
     best.ok = true, best.view = m, best.axes = axes, best.dist = std::sqrt(d2), best.jump = j;

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-10-02 — v0.45.3
+## 2026-10-02 — v0.45.4
 
 ### Fixed
 - **MXB Coach: v0.45.2 froze the game and made menu clicks wait.** Its asynchronous depth reads
@@ -11,6 +11,19 @@
   on-track HUD draw both within 300 ms). In a menu, the pause screen or a loading screen the swap
   hook builds, reads and draws nothing. The snap reads only its check until the check agrees.
   The v0.45.2 axes lookup and the grid re-read-on-change are kept.
+
+## 2026-10-02 — v0.45.3
+
+### Fixed
+- **MXB Coach: the track's own ground is no longer thrown away on a supercross track.** The
+  check that `<track>.ground` lines up with the rider used the first 200 riding samples, and on
+  a supercross track those are all the run out of the gate, which stands past the edge of the
+  track's terrain (Steezy Mx - SMX - Carson: a 170 m terrain, the gate at x=193). Only 20 of them
+  landed on the grid, under the half it needs, so the right ground was refused for the session
+  ("0 samples on the grid - NOT this track's ground"). Now only samples on the ground with the grid under them count, a metre
+  apart; a grid the laps never land on is still refused, after a minute of riding off it. The log
+  line says how many were off it.
+- The gear line no longer blames an old MXB Coach when there is simply no sheet for the track yet.
 
 ## 2026-10-02 — v0.45.2
 

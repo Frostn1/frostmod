@@ -318,7 +318,7 @@ static void RenderToneMap(const char* path, const coachhud::Sheet& sh, const std
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    // --- v0.45.3: depth reads only while riding, at most once a second ---------------------
+    // --- v0.45.4: depth reads only while riding, at most once a second ---------------------
     {
         CHECK(!Riding(5000, 0, 0), "nothing seen yet: not riding");
         CHECK(Riding(5000, 4900, 4950), "a sample and an on-track draw just now: riding");
@@ -1161,6 +1161,42 @@ int main(int argc, char** argv) {
             done = al3.add(grid, x, 10.0f + 4.0f * std::sin(float(i) * 0.37f), z);
         }
         CHECK(done && !al3.result().ok, "the wrong ground is refused: spread %.2f", double(al3.result().spread));
+
+        // v0.45.3, Sean's Carson run: a supercross gate past the terrain's edge. The first few
+        // hundred samples are the run out of the gate, off the grid; they must not count, and the
+        // verdict comes from the track proper. (It said "0 samples on the grid - NOT this
+        // track's ground" and threw the right grid away.)
+        AlignCheck al4;
+        done = false;
+        for (int i = 0; i < 400 && !done; ++i) done = al4.add(grid, 310.0f + float(i) * 0.2f, 1.08f, 130.0f);
+        CHECK(!done && !al4.result().done, "the run out of the gate, off the grid, decides nothing");
+        for (int i = 0; i < 2000 && !done; ++i) {
+            const float x = 150.0f + 100.0f * std::cos(float(i) * 0.005f), z = 100.0f + 80.0f * std::sin(float(i) * 0.005f);
+            // A supercross lap is nearly half air: those samples sit metres over the ground.
+            const bool  air = (i / 20) % 2 == 1;
+            done = al4.add(grid, x, H(x, z) + (air ? 2.5f + float(i % 20) * 0.2f : 0.6f), z, !air);
+        }
+        CHECK(done && al4.result().ok && al4.result().dx == 0 && al4.result().dz == 0 && std::fabs(al4.result().dy - 0.6f) < 0.05f,
+              "the gate off the grid, the track on it: aligned dy=%.2f spread=%.2f on %d off %d", double(al4.result().dy),
+              double(al4.result().spread), al4.result().on_grid, al4.result().off_grid);
+        CHECK(al4.result().off_grid == 400 && al4.result().on_grid >= kAlignSamples * 9 / 10,
+              "and says how many were off it: on %d off %d", al4.result().on_grid, al4.result().off_grid);
+
+        // Standing still (or crawling) on the grid adds one sample, not two hundred: the verdict
+        // is taken over a stretch of track, not a few seconds of one spot.
+        AlignCheck al5;
+        done = false;
+        for (int i = 0; i < 1000 && !done; ++i) done = al5.add(grid, 50.0f + float(i) * 0.001f, H(50, 50) + 0.6f, 50.0f);
+        CHECK(!done, "a thousand samples within a metre are one place");
+
+        // A grid the laps never land on (another track's, somewhere else): refused after a minute
+        // of riding off it, rather than waited for for ever.
+        AlignCheck al6;
+        done = false;
+        int n6 = 0;
+        while (n6 < kAlignGiveUp + 10 && !done) done = al6.add(grid, 1000.0f + float(n6++), 5.0f, 1000.0f);
+        CHECK(done && n6 == kAlignGiveUp && !al6.result().ok && al6.result().on_grid == 0 && al6.result().off_grid == kAlignGiveUp,
+              "never on the grid: refused after %d samples (on %d off %d)", n6, al6.result().on_grid, al6.result().off_grid);
 
         // The ribbon on the grid: every edge on the ground, lifted by the slope, never under it.
         std::vector<unsigned char> sg(28, 0);

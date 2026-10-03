@@ -292,6 +292,14 @@ std::atomic<uint64_t> g_frame_draw_cb{0}, g_frame_tele_cb{0};
 // thread decides whether a lock held by one can stall the other.
 std::atomic<DWORD> g_tid_draw{0}, g_tid_tele{0};
 std::atomic<uint32_t> g_draw_lock_miss{0};
+// Bumped at run and event boundaries: telemetry samples queued before one are not processed after it.
+std::atomic<unsigned> g_tele_gen{0};
+// What the callback needs back for the game's ground, published by the worker.
+std::atomic<bool>  g_live_on{false};
+std::atomic<ULONGLONG> g_live_ride_since{0};
+std::atomic<uint32_t> g_tq_dropped{0};  // samples the telemetry worker's ring had no room for
+void StartTelemetryWorker();
+void StopTelemetryWorker();
 // MXBMRP3 in this process (its module loaded, not just installed), looked for off the frame path.
 std::atomic<bool> g_mxbmrp3{false};
 std::atomic<bool> g_safe{false};
@@ -947,7 +955,11 @@ bool LiveGroundOn() { return g_live.ready() && (!g_live_align.result().done || g
 /// the ground). Still there when the game next starts means the game hung or died mid-way: the
 /// sampling then stays off for that version rather than hang it again.
 std::string LiveBusyPath() { return g_base + "terrain.busy"; }
-void        LiveBusy(bool on) {
+// From the telemetry callback the marker is written by the telemetry worker (a file create or
+// delete there was disk I/O inside the game's callback): -1 nothing asked, 0 delete, 1 create.
+std::atomic<int> g_busy_want{-1};
+void LiveBusyAsync(bool on) { g_busy_want.store(on ? 1 : 0); }
+void LiveBusy(bool on) {
     if (!on) {
         DeleteFileA(LiveBusyPath().c_str());
         return;
@@ -1054,7 +1066,7 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
         out.said.push_back(msg);
         g_live_t0 = now;
         g_live_pace.reset();
-        LiveBusy(true);
+        LiveBusyAsync(true);
         return;  // the first slice on the next tick, once this line is in the log
     }
     const uint8_t* slot = coachterrain::game::Slot(g_terrain, g_live_slot);
@@ -1062,7 +1074,7 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
         out.said.push_back("the slot's heightfield changed while it was sampled; starting again");
         g_live_b.reset();
         g_live_seen = {};
-        LiveBusy(false);
+        LiveBusyAsync(false);
         return;
     }
     LARGE_INTEGER f, t0, t;
@@ -1087,7 +1099,7 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
         out.said.push_back(msg);
         g_live_off = true;
         g_live_b.reset();
-        LiveBusy(false);
+        LiveBusyAsync(false);
         return;
     }
     switch (g_live_b.state()) {
@@ -1098,7 +1110,7 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
             out.publish        = true;
             g_live_built       = true;
             g_live_check_ms    = now;
-            LiveBusy(false);
+            LiveBusyAsync(false);
             std::snprintf(msg, sizeof(msg),
                           "the game's ground is ready: %ux%u at %.2f m, %.1f%% of it answered, after %.1f s (%.0f ms of "
                           "asking); checking it lines up",
@@ -1120,7 +1132,7 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
                 g_live_seen = {};
             }
             g_live_b.reset();
-            LiveBusy(false);
+            LiveBusyAsync(false);
             break;
         default: break;
     }
@@ -1134,7 +1146,7 @@ void LiveGroundStep(const LiveIn& in) {
             g_live_off  = false;
             g_live_slot = 0;
             g_live_pace.reset();
-            if (g_live_b.state() == coachterrain::Builder::RUNNING) LiveBusy(false);
+            if (g_live_b.state() == coachterrain::Builder::RUNNING) LiveBusyAsync(false);
             g_live_b.reset();
             g_live_built = g_live_said = false;
             g_live_seen  = {};
@@ -1147,21 +1159,40 @@ void LiveGroundStep(const LiveIn& in) {
             break;
         default: break;
     }
-    LiveOut out;
+    // What a slice hands over waits here until g_mu is free: this runs inside the game's telemetry
+    // callback, which never waits for the lock (v0.49.6).
+    static LiveOut pending;
+    static bool    has_pending = false;
+    LiveOut        out;
     LiveGroundSlice(in, out);
-    if (out.said.empty() && !out.publish && !out.clear) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    if (!out.said.empty() || out.publish || out.clear) {
+        for (std::string& m : out.said) pending.said.push_back(std::move(m));
+        if (out.clear) {
+            pending.clear   = true;
+            pending.publish = false;
+        }
+        if (out.publish) {
+            pending.publish = true;
+            pending.grid    = std::move(out.grid);
+        }
+        has_pending = true;
+    }
+    if (!has_pending) return;
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+    if (!lock.owns_lock()) return;
     // An event that started or ended meanwhile: what was made is not its ground.
     const bool stale = g_live_req.load() == 1;
-    if (out.clear) {
+    if (pending.clear) {
         g_live.clear();
         g_live_align.reset();
     }
-    if (out.publish && !stale) {
-        g_live = std::move(out.grid);
+    if (pending.publish && !stale) {
+        g_live = std::move(pending.grid);
         g_live_align.reset();
     }
-    for (const std::string& m : out.said) Log("terrain", m);
+    for (const std::string& m : pending.said) Log("terrain", m);
+    pending     = LiveOut{};
+    has_pending = false;
 }
 
 /// The one-time check that the game's ground is under the rider, as for the grid file. Under g_mu.
@@ -3166,12 +3197,12 @@ void PerfReport(uint64_t now_ms) {
     char head[400];
     std::snprintf(head, sizeof(head),
                   " | ours on the render thread %.3f ms/frame avg, %.2f ms max | mxbmrp3=%s safe=%s search=%s rests=%llu "
-                  "camera=%s | threads render=%lu draw=%lu telemetry=%lu | lock misses swap=%u draw=%u",
+                  "camera=%s | threads render=%lu draw=%lu telemetry=%lu | lock misses swap=%u draw=%u | telemetry queue drops=%u",
                   n ? double(g_ours_sum_us) / double(n) / 1000.0 : 0.0, double(g_ours_max_us) / 1000.0,
                   g_mxbmrp3.load() ? "loaded" : "absent", g_safe.load() ? "on" : "off",
                   g_search.resting() ? "resting" : g_gate.live ? "live" : "idle", (unsigned long long)g_search.rests(),
                   SourceName(g_frame_source), (unsigned long)g_gl.thread, (unsigned long)g_tid_draw.load(),
-                  (unsigned long)g_tid_tele.load(), g_swap_lock_miss, g_draw_lock_miss.exchange(0));
+                  (unsigned long)g_tid_tele.load(), g_swap_lock_miss, g_draw_lock_miss.exchange(0), g_tq_dropped.exchange(0));
     Log("perf", coachperf::FrameText(g_hist, win_s) + head);
     std::string slots;
     for (int s = 0; s < coachperf::SLOT_COUNT; ++s) {
@@ -3200,7 +3231,9 @@ void PerfFrame(uint64_t t) {
         uint64_t ours = 0, top = 0;
         int      top_s = -1;
         for (int s = 0; s < coachperf::SLOT_COUNT; ++s) {
-            if (s == coachperf::SWAP_PRESENT || s == coachperf::CB_TELEMETRY || s == coachperf::CB_OTHER) continue;
+            if (s == coachperf::SWAP_PRESENT || s == coachperf::CB_TELEMETRY || s == coachperf::CB_OTHER ||
+                s == coachperf::WK_TELEMETRY)
+                continue;
             // swap.depth runs inside swap.draw: a candidate for the top, not counted twice.
             if (s != coachperf::SWAP_DEPTH) ours += g_frame_ticks[s];
             if (g_frame_ticks[s] > top) top = g_frame_ticks[s], top_s = s;
@@ -3684,6 +3717,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         LogHudSettings();
         LiveBusyCheck();
     }
+    StartTelemetryWorker();
     dir += "sessions\\";
     CreateDirectoryA(dir.c_str(), nullptr);
     std::lock_guard<std::mutex> lock(g_mu);
@@ -3692,6 +3726,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 }
 
 __declspec(dllexport) void Shutdown() {
+    StopTelemetryWorker();  // before g_mu: the worker may be waiting for it
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     ReleaseDevice();
@@ -3708,6 +3743,8 @@ __declspec(dllexport) void Shutdown() {
 
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     PerfScope perf_cb(coachperf::CB_OTHER);
+    ++g_tele_gen;  // samples still queued belong to what came before
+    g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event(_pData, _iDataSize);
     g_event = coachcue::ReadEvent(_pData, _iDataSize);
@@ -3741,6 +3778,8 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
 
 __declspec(dllexport) void EventDeinit() {
     PerfScope perf_cb(coachperf::CB_OTHER);
+    ++g_tele_gen;  // samples still queued belong to what came before
+    g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
     ++g_job_gen;
@@ -3784,6 +3823,8 @@ __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment,
 
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     PerfScope perf_cb(coachperf::CB_OTHER);
+    ++g_tele_gen;  // samples still queued belong to what came before
+    g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_stance_conf = stance::CONF_NONE;
     if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) {
@@ -3815,6 +3856,8 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
 
 __declspec(dllexport) void RunDeinit() {
     PerfScope perf_cb(coachperf::CB_OTHER);
+    ++g_tele_gen;  // samples still queued belong to what came before
+    g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
     g_cues.set_practice(false);
@@ -3967,11 +4010,100 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
     return live;
 }
 
+}  // extern "C"
+namespace {
+// ---------------------------------------------------------------------------------------
+// The telemetry worker (v0.49.6). Sean, 0.49.4 on 755 Compound: perf/spike frames of 51-138 ms
+// whose "telemetry cb" took 30-124 ms while our render-thread share was ~0.007 ms. RunTelemetry
+// did everything under g_mu on the game's telemetry thread - the recorder's writes and its flush,
+// cue, gear and pace work, DirectInput polls, hud.ini / voice.ini / sheet / grid file checks, the
+// terrain marker file - and waited for g_mu besides. Now the callback copies the sample into a
+// ring and returns; this thread does the rest. Only the game's own height query stays on the
+// telemetry thread (the physics asks it there), in slices of at most 0.3 ms.
+
+constexpr int kTeleBytes = 1024;  // SPluginsBikeData_t is a few hundred bytes
+constexpr int kTeleRing  = 256;   // five seconds at 50 Hz
+struct TeleSample {
+    float    time = 0, pos = 0;
+    int      size = 0;
+    unsigned gen  = 0;
+    uint8_t  data[kTeleBytes];
+};
+TeleSample             g_tq[kTeleRing];
+std::atomic<uint32_t>  g_tq_head{0}, g_tq_tail{0};  // one producer (the callback), one consumer (the worker)
+HANDLE                 g_tw_event  = nullptr;
+HANDLE                 g_tw_thread = nullptr;
+std::atomic<bool>      g_tw_stop{false};
+
+DWORD WINAPI TelemetryWorker(LPVOID) {
+    while (!g_tw_stop.load()) {
+        WaitForSingleObject(g_tw_event, 4);  // set only to stop; otherwise a look every 4 ms
+        // The terrain marker file, asked for by the sampler on the telemetry thread.
+        const int busy = g_busy_want.exchange(-1);
+        if (busy >= 0) LiveBusy(busy == 1);
+        for (;;) {
+            const uint32_t tail = g_tq_tail.load(std::memory_order_relaxed);
+            if (tail == g_tq_head.load(std::memory_order_acquire) || g_tw_stop.load()) break;
+            TeleSample& s = g_tq[tail % kTeleRing];
+            if (s.gen == g_tele_gen.load()) {
+                PerfScope    ps(coachperf::WK_TELEMETRY);
+                const LiveIn in = RunTelemetryLocked(s.size ? s.data : nullptr, s.size, s.time, s.pos);
+                g_live_on.store(in.on);
+                g_live_ride_since.store(in.riding_ms ? GetTickCount64() - in.riding_ms : 0);
+            }
+            g_tq_tail.store(tail + 1, std::memory_order_release);
+        }
+    }
+    return 0;
+}
+
+void StartTelemetryWorker() {
+    if (g_tw_thread) return;
+    g_tw_stop.store(false);
+    g_tw_event  = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    g_tw_thread = g_tw_event ? CreateThread(nullptr, 0, TelemetryWorker, nullptr, 0, nullptr) : nullptr;
+}
+/// Not under g_mu: the worker may be waiting for it.
+void StopTelemetryWorker() {
+    if (!g_tw_thread) return;
+    g_tw_stop.store(true);
+    SetEvent(g_tw_event);
+    WaitForSingleObject(g_tw_thread, 2000);
+    CloseHandle(g_tw_thread);
+    CloseHandle(g_tw_event);
+    g_tw_thread = nullptr;
+    g_tw_event  = nullptr;
+}
+}  // namespace
+extern "C" {
+
 __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     const uint64_t t0 = PerfNow();
     g_tid_tele.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    // The game's ground outside g_mu: asking the game anything while holding it can stall Draw.
-    LiveGroundStep(RunTelemetryLocked(_pData, _iDataSize, _fTime, _fPos));
+    if (g_tw_thread) {
+        // Copy the sample out and wake the worker: no lock, no I/O, no waiting.
+        const uint32_t head = g_tq_head.load(std::memory_order_relaxed);
+        if (head - g_tq_tail.load(std::memory_order_acquire) < uint32_t(kTeleRing)) {
+            TeleSample& s = g_tq[head % kTeleRing];
+            s.time = _fTime, s.pos = _fPos, s.gen = g_tele_gen.load();
+            s.size = _pData && _iDataSize > 0 ? (std::min)(_iDataSize, kTeleBytes) : 0;
+            if (s.size) std::memcpy(s.data, _pData, size_t(s.size));
+            g_tq_head.store(head + 1, std::memory_order_release);
+        } else {
+            g_tq_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        // No SetEvent: waking the worker from here let the scheduler run it on this core in the
+        // game's place (a 3-15 ms max in tests/telemetry_bench). It looks every 4 ms by itself.
+        // The game's ground: here, where the physics asks it, a 0.3 ms slice at most.
+        LiveIn in;
+        in.on                 = g_live_on.load();
+        const ULONGLONG since = g_live_ride_since.load();
+        in.riding_ms          = since ? GetTickCount64() - since : 0;
+        LiveGroundStep(in);
+    } else {
+        // No worker (it could not be started): as before.
+        LiveGroundStep(RunTelemetryLocked(_pData, _iDataSize, _fTime, _fPos));
+    }
     const uint64_t d = PerfNow() - t0;
     g_perf[coachperf::CB_TELEMETRY].add(d);
     KeepMax(g_frame_tele_cb, d);

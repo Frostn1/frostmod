@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-03 - v0.49.6
+
+MXB Coach: the game no longer waits in the telemetry callback (755 Compound stutter).
+
+- Sean's 0.49.4 perf log on 755 Compound: frames of 51-138 ms whose RunTelemetry took 30-124 ms, with
+  our render-thread share ~0.007 ms. RunTelemetry now copies the sample into a ring and returns; a
+  worker thread does the recorder's writes and flushes, cues, gear and pace, DirectInput polls and
+  every file check. Only the game's height query stays on the telemetry thread, in 0.3 ms slices
+  (was 1 ms) at 10% duty; the terrain marker file is written by the worker; publishing the sampled
+  ground try-locks.
+- tests/telemetry_bench (3000 calls against a built .dlo): RunTelemetry p99 89-124 us / max 0.4-12 ms
+  on 0.49.5, p99 ~4 us on 0.49.6. New perf slot `wk.telemetry` and `telemetry queue drops`.
+- Log lines may be 1500 characters (the perf lines were cut at 120).
+
 ## 2026-10-03 - v0.49.5
 
 MXB Coach in-game line: a newer sheet mid-ride no longer glitches the line or drops the frame rate.

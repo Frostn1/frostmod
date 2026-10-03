@@ -1566,6 +1566,34 @@ constexpr float kSnapAlpha           = 0.25f;  // each reading's weight: one dro
 constexpr float kSnapJumpM           = 0.6f;   // a reading this far from the correction already held is an outlier
 constexpr unsigned kSnapEveryMs      = 200;
 
+/// When the game's depth may be read back (v0.45.4). A glReadPixels of the depth makes the driver
+/// finish everything queued before it, so it is done only while riding - a telemetry sample and an
+/// on-track HUD draw both within kRidingFreshMs (neither comes in a menu, the pause screen or a
+/// loading screen) - and at most once every kDepthReadEveryMs, one budget for every probe.
+constexpr uint64_t kRidingFreshMs    = 300;
+constexpr uint64_t kDepthReadEveryMs = 1000;
+
+inline bool Riding(uint64_t now, uint64_t last_sample_ms, uint64_t last_track_draw_ms) {
+    // A stamp a moment newer than `now` (taken on another thread) counts as fresh.
+    auto fresh = [now](uint64_t t) { return t != 0 && (t >= now || now - t <= kRidingFreshMs); };
+    return fresh(last_sample_ms) && fresh(last_track_draw_ms);
+}
+
+/// One depth read a second at most, shared by the depth-mode probe and the snap.
+class ReadBudget {
+public:
+    bool take(uint64_t now, bool riding) {
+        if (!riding) return false;
+        if (last_ != 0 && now >= last_ && now - last_ < kDepthReadEveryMs) return false;
+        last_ = now;
+        return true;
+    }
+    void reset() { last_ = 0; }
+
+private:
+    uint64_t last_ = 0;
+};
+
 /// The height correction by distance ahead.
 class DepthSnap {
 public:

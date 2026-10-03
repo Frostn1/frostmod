@@ -318,6 +318,23 @@ static void RenderToneMap(const char* path, const coachhud::Sheet& sh, const std
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // --- v0.45.4: depth reads only while riding, at most once a second ---------------------
+    {
+        CHECK(!Riding(5000, 0, 0), "nothing seen yet: not riding");
+        CHECK(Riding(5000, 4900, 4950), "a sample and an on-track draw just now: riding");
+        CHECK(!Riding(5000, 4900, 1000), "telemetry but no on-track draw (a menu over the track): not riding");
+        CHECK(!Riding(5000, 1000, 4990), "drawn on track but no telemetry (paused): not riding");
+        CHECK(Riding(5000, 5010, 5000), "a stamp a moment ahead of now (another thread): riding");
+        ReadBudget b;
+        CHECK(!b.take(1000, false), "no read in a menu");
+        CHECK(b.take(1000, true), "the first read while riding");
+        int reads = 0;
+        for (uint64_t t = 1000; t < 11000; t += 16) reads += b.take(t, true) ? 1 : 0;  // 60 fps for 10 s
+        CHECK(reads == 9 || reads == 10, "at most one read a second at 60 fps (%d in 10 s)", reads);
+        int menu = 0;
+        for (uint64_t t = 20000; t < 30000; t += 16) menu += b.take(t, false) ? 1 : 0;
+        CHECK(menu == 0, "none at all in 10 s of menus (%d)", menu);
+    }
     // --- The game's own projection ------------------------------------------------------
     const Mat4 p = GameFrustum();
     CHECK(ValidProjection(p), "the logged world frustum is a perspective");

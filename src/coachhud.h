@@ -243,6 +243,83 @@ inline bool Fits(const Sheet& s, const coachcue::Event& e) {
     return e.track_len > 0 && std::fabs(s.track_len - e.track_len) <= 1.0f;
 }
 
+/// What a newer sheet's reference lap may do to the line in use (CheckRef).
+struct RefVerdict {
+    enum Kind { REPLACE, SAME, REJECT } kind = REPLACE;
+    float       dev_max = 0;   // furthest the candidate strays from the line in use, metres
+    const char* why     = "";  // for REJECT
+    std::vector<RefPoint> from;  // the line in use laid on the candidate's points, for a cross-fade
+};
+
+/// Whether `cand`, the reference lap of a sheet that appeared while the rider rides, may replace
+/// `cur`, the one being drawn. Coach rewrites the sheet after laps, and the lap it picks can be a
+/// partial one, one with a crash or a reset in it, or one on a different line; swapping any of
+/// those in mid-ride is the line glitching under the rider. Pure, so it runs off the frame thread.
+inline RefVerdict CheckRef(const std::vector<RefPoint>& cand, const std::vector<RefPoint>& cur, float track_len) {
+    RefVerdict v;
+    constexpr float kMaxStep = 50.0f;   // as coachline::kMaxGapM: further apart is not one stretch
+    constexpr float kMaxDev  = 20.0f;   // a lap this far from the line in use is another line
+    constexpr float kMinLen = 0.8f, kMaxLen = 1.25f;
+    const size_t n = cand.size();
+    if (n < 30) return v.kind = RefVerdict::REJECT, v.why = "too few points", v;
+    float len = 0, close = 0;
+    // The lap's own spacing says what a gap is: a few metres between points, so a stretch ten times
+    // that (a crash, a reset to the track, a missing piece) is not a lap to draw from.
+    std::vector<float> steps;
+    steps.reserve(n);
+    for (size_t i = 1; i < n; ++i) steps.push_back(std::hypot(cand[i].x - cand[i - 1].x, cand[i].z - cand[i - 1].z));
+    std::vector<float> sorted = steps;
+    std::nth_element(sorted.begin(), sorted.begin() + long(sorted.size() / 2), sorted.end());
+    const float median = sorted[sorted.size() / 2];
+    const float limit  = (std::min)(kMaxStep, (std::max)(10.0f, 8.0f * median));
+    for (size_t i = 1; i < n; ++i) {
+        const float d = steps[i - 1];
+        if (!std::isfinite(d) || d > limit) return v.kind = RefVerdict::REJECT, v.why = "a gap or a reset in the lap", v;
+        if (cand[i].pos < cand[i - 1].pos) return v.kind = RefVerdict::REJECT, v.why = "positions run backwards", v;
+        len += d;
+    }
+    close = std::hypot(cand[0].x - cand[n - 1].x, cand[0].z - cand[n - 1].z);
+    if (close > limit) return v.kind = RefVerdict::REJECT, v.why = "the lap doesn't close", v;
+    len += close;
+    if (track_len > 0 && (len < track_len * kMinLen || len > track_len * kMaxLen))
+        return v.kind = RefVerdict::REJECT, v.why = "length is not the track's", v;
+    if (cur.size() < 2) return v;  // nothing drawn yet: anything valid is better than nothing
+    // How far each candidate point is from the line in use, searching near the same lap position.
+    const size_t m = cur.size();
+    v.from.resize(n);
+    bool same = n == m;
+    for (size_t i = 0; i < n; ++i) {
+        float best = 1e30f;
+        size_t bj = 0;
+        for (size_t j = 0; j < m; ++j) {
+            float dl = std::fabs(cur[j].pos - cand[i].pos);
+            dl       = (std::min)(dl, 1.0f - dl);
+            if (dl > 0.05f) continue;
+            const float d = std::hypot(cur[j].x - cand[i].x, cur[j].z - cand[i].z);
+            if (d < best) best = d, bj = j;
+        }
+        if (best > 1e29f) return v.kind = RefVerdict::REJECT, v.why = "not where the line in use runs", v;
+        v.dev_max = (std::max)(v.dev_max, best);
+        v.from[i] = cur[bj];
+        v.from[i].pos = cand[i].pos;
+        if (same && (best > 0.05f || std::fabs(cur[i].t - cand[i].t) > 1e-3f)) same = false;
+    }
+    if (v.dev_max > kMaxDev) return v.kind = RefVerdict::REJECT, v.why = "far from the line in use", v;
+    if (same) v.kind = RefVerdict::SAME;
+    return v;
+}
+
+/// The line during a cross-fade: `from` towards `to` by `k` (0..1), same length, eased.
+inline void BlendRef(const std::vector<RefPoint>& from, const std::vector<RefPoint>& to, float k, std::vector<RefPoint>& out) {
+    const float e = k <= 0 ? 0.0f : k >= 1 ? 1.0f : k * k * (3.0f - 2.0f * k);
+    out = to;
+    if (from.size() != to.size()) return;
+    for (size_t i = 0; i < to.size(); ++i) {
+        out[i].x = from[i].x + (to[i].x - from[i].x) * e;
+        out[i].z = from[i].z + (to[i].z - from[i].z) * e;
+    }
+}
+
 /// The section `m` metres from the line lies in, or null.
 inline const Section* SectionAt(const Sheet& s, float m) {
     for (const Section& sec : s.sections)

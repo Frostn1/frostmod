@@ -199,17 +199,39 @@ static void TestPredicted() {
     auto three = [](float s) { return (std::max)({Mound(s, 50.0f), Mound(s, 58.0f), Mound(s, 66.0f)}); };
     // Off a 28 degree face at 14 m/s: ~17 m, clearing all three.
     const auto fast = CallsOf(Sheet(150, three, {}, 14.0f, false));
-    CHECK(!fast.empty() && fast[0].predicted && fast[0].kind == TRIPLE, "predicted triple: %s",
+    // A prediction places the jump but never names it: JUMP, not TRIPLE (or SINGLE).
+    CHECK(!fast.empty() && fast[0].predicted && fast[0].kind == JUMP && Label(fast[0]) == "JUMP", "predicted, unnamed: %s",
           fast.empty() ? "-" : KindName(fast[0].kind));
     if (!fast.empty()) CHECK(fast[0].landing_s > 66.0f && fast[0].landing_s < 74.0f, "lands at %.1f", fast[0].landing_s);
-    // At 9 m/s, a single.
+    // At 9 m/s the same: a jump here, and no SINGLE said about it.
     const auto slow = CallsOf(Sheet(150, three, {}, 9.0f, false));
-    CHECK(!slow.empty() && slow[0].kind == SINGLE, "predicted single: %s", slow.empty() ? "-" : KindName(slow[0].kind));
+    CHECK(!slow.empty() && slow[0].kind == JUMP, "predicted at 9 m/s: %s", slow.empty() ? "-" : KindName(slow[0].kind));
+    for (const Call& c : slow) CHECK(c.kind != SINGLE && c.kind != DOUBLE && c.kind != TRIPLE && c.kind != QUAD, "no counting from a prediction");
+    // The same lips with the lap's real air are counted.
+    const auto real = CallsOf(Sheet(150, three, {{50.0f, 70.0f}}));
+    CHECK(!real.empty() && real[0].kind == TRIPLE && !real[0].predicted, "real air: %s", real.empty() ? "-" : KindName(real[0].kind));
+    // A predicted landing runs short of the real one, so only a recorded flight draws its landing box.
+    std::vector<coachline::Vert> verts;
+    for (int i = -4; i <= 120; ++i) {
+        const float x = float(i) * 0.5f;
+        verts.push_back({x, 0.0f, 0.35f, x, {1, 1, 1, 1}, x});
+        verts.push_back({x, 0.0f, -0.35f, x, {1, 1, 1, 1}, x});
+    }
+    Call c;
+    c.kind = JUMP, c.takeoff = 0, c.landing = 1, c.takeoff_s = 20.0f, c.landing_s = 32.0f, c.airtime = 1.0f;
+    const std::vector<float> ahead = {20.0f, 32.0f};
+    std::vector<coachmark::Quad> shown, pred;
+    Marks(shown, {c}, ahead, verts, false);
+    c.predicted = true;
+    Marks(pred, {c}, ahead, verts, false);
+    CHECK(!pred.empty() && pred.size() < shown.size(), "a predicted jump has its lip but not a landing box: %zu vs %zu", pred.size(),
+          shown.size());
+
     // Crawling: rolled, and with no record of the air, no ROLL is claimed either.
     CHECK(CallsOf(Sheet(150, three, {}, 4.0f, false)).empty(), "crawling: no calls");
     // Without DRIV the speed comes from the lap's own times.
     const auto times = CallsOf(Sheet(150, three, {}, 14.0f, false, false));
-    CHECK(!times.empty() && times[0].kind == TRIPLE, "speed from the times: %s",
+    CHECK(!times.empty() && times[0].kind == JUMP, "speed from the times: %s",
           times.empty() ? "-" : KindName(times[0].kind));
 }
 

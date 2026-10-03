@@ -8,9 +8,10 @@
 //   * where the lap was in the air: "AIRH" (the share of each stretch airborne, and the bike's
 //     height above the ground), from Coach v-next on;
 //   * the lap's speed: "DRIV", or its own times and positions.
-// An older sheet with TRRN but no AIRH still gets calls: the flight is predicted from each lip's
-// angle and the lap's speed there (ballistic, no drag), and marked as predicted. ROLL needs AIRH:
-// only the lap's own record can say it stayed on the ground.
+// An older sheet with TRRN but no AIRH still marks its lips: the flight is predicted from each lip's
+// angle and the lap's speed there (ballistic, no drag), and marked as predicted. A prediction says
+// where a jump is, not which: it is called JUMP, never SINGLE or the like, and its landing is not
+// drawn. ROLL needs AIRH: only the lap's own record can say it stayed on the ground.
 //
 // How a jump is counted. A face is a rise of at least kFaceRise metres, steep enough
 // (kFaceSlope), short enough (kFaceMaxLen) to be built rather than a hill; its crest is the lip.
@@ -463,6 +464,11 @@ inline std::vector<Call> Calls(const Line& l) {
         c.speed     = SpeedAt(l, c.takeoff);
         c.kind      = Classify(l, faces, c.takeoff, c.landing, c.faces);
         if (c.kind == HOP) continue;
+        // Where the lip is, yes; what it is, no. A flight flown from the lip's angle lands short of
+        // the lap's real one (on SavageMX, Maryland, Walnut and Carson, whose sheets have both, the
+        // prediction named the right kind for 15 of 41 and said SINGLE for most of the rest, where
+        // the lap had cleared a double, a table or a step), so it is not named: a plain JUMP.
+        c.kind      = JUMP;
         done_s      = c.landing_s;
         out.push_back(c);
     }
@@ -583,7 +589,8 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
                 out.push_back(q);
             }
         }
-        if (!roll && sl > 0 && sl <= coachline::kAhead) {
+        // (A predicted flight's landing is a guess that runs short, so it isn't drawn.)
+        if (!roll && !c.predicted && sl > 0 && sl <= coachline::kAhead) {
             // The landing: a hollow box, faint, so it marks a spot without shouting.
             const Spot  p     = At(verts, sl);
             const float fade  = coachline::Fade(sl);

@@ -1397,6 +1397,8 @@ public:
     /// `at`: the rider's world position and ground (Anchor); without it the ribbon starts at the
     /// rider's lap position and stands on centreline heights, as before.
     /// Returns true when verts() changed.
+    /// Makes the next update() rebuild (the line it is given changed under it, as in a cross-fade).
+    void invalidate() { built_for_ = -1; }
     bool update(const std::vector<coachhud::RefPoint>& ref, const coachhud::Track& track, float pos, float offset,
                 const std::vector<Zone>& zones = {}, const RibbonExtras* ex = nullptr, const Anchor* at = nullptr) {
         if (ref.size() < 2 || !track.ready() || track.length() <= 0 || !std::isfinite(pos) || pos < 0 || pos > 1 ||

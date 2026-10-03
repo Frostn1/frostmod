@@ -821,7 +821,72 @@ static void TextItems() {
     CHECK(full.texts.size() == 1 && full.texts[0].s == "MORE SPEED", "falls back to the game's font when the frame is full");
 }
 
+// A sheet that appears mid-ride (Coach rewrites it after laps): the line in use is only replaced by
+// a whole, plausible lap on the same line, and then eased in. Replays a swap offline.
+static std::vector<RefPoint> Loop(float r, float cx, size_t n, float skip = 0, float shift = 0) {
+    std::vector<RefPoint> v;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = 6.2831853f * float(i) / float(n);
+        RefPoint p;
+        p.pos = float(i) / float(n);
+        p.t   = p.pos * 60.0f;
+        p.x   = cx + (r + (p.pos > 0.4f && p.pos < 0.6f ? shift : 0.0f)) * std::cos(a);
+        p.z   = (r + (p.pos > 0.4f && p.pos < 0.6f ? shift : 0.0f)) * std::sin(a);
+        v.push_back(p);
+    }
+    if (skip > 0) v.erase(v.begin() + long(n * 0.5f), v.begin() + long(n * (0.5f + skip)));
+    return v;
+}
+
+static void ASheetSwapKeepsTheLineStable() {
+    const float R = 100.0f, len = 6.2831853f * R;
+    const std::vector<RefPoint> cur = Loop(R, 0, 600);
+    // The same lap again: nothing moves.
+    RefVerdict v = CheckRef(Loop(R, 0, 600), cur, len);
+    CHECK(v.kind == RefVerdict::SAME, "an identical lap is the same line");
+    // A finer lap of the same line (more points): replaced, with no visible jump.
+    v = CheckRef(Loop(R, 0, 900), cur, len);
+    CHECK(v.kind == RefVerdict::REPLACE && v.dev_max < 0.6f, "a finer lap of the same line replaces it, dev %.2f", double(v.dev_max));
+    // A partial lap (a stretch missing: a crash or a reset): refused.
+    v = CheckRef(Loop(R, 0, 600, 0.2f), cur, len);
+    CHECK(v.kind == RefVerdict::REJECT, "a lap with a gap is refused");
+    CHECK(CheckRef(Loop(R, 0, 600, 0.03f), cur, len).kind == RefVerdict::REJECT, "a 19 m hole is refused too");
+    // Far too short for the track: refused.
+    v = CheckRef(Loop(R * 0.5f, 0, 600), cur, len);
+    CHECK(v.kind == RefVerdict::REJECT, "a lap that is not the track's length is refused");
+    // Too few points.
+    v = CheckRef(Loop(R, 0, 10), cur, len);
+    CHECK(v.kind == RefVerdict::REJECT, "a handful of points is refused");
+    // Positions running backwards.
+    std::vector<RefPoint> back = Loop(R, 0, 600);
+    std::swap(back[100].pos, back[101].pos);
+    CHECK(CheckRef(back, cur, len).kind == RefVerdict::REJECT, "positions running backwards are refused");
+    // A lap on another line, 40 m off for a stretch: refused; 3 m off: replaced.
+    CHECK(CheckRef(Loop(R, 0, 600, 0, 40.0f), cur, len).kind == RefVerdict::REJECT, "a lap 40 m off the line is refused");
+    v = CheckRef(Loop(R, 0, 600, 0, 3.0f), cur, len);
+    CHECK(v.kind == RefVerdict::REPLACE && v.dev_max > 2.9f && v.dev_max < 3.1f, "a lap 3 m off replaces it, dev %.2f", double(v.dev_max));
+    // The fade from the old line to the new one never steps more than a small share of the gap.
+    std::vector<RefPoint> now_pts, prev_pts;
+    float worst = 0;
+    const std::vector<RefPoint> to = Loop(R, 0, 600, 0, 3.0f);
+    for (int f = 0; f <= 90; ++f) {
+        BlendRef(v.from, to, float(f) / 90.0f, now_pts);
+        if (!prev_pts.empty())
+            for (size_t i = 0; i < now_pts.size(); ++i)
+                worst = (std::max)(worst, std::hypot(now_pts[i].x - prev_pts[i].x, now_pts[i].z - prev_pts[i].z));
+        prev_pts = now_pts;
+    }
+    CHECK(worst < 0.15f, "the fade moves no point more than %.2f m a frame", double(worst));
+    BlendRef(v.from, to, 0.0f, now_pts);
+    CHECK(std::fabs(now_pts[300].x - v.from[300].x) < 1e-4f, "the fade starts on the old line");
+    BlendRef(v.from, to, 1.0f, now_pts);
+    CHECK(std::fabs(now_pts[300].x - to[300].x) < 1e-4f, "and ends on the new one");
+    // Nothing drawn yet: any valid lap goes in.
+    CHECK(CheckRef(Loop(R, 0, 600), {}, len).kind == RefVerdict::REPLACE, "with no line in use a valid lap is taken");
+}
+
 int main() {
+    ASheetSwapKeepsTheLineStable();
     TheBytesAreExact();
     RefusesWhatTheAppDoesNotWrite();
     TextIsMadeSafeToDraw();

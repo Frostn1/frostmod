@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-02 - v0.48.1
+
+MXB Coach in-game line: a relock after a crash has to be the camera that was drawing.
+
+- After the bike was put back, the search took whichever fixed-function load had its eye nearest the
+  bike, and the eye watch then learnt that load's distance as the usual one, so a wrong object could
+  become "the camera" and the line stayed misaligned. The distance and direction in which the drawing
+  camera holds the bike are now learnt while it draws, and a relock must hold the bike the same way
+  (1.5 m, 30 degrees); a load that doesn't is counted (`camera_not_where_it_was` in the 10 s log) and
+  skipped. After 3 s riding with no load that agrees the view is forgotten and the search starts
+  over, so changing camera still works. The agreement is checked on every load, every frame.
+- Once the axes are settled, "a model matrix at the bike" is tested under those axes only. Under all
+  48 a true chase camera heading near a compass point on a track near the origin matched some
+  permutation of the bike's coordinates and was refused.
+
 ## 2026-10-02 - v0.48.0
 
 MXB Coach in-game line: near fade, pace and gear hints on by default, steady jump marks.

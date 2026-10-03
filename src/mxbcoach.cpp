@@ -1706,6 +1706,8 @@ coachline::ModelviewPick g_mv_best;  // this frame's best modelview camera
 coachline::AxesLock      g_mv_lock;
 unsigned                 g_mv_loads = 0;
 coachline::CameraFollow  g_follow;
+coachline::ViewRef       g_view_ref;      // where the drawing camera held the bike: a relock must agree
+ULONGLONG                g_view_miss = 0; // since when no load has agreed with it, while riding
 // The correction from the game's own depth under the line (coachline::DepthSnap). Render thread
 // only; a new event or stint asks for a reset through the flag.
 coachline::DepthSnap     g_dsnap;
@@ -1725,9 +1727,10 @@ struct LastCam {
     int             axes = 0;
 } g_last_cam;
 // Why a frame with a camera drew nothing, counted and logged every 10 s.
-enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_DOWN, WHY_EYE, WHY_COUNT };
+enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_DOWN, WHY_EYE, WHY_VIEW, WHY_COUNT };
 const char* const kWhyName[WHY_COUNT] = {"no_ribbon",    "offscreen_fbo", "core_profile", "gl_error",
-                                         "stale_redraw", "held_no_draw",  "rider_down",   "camera_off_bike"};
+                                         "stale_redraw", "held_no_draw",  "rider_down",   "camera_off_bike",
+                                         "camera_not_where_it_was"};
 coachline::EyeWatch g_eye;
 unsigned            g_seen_gen = 0;
 bool                g_line_on_ground = false;  // the line is on the track's own ground: no snap
@@ -1828,8 +1831,8 @@ void GlModelLoaded(const float* m) {
         // Following a camera already found: only one next to it, so a one-frame outlier is
         // never taken. Searching: the nearest to the bike.
         const float* prev = g_mv_lock.locked() >= 0 ? g_follow.anchor(g_frame_ms) : nullptr;
-        if (prev) coachline::ModelviewFollow(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), prev);
-        else coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked());
+        if (prev) coachline::ModelviewFollow(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), prev, &g_view_ref);
+        else coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), &g_view_ref);
     }
     if (g_gl.cands.empty() || g_diag_left <= 0) return;
     coachline::Candidate& c = g_gl.cands.back();
@@ -2904,6 +2907,35 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         ++g_why[WHY_DOWN];
                         source = 0;
                     }
+                    // Learn where this camera holds the bike while it draws, and check it each frame
+                    // (the loads are filtered by it): after a crash or a reset a relock must be the
+                    // same camera, not whichever load has its eye nearest the bike.
+                    if (g_rider_state.visible() && g_mv_lock.locked() >= 0) {
+                        if (g_mv_best.ok) {
+                            g_view_miss = 0;
+                            if (source == 2) {
+                                const bool was = g_view_ref.known();
+                                g_view_ref.learn(coachline::BikeInView(g_mv_best.view, coachline::AxesAt(g_mv_best.axes), g_snap[0],
+                                                                       g_snap[1], g_snap[2]));
+                                if (!was && g_view_ref.known())
+                                    Log("ground", "camera view learnt: the bike is " + std::to_string(g_view_ref.dist()) +
+                                                      " m from it; a relock has to hold the bike there");
+                            }
+                        } else if (g_view_ref.known() && g_mv_best.rejected > 0) {
+                            ++g_why[WHY_VIEW];
+                            if (!g_view_miss) g_view_miss = now;
+                            else if (now - g_view_miss > coachline::kViewGiveUpMs) {
+                                // Seconds of loads near the bike and none holding it as before: the
+                                // rider changed camera. Start the search over.
+                                Log("ground", "no camera held the bike where it was for " +
+                                                  std::to_string(coachline::kViewGiveUpMs / 1000) + " s; searching freely");
+                                g_view_ref.reset();
+                                g_follow.reset();
+                                g_last_cam.ok = false;
+                                g_view_miss   = 0;
+                            }
+                        }
+                    }
                     const bool held = source == -2;
                     if (held) source = 2;
                     if (source == 1 || source == 2) g_cam_since = now;
@@ -3189,6 +3221,8 @@ __declspec(dllexport) void EventDeinit() {
     g_ukey.reset();
     g_mv_lock.reset();
     g_follow.reset();
+    g_view_ref.reset();
+    g_view_miss = 0;
     g_dsnap_reset = true;
     g_last_cam.ok = false;
     g_cam_since = 0;

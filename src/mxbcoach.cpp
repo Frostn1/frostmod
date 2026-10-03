@@ -2033,8 +2033,13 @@ struct GlCapture {
     // still on GL_PROJECTION: the camera being assembled.
     bool                              building = false;
     coachline::Candidate              cur;
+    bool                              cur_main = true;  // the one being built is the main 3D pass's
     std::vector<coachline::Candidate> cands;  // this frame's
-    unsigned n_frustum = 0, n_cands = 0, n_frames = 0, n_picked = 0, n_drawn = 0, n_draw_errors = 0;
+    // v0.49.7: the projection in effect for the modelview loads that follow it, and whether it is
+    // the main pass's (coachline::MainPass); unknown until one has been built.
+    coachline::Candidate last;
+    bool                 has_last = false, last_main = true;
+    unsigned n_frustum = 0, n_cands = 0, n_frames = 0, n_picked = 0, n_drawn = 0, n_draw_errors = 0, n_other_pass = 0;
 };
 GlCapture             g_gl;
 float                    g_snap[3] = {NAN, NAN, NAN};  // the bike, as of the last swap
@@ -2072,11 +2077,28 @@ struct LastCam {
     int             axes = 0;
 } g_last_cam;
 // Why a frame with a camera drew nothing, counted and logged every 10 s.
-enum Why { WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_DOWN, WHY_EYE, WHY_VIEW, WHY_COUNT };
+enum Why {
+    WHY_NO_VERTS, WHY_FBO, WHY_CORE, WHY_GL_ERROR, WHY_STALE, WHY_HOLD, WHY_DOWN, WHY_EYE, WHY_VIEW, WHY_NOCAM,
+    WHY_UNCONFIRMED, WHY_NOT_WITH_BIKE, WHY_COUNT
+};
 const char* const kWhyName[WHY_COUNT] = {"no_ribbon",    "offscreen_fbo", "core_profile", "gl_error",
                                          "stale_redraw", "held_no_draw",  "rider_down",   "camera_off_bike",
-                                         "camera_not_where_it_was"};
+                                         "camera_not_where_it_was", "no_camera", "relock_unconfirmed",
+                                         "eye_not_moving_with_bike"};
 coachline::EyeWatch g_eye;
+// v0.49.7 (coachline.h, "A pick that is one camera across frames", "When to let a camera go"):
+coachline::EyeWatch      g_ueye;        // the shader-uniform camera's eye, watched like the modelview one
+coachline::Continuity    g_cont;        // the modelview pick, frame to frame
+coachline::Continuity    g_free_cont;   // a load the learnt view refuses: the camera button?
+coachline::ModelviewPick g_mv_free;     // this frame's nearest load without the learnt view
+bool                     g_want_free = false;  // set at the swap: the next frame also looks without it
+coachline::Candidate     g_mv_best_proj, g_mv_free_proj;  // the projection in effect at each pick
+bool                     g_mv_best_has_proj = false, g_mv_free_has_proj = false;
+coachline::Relock        g_relock;
+coachline::MainPass      g_main;
+const char*              g_proj_from = nullptr;  // where the drawing projection came from, as last logged
+const char*              g_view_kind = "none";   // onboard / chase / far, as last logged
+unsigned                 g_view_changes = 0;
 unsigned            g_seen_gen = 0;
 bool                g_line_on_ground = false;  // the line is on the track's own ground: no snap
 unsigned g_why[WHY_COUNT] = {};
@@ -2151,6 +2173,14 @@ void DrainErrors() {
 void GlFinish() {
     if (!g_gl.building) return;
     g_gl.building = false;
+    // In effect for the loads that follow, whatever was multiplied onto it (a bare frustum too).
+    if (coachline::ValidView(g_gl.cur.view)) {
+        g_gl.last      = g_gl.cur;
+        g_gl.has_last  = true;
+        g_gl.last_main = g_gl.cur_main;
+    } else {
+        g_gl.has_last = false;
+    }
     if (g_gl.cur.ops == 0 || !coachline::ValidView(g_gl.cur.view) || g_gl.cands.size() >= kMaxCandidates) return;
     g_gl.cands.push_back(g_gl.cur);
     ++g_gl.n_cands;
@@ -2160,12 +2190,16 @@ void GlStart(const coachline::Mat4& proj) {
     g_gl.building = true;
     g_gl.cur      = coachline::Candidate{};
     g_gl.cur.proj = proj;
+    g_gl.cur_main = g_main.is_main(proj, g_aspect);
 }
 void GlProjectionLoaded(const float* m) {
     GlFinish();
     coachline::Mat4 a;
     std::memcpy(a.m, m, sizeof(a.m));
     if (coachline::ValidProjection(a)) GlStart(a);
+    // A perspective projection that is no camera's (fovy or shape out of range): the pass the
+    // loads after it belong to is unknown, so they are offered as before.
+    else if (coachperf::IsPerspective(m)) g_gl.has_last = false;
 }
 void GlProjectionTimes(const coachline::Mat4& m) {
     if (!g_gl.building) return;
@@ -2196,14 +2230,26 @@ void GlModelLoaded(const float* m) {
     ++g_frame_loads;
     PerfScope ps(coachperf::HK_MODELVIEW, &g_frame_ticks[coachperf::HK_MODELVIEW]);
     ++g_frame_offered;
-    if (std::isfinite(g_snap[0])) {
+    // v0.49.7: a load in another 3D pass than the main one (the environment cube's square 90-degree
+    // faces, a mirror) is no camera the rider looks through, once the main pass is known.
+    if (g_gl.has_last && !g_gl.last_main && g_main.ok()) {
+        ++g_gl.n_other_pass;
+    } else if (std::isfinite(g_snap[0])) {
         coachline::Mat4 a;
         std::memcpy(a.m, m, sizeof(a.m));
         // Following a camera already found: only one next to it, so a one-frame outlier is
-        // never taken. Searching: the nearest to the bike.
+        // never taken. Searching: the nearest to the bike. v0.49.7: the learnt view is a relock's
+        // check only. While following, continuity and the eye watch hold it; the helmet camera
+        // turns with the rider's head and was refused by it mid-corner.
         const float* prev = g_mv_lock.locked() >= 0 ? g_follow.anchor(g_frame_ms) : nullptr;
-        if (prev) coachline::ModelviewFollow(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), prev, &g_view_ref);
-        else coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), &g_view_ref);
+        const bool   took = prev ? coachline::ModelviewFollow(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), prev)
+                                 : coachline::ModelviewOffer(g_mv_best, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked(), &g_view_ref);
+        if (took) g_mv_best_proj = g_gl.last, g_mv_best_has_proj = g_gl.has_last;
+        // No camera last frame and a learnt view: also the nearest load without it, in case the
+        // rider changed camera (decided at the swap).
+        if (g_want_free && !prev &&
+            coachline::ModelviewOffer(g_mv_free, a, g_snap[0], g_snap[1], g_snap[2], g_mv_lock.locked()))
+            g_mv_free_proj = g_gl.last, g_mv_free_has_proj = g_gl.has_last;
     }
     if (g_gl.cands.empty() || g_diag_left <= 0) return;
     coachline::Candidate& c = g_gl.cands.back();
@@ -2282,6 +2328,7 @@ void WINAPI hkFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n
         GlFinish();
         coachline::Mat4 p;
         if (g_gate.live && coachline::Frustum(l, r, b, t, n, f, p) && coachline::ValidProjection(p)) GlStart(p);
+        else g_gl.has_last = false;
         ++g_gl.n_frustum;
     }
     g_orig_frustum(l, r, b, t, n, f);
@@ -2320,6 +2367,11 @@ void WINAPI hkScaled(GLdouble x, GLdouble y, GLdouble z) {
     g_orig_scaled(x, y, z);
 }
 
+std::string F2(float a) {
+    char s[32];
+    std::snprintf(s, sizeof(s), "%.2f", double(a));
+    return s;
+}
 std::string F3(float a, float b, float c) {
     char s[96];
     std::snprintf(s, sizeof(s), "(%.2f, %.2f, %.2f)", double(a), double(b), double(c));
@@ -3340,20 +3392,93 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                           std::to_string(pk.dist) + " m from the bike");
                     }
                     // 2. The view baked into the fixed-function modelview loads.
-                    if (g_mv_lock.vote(g_mv_best.ok ? g_mv_best.axes : -1))
+                    const bool visible   = g_rider_state.visible();
+                    const bool following = g_mv_lock.locked() >= 0 && g_follow.holding(now);
+                    // v0.49.7: the rider pressed the camera button. No load holds the bike the way
+                    // the learnt view says, and one load, looked at without it, has been one camera
+                    // moving with the bike for kLockFrames frames while riding steadily (not the crash
+                    // camera): it is taken and the old view forgotten.
+                    bool took_free = false;
+                    if (!g_mv_best.ok && g_mv_free.ok && g_view_ref.known() && g_relock.settled(now, visible)) {
+                        float e[3], b[3];
+                        coachline::CameraPos(g_mv_free.view, e[0], e[1], e[2]);
+                        coachline::AxesAt(g_mv_free.axes).apply(g_snap[0], g_snap[1], g_snap[2], b[0], b[1], b[2]);
+                        const int n = g_free_cont.next(e, b);
+                        if (n >= coachline::kLockFrames && g_free_cont.moved_with_bike()) {
+                            Log("ground", "view changed: no load holds the bike " + F2(g_view_ref.dist()) + " m away (" +
+                                              coachline::ViewKind(g_view_ref.dist()) + ") any more, and one has held it " +
+                                              F2(g_mv_free.dist) + " m away (" + coachline::ViewKind(g_mv_free.dist) + ") for " +
+                                              std::to_string(n) + " frames, moving with the bike: taking it");
+                            ++g_view_changes;
+                            g_view_ref.reset();
+                            g_follow.reset();
+                            g_eye.reset();
+                            g_cont.reset();
+                            g_last_cam.ok      = false;
+                            g_mv_best          = g_mv_free;
+                            g_mv_best_proj     = g_mv_free_proj;
+                            g_mv_best_has_proj = g_mv_free_has_proj;
+                            g_free_cont.reset();
+                            took_free = true;
+                        }
+                    } else {
+                        g_free_cont.reset();
+                    }
+                    // One camera across frames (coachline::Continuity): the axes lock and a relock
+                    // count only frames in which the pick is the same camera as the frame before.
+                    int cont = 0;
+                    if (g_mv_best.ok) {
+                        float e[3], b[3];
+                        coachline::CameraPos(g_mv_best.view, e[0], e[1], e[2]);
+                        coachline::AxesAt(g_mv_best.axes).apply(g_snap[0], g_snap[1], g_snap[2], b[0], b[1], b[2]);
+                        cont = g_cont.next(e, b);
+                        if (g_cont.take_contradicted()) ++g_why[WHY_NOT_WITH_BIKE];
+                    } else {
+                        g_cont.reset();
+                    }
+                    if (g_mv_lock.vote(g_mv_best.ok && cont >= 2 ? g_mv_best.axes : -1))
                         Log("ground", "camera locked: fixed-function modelview, GL = telemetry " +
                                           coachline::AxesName(coachline::AxesAt(g_mv_best.axes)) + ", eye " +
-                                          std::to_string(g_mv_best.dist) + " m from the bike");
+                                          std::to_string(g_mv_best.dist) + " m from the bike (" +
+                                          coachline::ViewKind(g_mv_best.dist) + " view), the same camera " +
+                                          std::to_string(cont) + " frames running" +
+                                          (g_cont.moved_with_bike() ? " and moving with the bike" : " (bike standing)"));
+                    // A pick with no camera being followed draws once it has been one camera for
+                    // kRelockFrames frames, so a one-frame object after a crash or a view change never does.
+                    const bool confirmed = g_mv_best.ok && (following || took_free || cont >= coachline::kRelockFrames);
+                    // The projection: the one in effect when the picked load was issued, if it has the
+                    // window's shape; else the window's; else the one in effect anyway (a window whose
+                    // shape is not the render's: three screens, a scaled or letterboxed render).
+                    coachline::Candidate cp;
+                    const char*          proj_from = nullptr;
+                    if (g_mv_best.ok) {
+                        const bool eff = g_mv_best_has_proj && coachline::ValidProjection(g_mv_best_proj.proj);
+                        if (eff && coachline::AspectMatches(g_mv_best_proj.proj, aspect)) cp = g_mv_best_proj, proj_from = "in effect at the pick";
+                        else if (have_wp) cp = wp, proj_from = "the window's shape";
+                        else if (eff) cp = g_mv_best_proj, proj_from = "in effect at the pick, not the window's shape";
+                    }
 
-                    int source = 0;
+                    int  source = 0;
+                    bool fresh2 = false, eye_off = false;
                     if (pk.index >= 0 && g_ukey.locked() && DrawMatrices(pk, aspect, proj, view)) {
                         source = 1;
                         model  = coachline::Mat4{};
                         ax     = coachline::AxesAt(pk.axes);
-                    } else if (g_mv_lock.locked() >= 0 && g_mv_best.ok && have_wp) {
+                        // The uniform camera is watched like the modelview one (v0.49.7: it never was).
+                        if (!g_ueye.ok(pk.dist, now)) {
+                            Log("ground", "uniform camera moved off the bike (eye " + F2(pk.dist) + " m, usually " +
+                                              F2(g_ueye.usual()) + " m); finding it again");
+                            g_ukey.reset();
+                            g_ueye.reset();
+                            ++g_why[WHY_EYE];
+                            eye_off = true;
+                            source  = 0;
+                        }
+                    } else if (g_mv_lock.locked() >= 0 && confirmed && proj_from) {
                         source = 2;
-                        proj   = wp.proj;
-                        view   = wp.view;
+                        fresh2 = true;
+                        proj   = cp.proj;
+                        view   = cp.view;
                         model  = g_mv_best.view;
                         ax     = coachline::AxesAt(g_mv_best.axes);
                         float eye[3];
@@ -3373,10 +3498,12 @@ BOOL WINAPI hkSwap(HDC hdc) {
                             ++g_why[WHY_HOLD];
                             source = -2;  // held, nothing drawn
                         }
-                    } else if (now - g_cam_since > coachline::kFallbackMs &&
+                    } else if (g_hud_set.fallback && now - g_cam_since > coachline::kFallbackMs &&
                                coachline::OnboardView(g_rider.x, g_rider_y, g_rider.y, g_rider_v[0], g_rider_v[1],
                                                       g_rider_v[2], model)) {
-                        // 3. Nothing found for two seconds: the helmet view from the telemetry.
+                        // 3. Asked for (line_fallback=1) and nothing found for two seconds: the helmet
+                        // view from the telemetry. Off by default since v0.49.7: it turns with the
+                        // bike's heading, not with the game's camera.
                         source = 3;
                         if (have_wp) {
                             proj = wp.proj;
@@ -3389,8 +3516,21 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         view     = coachline::Mat4{};
                         ax       = coachline::AxesAt(coachline::FallbackAxes());
                         depth_ok = false;
+                    } else if (visible) {
+                        ++g_why[g_mv_best.ok && !confirmed ? WHY_UNCONFIRMED : WHY_NOCAM];
                     }
-                    if (source > 0 && source != 3 && !(source == 2 && !g_mv_best.ok && pk.index < 0)) {
+                    // The camera being followed must stay where it has been relative to the bike: the
+                    // crash camera, a replay view, a camera change or a wrong object drifts off, and is
+                    // let go. What happens next is coachline::Relock's call, below.
+                    if (fresh2 && !g_eye.ok(g_mv_best.dist, now)) {
+                        Log("ground", "camera moved off the bike (eye " + F2(g_mv_best.dist) + " m, usually " +
+                                          F2(g_eye.usual()) + " m)");
+                        ++g_why[WHY_EYE];
+                        eye_off = true;
+                        fresh2  = false;
+                        source  = 0;
+                    }
+                    if (source == 1 || fresh2) {
                         g_last_cam.ok = true, g_last_cam.proj = proj, g_last_cam.view = view, g_last_cam.model = model;
                         // Compared field by field: by name it built 96 strings a frame.
                         for (int k = 0; k < coachline::kNumAxes; ++k) {
@@ -3400,18 +3540,6 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                 break;
                             }
                         }
-                    }
-                    // The camera being followed must stay where it has been relative to the bike: the
-                    // crash camera, a replay view or a wrong object drifts off, and is let go.
-                    if (source == 2 && g_mv_best.ok && !g_eye.ok(g_mv_best.dist, now)) {
-                        Log("ground", "camera moved off the bike (eye " + std::to_string(g_mv_best.dist) + " m, usually " +
-                                          std::to_string(g_eye.usual()) + " m); finding it again");
-                        g_follow.reset();
-                        g_mv_lock.reset();
-                        g_eye.reset();
-                        g_last_cam.ok = false;
-                        ++g_why[WHY_EYE];
-                        source = 0;
                     }
                     // Down, getting up, or put back on the track: hidden, and everything built from
                     // the old position is started again - the ribbon (re-anchored at the bike's real
@@ -3423,41 +3551,87 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         g_ribbon.clear();
                         g_dsnap_reset = true;
                         g_eye.reset();
+                        g_ueye.reset();
+                        g_cont.reset();
                         g_ground_s = NAN;
                     }
-                    if (!g_rider_state.visible()) {
+                    if (!visible) {
                         ++g_why[WHY_DOWN];
                         source = 0;
+                        fresh2 = false;
                     }
-                    // Learn where this camera holds the bike while it draws, and check it each frame
-                    // (the loads are filtered by it): after a crash or a reset a relock must be the
-                    // same camera, not whichever load has its eye nearest the bike.
-                    if (g_rider_state.visible() && g_mv_lock.locked() >= 0) {
-                        if (g_mv_best.ok) {
-                            g_view_miss = 0;
-                            if (source == 2) {
-                                const bool was = g_view_ref.known();
-                                g_view_ref.learn(coachline::BikeInView(g_mv_best.view, coachline::AxesAt(g_mv_best.axes), g_snap[0],
-                                                                       g_snap[1], g_snap[2]));
-                                if (!was && g_view_ref.known())
-                                    Log("ground", "camera view learnt: the bike is " + std::to_string(g_view_ref.dist()) +
-                                                      " m from it; a relock has to hold the bike there");
-                            }
-                        } else if (g_view_ref.known() && g_mv_best.rejected > 0) {
-                            ++g_why[WHY_VIEW];
-                            if (!g_view_miss) g_view_miss = now;
-                            else if (now - g_view_miss > coachline::kViewGiveUpMs) {
-                                // Seconds of loads near the bike and none holding it as before: the
-                                // rider changed camera. Start the search over.
-                                Log("ground", "no camera held the bike where it was for " +
-                                                  std::to_string(coachline::kViewGiveUpMs / 1000) + " s; searching freely");
+                    // Letting go and finding again (coachline::Relock): a camera change, the crash
+                    // camera, a learnt view nothing matches any more, a lock that finds nothing.
+                    {
+                        const bool                   fresh = source == 1 || fresh2;
+                        const coachline::RelockStep st =
+                            g_relock.frame(now, visible, g_rider_state.generation(), fresh, eye_off, g_view_ref.known(),
+                                           g_mv_lock.locked() >= 0 || g_ukey.locked() != 0);
+                        if (st.why) {
+                            const std::string why = st.why;
+                            std::string       text =
+                                why == "view_change"          ? "the eye left its usual distance while riding: the camera was changed"
+                                : why == "eye_off_near_crash" ? "the eye left the bike within 2 s of a crash or reset (the crash camera); the learnt view is kept"
+                                : why == "view_unmatched"     ? "no camera from the game for 3 s while riding"
+                                                              : "no camera from the game for 8 s with a lock held";
+                            if (st.forget_view) {
+                                text += "; the learnt view (bike " + F2(g_view_ref.dist()) + " m away, " +
+                                        coachline::ViewKind(g_view_ref.dist()) + ") is forgotten";
                                 g_view_ref.reset();
-                                g_follow.reset();
-                                g_last_cam.ok = false;
-                                g_view_miss   = 0;
                             }
+                            if (st.drop_follow) {
+                                g_follow.reset();
+                                g_eye.reset();
+                                g_ueye.reset();
+                                g_cont.reset();
+                                g_last_cam.ok = false;
+                            }
+                            if (st.drop_lock) {
+                                g_mv_lock.reset();
+                                g_ukey.reset();
+                                text += "; the camera lock is dropped";
+                            }
+                            if (st.wake) g_search.reset();
+                            Log("ground", "relock (" + why + "): " + text + "; searching");
                         }
                     }
+                    // Learn where this camera holds the bike while it draws: a relock after a crash
+                    // or a reset must hold it at the same distance (and, for a camera that keeps the
+                    // bike steady in view, in the same direction), not be whichever load has its eye
+                    // nearest the bike.
+                    if (visible && fresh2) {
+                        const bool was    = g_view_ref.known();
+                        g_view_ref.learn(coachline::BikeInView(g_mv_best.view, coachline::AxesAt(g_mv_best.axes), g_snap[0],
+                                                               g_snap[1], g_snap[2]));
+                        if (!was && g_view_ref.known())
+                            Log("ground", "camera view learnt: the bike is " + F2(g_view_ref.dist()) + " m from it (" +
+                                              coachline::ViewKind(g_view_ref.dist()) +
+                                              "); a relock has to hold the bike at that distance");
+                    }
+                    if (visible && g_mv_lock.locked() >= 0 && !g_mv_best.ok && g_view_ref.known() && g_mv_best.rejected > 0)
+                        ++g_why[WHY_VIEW];
+                    // Which view the camera drawn through is, and where its projection came from:
+                    // logged when either changes, at most once a second.
+                    {
+                        static ULONGLONG s_view_log_ms = 0;
+                        const char*      kind = source == 1 ? coachline::ViewKind(pk.dist)
+                                                : fresh2    ? coachline::ViewKind(g_mv_best.dist)
+                                                            : nullptr;
+                        const char*      pf   = source == 1 ? "the shader's" : proj_from;
+                        if (kind && (kind != g_view_kind || pf != g_proj_from) && now - s_view_log_ms >= 1000) {
+                            s_view_log_ms     = now;
+                            g_view_kind       = kind;
+                            g_proj_from       = pf;
+                            const float fovy  = proj.m[5] > 0 ? 2.0f * std::atan(1.0f / proj.m[5]) * 57.2957795f : 0.0f;
+                            Log("ground", std::string("view: ") + kind + " (eye " +
+                                              F2(source == 1 ? pk.dist : g_mv_best.dist) + " m from the bike, " +
+                                              SourceName(source) + "), projection " + (pf ? pf : "?") + ": fovy " + F2(fovy) +
+                                              " aspect " + F2(coachline::Aspect(proj)) + ", window " + F2(aspect) +
+                                              (g_main.widest() ? ", main pass by widest depth range" : ""));
+                        }
+                    }
+                    const bool fresh_any = source == 1 || fresh2;
+                    g_want_free          = !fresh_any && g_view_ref.known();
                     const bool held = source == -2;
                     if (held) source = 2;
                     if (source == 1 || source == 2) g_cam_since = now;
@@ -3552,6 +3726,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     g_search.frame(now, false, false);
                     g_gate.frame(false, false);
                     g_frame_source = 0;
+                    g_want_free    = false;
                 }
                 // Every 10 s while it is on: where the camera came from, and what was drawn.
                 if (lock.owns_lock() && g_gl_ok && g_hud_set.ground && now - g_gl_logged > 10000) {
@@ -3560,6 +3735,16 @@ BOOL WINAPI hkSwap(HDC hdc) {
                                       " uniforms=" + std::to_string(g_ups_total) +
                                       " modelview_loads=" + std::to_string(g_mv_loads) +
                                       " camera=" + SourceName(g_source) +
+                                      " view=" + g_view_kind +
+                                      (g_view_ref.known() ? " learnt=" + F2(g_view_ref.dist()) + "m dir_spread=" +
+                                                                F2(g_view_ref.spread_deg()) + "deg" +
+                                                                (g_view_ref.steady() ? "(checked)" : "(not checked)")
+                                                          : std::string(" learnt=none")) +
+                                      " view_changes=" + std::to_string(g_view_changes) +
+                                      " other_pass_loads=" + std::to_string(g_gl.n_other_pass) +
+                                      (g_main.widest() ? " main_pass=widest-depth aspect " + F2(g_main.widest_aspect())
+                                                       : std::string("")) +
+                                      " fallback=" + (g_hud_set.fallback ? "on" : "off") +
                                       " picked=" + std::to_string(g_u_picked - g_prev_picked) +
                                       " drawn=" + std::to_string(g_gl.n_drawn - g_prev_drawn) + " (last 10 s)" +
                                       " snap=" + [] {
@@ -3609,6 +3794,12 @@ BOOL WINAPI hkSwap(HDC hdc) {
         if (g_ups_frame || !g_ups.empty()) ClearUploads();
         g_ups_frame = 0;
         g_mv_best = coachline::ModelviewPick{};
+        g_mv_free = coachline::ModelviewPick{};
+        g_mv_best_has_proj = g_mv_free_has_proj = false;
+        if (g_main.frame_end())
+            Log("ground", "no 3D projection has had the window's shape (aspect " + F2(g_aspect) + ") for " +
+                              std::to_string(coachline::kNoMatchFrames) + " frames; the main pass is the widest depth range, aspect " +
+                              F2(g_main.widest_aspect()) + " (several screens, or a render scaled to the window)");
     }
     // The game's own present, timed: a driver or GPU stall shows here, not as our work.
     const uint64_t t_present = PerfNow();
@@ -3802,6 +3993,14 @@ __declspec(dllexport) void EventDeinit() {
     g_follow.reset();
     g_view_ref.reset();
     g_view_miss = 0;
+    g_relock.reset();
+    g_cont.reset();
+    g_free_cont.reset();
+    g_ueye.reset();
+    g_eye.reset();
+    g_want_free = false;
+    g_view_kind = "none";
+    g_proj_from = nullptr;
     g_dsnap_reset = true;
     g_last_cam.ok = false;
     g_cam_since = 0;

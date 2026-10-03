@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-10-03 - v0.49.7
+
+MXB Coach in-game line: it stays on the track through the helmet camera, the camera button and a
+crash, and is never drawn through a view that is not the game's camera.
+
+- **The report.** A rider on 0.49.0, in the helmet camera: "it stopped following the track and
+  locked to the camera" (a ribbon running off to the side; a line hanging at the horizon, moving
+  with the view). Sean's own 0.49.5 log in the helmet camera shows how: the learnt view (0.48.1)
+  refused the true camera whenever the rider's head turned the bike more than 30 degrees in the
+  view (`camera_not_where_it_was`), the camera was lost, and after 2 s the line was drawn through
+  the telemetry fallback, a view made from the bike's heading (39 times in 1h30). That view is fixed
+  to the screen, not the track.
+- **The telemetry fallback is off** unless `line_fallback=1` is in hud.ini. With no camera found
+  there is no line (`not drawn: no_camera=`), rather than a line in the wrong place.
+- **The learnt view checks the distance always and the direction only for a camera that keeps the
+  bike steady in view** (the chase camera; the log says the spread). It is a relock's check only:
+  while a camera is followed, continuity and the eye watch hold it.
+- **One camera, not one set of axes.** The 30-frame lock and every relock count only frames in which
+  the pick is the same camera as the frame before: its eye within 3 m, its distance to the bike
+  within 0.5 m, and once the bike has moved 2 m, its eye moved with it. A relock with the axes known
+  draws after 5 such frames, so a one-frame object never does.
+- **The camera button.** With no camera held and a learnt view, the nearest load without that view is
+  also followed; once it has been one camera moving with the bike for 30 frames while riding steadily
+  (not within 2 s of a crash), it is taken and the old view forgotten (`view changed: ...`). The eye
+  leaving its usual distance while riding is a camera change too: the old view is forgotten and the
+  search wakes. 0.48.1 kept the old view for ever once the eye watch had dropped the lock.
+- **Letting go** in one place (coachline::Relock): no camera for 3 s while riding forgets the learnt
+  view, for 8 s with a lock held drops the lock. Down or in a menu nothing is let go.
+- **The projection** is the one in effect when the picked load was issued; a load in a 3D pass other
+  than the main one (the environment cube's square faces) is left out. When no projection has the
+  window's shape for 60 frames (three screens, a render scaled to the window), the main pass is the
+  one with the widest depth range; aspects up to 8 are a camera's (was 4).
+- The shader-uniform camera is watched by the eye watch like the modelview one.
+- **Log:** `view: onboard|chase|far (eye N m from the bike), projection ...` when it changes,
+  `camera locked: ... (onboard view), the same camera N frames running and moving with the bike`,
+  `relock (view_change|eye_off_near_crash|view_unmatched|lock_stale): ...`, and in the 10 s line
+  `view=`, the learnt distance and direction spread, `view_changes=`, `other_pass_loads=`,
+  `fallback=`, and `no_camera`, `relock_unconfirmed`, `eye_not_moving_with_bike` in `not drawn:`.
+- Test: a ride through 0.49.6's rules and these (chase, camera button, helmet camera looking into
+  the corners, a crash): 0.49.6 loses the helmet camera for 419 of 2490 frames (62 through the
+  fallback); 0.49.7 draws 2460 through the camera, none through anything else, takes the helmet
+  camera 31 frames after the button and 1 frame after getting up.
+
 ## 2026-10-03 - v0.49.6
 
 MXB Coach: the game no longer waits in the telemetry callback (755 Compound stutter).

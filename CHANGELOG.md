@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-02 — v0.46.2
+
+### Fixed
+- **MXB Coach: the line no longer climbs rut walls.** The ribbon took each edge's height from
+  the ground under that edge, so a rut wall under one edge of the 0.7 m line tilted it up the
+  wall. The line now stands on the ground under its centre (the path actually ridden) and its
+  edges lean only as the ground does over a wider window, within 8 cm of it: a berm's lean is
+  kept, a wall is cut down to it.
+- **MXB Coach: jumps are no longer called SINGLE from a guess.** On a sheet without the lap's
+  air (an older one, before Coach's first whole lap on the track) the flight is predicted from
+  each lip, and the prediction runs short of the real flight: on four tracks whose sheets have
+  both, it named 17 of 58 jumps right and said SINGLE for most of the rest (the lap had cleared
+  doubles, tables and steps). A predicted jump is now a plain JUMP at its lip, with no landing
+  box; the named calls (SINGLE, DOUBLE, TABLE, STEP UP and so on) come from the lap's own air.
+
 ## 2026-10-02 â€” v0.46.1
 
 ### Added

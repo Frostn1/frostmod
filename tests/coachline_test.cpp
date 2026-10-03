@@ -1227,6 +1227,51 @@ int main(int argc, char** argv) {
               "more lift where it is steep, capped");
     }
 
+    // Rut walls: a ground with a 0.35 m deep, 0.5 m wide rut running just beside the line. The
+    // ribbon stands on the ground under its centre and leans only as the ground does over a wider
+    // window, so it doesn't climb the wall under its edge; a berm's lean it keeps.
+    {
+        const uint32_t W = 200, Hn = 140;
+        const float    step = 0.25f;
+        auto           rut = [](float z) { return z > 29.1f && z < 29.65f ? -0.35f : 0.0f; };
+        GroundGrid g;
+        CHECK(g.make(W, Hn, step, 0, 0), "a fine grid");
+        for (uint32_t r = 0; r < Hn; ++r)
+            for (uint32_t c = 0; c < W; ++c) g.set(c, r, 2.0f + rut(float(r) * step));
+        std::vector<unsigned char> sg(28, 0);
+        PutF(&sg[4], 40.0f);
+        coachhud::Track flat;
+        flat.build(1, sg.data(), 28, nullptr);
+        std::vector<coachhud::RefPoint> line;
+        for (int i = 0; i <= 40; ++i) {
+            coachhud::RefPoint r;
+            r.pos = float(i) / 41.0f, r.t = float(i) * 0.05f, r.x = 3.0f + float(i), r.z = 29.2f;  // beside the rut's wall
+            line.push_back(r);
+        }
+        RibbonExtras ex;
+        ex.version = 1, ex.grid = &g;
+        Anchor at;
+        at.x = line[2].x, at.z = 29.2f, at.ground = 0.0f;
+        Ribbon rb;
+        CHECK(rb.update(line, flat, line[2].pos, 0.0f, {}, &ex, &at), "a ribbon beside a rut");
+        float worst = 0;
+        for (const Vert& x : rb.verts()) worst = (std::max)(worst, std::fabs(x.y - (2.0f + rut(29.2f))));
+        // The ground under the path is the rut's floor 0.35 m down; the edges may lean off it by
+        // kEdgeTol and the lift - not by the wall's whole height.
+        CHECK(worst <= kEdgeTol + kLiftMax + 0.02f, "edges stay within %.2f m of the path's ground: %.3f", double(kEdgeTol + kLiftMax), double(worst));
+        // A berm: 0.5 up across 1.4 m of it (a 20 degree lean) is followed, not cut.
+        GroundGrid b;
+        CHECK(b.make(W, Hn, step, 0, 0), "a berm grid");
+        for (uint32_t r = 0; r < Hn; ++r)
+            for (uint32_t c = 0; c < W; ++c) b.set(c, r, 2.0f + 0.36f * (float(r) * step - 29.0f));
+        ex.grid = &b;
+        ex.version = 2;
+        CHECK(rb.update(line, flat, line[2].pos, 0.0f, {}, &ex, &at), "a ribbon on the berm");
+        float tilt = 0;
+        for (size_t k = 0; k + 1 < rb.verts().size(); k += 2) tilt = (std::max)(tilt, std::fabs(rb.verts()[k].y - rb.verts()[k + 1].y));
+        CHECK(std::fabs(tilt - 2 * HalfWidth() * 0.36f) < 0.03f, "the berm's lean is kept: %.3f vs %.3f", double(tilt), double(2 * HalfWidth() * 0.36f));
+    }
+
     // Crashes, replayed: riding, down, sliding, up, then the game putting the bike back 40 m away.
     {
         RiderState rs;

@@ -1042,6 +1042,21 @@ private:
 constexpr float kLiftBase  = 0.05f;
 constexpr float kLiftSlope = 0.12f;  // extra metres per unit of slope
 constexpr float kLiftMax   = 0.15f;
+/// How the painted ribbon leans across itself. A rut wall under one edge of the 0.7 m ribbon is a
+/// step of 0.2 to 0.5 m in a few centimetres: following it tilts the ribbon up the wall ("the line
+/// goes over very big rut walls"), where the ridden path - the ground under the ribbon's centre -
+/// is what the rider is shown. So an edge may stand off the lean of the ground across a wider
+/// window (the berm's slope, kept) by no more than kEdgeTol: a wall, which is a step and not a
+/// slope, is cut down to that.
+constexpr float kEdgeTol = 0.08f;  // m: an edge's own detail, kept
+/// The edge's height: the ground under the path (`mid`) plus the lean across the wider window
+/// (`lean`, for this side: how much higher the ground a half-width out is, from the slope of the
+/// ground across a wider window), within kEdgeTol of it. NaN lean (the wider window is off the grid):
+/// the edge's own ground.
+inline float EdgeHeight(float mid, float edge, float lean) {
+    if (!std::isfinite(lean)) return edge;
+    return (std::max)(mid + lean - kEdgeTol, (std::min)(mid + lean + kEdgeTol, edge));
+}
 inline float LiftFor(float slope_along, float slope_across) {
     const float s = (std::max)(std::fabs(slope_along), std::fabs(slope_across));
     return (std::min)(kLiftMax, kLiftBase + kLiftSlope * (std::isfinite(s) ? s : 0.0f));
@@ -1389,10 +1404,24 @@ public:
                     const float nx = -tz, nz = tx;  // the left perpendicular in x/z (y up)
                     // On the track's own ground grid: each edge on the ground under it, lifted by
                     // how steep it is there along and across.
-                    float gl, gr;
+                    float gl, gr, gm;
                     if (ex && ex->grid && ex->grid->at(cx + nx * hw, cz + nz * hw, gl) &&
                         ex->grid->at(cx - nx * hw, cz - nz * hw, gr)) {
-                        const float mid   = (gl + gr) * 0.5f;
+                        // The ground under the path itself sets the height; the edges only lean
+                        // the ribbon as the ground does across a wider window (EdgeHeight).
+                        const float mid = ex->grid->at(cx, cz, gm) ? gm : (gl + gr) * 0.5f;
+                        // The lean over windows 2, 3 and 4 half-widths either side; the middle
+                        // one, so a rut under one window's edge is outvoted.
+                        float lean = NAN, ln[3];
+                        int   have = 0;
+                        for (int k = 2; k <= 4; ++k) {
+                            float wl, wr;
+                            if (ex->grid->at(cx + nx * float(k) * hw, cz + nz * float(k) * hw, wl) &&
+                                ex->grid->at(cx - nx * float(k) * hw, cz - nz * float(k) * hw, wr))
+                                ln[have++] = (wl - wr) / (2.0f * float(k));
+                        }
+                        if (have == 3) lean = (std::max)((std::min)(ln[0], ln[1]), (std::min)((std::max)(ln[0], ln[1]), ln[2]));
+                        gl = EdgeHeight(mid, gl, lean), gr = EdgeHeight(mid, gr, std::isfinite(lean) ? -lean : lean);
                         const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
                         const float lift  = LiftFor(along, (gl - gr) / (2 * hw));
                         yl = gl + lift, yr = gr + lift;
@@ -1401,7 +1430,21 @@ public:
                         float la, lb, ra, rb;
                         if (TerrainAt(*ex, i, hw, la) && TerrainAt(*ex, ib, hw, lb) &&
                             TerrainAt(*ex, i, -hw, ra) && TerrainAt(*ex, ib, -hw, rb)) {
-                            const float l = la + (lb - la) * fc, r = ra + (rb - ra) * fc, mid = (l + r) * 0.5f;
+                            float       ma, mb, w1, w2, w3, w4;
+                            const float l0 = la + (lb - la) * fc, r0 = ra + (rb - ra) * fc;
+                            const float mid = TerrainAt(*ex, i, 0.0f, ma) && TerrainAt(*ex, ib, 0.0f, mb)
+                                                  ? ma + (mb - ma) * fc
+                                                  : (l0 + r0) * 0.5f;
+                            float lean = NAN, ln[3];
+                            int   have = 0;
+                            for (int k = 2; k <= 4; ++k) {
+                                const float o = float(k) * hw;
+                                if (TerrainAt(*ex, i, o, w1) && TerrainAt(*ex, ib, o, w2) && TerrainAt(*ex, i, -o, w3) &&
+                                    TerrainAt(*ex, ib, -o, w4))
+                                    ln[have++] = ((w1 + (w2 - w1) * fc) - (w3 + (w4 - w3) * fc)) / (2.0f * float(k));
+                            }
+                            if (have == 3) lean = (std::max)((std::min)(ln[0], ln[1]), (std::min)((std::max)(ln[0], ln[1]), ln[2]));
+                            const float l = EdgeHeight(mid, l0, lean), r = EdgeHeight(mid, r0, std::isfinite(lean) ? -lean : lean);
                             const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
                             const float lift  = LiftFor(along, (l - r) / (2 * hw));
                             yl = l + lift, yr = r + lift;

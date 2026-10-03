@@ -45,12 +45,13 @@ enum Slot {
     CB_DRAW,       // the plugin API's Draw callback
     CB_TELEMETRY,  // RunTelemetry (the sampler's slice included)
     CB_OTHER,      // every other plugin callback
+    WK_TELEMETRY,  // one sample's work on the telemetry worker (off every game thread, v0.49.6)
     SLOT_COUNT
 };
 inline const char* SlotName(int s) {
     static const char* const k[SLOT_COUNT] = {"hook.proj", "hook.modelview", "hook.uniform", "swap.work",
                                               "swap.draw", "swap.depth",     "swap.present", "cb.draw",
-                                              "cb.telemetry", "cb.other"};
+                                              "cb.telemetry", "cb.other",   "wk.telemetry"};
     return s >= 0 && s < SLOT_COUNT ? k[s] : "?";
 }
 

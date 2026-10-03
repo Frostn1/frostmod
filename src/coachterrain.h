@@ -208,7 +208,7 @@ constexpr double kSettleMs = 3000.0;
 /// that took far too long) or too much asking in all trips it: off for the event.
 class Pacer {
 public:
-    static constexpr double kSliceMs = 1.0, kDuty = 0.1, kOverrunMs = 8.0, kTotalMs = 2000.0;
+    static constexpr double kSliceMs = 0.3, kDuty = 0.1, kOverrunMs = 8.0, kTotalMs = 2000.0;
 
     void reset() { *this = Pacer{}; }
     bool may_run(double now_ms) const { return !tripped_ && now_ms >= next_ms_; }

@@ -34,11 +34,11 @@ constexpr size_t kMaxValue = 120;
 /// These strings come from the game's own structs and from files the rider can edit, so they
 /// are not trusted to be short, single-line, or even text. A newline in a track name would
 /// forge a log entry; a control character would make the file unreadable in a chat window.
-inline std::string Safe(const std::string& in) {
+inline std::string Safe(const std::string& in, size_t max = kMaxValue) {
     std::string out;
-    out.reserve((std::min)(in.size(), kMaxValue));
+    out.reserve((std::min)(in.size(), max));
     for (char raw : in) {
-        if (out.size() >= kMaxValue) {
+        if (out.size() >= max) {
             out += "...";
             break;
         }
@@ -51,8 +51,11 @@ inline std::string Safe(const std::string& in) {
 }
 
 /// One line: "[stamp] tag: message". The stamp is the caller's, so this stays clock-free.
+/// The message is our own text, with the values in it already made Safe, so it gets the longer
+/// kMaxMessage (v0.49.6: at 120 the perf report's slot and spike lines were cut off mid-number).
+constexpr size_t kMaxMessage = 1500;
 inline std::string Line(const std::string& stamp, const std::string& tag, const std::string& message) {
-    return "[" + Safe(stamp) + "] " + Safe(tag) + ": " + Safe(message) + "\n";
+    return "[" + Safe(stamp) + "] " + Safe(tag) + ": " + Safe(message, kMaxMessage) + "\n";
 }
 
 /// Whether adding `adding` bytes to a log already `have` bytes long should start it over.

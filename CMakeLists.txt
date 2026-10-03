@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.49.5")
+set(FROSTMOD_VERSION "0.49.6")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -337,6 +337,8 @@ add_test(NAME coachperf COMMAND coachperf_test)
 # a test: timings are the machine's; run it and read the table).
 if(WIN32)
     add_executable(glhook_bench tests/glhook_bench.cpp)
+    # How long the game waits in RunTelemetry, against a built .dlo (not a test either).
+    add_executable(telemetry_bench tests/telemetry_bench.cpp)
 endif()
 
 

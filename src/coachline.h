@@ -621,6 +621,17 @@ constexpr float kGroundRebuildM = 0.05f; // the rider's ground estimate moving t
 constexpr float kRefOffAlpha    = 0.1f;  // how fast the reference lap's offset to the ground follows
 constexpr float kStepTerrain  = 0.5f;   // and on the track's own ground, to follow its bumps
 constexpr float kHalfWidth    = 0.35f;  // half the painted line's width
+
+/// The line's look as hud.ini last set it (coachhud::LineLook): the plugin copies it in when the
+/// file changes. Its defaults are the look the line has always had, so the tests and the offline
+/// previews, which never set it, draw exactly what they drew before.
+inline coachhud::LineLook& Look() {
+    static coachhud::LineLook look;
+    return look;
+}
+
+/// Half the painted line's width, as the rider set it.
+inline float HalfWidth() { return kHalfWidth * Look().width; }
 constexpr float kLift         = 0.06f;  // above the centreline height; polygon offset does the rest
 constexpr float kLiftTerrain  = 0.02f;  // above the track's own ground: painted on, not floating
 constexpr float kAhead        = 60.0f;  // metres drawn ahead
@@ -802,13 +813,12 @@ inline std::vector<std::pair<size_t, size_t>> ToneZones(const std::vector<coachh
     return kept;
 }
 
-/// The gradient: green, white, yellow, red at tone 0, 1, 2, 3, linear between. Saturated a
+/// The gradient: green, white, yellow, red at tone 0, 1, 2, 3 (or the rider's colours), linear between. Saturated a
 /// little past the pure colours, so they read on brown dirt at the ribbon's 0.7 alpha.
 inline void ToneColour(float t, float& r, float& g, float& b) {
-    static const float stops[4][3] = {{0.15f, 0.85f, 0.20f},   // gas
-                                      {0.97f, 0.97f, 0.97f},   // coast
-                                      {1.00f, 0.86f, 0.05f},   // light brake
-                                      {0.95f, 0.12f, 0.08f}};  // heavy brake
+    // Gas, coast, light brake, heavy brake: the defaults in coachhud::LineLook, or the rider's.
+    const coachhud::LineLook& l        = Look();
+    const float* const        stops[4] = {l.gas, l.coast, l.light, l.heavy};
     t = (std::max)(0.0f, (std::min)(3.0f, t));
     const int   i = (std::min)(2, int(t));
     const float f = t - float(i);
@@ -1148,7 +1158,7 @@ inline std::vector<float> LineColours(const std::vector<coachhud::RefPoint>& ref
     for (float t : tone) {
         float r, g, b;
         ToneColour(t, r, g, b);
-        out.insert(out.end(), {r, g, b, kLineAlpha});
+        out.insert(out.end(), {r, g, b, Look().opacity});
     }
     return out;
 }
@@ -1260,7 +1270,7 @@ public:
         const uint32_t ver  = ex ? ex->version : 0;
         const bool anchored = at && std::isfinite(at->x) && std::isfinite(at->z);
         const float ground  = anchored && std::isfinite(at->ground) ? at->ground : NAN;
-        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver && grid_ == (ex ? ex->grid : nullptr) &&
+        if (built_for_ >= 0 && ref_n_ == ref.size() && zones_n_ == zones.size() && ver_ == ver && grid_ == (ex ? ex->grid : nullptr) && hw_ == HalfWidth() &&
             std::fabs(offset - offset_) < 0.1f && (std::isfinite(ground) == std::isfinite(ground_)) &&
             !(std::isfinite(ground) && std::fabs(ground - ground_) > kGroundRebuildM)) {
             float d;
@@ -1281,6 +1291,7 @@ public:
         zones_n_   = zones.size();
         ver_       = ver;
         offset_    = offset;
+        hw_        = HalfWidth();
         // The rows already drawn, by where they are on the line, to measure how far a rebuild moves
         // them (jitter(): it should be nothing sideways and centimetres up or down).
         std::vector<Vert> old;
@@ -1290,6 +1301,7 @@ public:
         // Rows every half metre either way: the ground's bumps need them, and so does the colour,
         // which fades over a few metres and must not be stepped.
         const float step    = kStepTerrain;
+        const float hw      = HalfWidth();  // as wide as the rider set it
         // The segment the rider is on: by where they are when that is known (AnchorPoint), else
         // the last point at or behind their lap position, wrapping the lap.
         const size_t n  = ref.size();
@@ -1378,20 +1390,20 @@ public:
                     // On the track's own ground grid: each edge on the ground under it, lifted by
                     // how steep it is there along and across.
                     float gl, gr;
-                    if (ex && ex->grid && ex->grid->at(cx + nx * kHalfWidth, cz + nz * kHalfWidth, gl) &&
-                        ex->grid->at(cx - nx * kHalfWidth, cz - nz * kHalfWidth, gr)) {
+                    if (ex && ex->grid && ex->grid->at(cx + nx * hw, cz + nz * hw, gl) &&
+                        ex->grid->at(cx - nx * hw, cz - nz * hw, gr)) {
                         const float mid   = (gl + gr) * 0.5f;
                         const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
-                        const float lift  = LiftFor(along, (gl - gr) / (2 * kHalfWidth));
+                        const float lift  = LiftFor(along, (gl - gr) / (2 * hw));
                         yl = gl + lift, yr = gr + lift;
                         prev_mid = mid;
                     } else if (terrain) {
                         float la, lb, ra, rb;
-                        if (TerrainAt(*ex, i, kHalfWidth, la) && TerrainAt(*ex, ib, kHalfWidth, lb) &&
-                            TerrainAt(*ex, i, -kHalfWidth, ra) && TerrainAt(*ex, ib, -kHalfWidth, rb)) {
+                        if (TerrainAt(*ex, i, hw, la) && TerrainAt(*ex, ib, hw, lb) &&
+                            TerrainAt(*ex, i, -hw, ra) && TerrainAt(*ex, ib, -hw, rb)) {
                             const float l = la + (lb - la) * fc, r = ra + (rb - ra) * fc, mid = (l + r) * 0.5f;
                             const float along = std::isfinite(prev_mid) ? (mid - prev_mid) / step : 0.0f;
-                            const float lift  = LiftFor(along, (l - r) / (2 * kHalfWidth));
+                            const float lift  = LiftFor(along, (l - r) / (2 * hw));
                             yl = l + lift, yr = r + lift;
                             prev_mid = mid;
                         }
@@ -1404,12 +1416,12 @@ public:
                             col[c] = ex->rgba[i * 4 + c] + (ex->rgba[ib * 4 + c] - ex->rgba[i * 4 + c]) * fc;
                     } else {
                         ToneColour(InZone(zones, lap * lapM, lapM) ? 3.0f : 1.0f, col[0], col[1], col[2]);
-                        col[3] = kLineAlpha;
+                        col[3] = Look().opacity;
                     }
                     float mm = total > 0 ? std::fmod(m0 + nextRow, total) : m0 + nextRow;
                     if (mm < 0) mm += total;
-                    verts_.push_back({cx + nx * kHalfWidth, yl, cz + nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}, mm});
-                    verts_.push_back({cx - nx * kHalfWidth, yr, cz - nz * kHalfWidth, nextRow, {col[0], col[1], col[2], col[3]}, mm});
+                    verts_.push_back({cx + nx * hw, yl, cz + nz * hw, nextRow, {col[0], col[1], col[2], col[3]}, mm});
+                    verts_.push_back({cx - nx * hw, yr, cz - nz * hw, nextRow, {col[0], col[1], col[2], col[3]}, mm});
                     nextRow += step;
                 }
             }
@@ -1448,7 +1460,7 @@ public:
 
 private:
     std::vector<Vert> verts_;
-    float             built_for_ = -1.0f, offset_ = 0;
+    float             built_for_ = -1.0f, offset_ = 0, hw_ = 0;
     float             bx_ = NAN, bz_ = NAN, ground_ = NAN;
     const GroundGrid* grid_ = nullptr;
     float             max_dy_ = 0, max_shift_ = 0;

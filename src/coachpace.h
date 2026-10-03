@@ -388,11 +388,12 @@ inline std::vector<coachline::Vert> Marks(const std::vector<coachline::Vert>& st
     std::vector<coachline::Vert> out;
     const size_t rows = strip.size() / 2;
     if (h.kind == NONE || h.level <= 0 || rows < 2 || !std::isfinite(phase_m)) return out;
-    const float* col = h.kind == FAST ? kFastColour : kSlowColour;
+    // The rider's colours (coachhud::LineLook), kFastColour and kSlowColour until they pick others.
+    const float* col = h.kind == FAST ? coachline::Look().fast : coachline::Look().slow;
     // The ribbon at `s` metres: its centre, the unit vector across it to the left, the unit
     // vector along it, and the ground height across it (left and right edge).
     struct Frame {
-        float cx, cz, nx, nz, tx, tz, yl, yr, s;
+        float cx, cz, nx, nz, tx, tz, yl, yr, s, hw;
     };
     auto frame_at = [&](float s, Frame& f) {
         if (s < strip[0].s || s > strip[(rows - 1) * 2].s) return false;
@@ -409,6 +410,7 @@ inline std::vector<coachline::Vert> Marks(const std::vector<coachline::Vert>& st
         const float nl = std::hypot(nx, nz);
         if (nl < 1e-4f) return false;
         f.nx = nx / nl, f.nz = nz / nl;
+        f.hw = 0.5f * nl;
         // Along the line: the left perpendicular turned back, (x, z) -> (z, -x) of the left vector.
         f.tx = f.nz, f.tz = -f.nx;
         f.yl = ly, f.yr = ry, f.s = s;
@@ -419,7 +421,7 @@ inline std::vector<coachline::Vert> Marks(const std::vector<coachline::Vert>& st
         coachline::Vert v;
         v.x = f.cx + f.tx * along + f.nx * across;
         v.z = f.cz + f.tz * along + f.nz * across;
-        const float w = (across / coachline::kHalfWidth + 1.0f) * 0.5f;  // 0 right edge, 1 left
+        const float w = (across / f.hw + 1.0f) * 0.5f;  // 0 right edge, 1 left
         v.y = f.yr + (f.yl - f.yr) * w + kMarkLift;
         v.s = f.s;
         v.rgba[0] = col[0], v.rgba[1] = col[1], v.rgba[2] = col[2], v.rgba[3] = a;

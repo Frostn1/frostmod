@@ -414,6 +414,31 @@ static void Dump(const char* path, float at_s, float speed) {
     std::fclose(o);
 }
 
+// The line's look: its defaults are today's colours, and a colour or opacity the rider picks is
+// what LineColours and the marks then use.
+static void TestLook() {
+    using namespace coachpace;
+    coachhud::LineLook&      look = coachline::Look();
+    const coachhud::LineLook keep = look;
+    for (int c = 0; c < 3; ++c)
+        CHECK(look.fast[c] == kFastColour[c] && look.slow[c] == kSlowColour[c], "pace defaults unchanged");
+    CHECK(look.opacity == coachline::kLineAlpha, "opacity default is the line's alpha");
+    float r, g, b;
+    coachline::ToneColour(0, r, g, b);
+    CHECK(r == 0.15f && g == 0.85f && b == 0.20f, "gas default unchanged");
+    look.gas[0] = 0.0f, look.gas[1] = 0.0f, look.gas[2] = 1.0f;
+    look.opacity = 0.4f;
+    coachline::ToneColour(0, r, g, b);
+    CHECK(r == 0.0f && g == 0.0f && b == 1.0f, "the rider's gas colour");
+    const Lap l = MakeLap();
+    const std::vector<float> rgba = coachline::LineColours(l.ref, l.drive);
+    CHECK(!rgba.empty() && rgba[3] == 0.4f, "the rider's opacity");
+    CHECK(coachline::HalfWidth() == coachline::kHalfWidth, "width default");
+    look.width = 2.0f;
+    CHECK(coachline::HalfWidth() == 2.0f * coachline::kHalfWidth, "twice as wide");
+    look = keep;
+}
+
 int main(int argc, char** argv) {
     Lap l  = MakeLap();
     g_prof = BuildProfile(l.ref, l.drive, l.height);
@@ -425,6 +450,7 @@ int main(int argc, char** argv) {
     TestColours();
     TestMarks();
     TestHud();
+    TestLook();
     if (argc >= 3 && std::strcmp(argv[1], "--dump") == 0) {
         const std::string dir = argv[2];
         Dump((dir + "/pace-too-fast.txt").c_str(), 160.0f, 28.5f);   // 14% fast, 35 m from the corner

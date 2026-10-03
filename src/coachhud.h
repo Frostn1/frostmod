@@ -273,6 +273,60 @@ constexpr float kRowDefaultX = 0.5f, kRowDefaultY = 0.365f;
 /// enough to grab, and keeps picking it up from depending on what it happens to say.
 constexpr float kRowHitW = 0.16f;
 
+/// How the on-line text is drawn (coachmark::Text): the 5 x 7 block font as it is, with fatter
+/// strokes, or leaning forward. All three are the same quads; that font can do nothing else.
+enum TextStyle : int { TEXT_BLOCK = 0, TEXT_BOLD = 1, TEXT_ITALIC = 2 };
+
+/// The look of the line on the ground (coachline.h) and of what is drawn on it, as Coach sets
+/// it in hud.ini. Every key is optional: one that isn't there, or doesn't read, is the look the
+/// line has always had, so an older Coach (or none) changes nothing.
+struct LineLook {
+    float width   = 1.0f;  // line_width: times the line's own width (coachline::kHalfWidth), 0.25..3
+    float opacity = 0.7f;  // line_opacity: 0.1..1 (coachline::kLineAlpha)
+    // RGB 0..1, written by Coach as #RRGGBB: the line's gradient stops (coachline::ToneColour)
+    // and the pace hints' colours (coachpace::kFastColour, kSlowColour).
+    float gas[3]   = {0.15f, 0.85f, 0.20f};
+    float coast[3] = {0.97f, 0.97f, 0.97f};
+    float light[3] = {1.00f, 0.86f, 0.05f};
+    float heavy[3] = {0.95f, 0.12f, 0.08f};
+    float fast[3]  = {1.00f, 0.25f, 0.80f};
+    float slow[3]  = {0.20f, 0.85f, 1.00f};
+    // line_text: the words and the gear sign on the line (jump calls, their speed, gear hints).
+    // Off leaves just the line and its marks.
+    bool  text       = true;
+    float text_size  = 1.0f;  // 0.5..2, times the text's own size
+    int   text_style = TEXT_BLOCK;
+
+    bool operator==(const LineLook& o) const {
+        auto same3 = [](const float* a, const float* b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]; };
+        return width == o.width && opacity == o.opacity && same3(gas, o.gas) && same3(coast, o.coast) &&
+               same3(light, o.light) && same3(heavy, o.heavy) && same3(fast, o.fast) && same3(slow, o.slow) &&
+               text == o.text && text_size == o.text_size && text_style == o.text_style;
+    }
+    bool operator!=(const LineLook& o) const { return !(*this == o); }
+};
+
+/// `#RRGGBB` (or without the #) as RGB 0..1. False, and `out` untouched, for anything else.
+inline bool ParseHexColour(const std::string& v, float out[3]) {
+    const char* p = v.c_str();
+    if (*p == '#') ++p;
+    if (std::strlen(p) != 6) return false;
+    unsigned c = 0;
+    for (int i = 0; i < 6; ++i) {
+        const char ch = p[i];
+        const int  d  = ch >= '0' && ch <= '9'   ? ch - '0'
+                        : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                        : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                                                 : -1;
+        if (d < 0) return false;
+        c = c * 16 + unsigned(d);
+    }
+    out[0] = float((c >> 16) & 0xFF) / 255.0f;
+    out[1] = float((c >> 8) & 0xFF) / 255.0f;
+    out[2] = float(c & 0xFF) / 255.0f;
+    return true;
+}
+
 struct Settings {
     bool enabled = true, cue = true, section = true, gap = true, stance = true, map = true, setup = true;
     // Off by default: they are additions, and a HUD that grows parts on its own after an
@@ -302,6 +356,7 @@ struct Settings {
     float row_x  = kRowDefaultX, row_y = kRowDefaultY;
     // Right-drag a part to move it. On by default - it is how the rider finds out they can.
     bool  move = true;
+    LineLook look;
 };
 
 /// `<save>\mxbcoach\hud.ini`, [hud] key=1|0. Anything missing is on, except the map when
@@ -348,6 +403,30 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.row_x   = fraction("row_x", kRowDefaultX);
     s.row_y   = fraction("row_y", kRowDefaultY);
     s.move    = flag("move", true);
+    // The line's look. A number past its range is clamped into it (the rider asked for more or
+    // less, and gets the most there is); one that isn't a number is the default.
+    auto number = [&](const char* key, float def, float lo, float hi) {
+        const std::string v = stance::IniValue(ini, "hud", key);
+        if (v.empty()) return def;
+        char*       end = nullptr;
+        const float f   = std::strtof(v.c_str(), &end);
+        if (end == v.c_str() || *end != '\0' || !std::isfinite(f)) return def;
+        return (std::max)(lo, (std::min)(hi, f));
+    };
+    auto colour = [&](const char* key, float out[3]) { ParseHexColour(stance::IniValue(ini, "hud", key), out); };
+    LineLook& l = s.look;
+    l.width     = number("line_width", l.width, 0.25f, 3.0f);
+    l.opacity   = number("line_opacity", l.opacity, 0.1f, 1.0f);
+    colour("col_gas", l.gas);
+    colour("col_coast", l.coast);
+    colour("col_light", l.light);
+    colour("col_heavy", l.heavy);
+    colour("col_fast", l.fast);
+    colour("col_slow", l.slow);
+    l.text      = flag("line_text", true);
+    l.text_size = number("text_size", l.text_size, 0.5f, 2.0f);
+    const std::string style = stance::IniValue(ini, "hud", "text_style");
+    l.text_style = style == "bold" ? TEXT_BOLD : style == "italic" ? TEXT_ITALIC : TEXT_BLOCK;
     return s;
 }
 
@@ -910,6 +989,12 @@ constexpr uint32_t kGearDown = 0xFF1A8CFFu;  // orange (coachgear::kDownColour)
 constexpr float    kGearBadgeW = 0.07f;
 constexpr uint32_t kCyan    = 0xFFFFD933u;  // the pace hints' "faster" colour (coachpace::kSlowColour)
 
+/// RGB 0..1 as the game's opaque ABGR.
+inline uint32_t Abgr(const float rgb[3]) {
+    auto c = [](float v) { return uint32_t(std::lround((std::max)(0.0f, (std::min)(1.0f, v)) * 255.0f)); };
+    return 0xFF000000u | (c(rgb[2]) << 16) | (c(rgb[1]) << 8) | c(rgb[0]);
+}
+
 inline uint32_t CueColour(uint8_t kind) {
     switch (kind) {
         case coachcue::BRAKE: return kRed;
@@ -1186,12 +1271,15 @@ inline void Build(const View& v, Frame& f) {
     }
 
     // 4b. MORE SPEED, under the gap row, while a jump ahead needs more speed than the rider has.
-    if (v.set.pace && v.set.ground && v.more_speed) {
+    // One of the line's words, so it goes with them (line_text), at their size and in the pace
+    // hints' "faster" colour as the rider set it. The game's font has no bold or italic.
+    if (v.set.pace && v.set.ground && v.more_speed && v.set.look.text) {
         const char* s  = "MORE SPEED";
-        const float w  = TextWidth(std::strlen(s), kCueSize * 0.8f) + 0.02f;
-        const Box   b  = BoxAt(v.set.row_x - w * 0.5f, v.set.row_y + kRowH + 0.006f, w, kCueSize);
+        const float h  = kCueSize * v.set.look.text_size, fs = h * 0.8f;
+        const float w  = TextWidth(std::strlen(s), fs) + 0.02f;
+        const Box   b  = BoxAt(v.set.row_x - w * 0.5f, v.set.row_y + kRowH + 0.006f, w, h);
         Rect(f, b.x0, b.y0, b.x1, b.y1, kBacking);
-        Say(f, s, v.set.row_x, b.y0 + (kCueSize - kCueSize * 0.8f) * 0.5f, kCueSize * 0.8f, 1, kCyan);
+        Say(f, s, v.set.row_x, b.y0 + (h - fs) * 0.5f, fs, 1, Abgr(v.set.look.slow));
     }
 
     // 4c. The gear hint, beside the cue box: an arrow and the gear to be in.

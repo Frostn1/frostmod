@@ -351,6 +351,34 @@ static void TestParse() {
     CHECK(!coachhud::ParseSettings("[hud]\njumps=0\n", false).jumps, "jumps=0");
 }
 
+// The on-line text in the rider's style: bold widens each lit run, italic leans the rows, block is
+// the font as drawn before. Off (line_text=0) draws no label at all.
+static void TheTextStyles() {
+    const float base[3] = {0, 0, 0}, right[3] = {1, 0, 0}, col[4] = {1, 1, 1, 1};
+    coachhud::LineLook& look = coachline::Look();
+    const coachhud::LineLook keep = look;
+    auto span = [&](const std::vector<coachmark::Quad>& q) {
+        float lo = 1e9f, hi = -1e9f;
+        for (const auto& m : q)
+            for (int c = 0; c < 4; ++c) lo = (std::min)(lo, m.p[c][0]), hi = (std::max)(hi, m.p[c][0]);
+        return hi - lo;
+    };
+    std::vector<coachmark::Quad> block, bold, italic;
+    look.text_style = coachhud::TEXT_BLOCK;
+    coachmark::Text(block, "I", base, right, 0.7f, col, 0);
+    look.text_style = coachhud::TEXT_BOLD;
+    coachmark::Text(bold, "I", base, right, 0.7f, col, 0);
+    look.text_style = coachhud::TEXT_ITALIC;
+    coachmark::Text(italic, "I", base, right, 0.7f, col, 0);
+    CHECK(block.size() == bold.size() && block.size() == italic.size(), "the same quads in every style");
+    CHECK(span(bold) > span(block) + 0.03f, "bold is wider: %.3f vs %.3f", span(bold), span(block));
+    // The I's stem: upright in block, its top further right than its bottom in italic.
+    const coachmark::Quad& stem = italic[3];
+    CHECK(stem.p[2][0] > stem.p[1][0] && stem.p[3][0] > stem.p[0][0], "italic leans forward");
+    CHECK(block[3].p[2][0] == block[3].p[1][0], "block stands upright");
+    look = keep;
+}
+
 int main() {
     TestRhythm();
     TestTable();
@@ -361,6 +389,7 @@ int main() {
     TestLabels();
     TestMarks();
     TestParse();
+    TheTextStyles();
     if (g_failures) {
         std::printf("%d check(s) failed\n", g_failures);
         return 1;

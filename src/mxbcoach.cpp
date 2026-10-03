@@ -975,6 +975,23 @@ void LookForHud(bool at_line) {
     LoadHud(true);
 }
 
+/// The line's look from hud.ini into the drawing code. On a change the line's colours are made
+/// again and the ribbon, the pace colours and the marks rebuilt, so what the rider picks in Coach
+/// shows within the second the file is re-read.
+void ApplyLook() {
+    const coachhud::LineLook& l = g_hud_set.look;
+    if (coachline::Look() == l) return;
+    coachline::Look() = l;
+    g_extras.rgba     = coachline::LineColours(g_hud_sheet.ref, g_hud_sheet.drive);
+    ++g_extras.version;
+    g_pace_key = -1;  // the pace hint's colours are made from the line's
+    char b[160];
+    std::snprintf(b, sizeof(b), "line look: width x%.2f opacity %.2f text=%d size x%.2f style=%s", l.width, l.opacity,
+                  l.text ? 1 : 0, l.text_size,
+                  l.text_style == coachhud::TEXT_BOLD ? "bold" : l.text_style == coachhud::TEXT_ITALIC ? "italic" : "block");
+    Log("hud.ini", b);
+}
+
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
 // own map, in the same plugins folder, turns ours off unless the file asks for it.
 void ReadHudSettings(bool force) {
@@ -986,6 +1003,7 @@ void ReadHudSettings(bool force) {
     if (seen) g_ini_time = a.ftLastWriteTime;
     const bool mxbmrp3 = !g_plugins.empty() && GetFileAttributesA((g_plugins + "mxbmrp3.dlo").c_str()) != INVALID_FILE_ATTRIBUTES;
     g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
+    ApplyLook();
 }
 
 /// hud.ini as it ended up, since a part switched off looks exactly like a part that is broken.
@@ -2806,7 +2824,8 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         g_draw_verts = g_ribbon.verts();
                         g_draw_marks = pace ? coachpace::Marks(g_draw_verts, g_pace_hint, g_pace_phase)
                                             : std::vector<coachline::Vert>();
-                        if (GearOn() && g_gear_hint.level > 0) {
+                        // The gear sign is one of the line's words: off with them (line_text=0).
+                        if (GearOn() && g_gear_hint.level > 0 && g_hud_set.look.text) {
                             const std::vector<coachline::Vert> gm = coachgear::Marks(g_draw_verts, g_gear_hint);
                             g_draw_marks.insert(g_draw_marks.end(), gm.begin(), gm.end());
                         }

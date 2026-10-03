@@ -701,6 +701,35 @@ static void DraggingAPart() {
     CHECK(fresh.find("keep=me") != std::string::npos, "without losing what was there");
 }
 
+// The line's look (hud.ini line_*, col_*, text_*): every key optional, today's look without them,
+// a number past its range clamped, anything unreadable the default.
+static void TheLineLook() {
+    const LineLook def;
+    CHECK(ParseSettings("", false).look == def, "no file: the look the line has always had");
+    CHECK(def.width == 1.0f && def.opacity == 0.7f && def.text && def.text_size == 1.0f && def.text_style == TEXT_BLOCK,
+          "the defaults");
+    Settings s = ParseSettings(
+        "[hud]\nline_width=2\nline_opacity=0.4\ncol_gas=#000000\ncol_heavy=FF8000\ncol_slow=#ffffff\n"
+        "line_text=0\ntext_size=1.5\ntext_style=italic\n",
+        false);
+    CHECK(s.look.width == 2.0f && s.look.opacity == 0.4f, "width %f opacity %f", s.look.width, s.look.opacity);
+    CHECK(s.look.gas[0] == 0 && s.look.gas[1] == 0 && s.look.gas[2] == 0, "gas black");
+    CHECK(s.look.heavy[0] == 1.0f && std::fabs(s.look.heavy[1] - 128 / 255.0f) < 1e-6f && s.look.heavy[2] == 0, "no #");
+    CHECK(s.look.slow[0] == 1.0f && s.look.slow[2] == 1.0f, "lower case hex");
+    CHECK(s.look.coast[0] == def.coast[0] && s.look.fast[1] == def.fast[1], "unset colours keep theirs");
+    CHECK(!s.look.text && s.look.text_size == 1.5f && s.look.text_style == TEXT_ITALIC, "text");
+    CHECK(ParseSettings("[hud]\ntext_style=bold\n", false).look.text_style == TEXT_BOLD, "bold");
+    // Past the ends: clamped. Not a number, or not a colour: the default.
+    s = ParseSettings("[hud]\nline_width=9\nline_opacity=0\ntext_size=0.1\n", false);
+    CHECK(s.look.width == 3.0f && s.look.opacity == 0.1f && s.look.text_size == 0.5f, "clamped");
+    s = ParseSettings("[hud]\nline_width=wide\ncol_gas=#12345\ncol_coast=#GGGGGG\ntext_style=gothic\n", false);
+    CHECK(s.look == def, "nonsense is the default");
+    // The rest of the file still reads alongside them.
+    CHECK(!ParseSettings("[hud]\nline_width=2\ncue=0\n", false).cue, "other keys unaffected");
+    // MORE SPEED's colour is the pace hints' "faster" colour, the HUD's kCyan by default.
+    CHECK(Abgr(def.slow) == kCyan, "default slow colour is kCyan: %08X", Abgr(def.slow));
+}
+
 int main() {
     TheBytesAreExact();
     RefusesWhatTheAppDoesNotWrite();
@@ -722,6 +751,7 @@ int main() {
     TheRiderPointsAndThePartsMove();
     TheRidersMarkerIsNeverDropped();
     DraggingAPart();
+    TheLineLook();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

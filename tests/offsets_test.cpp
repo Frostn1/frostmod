@@ -319,6 +319,32 @@ static void terrain_guard2_constants_agree() {
           "the fault address is not inside the second sampler");
 }
 
+// MXB Coach calls the sampler on the track slots the bus accessor (0x1BB570) indexes. Its lea's
+// displacement is decoded at runtime, so the mask must wildcard exactly those four bytes, and
+// the offsets the decode uses must land on them; the slot count and stride are in the code.
+static void track_slot_accessor_constants_agree() {
+    const size_t sigLen  = sizeof(mxb::SIG_TRACK_SLOT_ACCESSOR) - 1;
+    const size_t maskLen = sizeof(mxb::SIG_TRACK_SLOT_ACCESSOR_MASK) - 1;
+    CHECK(sigLen == maskLen, "accessor signature %zu bytes, mask %zu", sigLen, maskLen);
+    for (size_t i = 0; i < maskLen; ++i) {
+        const bool disp = i >= mxb::TRACK_SLOT_LEA_DISP_OFF && i < mxb::TRACK_SLOT_LEA_END_OFF;
+        CHECK((mxb::SIG_TRACK_SLOT_ACCESSOR_MASK[i] == '?') == disp, "accessor byte %zu masked wrongly", i);
+    }
+    const unsigned char* sig = (const unsigned char*)mxb::SIG_TRACK_SLOT_ACCESSOR;
+    CHECK(sig[0x0E] == 0x48 && sig[0x0F] == 0x8D && sig[0x10] == 0x05, "no `lea rax, [rip+disp32]` before the disp");
+    CHECK(mxb::TRACK_SLOT_LEA_END_OFF == mxb::TRACK_SLOT_LEA_DISP_OFF + 4, "the lea does not end after its disp");
+    CHECK(sig[0x06] == 0x83 && sig[0x07] == 0xF9 && sig[0x08] == mxb::TRACK_SLOT_COUNT - 1,
+          "`cmp ecx, %d` is not the slot count", mxb::TRACK_SLOT_COUNT - 1);
+    uint32_t stride = 0;
+    memcpy(&stride, sig + 0x1E, 4);
+    CHECK(sig[0x1B] == 0x48 && sig[0x1C] == 0x69 && sig[0x1D] == 0xC9 && stride == mxb::TRACK_SLOT_STRIDE,
+          "`imul rcx, rcx, 0x%x` is not the slot stride", unsigned(stride));
+    CHECK(mxb::OFF_TERRAIN_SIZE_X == 0x758 && mxb::OFF_TERRAIN_ORIGIN_Z == 0x76C &&
+          mxb::OFF_TERRAIN_GRID + 8 == mxb::OFF_TERRAIN_SIZE_X,
+          "the heightfield fields do not agree with the sampler's reads");
+    CHECK(mxb::OFF_TERRAIN_ORIGIN_Z + 4 < mxb::TRACK_SLOT_STRIDE, "the heightfield is outside a slot");
+}
+
 static void terrain_guard_constants_agree() {
     const size_t sigLen  = sizeof(mxb::SIG_TERRAIN_SAMPLE) - 1;
     const size_t maskLen = sizeof(mxb::SIG_TERRAIN_SAMPLE_MASK) - 1;
@@ -404,6 +430,7 @@ static void world_session_constants_agree() {
 int main() {
     terrain_guard_constants_agree();
     terrain_guard2_constants_agree();
+    track_slot_accessor_constants_agree();
     world_session_constants_agree();
     ghs_guard_constants_agree();
     detours_are_recognised_before_the_signature_check();

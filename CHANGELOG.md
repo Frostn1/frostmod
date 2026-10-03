@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-02 - v0.48.2
+
+MXB Coach and FrostMod: fewer driver round trips per frame (frame rate with a heavy HUD plugin).
+
+- Every glGet* / glGetError is a round trip to the driver's worker thread. The ground line asked
+  about nine per frame (error drains, framebuffer, program, active texture, twice over for the marks)
+  and FrostMod's overlay one more. Now: the program is followed through the glUseProgram hook, the
+  active texture is restored by glPopAttrib, the framebuffer, error checks and the overlay's viewport
+  are asked every 32nd to 64th frame, and the marks share the line's state.
+- The fixed-function modelview search (about 1000 loads a frame) is skipped on menu, pause and
+  loading frames.
+
 ## 2026-10-02 - v0.48.1
 
 MXB Coach in-game line: a relock after a crash has to be the camera that was drawing.

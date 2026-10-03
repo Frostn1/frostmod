@@ -4536,8 +4536,11 @@ void DrawOverlay(HDC hdc) {
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_chOpen.load() && !MsgFeedLive()) return;
 
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
+    // glGetIntegerv is a round trip to the driver's worker thread (the CPU waits for the frame's
+    // queued GL): the viewport is asked on the first frame and every 32nd, not each one (v0.48.2).
+    static GLint vp[4] = {0, 0, 0, 0};
+    static unsigned vpAge = 0;
+    if (vp[2] <= 0 || vp[3] <= 0 || (vpAge++ & 31) == 0) glGetIntegerv(GL_VIEWPORT, vp);
     const int pw = vp[2], ph = vp[3];
     if (pw <= 0 || ph <= 0) return;
 

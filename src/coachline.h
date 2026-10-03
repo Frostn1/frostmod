@@ -905,25 +905,59 @@ private:
 /// height above the ground (dy) and how much it wandered (spread). A spread over kAlignMaxSpread
 /// means this grid isn't this track's ground (a renamed folder, a different layout), and the line
 /// goes back to the depth snap.
+///
+/// Only samples with the grid under them count toward the verdict, a metre or more apart, on
+/// the ground. Sean's Carson run (v0.45.0): a supercross gate stands off the track's terrain
+/// (its .trh is 170 m square; the gate is at x=193), and the first 200 samples were all the run
+/// out of it: 20 of them were on the grid, under the half needed, and the right ground was
+/// thrown away as "NOT this track's ground (0 samples on the grid)" for the rest of the session. Counting only what
+/// lands on the grid, the verdict waits for the track proper; a grid the rider never rides onto
+/// at all (a different track) is still refused, after kAlignGiveUp samples off it.
 constexpr int   kAlignSamples   = 200;
 constexpr int   kAlignSearchM   = 2;
 constexpr float kAlignMaxSpread = 1.2f;
+constexpr float kAlignStepM     = 1.0f;   // m between the samples kept: 200 m of track, not 4 s of it
+constexpr int   kAlignGiveUp    = 3000;   // samples off the grid (a minute of riding) before giving up on it
+constexpr int   kAlignMinOnGrid = 50;     // and fewer than this on it by then: not this track's ground
 
 struct Alignment {
     bool  done = false, ok = false;
     float dx = 0, dz = 0, dy = 0, spread = 0;
     int   on_grid = 0;
+    int   off_grid = 0;  // samples that had no ground under them on the grid, and didn't count
 };
 
 class AlignCheck {
 public:
     void reset() {
         pts_.clear();
+        off_    = 0;
         result_ = Alignment{};
     }
-    /// One riding sample (not crashed, moving). Returns true the call the verdict is reached.
-    bool add(const GroundGrid& g, float x, float y, float z) {
+    /// One riding sample (not crashed, moving). `grounded`: a wheel on the ground, since in the air
+    /// the bike's height says nothing about the ground under it. Returns true the call the verdict
+    /// is reached.
+    bool add(const GroundGrid& g, float x, float y, float z, bool grounded = true) {
         if (result_.done || !g.ready() || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+        if (!grounded) return false;
+        float h;
+        if (!g.at(x, z, h)) {
+            // Off the grid (a gate or a pit lane past the terrain's edge, or another track's
+            // grid altogether): no evidence either way, so it doesn't count toward the verdict.
+            if (++off_ < kAlignGiveUp) return false;
+            if (int(pts_.size()) >= kAlignMinOnGrid) {
+                decide(g);
+            } else {
+                result_          = Alignment{};
+                result_.done     = true;
+                result_.spread   = INFINITY;
+                result_.on_grid  = int(pts_.size());
+                result_.off_grid = off_;
+                pts_.clear();
+            }
+            return true;
+        }
+        if (!pts_.empty() && std::hypot(x - pts_.back().x, z - pts_.back().z) < kAlignStepM) return false;
         pts_.push_back({x, y, z});
         if (int(pts_.size()) < kAlignSamples) return false;
         decide(g);
@@ -967,11 +1001,13 @@ private:
             }
         if (std::isfinite(best.spread) && (best.dx != 0 || best.dz != 0)) best.spread -= 0.05f;
         best.ok = std::isfinite(best.spread) && best.spread <= kAlignMaxSpread && best.dy > -1.0f && best.dy < 3.0f;
+        best.off_grid = off_;
         result_ = best;
         pts_.clear();
         pts_.shrink_to_fit();
     }
     std::vector<P> pts_;
+    int            off_ = 0;
     Alignment      result_;
 };
 

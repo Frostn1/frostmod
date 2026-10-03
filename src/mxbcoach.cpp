@@ -81,6 +81,7 @@ constexpr size_t kDataPosZ       = 32;
 constexpr size_t kDataVelX       = 36;  // f32[3] m/s
 constexpr size_t kDataSuspLength = 120;  // f32[2] metres: 0 = front, 1 = rear
 constexpr size_t kDataCrashed    = 136;
+constexpr size_t kDataWheelMat   = 168;  // i32[2]: the ground under each wheel, 0 = none (in the air)
 
 // SPluginsBikeEvent_t: m_afSuspMaxTravel, f32[2] metres, 0 = front and 1 = rear. It is what
 // the shocks' lengths are a proportion of, and it only arrives with the event.
@@ -651,8 +652,10 @@ void BuildExtras() {
     g_gear_hint = coachgear::Hint{};
     g_gear_t    = -1;
     g_gear_said = coachgear::NONE;
-    Log("gear", g_hud_sheet.gear.empty() ? "no GEAR in the sheet (MXB Coach is older than the gear hints): no gear hints"
-                                         : std::to_string(g_gear_prof.shifts.size()) + " shifts in Coach's lap");
+    // No sheet at all is not an old Coach: it just hasn't written one for this track yet.
+    Log("gear", g_hud_sheet.ref.empty()    ? "no sheet yet: no gear hints until MXB Coach writes one"
+                : g_hud_sheet.gear.empty() ? "no GEAR in the sheet (MXB Coach is older than the gear hints): no gear hints"
+                                           : std::to_string(g_gear_prof.shifts.size()) + " shifts in Coach's lap");
 }
 
 /// Whether gear hints are worked out: asked for, with Coach's gears.
@@ -2883,11 +2886,16 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         if (!crashed && speed > 3.0f && g_track.height_at_lap(_fPos, centre_h)) g_height.add(g_rider_y - centre_h);
         g_rider_state.sample(_fTime, crashed, here.x, g_rider_y, here.y);
         // The one-time check that the track's grid and the telemetry share a frame.
-        if (!crashed && speed > 3.0f && g_grid.ready() && g_align.add(g_grid, here.x, g_rider_y, here.y)) {
+        // On the ground only (a wheel touching something): in the air the bike's height says
+        // nothing about the ground, and a supercross lap is nearly half air.
+        const bool grounded = _iDataSize < int(kDataWheelMat + 8) || coachcue::U32(b + kDataWheelMat) != 0 ||
+                              coachcue::U32(b + kDataWheelMat + 4) != 0;
+        if (!crashed && speed > 3.0f && g_grid.ready() && g_align.add(g_grid, here.x, g_rider_y, here.y, grounded)) {
             const coachline::Alignment& a = g_align.result();
-            char msg[220];
-            std::snprintf(msg, sizeof(msg), "trh aligned dx=%.0f dz=%.0f dy=%.2f spread=%.2f (%d samples on the grid)%s",
-                          double(a.dx), double(a.dz), double(a.dy), double(a.spread), a.on_grid,
+            char msg[260];
+            std::snprintf(msg, sizeof(msg),
+                          "trh aligned dx=%.0f dz=%.0f dy=%.2f spread=%.2f (%d samples on the grid, %d off it)%s",
+                          double(a.dx), double(a.dz), double(a.dy), double(a.spread), a.on_grid, a.off_grid,
                           a.ok ? "" : " - NOT this track's ground; the line snaps to what the game draws instead");
             Log("ground", msg);
             if (a.ok) g_grid.shift(a.dx, a.dz);

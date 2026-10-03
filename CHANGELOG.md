@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-02 - v0.49.3
+
+FrostMod: hands the game's master server list to MXB App.
+
+- While the game runs MXB App cannot log in to the master, so a server newer than its remembered book
+  was joinable in-game but never listed in the app. The server-browser hook now writes the address
+  and name of every row the game built (public IPv4 only, filtered rows left out) to
+  `frostmod_masterlist.txt` beside the log, when the list changes. Read-only on the game side.
+
 ## 2026-10-02 - v0.49.2
 
 FrostMod: the log, filter and settings no longer move to %TEMP% at game start.

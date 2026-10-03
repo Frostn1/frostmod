@@ -16,6 +16,17 @@ MXB Coach in-game text: a style, size and place for each text item.
   and draws it at `jump_x` / `jump_y` (middle of the screen, 0.45 down, until set). MORE SPEED and the
   gear badge stay under the gap row and beside the cue box until their `_x` / `_y` are written.
 - Every key is optional: a hud.ini without them looks exactly as before. Re-read about once a second.
+## 2026-10-02 - v0.48.2
+
+MXB Coach and FrostMod: fewer driver round trips per frame (frame rate with a heavy HUD plugin).
+
+- Every glGet* / glGetError is a round trip to the driver's worker thread. The ground line asked
+  about nine per frame (error drains, framebuffer, program, active texture, twice over for the marks)
+  and FrostMod's overlay one more. Now: the program is followed through the glUseProgram hook, the
+  active texture is restored by glPopAttrib, the framebuffer, error checks and the overlay's viewport
+  are asked every 32nd to 64th frame, and the marks share the line's state.
+- The fixed-function modelview search (about 1000 loads a frame) is skipped on menu, pause and
+  loading frames.
 
 ## 2026-10-02 - v0.48.1
 

@@ -205,10 +205,37 @@ static bool ReadBasePointer(const char* dllDir, char (&out)[MAX_PATH]) {
     return true;
 }
 
-// Resolve the log path once, from the dll's own module handle (its folder is the
-// same folder as frostmod.exe) or the folder frostmod.dir names. Called from DllMain
-// before anything else logs.
+// Open a log for append, sharing it with every other reader and writer.
+//
+// fopen_s opens a file for writing with NO sharing, so while anything else had the log open -
+// our own Log() writing a line on the Init thread, MXB App reading it for "Send logs", an
+// editor - the open failed. That is how a player's log stopped after its load banner: the
+// game's Startup() re-resolved the path at the very moment the Init thread was writing that
+// banner, the probe open hit our own handle, and FrostMod moved itself to %TEMP% - log,
+// filter rules, filter flag, command file, everything. Brief retries cover an open that
+// lands mid-write.
+static FILE* OpenLogShared(const char* path) {
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (FILE* f = _fsopen(path, "a", _SH_DENYNO)) return f;
+        if (errno != EACCES) break;   // a sharing clash; anything else will not clear by waiting
+        Sleep(2);
+    }
+    return nullptr;
+}
+
+// Set once g_logPath is FrostMod's own folder (not the %TEMP% fallback). From then on the
+// path never moves: every file FrostMod keeps is found next to the log.
+static bool g_logPathSettled = false;
+// Why the log is in %TEMP%, if it is. Logged by Init and Startup, so the fallback is never silent.
+static char g_logNote[MAX_PATH * 2 + 128] = {0};
+
+// Resolve the log path from the dll's own module handle (its folder is the same folder as
+// frostmod.exe) or the folder frostmod.dir names. Called from DllMain before anything else
+// logs, and again from Startup(); a path already settled is kept as it is.
 void InitLogPath(HMODULE self) {
+    // Under the log mutex: Log() reads g_logPath on other threads while this writes it.
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    if (g_logPathSettled) return;
     char p[MAX_PATH];
     if (self && GetModuleFileNameA(self, p, sizeof(p))) {
         if (char* slash = strrchr(p, '\\')) *(slash + 1) = 0;
@@ -224,10 +251,35 @@ void InitLogPath(HMODULE self) {
         // where a hand-installed `frostmod.dlo` logs, and two of us appending to one file
         // makes both halves harder to read at the moment someone needs them.
         strcat_s(cand, g_sessionOnly ? "frostmod_session.log" : "frostmod.log");
-        if (FILE* f; fopen_s(&f, cand, "a") == 0 && f) { fclose(f); strcpy_s(g_logPath, cand); return; }
+        if (FILE* f = OpenLogShared(cand)) {
+            fclose(f);
+            if (g_logPath[0] && _stricmp(g_logPath, cand) != 0)
+                sprintf_s(g_logNote, "[init] log: %s is writable again - logging there (earlier lines went to %s)",
+                          cand, g_logPath);
+            else
+                g_logNote[0] = 0;
+            strcpy_s(g_logPath, cand);
+            g_logPathSettled = true;
+            return;
+        }
+        const int err = errno;
+        sprintf_s(g_logNote, "[init] log: cannot write %s (errno %d) - logging to %%TEMP%% instead, and "
+                  "FrostMod's settings, filter rules and flags are read from there too", cand, err);
+    } else {
+        sprintf_s(g_logNote, "[init] log: cannot find this dll's own path (error %lu) - logging to %%TEMP%%",
+                  GetLastError());
     }
     char t[MAX_PATH];
     if (GetTempPathA(sizeof(t), t)) { strcat_s(t, "frostmod.log"); strcpy_s(g_logPath, t); }
+}
+
+void Log(const char* fmt, ...);
+
+// Say where the log went when that is not FrostMod's own folder.
+void LogPathNote() {
+    char note[sizeof(g_logNote)];
+    { std::lock_guard<std::mutex> lk(g_logMutex); strcpy_s(note, g_logNote); }
+    if (note[0]) Log("%s", note);
 }
 
 void Log(const char* fmt, ...) {
@@ -246,7 +298,7 @@ void Log(const char* fmt, ...) {
     const char* path = g_logPath[0] ? g_logPath
                      : (GetTempPathA(sizeof(temp), temp) ? (strcat_s(temp, "frostmod.log"), temp) : nullptr);
     if (path) {
-        if (FILE* f; fopen_s(&f, path, "a") == 0 && f) {
+        if (FILE* f = OpenLogShared(path)) {
             SYSTEMTIME st; GetLocalTime(&st);
             fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
             fclose(f);
@@ -6355,6 +6407,7 @@ DWORD WINAPI Init(LPVOID) {
         Log("[init] mode: %s (%s)", plugin ? "game plugin - loaded by the game, nothing injected"
                                            : "injected by frostmod.exe", name);
         if (g_baseNote[0]) Log("%s", g_baseNote);
+        LogPathNote();
     }
 
     // Before anything else that could fault, so a crash during our own setup is reported
@@ -6855,11 +6908,16 @@ void EnsureInit() {
     if (!g_initStarted.compare_exchange_strong(expected, true)) return;
     if (!ClaimProcess()) {
         g_standDown.store(true);
-        Log("[init] another FrostMod is already running in this game - this copy stands down "
-            "(no hooks, no overlay). Remove one of frostmod.dlo / the injector.");
+        char self[MAX_PATH] = {0};
+        if (g_selfModule) GetModuleFileNameA(g_selfModule, self, sizeof(self));
+        Log("[init] another FrostMod is already running in this game (Local\\FrostModActive-%lu is "
+            "taken) - this copy (%s) stands down (no hooks, no overlay). Remove one of frostmod.dlo / "
+            "the injector.", GetCurrentProcessId(), self[0] ? self : "?");
         return;
     }
-    CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
+    if (HANDLE t = CreateThread(nullptr, 0, Init, nullptr, 0, nullptr)) CloseHandle(t);
+    else Log("[init] could not start the init thread (error %lu) - FrostMod stops here: no hooks, "
+             "no overlay, no filter.", GetLastError());
 }
 
 } // namespace
@@ -6919,6 +6977,10 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
     Log("=============== FrostMod %s plugin Startup()%s savePath='%s' ===============",
         FROSTMOD_VERSION, g_sessionOnly ? " [session only: no hooks, no overlay]" : "",
         g_savePath[0] ? g_savePath : "<null>");
+    LogPathNote();
+    if (g_standDown.load())
+        Log("[init] this copy is standing down: another FrostMod already runs in this game (see the "
+            "[init] line above). Remove one of frostmod.dlo / the injector.");
     if (g_sessionOnly) {
         // This copy never runs Init, so it would otherwise have no crash filter at all -
         // and it is the copy the game delivers the event callbacks to, which makes it the

@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-02 — v0.45.2
+
+### Fixed
+- **MXB Coach: stutter with the ground line on.** Its depth reads (the snap every 200 ms, the
+  depth-mode probe every 2 s) were synchronous `glReadPixels`, each one a full CPU-GPU pipeline
+  flush: a hitch about five times a second even on a fast PC. They now go into pixel-pack
+  buffers with a fence and are picked up a frame or two later, without ever waiting, and are
+  decided through the camera of the frame they were read on. A GL without buffer objects or
+  fences keeps the old reads, at most once a second. The game's pack buffer binding and pixel
+  store state are left as they were.
+- The camera's axes are no longer looked up by building 96 strings a frame, and a track grid
+  file that doesn't parse is no longer re-read whole every second.
+
 ## 2026-10-02 — v0.45.1
 
 ### Reverted

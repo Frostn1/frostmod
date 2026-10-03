@@ -96,6 +96,7 @@ coachline::AlignCheck g_align;
 std::string           g_grid_name;
 ULONGLONG             g_grid_look_ms = 0;
 bool                  g_grid_said_missing = false;
+std::string           g_grid_bad;  // the stamp of a grid file that didn't parse, not read again unchanged
 // Crashes, getting up and the game putting the bike back (coachline::RiderState).
 coachline::RiderState g_rider_state;
 // What the sheet adds to the line on the track: the ground across it and where its lap braked.
@@ -737,6 +738,14 @@ void LoadGround(bool quiet) {
     if (g_event.track.empty() || g_base.empty()) return;
     const std::string name = coachcue::SafeName(g_event.track) + ".ground";
     const std::string path = g_base + "cues\\" + name;
+    // A grid that didn't parse is read again only once it has changed: it used to be read whole
+    // (up to 64 MB) every second, under the lock the render thread's HUD draw waits on.
+    std::string               stamp;
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa))
+        stamp = path + "|" + std::to_string(fa.nFileSizeLow) + "|" + std::to_string(fa.ftLastWriteTime.dwLowDateTime) +
+                "|" + std::to_string(fa.ftLastWriteTime.dwHighDateTime);
+    if (quiet && !stamp.empty() && stamp == g_grid_bad) return;
     FILE*             f    = std::fopen(path.c_str(), "rb");
     if (!f) {
         if (!quiet || !g_grid_said_missing)
@@ -752,6 +761,7 @@ void LoadGround(bool quiet) {
     while ((got = std::fread(chunk, 1, sizeof(chunk), f)) > 0 && buf.size() < (64u << 20)) buf.insert(buf.end(), chunk, chunk + got);
     std::fclose(f);
     if (!g_grid.parse(buf.data(), buf.size())) {
+        g_grid_bad = stamp;
         Log("ground", "track grid " + name + " didn't read; the line snaps to what the game draws instead");
         return;
     }
@@ -1976,36 +1986,161 @@ void LogUniforms(float aspect, const coachline::UniformPick& pk) {
     if (rows.empty()) Log("ground/diag", "  no upload this frame has a camera's shape");
 }
 
-/// Looks at the game's depth buffer under the ribbon 10 m ahead, once every two seconds: an
-/// empty one (the scene was drawn elsewhere and copied in) means no depth test at all, a full
-/// one is tested against the way the game tests (reversed or not). Inside the draw's
-/// glPushAttrib, so the read buffer it may set is restored.
-void DepthProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
-    const ULONGLONG now = GetTickCount64();
-    if (now - g_probe_ms < 2000 || g_draw_verts.size() < 12) return;
-    g_probe_ms = now;
-    GLint pack = 0;
-    glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack);
-    if (glGetError() == GL_NO_ERROR && pack != 0) return;  // the read would land in the game's buffer
-    const coachline::Vert& a = g_draw_verts[10];
-    const coachline::Vert& b = g_draw_verts[11];
-    const coachline::Screen s = coachline::Project(proj, view, (a.x + b.x) * 0.5f, a.y, (a.z + b.z) * 0.5f, ax);
-    if (!s.ok || s.x < 0 || s.x > 1 || s.y < 0 || s.y > 1) return;
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
-    if (vp[2] <= 0 || vp[3] <= 0) return;
-    GLint game_func = GL_LESS;
-    glGetIntegerv(GL_DEPTH_FUNC, &game_func);
-    glReadBuffer(GL_BACK);
-    float d = 1.0f;
-    glReadPixels(vp[0] + GLint(s.x * float(vp[2])), vp[1] + GLint((1.0f - s.y) * float(vp[3])), 1, 1,
-                 GL_DEPTH_COMPONENT, GL_FLOAT, &d);
-    if (glGetError() != GL_NO_ERROR) return;
+// ---------------------------------------------------------------------------------------
+// The depth reads, v0.45.2: asynchronous.
+//
+// Up to v0.45.1 each read of the game's depth was a glReadPixels into our own memory, and that
+// makes the driver finish everything queued before it: a full CPU-GPU pipeline flush, about five
+// times a second (the snap every 200 ms, the depth-mode probe every 2 s). On a strong PC with
+// the GPU mostly idle it showed as a hitch at each one. Now a read goes into a pixel-pack buffer
+// of ours with a fence behind it, and is picked up on a later frame once the fence says the GPU
+// got there (glClientWaitSync with a timeout of 0: nothing ever waits). What a read decides is
+// decided as before, through the camera, viewport and depth range of the frame it was taken on,
+// since the camera has moved since. Without buffer objects or fences (GL < 2.1, no ARB_sync)
+// the old synchronous reads stay, at most once a second.
+
+using glGenBuffers_t       = void(WINAPI*)(GLsizei, GLuint*);
+using glBindBuffer_t       = void(WINAPI*)(GLenum, GLuint);
+using glBufferData_t       = void(WINAPI*)(GLenum, intptr_t, const void*, GLenum);
+using glGetBufferSubData_t = void(WINAPI*)(GLenum, intptr_t, intptr_t, void*);
+using glDeleteBuffers_t    = void(WINAPI*)(GLsizei, const GLuint*);
+using GLsyncH              = struct __GLsync*;
+using glFenceSync_t        = GLsyncH(WINAPI*)(GLenum, GLbitfield);
+using glClientWaitSync_t   = GLenum(WINAPI*)(GLsyncH, GLbitfield, uint64_t);
+using glDeleteSync_t       = void(WINAPI*)(GLsyncH);
+
+constexpr GLenum kGlPixelPackBuffer         = 0x88EB;
+constexpr GLenum kGlPixelPackBufferBinding  = 0x88ED;
+constexpr GLenum kGlStreamRead              = 0x88E1;
+constexpr GLenum kGlSyncGpuCommandsComplete = 0x9117;
+constexpr GLenum kGlAlreadySignaled         = 0x911A;
+constexpr GLenum kGlConditionSatisfied      = 0x911C;
+constexpr GLenum kGlWaitFailed              = 0x911D;
+
+constexpr int       kReadMax         = 1 + coachline::kSnapN;  // the check, then the snap points
+constexpr int       kReadSlots       = 3;
+constexpr ULONGLONG kReadGiveUpMs    = 2000;  // a fence still unsignalled by then: dropped
+constexpr ULONGLONG kSyncReadEveryMs = 1000;  // the synchronous fallback's limit
+
+enum ReadKind { READ_DEPTH_MODE, READ_SNAP };
+
+/// One probe's reads and everything needed to make sense of them later.
+struct DepthRead {
+    ReadKind kind = READ_SNAP;
+    int      n    = 0;  // pixels read
+    GLint    px[kReadMax] = {}, py[kReadMax] = {};
+    float    sx[kReadMax] = {}, sy[kReadMax] = {};
+    bool     ok[kReadMax] = {};  // read without a GL error
+    float    d[kReadMax]  = {};
+    GLint    game_func    = GL_LESS;  // READ_DEPTH_MODE: the game's depth func at the read
+    // READ_SNAP: the camera and depth range it was read through, the bike then, and the check.
+    coachline::Mat4 proj, view;
+    coachline::Axes ax;
+    float           range[2]  = {0.0f, 1.0f};
+    float           bike[3]   = {NAN, NAN, NAN};
+    bool            has_check = false;  // a check was due (the bike moving)
+    int             check     = -1;     // its pixel, or -1 when the point was off screen
+    float           aim_x = NAN, aim_z = NAN;
+    unsigned        gen = 0;  // g_snap_gen at the read: a reset since makes it stale
+
+    int add(const GLint vp[4], float x, float y) {
+        const int k = n++;
+        sx[k] = x, sy[k] = y;
+        px[k] = vp[0] + GLint(x * float(vp[2]));
+        py[k] = vp[1] + GLint((1.0f - y) * float(vp[3]));
+        d[k]  = 1.0f;
+        return k;
+    }
+};
+
+struct ReadSlot {
+    GLuint    pbo   = 0;
+    GLsyncH   fence = nullptr;  // non-null: in flight
+    ULONGLONG at    = 0;
+    DepthRead r;
+};
+
+struct AsyncReader {
+    bool                 looked = false, ok = false;
+    HGLRC                ctx    = nullptr;  // the context the buffers belong to
+    glGenBuffers_t       gen_buffers = nullptr;
+    glBindBuffer_t       bind        = nullptr;
+    glBufferData_t       data        = nullptr;
+    glGetBufferSubData_t sub_data    = nullptr;
+    glDeleteBuffers_t    del_buffers = nullptr;
+    glFenceSync_t        fence       = nullptr;
+    glClientWaitSync_t   wait        = nullptr;
+    glDeleteSync_t       del_sync    = nullptr;
+    ReadSlot             slot[kReadSlots];
+} g_rd;
+unsigned g_snap_gen = 0;  // bumped whenever the snap's state is started again
+
+template <class T>
+bool GlProc(const char* name, T& out) {
+    void* p = (void*)wglGetProcAddress(name);
+    if (reinterpret_cast<uintptr_t>(p) <= 3 || p == (void*)-1) p = nullptr;  // see InstallShaderHooks
+    out = reinterpret_cast<T>(p);
+    return p != nullptr;
+}
+
+/// Whether reads can go through our pixel-pack buffers. Looked up once per GL context: a new
+/// context (the game recreated its window) starts again, and the old one's buffer and fence names
+/// are forgotten, never deleted, since in the new context they could be the game's.
+bool AsyncReads() {
+    const HGLRC ctx = wglGetCurrentContext();
+    if (g_rd.looked && ctx == g_rd.ctx) return g_rd.ok;
+    for (ReadSlot& s : g_rd.slot) s = ReadSlot{};
+    g_rd.looked = true, g_rd.ctx = ctx, g_rd.ok = false;
+    const bool procs = ctx && GlProc("glGenBuffers", g_rd.gen_buffers) && GlProc("glBindBuffer", g_rd.bind) &&
+                       GlProc("glBufferData", g_rd.data) && GlProc("glGetBufferSubData", g_rd.sub_data) &&
+                       GlProc("glDeleteBuffers", g_rd.del_buffers) && GlProc("glFenceSync", g_rd.fence) &&
+                       GlProc("glClientWaitSync", g_rd.wait) && GlProc("glDeleteSync", g_rd.del_sync);
+    if (procs) {
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        GLint was = 0;
+        glGetIntegerv(kGlPixelPackBufferBinding, &was);
+        GLuint names[kReadSlots] = {};
+        g_rd.gen_buffers(kReadSlots, names);
+        bool named = true;
+        for (GLuint n : names) named = named && n != 0;
+        if (named && glGetError() == GL_NO_ERROR) {
+            for (int i = 0; i < kReadSlots; ++i) {
+                g_rd.bind(kGlPixelPackBuffer, names[i]);
+                g_rd.data(kGlPixelPackBuffer, intptr_t(kReadMax * sizeof(float)), nullptr, kGlStreamRead);
+            }
+            g_rd.bind(kGlPixelPackBuffer, GLuint(was));
+            g_rd.ok = glGetError() == GL_NO_ERROR;
+        }
+        if (g_rd.ok) {
+            for (int i = 0; i < kReadSlots; ++i) g_rd.slot[i].pbo = names[i];
+        } else {
+            GLuint del[kReadSlots];
+            int    nd = 0;
+            for (GLuint n : names)
+                if (n) del[nd++] = n;
+            if (nd) g_rd.del_buffers(nd, del);
+            while (glGetError() != GL_NO_ERROR) {
+            }
+        }
+    }
+    std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
+    if (lock.owns_lock())
+        Log("ground", g_rd.ok ? "depth reads: asynchronous (pixel-pack buffers and fences)"
+                              : "depth reads: no buffer objects or fences in this GL; synchronous, at most once a second");
+    return g_rd.ok;
+}
+
+/// The depth-mode probe's reading (DepthProbe).
+void ResolveDepthMode(const DepthRead& r) {
+    if (r.n < 1 || !r.ok[0]) return;
+    const float     d   = r.d[0];
     const DepthMode was = g_depth;
     // Depth 1.0 (or 0) under the line is the far plane or a cleared buffer, not the ground: no
     // reading. v0.43.4 took it as "the scene isn't in this buffer" and drew the line over
     // everything for a few seconds at a time.
     if (!(d > 1e-6f && d < 0.999999f)) return;
+    const GLint game_func = r.game_func;
     g_depth = game_func == GL_GREATER || game_func == GL_GEQUAL ? DEPTH_GEQUAL : DEPTH_LEQUAL;
     if (g_depth != was) {
         std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
@@ -2016,42 +2151,17 @@ void DepthProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const 
     }
 }
 
-/// Reads the game's depth under the ribbon at coachline::kSnapAt metres ahead and feeds the
-/// correction (coachline::DepthSnap). Inside the draw's glPushAttrib; skipped while a pixel-pack
-/// buffer is bound, since the read would land in it.
-void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
-    const ULONGLONG now = GetTickCount64();
-    if (now - g_dsnap_ms < coachline::kSnapEveryMs || g_draw_verts.size() < 8) return;
-    g_dsnap_ms = now;
-    GLint pack = 0;
-    glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack);
-    if (glGetError() == GL_NO_ERROR && pack != 0) return;
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
-    if (vp[2] <= 0 || vp[3] <= 0) return;
-    // The depth range the game left set: a split range (near and far passes) changes what a
-    // depth value means, and v0.43.4 assumed 0..1.
-    float range[2] = {0.0f, 1.0f};
-    glGetFloatv(0x0B70 /* GL_DEPTH_RANGE */, range);
-    if (glGetError() != GL_NO_ERROR || !(range[1] > range[0])) range[0] = 0.0f, range[1] = 1.0f;
-    glReadBuffer(GL_BACK);
-    auto read = [&](float sx, float sy, float& d) {
-        d = 1.0f;
-        glReadPixels(vp[0] + GLint(sx * float(vp[2])), vp[1] + GLint((1.0f - sy) * float(vp[3])), 1, 1, GL_DEPTH_COMPONENT,
-                     GL_FLOAT, &d);
-        return glGetError() == GL_NO_ERROR && d > range[0] + 1e-6f && d < range[1] - 1e-6f;
-    };
-    if (g_line_total > 0 && std::fabs(g_lsnap.total() - g_line_total) > 0.5f) g_lsnap.reset(g_line_total);
+/// The snap's readings (SnapProbe): the check first, then, while it agrees, the corrections.
+void ResolveSnap(const DepthRead& r) {
+    if (r.gen != g_snap_gen || g_line_on_ground) return;  // started again since, or no snap now
+    auto good = [&](int k) { return r.ok[k] && r.d[k] > r.range[0] + 1e-6f && r.d[k] < r.range[1] - 1e-6f; };
     // The check: the ground 4 m ahead of the bike, read back, against the bike's own height.
-    const float vx = g_rider_v[0], vz = g_rider_v[2], vh = std::hypot(vx, vz);
-    if (vh > 2.0f) {
-        const float lift = std::isfinite(g_scheck.lift()) ? g_scheck.lift() : coachline::kOriginGuess;
-        const float axp = g_snap[0] + vx / vh * 4.0f, azp = g_snap[2] + vz / vh * 4.0f, ayp = g_snap[1] - lift;
-        const coachline::Screen sc = coachline::Project(proj, view, axp, ayp, azp, ax);
-        float d, hx = NAN, hy = NAN, hz = NAN;
-        if (sc.ok && sc.x > 0 && sc.x < 1 && sc.y > 0 && sc.y < 1 && read(sc.x, sc.y, d))
-            coachline::Unproject(proj, view, ax, sc.x, sc.y, d, hx, hy, hz, range[0], range[1]);
-        g_scheck.add(g_snap[1], hx, hy, hz, axp, azp);
+    if (r.has_check) {
+        float hx = NAN, hy = NAN, hz = NAN;
+        if (r.check >= 0 && good(r.check))
+            coachline::Unproject(r.proj, r.view, r.ax, r.sx[r.check], r.sy[r.check], r.d[r.check], hx, hy, hz,
+                                 r.range[0], r.range[1]);
+        g_scheck.add(r.bike[1], hx, hy, hz, r.aim_x, r.aim_z);
     }
     const bool on = g_scheck.on();
     if (on != g_snap_on) {
@@ -2062,6 +2172,176 @@ void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const c
                              : "snap off: " + g_scheck.why());
     }
     if (!on) return;
+    for (int k = 0; k < r.n; ++k) {
+        if (k == r.check || !good(k)) continue;
+        ++g_dsnap_reads;
+        float hx, hy, hz, m;
+        if (!coachline::Unproject(r.proj, r.view, r.ax, r.sx[k], r.sy[k], r.d[k], hx, hy, hz, r.range[0], r.range[1]))
+            continue;
+        const float dy = coachline::SnapReadingAt(g_draw_verts, g_lsnap, hx, hy, hz, r.bike[0], r.bike[2], m);
+        if (std::isfinite(dy) && g_lsnap.feed(m, g_lsnap.at(m) + dy)) ++g_dsnap_used;
+    }
+}
+
+void ResolveRead(const DepthRead& r) {
+    if (r.kind == READ_DEPTH_MODE) ResolveDepthMode(r);
+    else ResolveSnap(r);
+}
+
+/// Reads `r`'s pixels from the back buffer: into a free buffer of ours with a fence behind it,
+/// or, without them, synchronously and decided at once. The game's pack buffer binding and pixel
+/// store state are put back as they were. A read with no free buffer is dropped.
+void SubmitRead(DepthRead& r) {
+    if (r.n == 0) {  // nothing on screen to read: decided now, as before
+        ResolveRead(r);
+        return;
+    }
+    glReadBuffer(GL_BACK);
+    if (!g_rd.ok) {
+        for (int k = 0; k < r.n; ++k) {
+            glReadPixels(r.px[k], r.py[k], 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &r.d[k]);
+            r.ok[k] = glGetError() == GL_NO_ERROR;
+        }
+        ResolveRead(r);
+        return;
+    }
+    ReadSlot* s = nullptr;
+    for (ReadSlot& c : g_rd.slot)
+        if (!c.fence && c.pbo) {
+            s = &c;
+            break;
+        }
+    if (!s) return;
+    GLint was = 0;
+    glGetIntegerv(kGlPixelPackBufferBinding, &was);
+    glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
+    glPixelStorei(GL_PACK_SWAP_BYTES, GL_FALSE);
+    glPixelStorei(GL_PACK_LSB_FIRST, GL_FALSE);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    g_rd.bind(kGlPixelPackBuffer, s->pbo);
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    bool any = false;
+    for (int k = 0; k < r.n; ++k) {
+        glReadPixels(r.px[k], r.py[k], 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT,
+                     reinterpret_cast<void*>(uintptr_t(size_t(k) * sizeof(float))));
+        r.ok[k] = glGetError() == GL_NO_ERROR;
+        any     = any || r.ok[k];
+    }
+    g_rd.bind(kGlPixelPackBuffer, GLuint(was));
+    glPopClientAttrib();
+    if (!any) {  // every read failed: decided now, as a failed synchronous read was
+        ResolveRead(r);
+        return;
+    }
+    s->r     = r;
+    s->at    = GetTickCount64();
+    s->fence = g_rd.fence(kGlSyncGpuCommandsComplete, 0);
+    if (!s->fence) ResolveRead([&] { DepthRead f = r; for (bool& o : f.ok) o = false; return f; }());
+}
+
+/// Each drawn frame, before any new read: the reads whose fence has signalled are taken (oldest
+/// first) and decided. Never waits; a fence not signalled within kReadGiveUpMs is dropped.
+void PollDepthReads() {
+    if (!g_rd.ok || wglGetCurrentContext() != g_rd.ctx) return;  // AsyncReads() starts again
+    const ULONGLONG now = GetTickCount64();
+    for (;;) {
+        ReadSlot* next = nullptr;
+        for (ReadSlot& s : g_rd.slot) {
+            if (!s.fence) continue;
+            const GLenum st = g_rd.wait(s.fence, 0, 0);
+            if (st == kGlAlreadySignaled || st == kGlConditionSatisfied) {
+                if (!next || s.at < next->at) next = &s;
+            } else if (st == kGlWaitFailed || now - s.at > kReadGiveUpMs) {
+                g_rd.del_sync(s.fence);
+                s.fence = nullptr;
+            }
+        }
+        if (!next) return;
+        g_rd.del_sync(next->fence);
+        next->fence = nullptr;
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        GLint was = 0;
+        glGetIntegerv(kGlPixelPackBufferBinding, &was);
+        g_rd.bind(kGlPixelPackBuffer, next->pbo);
+        float d[kReadMax];
+        g_rd.sub_data(kGlPixelPackBuffer, 0, intptr_t(size_t(next->r.n) * sizeof(float)), d);
+        g_rd.bind(kGlPixelPackBuffer, GLuint(was));
+        if (glGetError() != GL_NO_ERROR) continue;
+        for (int k = 0; k < next->r.n; ++k)
+            if (next->r.ok[k]) next->r.d[k] = d[k];
+        ResolveRead(next->r);
+    }
+}
+
+/// Looks at the game's depth buffer under the ribbon 10 m ahead, once every two seconds: an
+/// empty one (the scene was drawn elsewhere and copied in) means no depth test at all, a full
+/// one is tested against the way the game tests (reversed or not). Inside the draw's
+/// glPushAttrib, so the read buffer it may set is restored. Decided when the read comes back.
+void DepthProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_probe_ms < 2000 || g_draw_verts.size() < 12) return;
+    g_probe_ms = now;
+    AsyncReads();
+    GLint pack = 0;
+    glGetIntegerv(kGlPixelPackBufferBinding, &pack);
+    if (glGetError() == GL_NO_ERROR && pack != 0) return;  // the game has its own pack buffer bound
+    const coachline::Vert& a = g_draw_verts[10];
+    const coachline::Vert& b = g_draw_verts[11];
+    const coachline::Screen s = coachline::Project(proj, view, (a.x + b.x) * 0.5f, a.y, (a.z + b.z) * 0.5f, ax);
+    if (!s.ok || s.x < 0 || s.x > 1 || s.y < 0 || s.y > 1) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] <= 0 || vp[3] <= 0) return;
+    DepthRead r;
+    r.kind      = READ_DEPTH_MODE;
+    r.game_func = GL_LESS;
+    glGetIntegerv(GL_DEPTH_FUNC, &r.game_func);
+    r.add(vp, s.x, s.y);
+    SubmitRead(r);
+}
+
+/// Reads the game's depth under the ribbon at coachline::kSnapAt metres ahead and feeds the
+/// correction (coachline::LineSnap), once the check agrees, when the reads come back. Inside the
+/// draw's glPushAttrib; skipped while the game has a pixel-pack buffer bound.
+void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Axes& ax) {
+    const ULONGLONG now   = GetTickCount64();
+    const ULONGLONG every = AsyncReads() ? coachline::kSnapEveryMs : (std::max)(ULONGLONG(coachline::kSnapEveryMs), kSyncReadEveryMs);
+    if (now - g_dsnap_ms < every || g_draw_verts.size() < 8) return;
+    g_dsnap_ms = now;
+    GLint pack = 0;
+    glGetIntegerv(kGlPixelPackBufferBinding, &pack);
+    if (glGetError() == GL_NO_ERROR && pack != 0) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] <= 0 || vp[3] <= 0) return;
+    DepthRead r;
+    r.kind = READ_SNAP;
+    // The depth range the game left set: a split range (near and far passes) changes what a
+    // depth value means, and v0.43.4 assumed 0..1.
+    glGetFloatv(0x0B70 /* GL_DEPTH_RANGE */, r.range);
+    if (glGetError() != GL_NO_ERROR || !(r.range[1] > r.range[0])) r.range[0] = 0.0f, r.range[1] = 1.0f;
+    if (g_line_total > 0 && std::fabs(g_lsnap.total() - g_line_total) > 0.5f) {
+        g_lsnap.reset(g_line_total);
+        ++g_snap_gen;
+    }
+    r.proj = proj, r.view = view, r.ax = ax, r.gen = g_snap_gen;
+    for (int k = 0; k < 3; ++k) r.bike[k] = g_snap[k];
+    auto on_screen = [](const coachline::Screen& sc) { return sc.ok && sc.x > 0 && sc.x < 1 && sc.y > 0 && sc.y < 1; };
+    // The check: the ground 4 m ahead of the bike, to be read back against the bike's own height.
+    const float vx = g_rider_v[0], vz = g_rider_v[2], vh = std::hypot(vx, vz);
+    if (vh > 2.0f) {
+        const float lift = std::isfinite(g_scheck.lift()) ? g_scheck.lift() : coachline::kOriginGuess;
+        r.has_check = true;
+        r.aim_x     = g_snap[0] + vx / vh * 4.0f, r.aim_z = g_snap[2] + vz / vh * 4.0f;
+        const coachline::Screen sc = coachline::Project(proj, view, r.aim_x, g_snap[1] - lift, r.aim_z, ax);
+        if (on_screen(sc)) r.check = r.add(vp, sc.x, sc.y);
+    }
+    // The corrections' points, read with the check: used only if it agrees when they come back.
     const std::vector<coachline::Vert>& v = g_draw_verts;
     for (int k = 0; k < coachline::kSnapN; ++k) {
         size_t row = 0;
@@ -2073,14 +2353,9 @@ void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const c
         const float cy = (v[row].y + v[row + 1].y) * 0.5f + g_lsnap.at(v[row].m);
         const coachline::Screen sc = coachline::Project(proj, view, cx, cy, cz, ax);
         if (!sc.ok || sc.x < 0 || sc.x > 1 || sc.y < 0 || sc.y > 1) continue;
-        float d;
-        if (!read(sc.x, sc.y, d)) continue;
-        ++g_dsnap_reads;
-        float hx, hy, hz, m;
-        if (!coachline::Unproject(proj, view, ax, sc.x, sc.y, d, hx, hy, hz, range[0], range[1])) continue;
-        const float dy = coachline::SnapReadingAt(v, g_lsnap, hx, hy, hz, g_snap[0], g_snap[2], m);
-        if (std::isfinite(dy) && g_lsnap.feed(m, g_lsnap.at(m) + dy)) ++g_dsnap_used;
+        r.add(vp, sc.x, sc.y);
     }
+    SubmitRead(r);
 }
 
 /// The ribbon through the game's camera, in the window's framebuffer. On the render thread.
@@ -2117,6 +2392,7 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
     g_gl.own          = true;
     glPushAttrib(GL_ALL_ATTRIB_BITS);
     if (g_use_program && program) g_use_program(0);
+    PollDepthReads();  // the reads of earlier frames that have come back, decided first
     if (depth_ok) DepthProbe(proj, coachline::Mul(view, model), ax);
     if (g_dsnap_reset) {
         g_dsnap.reset();
@@ -2124,6 +2400,7 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         g_scheck.reset();
         g_snap_on     = false;
         g_dsnap_reset = false;
+        ++g_snap_gen;  // reads still in flight belong to what was just let go
     }
     // Without the track's own ground, snap to what the game drew, a few times a second.
     if (depth_ok && g_depth != DEPTH_NONE && !g_line_on_ground) SnapProbe(proj, coachline::Mul(view, model), ax);
@@ -2443,8 +2720,14 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     }
                     if (source > 0 && source != 3 && !(source == 2 && !g_mv_best.ok && pk.index < 0)) {
                         g_last_cam.ok = true, g_last_cam.proj = proj, g_last_cam.view = view, g_last_cam.model = model;
-                        for (int k = 0; k < coachline::kNumAxes; ++k)
-                            if (coachline::AxesName(coachline::AxesAt(k)) == coachline::AxesName(ax)) g_last_cam.axes = k;
+                        // Compared field by field: by name it built 96 strings a frame.
+                        for (int k = 0; k < coachline::kNumAxes; ++k) {
+                            const coachline::Axes c = coachline::AxesAt(k);
+                            if (std::equal(c.src, c.src + 3, ax.src) && std::equal(c.sgn, c.sgn + 3, ax.sgn)) {
+                                g_last_cam.axes = k;
+                                break;
+                            }
+                        }
                     }
                     // The camera being followed must stay where it has been relative to the bike: the
                     // crash camera, a replay view or a wrong object drifts off, and is let go.
@@ -2712,6 +2995,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     LoadHud();
     g_grid.clear();
     g_grid_said_missing = false;
+    g_grid_bad.clear();
     LoadGround(false);
     g_rider_state.reset();
     g_voice.failed = false;

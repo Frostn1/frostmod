@@ -878,6 +878,21 @@ public:
         return true;
     }
 
+    /// An empty grid, every height unknown, to be filled with set(): the game's own terrain,
+    /// sampled in memory (coachterrain.h). Same limits as a file's.
+    bool make(uint32_t w, uint32_t h, float st, float x0, float z0) {
+        clear();
+        if (w < 2 || h < 2 || w > kGridMaxDim || h > kGridMaxDim || !std::isfinite(st) || st < 0.05f || st > 10 ||
+            !std::isfinite(x0) || !std::isfinite(z0))
+            return false;
+        hs_.assign(size_t(w) * h, NAN);
+        w_ = w, h_ = h, step_ = st, x0_ = x0, z0_ = z0;
+        return true;
+    }
+    void set(uint32_t c, uint32_t r, float y) {
+        if (c < w_ && r < h_) hs_[size_t(r) * w_ + c] = std::isfinite(y) ? y : NAN;
+    }
+
     /// The ground at world (x, z), bilinear; false off the grid or where it is unknown.
     bool at(float x, float z, float& y) const {
         if (!ready() || !std::isfinite(x) || !std::isfinite(z)) return false;

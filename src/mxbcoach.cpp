@@ -46,6 +46,7 @@
 #include "coachpace.h"
 #include "coachlog.h"
 #include "coachrec.h"
+#include "coachterrain.h"
 #include "coachvoice.h"
 #include "offsets.h"
 #include "others.h"
@@ -99,6 +100,19 @@ std::string           g_grid_name;
 ULONGLONG             g_grid_look_ms = 0;
 bool                  g_grid_said_missing = false;
 std::string           g_grid_bad;  // the stamp of a grid file that didn't parse, not read again unchanged
+// The game's own ground (coachterrain.h): the game's height query, sampled into a grid in this
+// process and preferred over the `.ground` file. Never written out, logged or sent anywhere.
+coachterrain::game::Terrain  g_terrain;
+int                          g_terrain_state = 0;  // 0 not looked yet, 1 found, -1 off until the game restarts
+coachterrain::Builder        g_live_b;
+coachline::GroundGrid        g_live;
+coachline::AlignCheck        g_live_align;
+coachterrain::Header         g_live_hd;            // the slot's heightfield g_live was made from
+int                          g_live_slot     = 0;  // the slot being tried, 0-based
+bool                         g_live_said     = false;
+ULONGLONG                    g_live_t0 = 0, g_live_check_ms = 0;
+double                       g_live_busy_ms  = 0;  // time spent asking the game, for the log
+const coachline::GroundGrid* g_ground_was    = nullptr;  // the ground the line used last frame
 // Crashes, getting up and the game putting the bike back (coachline::RiderState).
 coachline::RiderState g_rider_state;
 // What the sheet adds to the line on the track: the ground across it and where its lap braked.
@@ -775,6 +789,148 @@ void LoadGround(bool quiet) {
     std::snprintf(msg, sizeof(msg), "track grid %s: %ux%u at %.2f m, on from the first second; checking it lines up",
                   name.c_str(), g_grid.width(), g_grid.height(), double(g_grid.step()));
     Log("ground", msg);
+}
+
+/// The game's ground, back to nothing: a new event, its end, or the slot changing under it.
+void ResetLiveGround() {
+    g_live.clear();
+    g_live_b.reset();
+    g_live_align.reset();
+    g_live_slot = 0;
+    g_live_said = false;
+}
+
+/// The game's ground, once it lines up with the rider (or until the check says).
+bool LiveGroundOn() { return g_live.ready() && (!g_live_align.result().done || g_live_align.result().ok); }
+
+/// The next slot with a heightfield in it, from `g_live_slot` on; -1 when there is none.
+int NextLiveSlot() {
+    for (int i = g_live_slot; i < mxb::TRACK_SLOT_COUNT; ++i)
+        if (coachterrain::Plausible(coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, i)))) return i;
+    return -1;
+}
+
+/// A slice of the game's ground, from RunTelemetry: the game's own thread, mid-run, the track
+/// loaded. A millisecond and a half of asking a tick, so a 550 m track is done in a few seconds
+/// and no tick is slowed by more than that. Under g_mu.
+void LiveGroundStep() {
+    if (!g_hud_set.enabled || !g_hud_set.ground || !g_practice) return;
+    if (g_terrain_state == 0) {
+        std::string why;
+        if (coachterrain::game::Locate(g_terrain, why)) {
+            g_terrain_state = 1;
+            char msg[220];
+            std::snprintf(msg, sizeof(msg),
+                          "the game's height query is at RVA 0x%zx%s, track slots at RVA 0x%zx: the line samples the "
+                          "game's own ground, in memory only",
+                          size_t(mxb::RVA_TERRAIN_SAMPLE), g_terrain.behind_hook ? " (behind FrostMod's guard)" : "",
+                          size_t(mxb::RVA_TRACK_SLOTS));
+            Log("terrain", msg);
+        } else {
+            g_terrain_state = -1;
+            Log("terrain", "off: " + why + ". The line uses the track's grid file, or snaps to what the game draws");
+        }
+    }
+    if (g_terrain_state != 1) return;
+    const ULONGLONG now = GetTickCount64();
+    // Built: still the slot's heightfield? A track reloaded under us is a different one.
+    if (g_live.ready()) {
+        if (now - g_live_check_ms < 1000) return;
+        g_live_check_ms = now;
+        if (coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, g_live_slot)) != g_live_hd) {
+            Log("terrain", "the game's ground changed under the line (track reloaded); sampling it again");
+            ResetLiveGround();
+        }
+        return;
+    }
+    if (g_live_b.state() != coachterrain::Builder::RUNNING) {
+        if (now - g_live_check_ms < 1000) return;
+        g_live_check_ms = now;
+        const int slot  = NextLiveSlot();
+        if (slot < 0) {
+            if (!g_live_said)
+                Log("terrain", g_live_slot ? "no other track slot has a heightfield; the line uses the track's grid file, "
+                                             "or snaps to what the game draws"
+                                           : "no heightfield loaded in any track slot yet");
+            g_live_said = true;
+            return;
+        }
+        g_live_slot = slot;
+        g_live_said = false;
+        g_live_b.start(coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, slot)));
+        const coachterrain::Header& h = g_live_b.header();
+        const coachterrain::Plan&   p = g_live_b.plan();
+        char                        msg[220];
+        std::snprintf(msg, sizeof(msg), "sampling the game's ground, slot %d: %dx%d over %.0fx%.0f m, as %ux%u at %.2f m",
+                      slot + 1, h.cols, h.rows, double(h.size_x), double(h.size_z), p.w, p.h, double(p.step));
+        Log("terrain", msg);
+        g_live_t0      = now;
+        g_live_busy_ms = 0;
+    }
+    const uint8_t* slot = coachterrain::game::Slot(g_terrain, g_live_slot);
+    if (coachterrain::ReadHeader(slot) != g_live_b.header()) {
+        Log("terrain", "the slot's heightfield changed while it was sampled; starting again");
+        g_live_b.reset();
+        return;
+    }
+    LARGE_INTEGER f, t0, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    const LONGLONG budget = f.QuadPart * 3 / 2000;  // 1.5 ms
+    const auto     ask    = [&](float x, float z, float& y) { return coachterrain::game::Ask(g_terrain, slot, x, z, y); };
+    do {
+        g_live_b.run(ask, 256);
+        QueryPerformanceCounter(&t);
+    } while (g_live_b.state() == coachterrain::Builder::RUNNING && t.QuadPart - t0.QuadPart < budget);
+    g_live_busy_ms += double(t.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
+    char msg[240];
+    switch (g_live_b.state()) {
+        case coachterrain::Builder::DONE: {
+            const double share = 100.0 * double(g_live_b.answered()) / double(g_live_b.total());
+            g_live_hd          = g_live_b.header();
+            g_live             = g_live_b.take();
+            g_live_align.reset();
+            std::snprintf(msg, sizeof(msg),
+                          "the game's ground is ready: %ux%u at %.2f m, %.1f%% of it answered, after %.1f s (%.0f ms of "
+                          "asking); checking it lines up",
+                          g_live.width(), g_live.height(), double(g_live.step()), share, double(now - g_live_t0) / 1000.0,
+                          g_live_busy_ms);
+            Log("terrain", msg);
+            break;
+        }
+        case coachterrain::Builder::FAILED:
+            if (g_live_b.asked() < g_live_b.total()) {
+                Log("terrain", "the game's height query faulted; off until the game restarts. The line uses the "
+                               "track's grid file, or snaps to what the game draws");
+                g_terrain_state = -1;
+            } else {
+                std::snprintf(msg, sizeof(msg), "slot %d answered too little of its grid to be the track's ground",
+                              g_live_slot + 1);
+                Log("terrain", msg);
+                ++g_live_slot;
+            }
+            g_live_b.reset();
+            break;
+        default: break;
+    }
+}
+
+/// The one-time check that the game's ground is under the rider, as for the grid file. Under g_mu.
+void LiveGroundAlign(float x, float y, float z, bool grounded) {
+    if (!g_live.ready() || !g_live_align.add(g_live, x, y, z, grounded)) return;
+    const coachline::Alignment& a = g_live_align.result();
+    char                        msg[240];
+    std::snprintf(msg, sizeof(msg), "game ground aligned dx=%.0f dz=%.0f dy=%.2f spread=%.2f (%d samples on it, %d off it)%s",
+                  double(a.dx), double(a.dz), double(a.dy), double(a.spread), a.on_grid, a.off_grid,
+                  a.ok ? "" : " - NOT under the rider; trying the next track slot");
+    Log("terrain", msg);
+    if (a.ok) {
+        g_live.shift(a.dx, a.dz);
+        return;
+    }
+    const int next = g_live_slot + 1;
+    ResetLiveGround();
+    g_live_slot = next;
 }
 
 void LoadHud(bool quiet = false) {
@@ -2609,8 +2765,16 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         LogUniforms(aspect, pk);
                         LogSources(aspect, have_wp ? &wp : nullptr);
                     }
-                    // The track's own grid, once it is known to line up (or until the check says).
-                    g_extras.grid = g_grid.ready() && (!g_align.result().done || g_align.result().ok) ? &g_grid : nullptr;
+                    // The game's own ground first, then the track's grid file, each once it is known to
+                    // line up (or until the check says). A change of ground remakes what was read off it.
+                    g_extras.grid = LiveGroundOn() ? &g_live
+                                    : g_grid.ready() && (!g_align.result().done || g_align.result().ok) ? &g_grid
+                                                                                                         : nullptr;
+                    if (g_extras.grid != g_ground_was) {
+                        g_ground_was     = g_extras.grid;
+                        g_jump_ver       = ~0u;
+                        g_pace_grid_lips = false;
+                    }
                     g_line_on_ground = g_extras.grid != nullptr || g_extras.terrain_k != 0;
                     if (source && !held) {
                         ++g_u_picked;
@@ -2836,6 +3000,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     g_grid_said_missing = false;
     g_grid_bad.clear();
     LoadGround(false);
+    ResetLiveGround();
     g_rider_state.reset();
     g_voice.failed = false;
     ReadVoiceSettings(true);
@@ -2852,6 +3017,7 @@ __declspec(dllexport) void EventDeinit() {
     g_hud_sheet = coachhud::Sheet{};
     g_grid.clear();
     g_align.reset();
+    ResetLiveGround();
     BuildExtras();
     g_hud_file.clear();
     g_ref.load({});
@@ -3020,6 +3186,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
             Log("ground", msg);
             if (a.ok) g_grid.shift(a.dx, a.dz);
         }
+        if (!crashed && speed > 3.0f) LiveGroundAlign(here.x, g_rider_y, here.y, grounded);
         g_have_sample = true;
         g_sample_ms   = GetTickCount64();
         PaceSample(speed, _fTime, crashed);
@@ -3046,6 +3213,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     LookForCues(false);
     LookForHud(false);
     if (!g_grid.ready() && GetTickCount64() - g_grid_look_ms >= 1000) LoadGround(true);
+    LiveGroundStep();
 }
 
 // The other riders. The roster is kept whether or not a stint is recording, since the entries

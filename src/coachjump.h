@@ -548,14 +548,32 @@ inline float LabelAlpha(float s) {
     return 1.0f;
 }
 
+/// Where the rider is on Coach's line, so a mark can be placed by its metre on the line rather than
+/// by its distance from the rider. `verts` (the ribbon) is rebuilt only every couple of metres and
+/// its `s` is the distance from the rider *at that rebuild*; the `m` of its rows is fixed to the
+/// line. Placing by `s` made every mark creep up to two metres and snap back each rebuild, which
+/// is the jitter Sean saw. Without a Frame the marks are placed by `s` as they were.
+struct Frame {
+    float rider_m = NAN;  // the rider's metre on the line now
+    float total   = 0;    // metres round the whole lap
+};
+
 /// The marks for the calls ahead of the rider: a bar across the line at each lip, a box where
 /// Coach's lap landed with a faint dotted arc of its flight between, and the label standing over
 /// the lip. `ahead` from AheadOf; `verts` the ribbon as built. Appends to `out`.
 inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& calls, const std::vector<float>& ahead,
-                  const std::vector<coachline::Vert>& verts, bool speed_hint = true) {
-    using coachmark::At;
+                  const std::vector<coachline::Vert>& verts, bool speed_hint = true, const Frame* fr = nullptr) {
     using coachmark::Flat;
     using coachmark::Spot;
+    const size_t first = out.size();
+    const bool   fixed = fr && std::isfinite(fr->rider_m) && fr->total > 0 && verts.size() >= 4;
+    // A distance ahead of the rider now -> the same place in the ribbon's own `s`.
+    auto in_ribbon = [&](float x) {
+        if (!fixed) return x;
+        const coachline::Vert& v0 = verts[0];
+        return v0.s + coachline::WrapAhead(fr->rider_m + x, v0.m, fr->total);
+    };
+    auto At = [&](const std::vector<coachline::Vert>& v, float x) { return coachmark::At(v, in_ribbon(x)); };
     for (const Call& c : calls) {
         if (c.takeoff >= ahead.size() || c.landing >= ahead.size()) continue;
         const float st = ahead[c.takeoff];
@@ -651,6 +669,13 @@ inline void Marks(std::vector<coachmark::Quad>& out, const std::vector<Call>& ca
             }
         }
     }
+    // Each quad's place on the line, for the ground correction held for that place.
+    if (fixed)
+        for (size_t i = first; i < out.size(); ++i) {
+            float m = std::fmod(fr->rider_m + out[i].s, fr->total);
+            if (m < 0) m += fr->total;
+            out[i].m = m;
+        }
 }
 
 }  // namespace coachjump

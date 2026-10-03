@@ -26,7 +26,9 @@ namespace coachmark {
 struct Quad {
     float p[4][3];
     float rgba[4];
-    float s;  // metres ahead along the ribbon it belongs to: the depth snap is looked up by it
+    float s;  // metres ahead along the ribbon it belongs to
+    float m = NAN;  // metres along Coach's line (lap metres) it lies at, when the caller knew: the
+                    // ground correction is looked up by it, since a place on the line doesn't move
 };
 
 /// Where the ribbon is `s` metres ahead: its centre, the ground under each edge, and its frame

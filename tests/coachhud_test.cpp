@@ -722,6 +722,18 @@ static void TheLineLook() {
     // Past the ends: clamped. Not a number, or not a colour: the default.
     s = ParseSettings("[hud]\nline_width=9\nline_opacity=0\ntext_size=0.1\n", false);
     CHECK(s.look.width == 3.0f && s.look.opacity == 0.1f && s.look.text_size == 0.5f, "clamped");
+    CHECK(def.near_fade == 8.0f, "near fade defaults to 8 m");
+    s = ParseSettings("[hud]\nline_fade=0\n", false);
+    CHECK(s.look.near_fade == 0.0f, "near fade off");
+    s = ParseSettings("[hud]\nline_fade=12.5\n", false);
+    CHECK(s.look.near_fade == 12.5f, "near fade %f", s.look.near_fade);
+    s = ParseSettings("[hud]\nline_fade=99\n", false);
+    CHECK(s.look.near_fade == 30.0f, "near fade clamped");
+    // The pace and gear hints are on with the line unless the file says off.
+    s = ParseSettings("[hud]\nground=1\n", false);
+    CHECK(s.pace && s.gear, "pace and gear hints on by default");
+    s = ParseSettings("[hud]\npace=0\ngear=0\n", false);
+    CHECK(!s.pace && !s.gear, "and off when the file says");
     s = ParseSettings("[hud]\nline_width=wide\ncol_gas=#12345\ncol_coast=#GGGGGG\ntext_style=gothic\n", false);
     CHECK(s.look == def, "nonsense is the default");
     // The rest of the file still reads alongside them.

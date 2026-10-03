@@ -149,6 +149,8 @@ coachgear::AirTracker   g_air;
 float                   g_gear_t = -1;
 coachgear::Dir          g_gear_said = coachgear::NONE;
 float                   g_line_total  = 0;     // metres round Coach's line, for the snap's bins
+coachline::Arc          g_arc;                 // metres along Coach's line at each sheet point
+float                   g_rider_m     = NAN;   // the rider's place on it this frame, metres (NaN: not known)
 volatile bool           g_dsnap_reset = true;  // the render thread restarts the ground snap
 coachhud::RefLap     g_ref;
 coachhud::LapClock   g_clock;
@@ -634,6 +636,7 @@ void BuildExtras() {
         const float d = std::hypot(g_hud_sheet.ref.front().x - g_hud_sheet.ref.back().x, g_hud_sheet.ref.front().z - g_hud_sheet.ref.back().z);
         g_line_total += d < coachline::kMaxGapM ? d : 0.0f;
     }
+    g_arc         = coachline::ArcOf(g_hud_sheet.ref);
     g_dsnap_reset = true;
     // The one line to change for a different colouring: any function giving RGBA per point.
     g_extras.rgba = coachline::LineColours(g_hud_sheet.ref, g_hud_sheet.drive);
@@ -2581,7 +2584,11 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         if (!std::isfinite(y)) y = last_y[i & 1];
         if (!std::isfinite(y) || !std::isfinite(p.x) || !std::isfinite(p.z)) break;
         last_y[i & 1] = y;
-        glColor4f(p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3] * coachline::Fade(p.s));
+        // Faded by how far ahead of the rider this row is *now*: `p.s` is from the last rebuild and
+        // up to two metres stale, which would step the near fade. Lap metres don't go stale.
+        const float ahead = std::isfinite(g_rider_m) ? coachline::WrapAhead(p.m, g_rider_m, g_arc.total) : p.s;
+        glColor4f(p.rgba[0], p.rgba[1], p.rgba[2],
+                  p.rgba[3] * coachline::Fade(ahead) * coachline::NearFade(ahead, coachline::Look().near_fade));
         float gx, gy, gz;
         ax.apply(p.x, y, p.z, gx, gy, gz);
         glVertex3f(gx, gy, gz);
@@ -2655,6 +2662,8 @@ const char* SourceName(int s) {
 std::vector<coachjump::Call>  g_jump_calls;
 uint32_t                      g_jump_ver = 0;
 std::vector<coachmark::Quad>  g_marks;  // this frame's, built under the lock, drawn outside it
+int                           g_ai    = -1;  // the segment the rider is on this frame, and how far along it
+float                         g_afrac = 0;
 
 /// This frame's marks for the calls ahead of the rider. Under g_mu, after the ribbon is built.
 void BuildMarks() {
@@ -2675,10 +2684,13 @@ void BuildMarks() {
         if (!g_hud_sheet.ref.empty()) Log("jumps", coachjump::Summary(line, g_jump_calls));
     }
     if (!g_hud_set.jumps || g_jump_calls.empty() || g_draw_verts.size() < 4) return;
-    float     frac = 0;
-    const int ai   = coachline::AnchorPoint(g_hud_sheet.ref, g_rider.x, g_rider.y, g_pos, frac);
-    coachjump::Marks(g_marks, g_jump_calls, coachjump::AheadOf(g_hud_sheet.ref, ai, frac, coachline::kAhead + 10.0f),
-                     g_draw_verts);
+    if (g_ai < 0 || !std::isfinite(g_rider_m)) return;
+    // Every mark is placed by its metre on Coach's line, not by its distance from the rider.
+    coachjump::Frame fr;
+    fr.rider_m = g_rider_m;
+    fr.total   = g_arc.total;
+        coachjump::Marks(g_marks, g_jump_calls, coachjump::AheadOf(g_hud_sheet.ref, g_ai, g_afrac, coachline::kAhead + 10.0f),
+                     g_draw_verts, true, &fr);
 }
 
 /// The marks through the same camera as the ribbon, with the same ground correction. On the
@@ -2730,7 +2742,11 @@ void DrawMarks(const coachline::Mat4& proj, const coachline::Mat4& view, const c
     const bool on_ground = g_line_on_ground;  // as the ribbon: no snap on the track's own ground
     glBegin(GL_QUADS);
     for (const coachmark::Quad& q : g_marks) {
-        const float dy = on_ground ? 0.0f : g_dsnap.at(q.s);
+        // As the ribbon: a mark carries the lap metre it lies at, and takes the correction held
+        // for that place on the line, which does not slide as the rider moves.
+        const float dy = on_ground || (std::isfinite(q.m) && !g_snap_on) ? 0.0f
+                         : std::isfinite(q.m)                           ? g_lsnap.at(q.m)
+                                                                        : g_dsnap.at(q.s);
         if (!std::isfinite(dy)) continue;
         glColor4f(q.rgba[0], q.rgba[1], q.rgba[2], q.rgba[3]);
         for (int c = 0; c < 4; ++c) {
@@ -2940,6 +2956,13 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones,
                                         pace ? &g_pace_ex : &g_extras, &at);
                         g_draw_verts = g_ribbon.verts();
+                        g_rider_m    = NAN;
+                        g_ai         = coachline::AnchorPoint(g_hud_sheet.ref, g_rider.x, g_rider.y, g_pos, g_afrac);
+                        if (g_ai >= 0 && size_t(g_ai) < g_arc.m.size() && g_arc.m.size() == g_hud_sheet.ref.size()) {
+                            const size_t n = g_hud_sheet.ref.size(), a = size_t(g_ai), b = (a + 1) % n;
+                            g_rider_m = g_arc.m[a] + g_afrac * std::hypot(g_hud_sheet.ref[b].x - g_hud_sheet.ref[a].x,
+                                                                          g_hud_sheet.ref[b].z - g_hud_sheet.ref[a].z);
+                        }
                         g_draw_marks = pace ? coachpace::Marks(g_draw_verts, g_pace_hint, g_pace_phase)
                                             : std::vector<coachline::Vert>();
                         // The gear sign is one of the line's words: off with them (line_text=0).

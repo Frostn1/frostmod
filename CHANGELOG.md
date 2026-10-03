@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-02 - v0.48.0
+
+MXB Coach in-game line: near fade, pace and gear hints on by default, steady jump marks.
+
+- **Near fade.** The line fades out toward the rider so the ruts it runs through stay visible
+  beside the bike: clear at the rider, solid `line_fade` metres ahead (default 8, 0 = off, up to
+  30). The fade is worked out from the rider's place on the line each frame, not from the last
+  rebuild, so it does not step as the ribbon rebuilds.
+- **Pace arrows and gear hints.** Both were off until `pace=1` / `gear=1` was in `hud.ini`, and
+  Coach only wrote them when switched on in its HUD list, so a rider who never did saw neither.
+  They are now on whenever the line is (`pace=0`, `gear=0` turn each off).
+- **Jump marks no longer wobble.** Takeoff bars, landing boxes, flight dashes and labels were placed
+  by their distance from the rider on a ribbon rebuilt only every two metres, so each moved up to
+  two metres and snapped back at every rebuild, and took the ground correction held for a place
+  they weren't at. They are now placed by their metre on Coach's line and take the correction for
+  that metre. Takeoff bar spread over an approach, in the test: 2.0 m before, 0.0 m after.
+
 ## 2026-10-02 - v0.47.0
 
 ### Fixed

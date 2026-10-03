@@ -296,12 +296,15 @@ struct LineLook {
     bool  text       = true;
     float text_size  = 1.0f;  // 0.5..2, times the text's own size
     int   text_style = TEXT_BLOCK;
+    // line_fade: the line fades out toward the rider so the ruts it runs through stay visible
+    // next to the bike: clear at the rider, solid this many metres ahead. 0 = off.
+    float near_fade  = 8.0f;
 
     bool operator==(const LineLook& o) const {
         auto same3 = [](const float* a, const float* b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]; };
         return width == o.width && opacity == o.opacity && same3(gas, o.gas) && same3(coast, o.coast) &&
                same3(light, o.light) && same3(heavy, o.heavy) && same3(fast, o.fast) && same3(slow, o.slow) &&
-               text == o.text && text_size == o.text_size && text_style == o.text_style;
+               text == o.text && text_size == o.text_size && text_style == o.text_style && near_fade == o.near_fade;
     }
     bool operator!=(const LineLook& o) const { return !(*this == o); }
 };
@@ -340,12 +343,13 @@ struct Settings {
     // On by default, since it only ever shows on the line the rider already asked for.
     bool  jumps = true;
     // Pace hints over that line (coachpace.h): chevrons when coming in too fast or too slow for
-    // Coach's lap, and "MORE SPEED" before a jump that needs it. Off until asked for; drawn only
+    // Coach's lap, and "MORE SPEED" before a jump that needs it. On by default; drawn only
     // with the line on the track.
-    bool  pace = false;
+    bool  pace = true;
     // Gear hints (coachgear.h): an arrow and the gear to be in where Coach's lap shifts, on the
-    // line (with it on) and beside the cue box. Off until asked for.
-    bool  gear = false;
+    // line (with it on) and beside the cue box. On with the line, like the jump calls (they were
+    // off until asked for, and a rider who never opened Coach's settings never saw either).
+    bool  gear = true;
     float cue_x = kCueDefaultX;  // centre of the cue box, a screen fraction
     float cue_y = kCueDefaultY;  // its top edge
     // The map and the suspension bars by their top-left corner. They used to be nailed to the
@@ -392,8 +396,8 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.trail   = flag("trail", false);
     s.ground  = flag("ground", s.trail);
     s.jumps   = flag("jumps", true);
-    s.pace    = flag("pace", false);
-    s.gear    = flag("gear", false);
+    s.pace    = flag("pace", true);
+    s.gear    = flag("gear", true);
     s.cue_x   = fraction("cue_x", kCueDefaultX);
     s.cue_y   = fraction("cue_y", kCueDefaultY);
     s.map_x   = fraction("map_x", kMapDefaultX);
@@ -423,6 +427,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     colour("col_heavy", l.heavy);
     colour("col_fast", l.fast);
     colour("col_slow", l.slow);
+    l.near_fade = number("line_fade", l.near_fade, 0.0f, 30.0f);
     l.text      = flag("line_text", true);
     l.text_size = number("text_size", l.text_size, 0.5f, 2.0f);
     const std::string style = stance::IniValue(ini, "hud", "text_style");

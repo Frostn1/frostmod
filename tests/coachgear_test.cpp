@@ -113,11 +113,11 @@ static void TheSheetCarriesTheGear() {
 }
 
 static void TheSetting() {
-    CHECK(!coachhud::ParseSettings("", false).gear, "off by default");
-    CHECK(!coachhud::ParseSettings("[hud]\nenabled=1\n", false).gear, "and with a file that doesn't say");
-    CHECK(coachhud::ParseSettings("[hud]\ngear=1\n", false).gear, "gear=1 turns it on");
+    CHECK(coachhud::ParseSettings("", false).gear, "on by default");
+    CHECK(coachhud::ParseSettings("[hud]\nenabled=1\n", false).gear, "and with a file that doesn't say");
+    CHECK(coachhud::ParseSettings("[hud]\ngear=1\n", false).gear, "gear=1 keeps it on");
     CHECK(!coachhud::ParseSettings("[hud]\ngear=0\nground=1\n", false).gear, "gear=0 keeps it off");
-    CHECK(!coachhud::ParseSettings("[hud]\ntrail=1\npace=1\nground=1\n", false).gear, "nothing else brings it");
+    CHECK(!coachhud::ParseSettings("[hud]\ntrail=1\npace=1\nground=1\ngear=0\n", false).gear, "gear=0 wins over the rest");
 }
 
 // --- Coach's shifts -------------------------------------------------------------------------

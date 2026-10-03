@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-02 - v0.49.3
+
+MXB Coach in-game line: a newer sheet mid-ride no longer glitches the line or drops the frame rate.
+
+- Coach rewrites the sheet after laps. The plugin read and parsed it inside RunLap under the lock, then
+  swapped whatever lap it held straight in (a partial or crashed lap, another line) and re-learnt the
+  depth snap. Now a short-lived worker reads, parses and checks the file with no lock held; the frame
+  side only swaps the result in, at the line.
+- The reference lap is replaced only if it is whole: no gap or reset, lap closes, length plausible for
+  the track, positions rising, and within 20 m of the line in use. Otherwise the line in use stays
+  (logged). The same lap again changes nothing; a better one fades in over 1.5 s. The game's ground and
+  its alignment are never touched, and the depth snap is not reset.
+
 ## 2026-10-02 - v0.49.2
 
 FrostMod: the log, filter and settings no longer move to %TEMP% at game start.

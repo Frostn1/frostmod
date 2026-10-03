@@ -36,6 +36,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "coachcue.h"
@@ -341,6 +342,7 @@ void LoadCues(bool quiet = false) {
 }
 
 /// Take a sheet the app has written since the last look; coachcue::ShouldLook says when.
+void StartSheetJob(bool cue, bool hud);
 void LookForCues(bool at_line) {
     const ULONGLONG now = GetTickCount64();
     if (!coachcue::ShouldLook(!g_cue_file.empty(), at_line, now, g_cue_looked)) return;
@@ -348,7 +350,11 @@ void LookForCues(bool at_line) {
     const std::string seen = DiskStamp(coachcue::SheetNames(g_event));
     // Nothing new, or the file went away: keep what is loaded rather than go quiet mid-lap.
     if (seen == g_cue_seen || seen.empty()) return;
-    LoadCues(true);
+    if (g_cue_file.empty()) {
+        LoadCues(true);
+        return;
+    }
+    StartSheetJob(true, false);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -619,7 +625,7 @@ ULONGLONG   g_hud_looked = 0;
 
 /// The line's extras from the sheet just loaded: its TRRN ground, and the colour of its lap (from
 /// its DRIV chunk, or its own times and positions).
-void BuildExtras() {
+void BuildExtras(bool reset_snap = true) {
     const uint32_t ver = g_extras.version + 1;
     g_extras           = coachline::RibbonExtras{};
     g_extras.version   = ver;
@@ -639,7 +645,9 @@ void BuildExtras() {
         g_line_total += d < coachline::kMaxGapM ? d : 0.0f;
     }
     g_arc         = coachline::ArcOf(g_hud_sheet.ref);
-    g_dsnap_reset = true;
+    // The depth snap belongs to the camera and the ground, not to the sheet: a sheet swapped in
+    // mid-ride must not make the line re-learn where the game draws.
+    if (reset_snap) g_dsnap_reset = true;
     // The one line to change for a different colouring: any function giving RGBA per point.
     g_extras.rgba = coachline::LineColours(g_hud_sheet.ref, g_hud_sheet.drive);
     if (!g_hud_sheet.ref.empty()) {
@@ -1056,6 +1064,49 @@ void LiveGroundAlign(float x, float y, float z, bool grounded) {
     g_live_req.compare_exchange_strong(expect, 2);
 }
 
+/// A newer sheet's line fades in over this long, so a swap is never a jump.
+constexpr ULONGLONG kFadeMs = 1500;
+std::vector<coachhud::RefPoint> g_fade_from;  // the old line laid on the new one's points
+std::vector<coachhud::RefPoint> g_fade_cur;   // this frame's blend
+ULONGLONG                       g_fade_t0 = 0;
+bool                            g_fade_on = false;
+
+/// Takes a sheet into use. `quiet` (mid-ride): the reference lap is only replaced if it passed
+/// CheckRef, and then faded in. Never touches the game's ground or its alignment.
+void ApplyHud(coachhud::Sheet&& found, const std::string& taken, bool quiet, const coachhud::RefVerdict* v) {
+    if (quiet && v && v->kind == coachhud::RefVerdict::REJECT) {
+        Log("hud", std::string("a newer sheet's lap was not used (") + v->why + "); keeping the line in use");
+        return;
+    }
+    if (quiet && v && v->kind == coachhud::RefVerdict::SAME && found.terrain_k == g_hud_sheet.terrain_k &&
+        found.drive.size() == g_hud_sheet.drive.size() && found.gear.size() == g_hud_sheet.gear.size()) {
+        // The same lap again: only what is about the ride (tips, sections, flags) moves on.
+        g_hud_sheet.sections = std::move(found.sections);
+        g_hud_sheet.flags    = found.flags;
+        g_hud_file           = taken;
+        Log("hud", "picked up a newer sheet: same line, " + std::to_string(g_hud_sheet.sections.size()) + " sections");
+        return;
+    }
+    g_hud_sheet = std::move(found);
+    g_hud_file  = taken;
+    g_ref.load(g_hud_sheet.ref);
+    BuildExtras(!quiet);
+    g_fade_on = false;
+    if (quiet && v && v->kind == coachhud::RefVerdict::REPLACE && v->from.size() == g_hud_sheet.ref.size() && v->dev_max > 0.05f) {
+        g_fade_from = v->from;
+        g_fade_t0   = GetTickCount64();
+        g_fade_on   = true;
+        char b[120];
+        std::snprintf(b, sizeof(b), "new line fades in over %d ms (up to %.1f m from the old)", int(kFadeMs), double(v->dev_max));
+        Log("hud", b);
+    }
+    if (!quiet) {
+        Log("hud", coachlog::SheetText("HUD sheet", g_hud_file, !g_hud_file.empty(), int(g_hud_sheet.sections.size())));
+    } else {
+        Log("hud", "picked up a newer sheet: " + std::to_string(g_hud_sheet.sections.size()) + " sections");
+    }
+}
+
 void LoadHud(bool quiet = false) {
     g_hud_seen = DiskStamp(coachhud::HudNames(g_event));
     coachhud::Sheet found;
@@ -1070,32 +1121,127 @@ void LoadHud(bool quiet = false) {
         }
     }
     // A newer file that doesn't parse leaves the sheet in use alone: dropping it for nothing
-    // would blank the gap and the ghost mid-session. Its stamp is kept above, so it isn't
-    // re-read every second either; the next write Coach makes is looked at again.
+    // would blank the gap and the ghost mid-session.
     if (quiet && taken.empty()) {
         if (!g_hud_file.empty()) Log("hud", "a newer sheet didn't read; keeping the one in use");
         return;
     }
-    g_hud_sheet = std::move(found);
-    g_hud_file  = taken;
-    g_ref.load(g_hud_sheet.ref);
-    BuildExtras();
-    // Without a sheet the map, the stance and the setup card still draw; only the gap, the
-    // ghost and the section tips need one, so this is a note rather than a failure.
-    if (!quiet) {
-        Log("hud", coachlog::SheetText("HUD sheet", g_hud_file, !g_hud_file.empty(), int(g_hud_sheet.sections.size())));
-    } else {
-        Log("hud", "picked up a newer sheet: " + std::to_string(g_hud_sheet.sections.size()) + " sections");
+    ApplyHud(std::move(found), taken, quiet, nullptr);
+}
+
+// ---------------------------------------------------------------------------------------
+// A newer sheet, mid-ride.
+//
+// Coach rewrites the sheets after laps. Reading and parsing them (a lap of points plus the
+// ground across it) used to happen inside RunLap, under g_mu, on the game's thread: a stall at
+// every lap, and the new lap went straight in whatever it was. Now a short-lived worker reads,
+// parses and checks the files with no lock held, and the frame side only swaps the result in
+// (ApplySheetJob, under g_mu): a few moves.
+struct SheetJob {
+    // In (copied under g_mu before the worker starts).
+    uint64_t                        gen = 0;
+    coachcue::Event                 ev;
+    bool                            do_cue = false, do_hud = false;
+    std::vector<coachhud::RefPoint> cur;  // the line in use
+    // Out.
+    std::string                     cue_name, hud_name;
+    coachcue::Sheet                 cue;
+    bool                            cue_ok = false;
+    coachhud::Sheet                 hud;
+    bool                            hud_ok = false;
+    coachhud::RefVerdict            verdict;
+};
+SheetJob         g_job;
+std::thread      g_job_thr;
+std::atomic<int> g_job_state{0};  // 0 idle, 1 running, 2 done (the worker finished writing g_job)
+uint64_t         g_job_gen = 0;   // bumped when an event starts or ends: an old result is dropped
+
+void SheetWorker() {
+    SheetJob& j = g_job;
+    if (j.do_cue)
+        for (const std::string& name : coachcue::SheetNames(j.ev)) {
+            std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
+            coachcue::Sheet s;
+            if (!b.empty() && coachcue::Parse(b.data(), b.size(), s) && coachcue::Fits(s, j.ev)) {
+                j.cue      = std::move(s);
+                j.cue_name = name;
+                j.cue_ok   = true;
+                break;
+            }
+        }
+    if (j.do_hud) {
+        for (const std::string& name : coachhud::HudNames(j.ev)) {
+            std::vector<uint8_t> b = ReadFile(g_base + "cues\\" + name);
+            coachhud::Sheet s;
+            if (!b.empty() && coachhud::Parse(b.data(), b.size(), s) && coachhud::Fits(s, j.ev)) {
+                j.hud      = std::move(s);
+                j.hud_name = name;
+                j.hud_ok   = true;
+                break;
+            }
+        }
+        if (j.hud_ok) j.verdict = coachhud::CheckRef(j.hud.ref, j.cur, j.ev.track_len);
+    }
+    g_job_state.store(2);
+}
+
+void JoinSheetJob() {
+    if (g_job_thr.joinable()) g_job_thr.join();
+    g_job_state.store(0);
+}
+
+/// Under g_mu: take a finished job's result, at the line or just past it, where a cue sheet's
+/// re-arming and a new lap's gap cut nothing short.
+void ApplySheetJob(bool near_line) {
+    if (g_job_state.load() != 2 || !near_line) return;
+    JoinSheetJob();
+    if (g_job.gen == g_job_gen) {
+        if (g_job.do_cue && g_job.cue_ok) {
+            const int cues = int(g_job.cue.cues.size());
+            g_cues.load(std::move(g_job.cue));
+            g_cue_file = g_base + "cues\\" + g_job.cue_name;
+            Log("cues", "picked up a newer sheet: " + std::to_string(cues) + " cues");
+        }  // else: keep what is loaded rather than go quiet mid-lap
+        if (g_job.do_hud) {
+            if (g_job.hud_ok) ApplyHud(std::move(g_job.hud), g_job.hud_name, true, &g_job.verdict);
+            else if (!g_hud_file.empty()) Log("hud", "a newer sheet didn't read; keeping the one in use");
+        }
+    }
+    g_job = SheetJob{};
+}
+
+/// Under g_mu: start reading whichever sheets changed on disk. One job at a time.
+void StartSheetJob(bool cue, bool hud) {
+    if (g_job_state.load() != 0) return;  // busy; the stamp isn't consumed, so the next look retries
+    JoinSheetJob();
+    g_job        = SheetJob{};
+    g_job.gen    = g_job_gen;
+    g_job.ev     = g_event;
+    g_job.do_cue = cue;
+    g_job.do_hud = hud;
+    g_job.cur    = g_hud_sheet.ref;
+    if (cue) g_cue_seen = DiskStamp(coachcue::SheetNames(g_event));
+    if (hud) g_hud_seen = DiskStamp(coachhud::HudNames(g_event));
+    g_job_state.store(1);
+    try {
+        g_job_thr = std::thread(SheetWorker);
+    } catch (...) {
+        g_job_state.store(0);
     }
 }
 
 void LookForHud(bool at_line) {
+    ApplySheetJob(at_line || (g_pos >= 0.0f && g_pos < 0.03f));
     const ULONGLONG now = GetTickCount64();
     if (!coachcue::ShouldLook(!g_hud_file.empty(), at_line, now, g_hud_looked)) return;
     g_hud_looked = now;
     const std::string seen = DiskStamp(coachhud::HudNames(g_event));
     if (seen == g_hud_seen || seen.empty()) return;
-    LoadHud(true);
+    if (g_hud_file.empty()) {  // nothing in use yet: nothing to protect, nothing to stall
+        LoadHud(true);
+        return;
+    }
+    StartSheetJob(false, true);
 }
 
 /// The line's look from hud.ini into the drawing code. On a change the line's colours are made
@@ -3023,7 +3169,22 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         // With a pace hint showing, the line's colours carry it (coachpace::Recolour).
                         const bool pace = PaceOn() && g_pace_hint.kind != coachpace::NONE;
                         g_pace_ex.grid  = g_extras.grid;  // the same ground under both
-                        g_ribbon.update(g_ref.points(), g_track, g_pos, g_height.offset(), zones,
+                        // A swapped-in line fades in from the old one: the ribbon is drawn from a blend
+                        // (same points as the new line, so its colours and ground stay aligned).
+                        const std::vector<coachhud::RefPoint>* line = &g_ref.points();
+                        if (g_fade_on) {
+                            const ULONGLONG el = now - g_fade_t0;
+                            if (el >= kFadeMs) {
+                                g_fade_on = false;
+                                g_fade_from.clear();
+                                g_ribbon.invalidate();
+                            } else {
+                                coachhud::BlendRef(g_fade_from, g_ref.points(), float(el) / float(kFadeMs), g_fade_cur);
+                                line = &g_fade_cur;
+                                g_ribbon.invalidate();
+                            }
+                        }
+                        g_ribbon.update(*line, g_track, g_pos, g_height.offset(), zones,
                                         pace ? &g_pace_ex : &g_extras, &at);
                         g_draw_verts = g_ribbon.verts();
                         g_rider_m    = NAN;
@@ -3210,6 +3371,8 @@ __declspec(dllexport) void Shutdown() {
     RemoveGroundHooks();
     LiveBusy(false);  // a clean exit, not a hang
     Log("mxbcoach", "shutting down");
+    ++g_job_gen;
+    JoinSheetJob();
     LogClose();
 }
 
@@ -3225,6 +3388,9 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
         g_susp_travel[0] = coachcue::F32(eb + kEventSuspMaxTravel);
         g_susp_travel[1] = coachcue::F32(eb + kEventSuspMaxTravel + 4);
     }
+    ++g_job_gen;
+    JoinSheetJob();
+    g_fade_on = false;
     Log("event", coachlog::EventText(g_event.type, g_event.track, g_event.bike, g_event.track_len, g_event.server));
     LoadCues();
     LoadHud();
@@ -3244,6 +3410,9 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
 __declspec(dllexport) void EventDeinit() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_event_end();
+    ++g_job_gen;
+    JoinSheetJob();
+    g_fade_on = false;
     g_cues.clear();
     g_cue_file.clear();
     g_hud_sheet = coachhud::Sheet{};

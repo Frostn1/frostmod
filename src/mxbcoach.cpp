@@ -1705,6 +1705,7 @@ float                    g_snap[3] = {NAN, NAN, NAN};  // the bike, as of the la
 coachline::ModelviewPick g_mv_best;  // this frame's best modelview camera
 coachline::AxesLock      g_mv_lock;
 unsigned                 g_mv_loads = 0;
+bool                     g_mv_wanted = true;  // set at each swap: a menu, pause or loading frame searches nothing
 coachline::CameraFollow  g_follow;
 coachline::ViewRef       g_view_ref;      // where the drawing camera held the bike: a relock must agree
 ULONGLONG                g_view_miss = 0; // since when no load has agreed with it, while riding
@@ -1791,6 +1792,14 @@ constexpr GLenum kGlTexture0               = 0x84C0;
 bool GlMine() { return !g_gl.own && g_gl.thread != 0 && GetCurrentThreadId() == g_gl.thread; }
 bool GlProj() { return GlMine() && g_gl.mode == GL_PROJECTION; }
 
+// What our own draw asks the driver, kept to a minimum (v0.48.2): see DrawGroundLine.
+int g_fbo_seen = -1;  // -1 not asked yet, 0 the window, 1 an offscreen target
+bool ErrorCheckFrame() { return (g_gl.n_frames & 63) == 0; }
+void DrainErrors() {
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
+    }
+}
+
 /// The camera being assembled is complete: the game has stopped multiplying onto it.
 void GlFinish() {
     if (!g_gl.building) return;
@@ -1825,6 +1834,7 @@ void GlProjectionMultiplied(const float* m) {
 /// translation for the diagnostic.
 void GlModelLoaded(const float* m) {
     ++g_mv_loads;
+    if (!g_mv_wanted) return;
     if (std::isfinite(g_snap[0])) {
         coachline::Mat4 a;
         std::memcpy(a.m, m, sizeof(a.m));
@@ -1940,6 +1950,18 @@ glProgramUniformMatrix4fv_t g_orig_pumat4 = nullptr;
 glUseProgram_t              g_orig_use    = nullptr;
 bool                        g_sh_tried = false, g_sh_ok = false;
 GLuint                      g_program  = 0;  // the game's current program, as glUseProgram set it
+bool                        g_program_known = false;  // asked the driver once, then followed
+/// The game's current program without a driver round trip: the hooked glUseProgram's last value,
+/// asked afresh when the shader hooks are not in, on the first draw and on every 64th frame.
+GLint KnownProgram() {
+    if (g_use_program && (!g_sh_ok || !g_program_known || ErrorCheckFrame())) {
+        GLint program = 0;
+        glGetIntegerv(kGlCurrentProgram, &program);
+        g_program       = GLuint(program);
+        g_program_known = true;
+    }
+    return GLint(g_program);
+}
 
 // This frame's uploads, the last one per (program, location): a per-object matrix uploaded a
 // thousand times a frame keeps one slot, so the camera is never crowded out.
@@ -2509,20 +2531,26 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         ++g_why[WHY_CORE];
         return;
     }
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    // Every glGet* and glGetError is a round trip to the driver's worker thread (NVIDIA's threaded
+    // optimisation): the CPU stops until everything the game queued has been executed. With a
+    // heavy HUD in the frame (MXBMRP3's thousands of primitives) that stall was the line's whole
+    // cost, so a frame asks the driver as little as it can (v0.48.2).
+    const bool check = ErrorCheckFrame();
+    if (check) DrainErrors();
     // Drawing into an offscreen target would paint the line into a reflection or a post-process
-    // input. Only the window itself. (A GL too old to know the query errors, and has no FBOs.)
-    GLint fbo = 0;
-    glGetIntegerv(kGlDrawFramebufferBinding, &fbo);
-    if (glGetError() == GL_NO_ERROR && fbo != 0) {
+    // input. Only the window itself, which is seldom otherwise at the swap: asked every 64th frame.
+    if (check || g_fbo_seen < 0) {
+        GLint fbo = 0;
+        glGetIntegerv(kGlDrawFramebufferBinding, &fbo);
+        g_fbo_seen = (glGetError() == GL_NO_ERROR && fbo != 0) ? 1 : 0;
+    }
+    if (g_fbo_seen > 0) {
         ++g_why[WHY_FBO];
         return;
     }
-    GLint program = 0, active = GLint(kGlTexture0);
-    if (g_use_program) glGetIntegerv(kGlCurrentProgram, &program);
-    if (g_active_texture) glGetIntegerv(kGlActiveTexture, &active);
-    glGetError();
+    // The program is the one glUseProgram last set (tracked, no query); glPushAttrib(ALL) below
+    // keeps and restores the active texture unit.
+    GLint program = KnownProgram();
 
     const GLenum mode = g_gl.mode;
     g_gl.own          = true;
@@ -2619,18 +2647,16 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         }
         glEnd();
     }
-    const GLenum drew = glGetError();
+    const GLenum drew = check ? glGetError() : GLenum(GL_NO_ERROR);
     g_orig_mode(GL_MODELVIEW);
     glPopMatrix();
     g_orig_mode(GL_PROJECTION);
     glPopMatrix();
     if (g_use_program && program) g_use_program(GLuint(program));
-    if (g_active_texture) g_active_texture(GLenum(active));
-    glPopAttrib();  // restores the matrix mode, among the rest
+    glPopAttrib();  // restores the matrix mode and the active texture unit, among the rest
     g_gl.mode = mode;
     g_gl.own  = false;
-    while (glGetError() != GL_NO_ERROR) {
-    }  // nothing of ours may surface as the game's error
+    if (check) DrainErrors();  // nothing of ours may surface as the game's error
     if (drew == GL_NO_ERROR) ++g_gl.n_drawn;
     else {
         ++g_gl.n_draw_errors;
@@ -2701,12 +2727,8 @@ void BuildMarks() {
 void DrawMarks(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Mat4& model,
                const coachline::Axes& ax, bool depth_ok) {
     if (g_marks.empty()) return;
-    while (glGetError() != GL_NO_ERROR) {
-    }
-    GLint program = 0, active = GLint(kGlTexture0);
-    if (g_use_program) glGetIntegerv(kGlCurrentProgram, &program);
-    if (g_active_texture) glGetIntegerv(kGlActiveTexture, &active);
-    glGetError();
+    const bool check = ErrorCheckFrame();
+    GLint program = KnownProgram();
     const GLenum mode = g_gl.mode;
     g_gl.own          = true;
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -2764,12 +2786,10 @@ void DrawMarks(const coachline::Mat4& proj, const coachline::Mat4& view, const c
     g_orig_mode(GL_PROJECTION);
     glPopMatrix();
     if (g_use_program && program) g_use_program(GLuint(program));
-    if (g_active_texture) g_active_texture(GLenum(active));
     glPopAttrib();
     g_gl.mode = mode;
     g_gl.own  = false;
-    while (glGetError() != GL_NO_ERROR) {
-    }
+    if (check) DrainErrors();
 }
 
 BOOL WINAPI hkSwap(HDC hdc) {
@@ -2794,8 +2814,11 @@ BOOL WINAPI hkSwap(HDC hdc) {
                 }
                 // Only while riding: in a menu, the pause screen or a loading screen nothing is
                 // built, read or drawn (coachline::Riding).
-                if (lock.owns_lock() && g_gl_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
-                    g_have_sample && RidingNow(now)) {
+                const bool wants = lock.owns_lock() && g_gl_ok && g_hud_set.enabled && g_hud_set.ground && g_practice &&
+                                   g_have_sample && RidingNow(now);
+                // The loads of the next frame are searched only when this one was riding with the line on.
+                g_mv_wanted = wants;
+                if (wants) {
                     if (!g_cam_since) g_cam_since = now;
                     RECT       rc{};
                     float      aspect = 0;

@@ -942,119 +942,13 @@ static void LogPrintableRuns(const char* tag, const char* buf, size_t len) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OVERJUMP PROBE (opt-in: frostmod.exe --probe-overjump [--force-overjump-off])
-//
-// Opt-in means opt-in. Arming this swaps a fn-ptr every dispatch site in the engine
-// calls through, so hkBus below stands in the path of ~140 commands to read two of
-// them, forwarding each one through a signature we inferred rather than one we were
-// given. v0.16.1 armed it by default and every session start on the first machine to
-// run it died at mxbikes.exe+0x297b20; see the install site for what that cost. Arm it
-// to answer the question below, on a machine you are watching, and not otherwise.
-//
-// One question: does the client run the session with the overjump-crash flag the
-// server or the menu asked for? beta21e added the option and it does not stick.
-// We swap the engine command-bus fn-ptr and, at every session start (cmd 0x310),
-// log the settings block the bus is handed - see offsets.h for how the field was
-// pinned. With force armed we also SET the disable flag, which is the fix itself:
-// it stays an offline/testing switch, because forcing it on a server that wants the
-// crash is a client-side cheat.
-//
-// The 16 pointer params are deliberate. The bus is variadic in practice - the session
-// start writes stack args out to [rsp+0x78] - and forwarding a fixed 16 reproduces the
-// caller's layout for every command. Slots past what a caller wrote hold stack garbage;
-// we hand it straight back, and the bus only reads what its own command needs.
+// The engine's command bus: every dispatch site in the game calls through one fn-ptr. We only
+// ever CALL it (ResolveBus); we never swap it. 16 pointer params reproduce the caller's layout.
 using BusFn = int64_t(__fastcall*)(uint32_t, void*, void*, void*, void*, void*, void*, void*,
                                    void*, void*, void*, void*, void*, void*, void*, void*);
-static BusFn  g_origBus       = nullptr;
-static bool   g_overjumpForce = false;   // --force-overjump-off: clear the flag
-static bool   g_overjumpHex   = false;   // --probe-overjump: also dump the whole block
 
 static bool SafeWriteInt(int* p, int v) {
     __try { *p = v; return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
-int64_t __fastcall hkBus(uint32_t cmd, void* a2, void* a3, void* a4, void* a5, void* a6,
-                         void* a7, void* a8, void* a9, void* a10, void* a11, void* a12,
-                         void* a13, void* a14, void* a15, void* a16) {
-    // The ini side, for a dedicated-server run: cmd 0x27 reads one int, arg3 = section,
-    // arg4 = key, arg5 = where the value lands. Read it back AFTER the bus has written it.
-    if (cmd == (uint32_t)mxb::CMD_CFG_READ_INT && SafeStr(a4) == "overjump_crash") {
-        int64_t r = g_origBus(cmd, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
-        Log("[overjump] ini read [%s] %s = %d (1 = crash on)",
-            SafeStr(a3).c_str(), SafeStr(a4).c_str(), SafeReadInt((const int*)a5));
-        return r;
-    }
-    if (cmd == (uint32_t)mxb::CMD_SESSION_START) {
-        static std::atomic<int> n{0};
-        int i = n.fetch_add(1);
-        char* cfg = (char*)a13;
-        // arg14 is a DWORD in a stack slot; the top half of the qword is whatever was
-        // there before, so mask it off before comparing against the expected size.
-        uint32_t size = (uint32_t)(uintptr_t)a14;
-        int disabled = SafeReadInt((const int*)(cfg + mxb::OFF_OVERJUMP_DISABLED));
-        Log("[overjump] session start #%d: settings=%p size=0x%X -> overjump crash %s",
-            i, (void*)cfg, size, disabled ? "OFF" : "ON");
-        if (size != mxb::SESSION_CFG_SIZE) {
-            Log("[overjump] size is not 0x%zX: the block moved in this build, so +0x%zX is "
-                "NOT the flag here. Re-derive it before trusting this line.",
-                mxb::SESSION_CFG_SIZE, mxb::OFF_OVERJUMP_DISABLED);
-        } else {
-            // The dump is 34 lines a session, so it stays behind --probe-overjump: the
-            // default line above is the one that answers the question.
-            if (g_overjumpHex && i < 8) {
-                char raw[mxb::SESSION_CFG_SIZE];
-                size_t got = SafeReadBytes(cfg, raw, sizeof(raw));
-                LogHexTag("[overjump.hex]", raw, got);
-            }
-            if (g_overjumpForce && !disabled) {
-                bool ok = SafeWriteInt((int*)(cfg + mxb::OFF_OVERJUMP_DISABLED), 1);
-                Log("[overjump] force: set the disable flag %s", ok ? "OK" : "FAILED (write faulted)");
-            }
-        }
-    }
-    return g_origBus(cmd, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
-}
-
-// Swap the bus fn-ptr for hkBus. A pointer swap, not a code patch: every dispatch site
-// calls through [RVA_CMD_BUS_PTR], so one aligned qword covers all 140+ of them and the
-// original is just the value we replaced.
-static void InstallOverjumpProbe() {
-    uintptr_t slot = g_base + mxb::RVA_CMD_BUS_PTR + g_sigDelta;
-    uint8_t *b = nullptr, *e = nullptr;
-    if (!GetExecRange(g_base, &b, &e)) {
-        Log("[overjump] no exec range for the module; probe NOT armed.");
-        return;
-    }
-    // The engine fills the slot during boot. We are past the content scan by now, so it is
-    // normally already set - but wait a bounded moment rather than bail on a race.
-    void* cur = nullptr;
-    for (int i = 0; i < 300; ++i) {
-        if (SafeReadBytes((const char*)slot, (char*)&cur, sizeof(cur)) == sizeof(cur) && cur) break;
-        Sleep(10);
-    }
-    if (!cur) {
-        Log("[overjump] bus fn-ptr @ RVA 0x%zx is unreadable or still null after 3s; "
-            "probe NOT armed.", (size_t)(slot - g_base));
-        return;
-    }
-    if ((uint8_t*)cur < b || (uint8_t*)cur >= e) {
-        Log("[overjump] bus fn-ptr @ RVA 0x%zx holds %p, which is outside .text - wrong slot "
-            "for this build; probe NOT armed.", (size_t)(slot - g_base), cur);
-        return;
-    }
-    DWORD old = 0;
-    if (!VirtualProtect((void*)slot, sizeof(void*), PAGE_READWRITE, &old)) {
-        Log("[overjump] VirtualProtect on the bus slot failed (%lu); probe NOT armed.", GetLastError());
-        return;
-    }
-    g_origBus = (BusFn)cur;
-    *(void**)slot = (void*)&hkBus;
-    VirtualProtect((void*)slot, sizeof(void*), old, &old);
-    Log("[overjump] probe armed: bus fn-ptr @ RVA 0x%zx -> hkBus (orig %p)%s%s",
-        (size_t)(slot - g_base), cur,
-        g_overjumpHex ? ", block dump on" : "",
-        g_overjumpForce ? ", FORCE ON - offline/testing only" : "");
 }
 
 // ===========================================================================
@@ -1089,11 +983,8 @@ static bool BusCall(BusFn bus, uint32_t cmd) {
     }
 }
 
-/// The bus as the game itself reaches it. Prefers the pointer captured before the overjump
-/// probe swapped the slot, so our own call goes straight to the engine rather than back
-/// through our hook; falls back to reading the slot and checking it lands in .text.
+/// The bus as the game itself reaches it: read the slot and check it lands in .text.
 static BusFn ResolveBus() {
-    if (g_origBus) return g_origBus;
     uintptr_t slot = g_base + mxb::RVA_CMD_BUS_PTR + g_sigDelta;
     void* cur = nullptr;
     if (SafeReadBytes((const char*)slot, (char*)&cur, sizeof(cur)) != sizeof(cur) || !cur) return nullptr;
@@ -6334,49 +6225,6 @@ DWORD WINAPI Init(LPVOID) {
     } else {
         Log("[init] content hooks NOT installed - reload is unavailable on this build "
             "until offsets.h is updated. (mods listing + logs still work.)");
-    }
-
-    // OVERJUMP PROBE: opt-in, behind --probe-overjump, like every other RE diagnostic here.
-    //
-    // v0.16.1 armed it for everyone, on the reasoning that the one line it writes per
-    // session start would then ride along in logs we are sent anyway. What that reasoning
-    // left out is the price: the probe swaps the engine's command-bus fn-ptr, and by its own
-    // design that one qword carries all 140+ dispatch sites - every command the game issues,
-    // not the two we read - through hkBus's *inferred* 16-pointer signature. It also shipped
-    // without the Windows run tasks/overjump-crash.md asks for. The first logs back settled
-    // it: 22 launches, 22 session starts, 22 access violations reading a null at
-    // mxbikes.exe+0x297b20, and not one session survived. The same player's v0.9.8 runs, four
-    // hours of them with no probe, never faulted once.
-    //
-    // So it is a flag again. A diagnostic that reroutes the whole engine is worth its risk
-    // only to someone who went looking for it, and the answer it collects is worth one run
-    // by one person, not every session of every player. The flag file also still carries the
-    // two raises it always did: "hex" adds the block dump, "force" clears the crash flag.
-    //
-    // MX Bikes only either way - the bus RVA is this title's, and on another one we would
-    // swap a pointer that is not the bus.
-    {
-        char ojFlag[MAX_PATH] = {0};
-        if (g_logPath[0]) {
-            strcpy_s(ojFlag, g_logPath);
-            if (char* s = strrchr(ojFlag, '\\')) { *(s + 1) = 0; strcat_s(ojFlag, "frostmod_overjump.flag"); }
-        }
-        // Silence on the normal path is deliberate: no flag, no bus swap, and no line
-        // claiming either. A log with no [overjump] lines in it is a log from a game whose
-        // command bus we never touched.
-        if (ojFlag[0] && GetFileAttributesA(ojFlag) != INVALID_FILE_ATTRIBUTES) {
-            char body[32] = {0};
-            if (FILE* f = nullptr; fopen_s(&f, ojFlag, "r") == 0 && f) {
-                fread(body, 1, sizeof(body) - 1, f);
-                fclose(f);
-            }
-            g_overjumpForce = strstr(body, "force") != nullptr;
-            g_overjumpHex   = strstr(body, "hex") != nullptr || g_overjumpForce;
-
-            if (g_game->offsets_complete) InstallOverjumpProbe();
-            else Log("[overjump] probe is MX Bikes-only - %s has no derived bus address.",
-                     g_game->display);
-        }
     }
 
     // RENDER hooks (drive Tick: F8, the reload-event check, and running reloads on

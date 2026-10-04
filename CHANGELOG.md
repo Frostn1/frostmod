@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Removed
+- **The overjump option is gone.** It wrote a flag into the game's session settings and swapped
+  the engine's command-bus pointer to do it. FrostMod no longer touches either: `--probe-overjump`,
+  `--force-overjump-off` and any leftover `frostmod_overjump.flag` are ignored.
 - **The rejoin fix is gone.** It rewrote a call in the game's disconnect code and freed other
   riders' vehicle records, and on 2026-10-04 it freed the local rider's own bike. FrostMod no
   longer touches the disconnect path at all: a rider who leaves and rejoins is handled exactly

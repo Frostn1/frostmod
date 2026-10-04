@@ -632,8 +632,6 @@ int main(int argc, char** argv) {
     bool switchLive  = false; // --switch-live: arm the track switcher's real load (may crash)
     bool unsafeReload = false;// --unsafe-reload: replay a step table the title hasn't confirmed
     int  reloadFrom   = 0;    // --unsafe-reload-from=N: start the replay at step N (0 = step 1)
-    bool probeOverjump = false; // --probe-overjump: log the session settings block at session start
-    bool forceOverjump = false; // --force-overjump-off: also clear the crash flag (offline only)
     bool filterSrv   = true;  // server-browser filter: ON by default (--no-filter-servers disables)
     bool installStartup   = false; // --install-startup: run automatically at login
     bool uninstallStartup = false; // --uninstall-startup: stop running at login
@@ -674,10 +672,6 @@ int main(int argc, char** argv) {
         else if (a == "--dump-serverlist")       dumpList = true;
         else if (a == "--capture-master")        captureMaster = true;
         else if (a == "--switch-live")           switchLive = true;
-        else if (a == "--probe-overjump")        probeOverjump = true;
-        // Forcing without the probe would leave no record of what was changed, so this
-        // implies --probe-overjump rather than making you pass both.
-        else if (a == "--force-overjump-off")  { forceOverjump = true; probeOverjump = true; }
         else if (a == "--unsafe-reload")         unsafeReload = true;
         // Skipping a step is only ever useful with the table already armed, so this
         // implies --unsafe-reload rather than making you pass both.
@@ -814,28 +808,6 @@ int main(int argc, char** argv) {
                "    WARNING: only use it from the testing MENU - mid-ride it crashes the game.\n");
     } else {
         DeleteFileA(switchFlag.c_str());
-    }
-    // This file is what arms the overjump probe at all: without it the DLL never swaps the
-    // command bus. Its contents raise it further - "hex" adds the block dump, "force" clears
-    // the crash flag. Deleting it below is what turns the probe back off for a player who
-    // ran with it once.
-    std::string overjumpFlag = ExeDir() + "frostmod_overjump.flag";
-    if (probeOverjump || forceOverjump) {
-        if (FILE* f = nullptr; fopen_s(&f, overjumpFlag.c_str(), "w") == 0 && f) {
-            fprintf(f, "%s%s", probeOverjump ? "hex " : "", forceOverjump ? "force" : "");
-            fclose(f);
-        }
-        if (probeOverjump)
-            printf("[*] --probe-overjump ON: the DLL swaps the engine command bus to read the\n"
-                   "    session settings block ([overjump] + [overjump.hex] lines). That puts us\n"
-                   "    in front of every command the game issues - arm it to answer the question,\n"
-                   "    on a machine you are watching, then run without it again.\n");
-        if (forceOverjump)
-            printf("[!] --force-overjump-off ON: the DLL CLEARS the crash flag as a session\n"
-                   "    starts. Offline and testing only - on a server that wants the crash this\n"
-                   "    is a client-side cheat.\n");
-    } else {
-        DeleteFileA(overjumpFlag.c_str());
     }
     std::string unsafeFlag = ExeDir() + "frostmod_unsafe_reload.flag";
     if (unsafeReload) {

@@ -4,7 +4,7 @@
 
 Three symptoms, from players, all of them the game closing to desktop (not the rider
 going down — that is the `[hardcore] overjump_crash` setting, which is a different
-subject and lives in `tasks/overjump-crash.md`):
+subject; FrostMod no longer touches it):
 
 1. landing an overjump, or hitting an object
 2. clicking **go to track**

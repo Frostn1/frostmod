@@ -46,8 +46,6 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
-#include "rejoin.h"
-#include "rejoinguard.h"
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
@@ -3049,7 +3047,7 @@ static uint8_t g_chSelBackup[mxb::SEL_SPAN];
 static frostmod::ChangeSnapshot g_chOld;
 static frostmod::ChangeSnapshot g_chFree;
 static ULONGLONG g_chFreeSince = 0;
-static void RjTearDown(int i);                           // fwd (the rejoin fix's teardown)
+static void VehTearDown(int i);                          // fwd (the old record's teardown)
 
 enum { CH_BIKE, CH_PAINT, CH_HELMET, CH_HELMET_PAINT, CH_GOGGLES, CH_SUIT, CH_GLOVES,
        CH_BOOTS, CH_BOOTS_PAINT, CH_COUNT };
@@ -3303,7 +3301,7 @@ static void ChFreeOldTick() {
     if (d == frostmod::ChangeFree::Free) {
         Log("[change] own bike moved from vehicle %d to %d - freeing the old one (race %d) so it "
             "does not stay on the stand", g_chFree.index, now, g_chFree.key);
-        RjTearDown(g_chFree.index);
+        VehTearDown(g_chFree.index);
     } else {
         Log("[change] own vehicle %d not freed (index now %d; it was already gone, reused, or the "
             "game never moved off it)", g_chFree.index, now);
@@ -3652,91 +3650,12 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
-// ---- rejoin: freeing a rider's entity when they disconnect -------------------
-// What this is and why: rejoin.h. The disconnect path clears the roster entry and leaves the
-// rider's entity behind, so a rejoin writes the new session into the old record. We repoint
-// the memset at the end of that path to a thunk that also calls the game's own entity
-// removal for the same id.
-//
-// MX Bikes only, for the same reason antifreeze is: the RVA is that title's.
-// Off unless rejoinfix=1 is in frostmod_radar.cfg (written with settingsver=2). It freed the
-// local rider's own bike on 2026-10-04 (rejoinguard.h), so it stays off until proven in play.
-static std::atomic<bool> g_rjOn{false};
-static uint8_t*          g_rjThunk   = nullptr;  // the 36 bytes we call instead of memset
-static uintptr_t         g_rjCall    = 0;        // VA of the call we rewrote
-static uint8_t           g_rjOrig[rejoin::kCallLen] = {0};
-static bool              g_rjPatched = false;
-
-// ---- rejoin, part two: the rider's vehicle -----------------------------------------------
-// The entity is not the only thing a departure leaves behind. The rider's VEHICLE record
-// (0xF4EE20, one per rider, with every bike and rider object) stays live too, and when the
-// same rider is added again, vehicle create finds it by race number and takes its reuse
-// shortcut (0x5CAE0 at 0x5D11C). That shortcut skips the series lookup and uses the BIKE
-// index as the series index - read at 0x5DDBE, [0xF3DB38] + bike * 0x234, well past the
-// few series there are. Where that memory is unmapped the game dies (seen live: 0xC0000005
-// in sprintf, frame mxbikes+0x5DE04); where it is not, the rejoined rider is built on top
-// of the one who left (the "two bikes in one").
-//
-// So after a rider leaves, their vehicle is torn down the way session end tears down every
-// vehicle (0x71D50) and the record is freed. A rejoin then takes the fresh path. It runs on
-// a later frame, once the game's own disconnect handling (0x605F0, which may be queued) has
-// released the rider's load request - until then the record is still the game's.
-// Every decision - who owns which vehicle, whether a departure may free it - is in
-// rejoinguard.h, so it is tested without a game. Locked because the disconnect thunk and
-// the plugin callbacks may not run on the frame thread.
-static_assert(rejoin::kVehMax == mxb::VEHICLE_MAX, "rejoinguard.h vehicle count");
-static rejoin::Tracker g_rjTrack;
-static std::mutex      g_rjMu;
-
-using EntityRemove_t = int64_t(__fastcall*)(int);
-static void RjEntityRemove(int id) {
-    __try { ((EntityRemove_t)(g_base + rejoin::kRvaEntityRemove))(id); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-// Called by the thunk, after the roster memset, with the departing id (the old behaviour:
-// the game's entity removal), plus a note of which vehicle was theirs - only if exactly one
-// fresh mapping says so. Nothing is freed here; RjTick decides on a later frame.
-static void __fastcall RjDisconnected(int id) {
-    RjEntityRemove(id);
-    int veh = -1, key = 0;
-    rejoin::Lookup l;
-    {
-        std::lock_guard<std::mutex> lk(g_rjMu);
-        l = g_rjTrack.OnDisconnect(id, GetTickCount64(), &veh, &key);
-    }
-    if (l == rejoin::Lookup::Mapped)
-        Log("[rejoin] connection %d left: vehicle %d (race %d) was theirs - waiting for its "
-            "race-entry removal before freeing anything", id, veh, key);
-    else
-        Log("[rejoin] connection %d left: nothing to free (%s)", id, rejoin::LookupText(l));
-}
-// Plugin callbacks: a real race-entry removal, a (re)join, and a session/event change.
-static void RjOnRaceRemove(int raceNum) {
-    if (!g_rjOn.load()) return;
-    std::lock_guard<std::mutex> lk(g_rjMu);
-    g_rjTrack.OnRaceRemove(raceNum, GetTickCount64());
-}
-static void RjOnRaceAdd(int raceNum) {
-    if (!g_rjOn.load()) return;
-    int dropped;
-    { std::lock_guard<std::mutex> lk(g_rjMu); dropped = g_rjTrack.OnRaceAdd(raceNum); }
-    if (dropped)
-        Log("[rejoin] race %d is back in the race: its pending free is cancelled", raceNum);
-}
-static void RjReset(const char* why) {
-    if (!g_rjOn.load()) return;
-    { std::lock_guard<std::mutex> lk(g_rjMu); g_rjTrack.Reset(); }
-    Log("[rejoin] %s: every vehicle mapping and pending departure dropped", why);
-}
-
-static uintptr_t RjRequestOf(int veh) {
-    for (int r = 0; r < mxb::LOAD_REQUEST_MAX; ++r) {
-        const uintptr_t q = g_base + mxb::RVA_LOAD_REQUESTS + (uintptr_t)r * mxb::LOAD_REQUEST_STRIDE;
-        if (SafeReadInt((const int*)q) != 0 && SafeReadInt((const int*)(q + 0x30)) == veh + 1) return q;
-    }
-    return 0;
-}
-static bool RjBus(uint32_t cmd, intptr_t a, intptr_t b) {
+// ---- vehicle teardown: the bike-change cleanup's free of the old own-vehicle record ------
+// Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
+// its conditions, then the record is zeroed as session end zeroes all of them. Its only
+// caller is ChFreeOldTick (see changefree.h): after an accepted bike change the game builds
+// the new bike in a free record and never tears the old one down.
+static bool VehBus(uint32_t cmd, intptr_t a, intptr_t b) {
     BusFn bus = ResolveBus();
     if (!bus) return false;
     __try {
@@ -3746,18 +3665,16 @@ static bool RjBus(uint32_t cmd, intptr_t a, intptr_t b) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 using VehicleFree_t = int64_t(__fastcall*)(void*);
-static bool RjFree(uintptr_t fn, void* arg) {
+static bool VehFree(uintptr_t fn, void* arg) {
     __try { ((VehicleFree_t)fn)(arg); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-// Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
-// its conditions, then the record is zeroed as session end zeroes all of them.
-static void RjTearDown(int i) {
-    // Last line of defence for both callers (the rejoin fix and the bike-change free): never
-    // a vehicle index out of range, never the vehicle the local rider is on right now.
-    if (i < 0 || i >= mxb::VEHICLE_MAX) { Log("[rejoin] teardown refused: vehicle %d out of range", i); return; }
+static void VehTearDown(int i) {
+    // Last line of defence: never a vehicle index out of range, never the vehicle the local
+    // rider is on right now.
+    if (i < 0 || i >= mxb::VEHICLE_MAX) { Log("[change] teardown refused: vehicle %d out of range", i); return; }
     if (SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1 == i) {
-        Log("[rejoin] teardown refused: vehicle %d is the local rider's own", i);
+        Log("[change] teardown refused: vehicle %d is the local rider's own", i);
         return;
     }
     const uintptr_t v = g_base + mxb::RVA_VEHICLES + (uintptr_t)i * mxb::VEHICLE_STRIDE;
@@ -3765,183 +3682,24 @@ static void RjTearDown(int i) {
     const int kind = rd(mxb::VEH_KIND);
     if (kind == 1) {
         if (rd(mxb::VEH_LIVE2) == 0) {
-            RjBus(0x239, rd(mxb::VEH_ID), 0);
-            RjFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+            VehBus(0x239, rd(mxb::VEH_ID), 0);
+            VehFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
         } else if (rd(mxb::VEH_ENTITY_ON) != 0) {
-            RjBus(0x285, rd(mxb::VEH_ENTITY), 0);
-            RjFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
+            VehBus(0x285, rd(mxb::VEH_ENTITY), 0);
+            VehFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
         }
     }
     if (kind <= 2) {
-        RjBus(0x18C, rd(mxb::VEH_50A8), 0);
-        RjBus(0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
+        VehBus(0x18C, rd(mxb::VEH_50A8), 0);
+        VehBus(0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
     }
     if (kind <= 3) {
-        RjBus(0x27A, rd(mxb::VEH_5838), 0);
-        RjBus(0x5C, rd(mxb::VEH_HANDLE), 0);
-        RjFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX));
+        VehBus(0x27A, rd(mxb::VEH_5838), 0);
+        VehBus(0x5C, rd(mxb::VEH_HANDLE), 0);
+        VehFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX));
     }
-    RjBus(0xEE, rd(mxb::VEH_TEAM), 0);
+    VehBus(0xEE, rd(mxb::VEH_TEAM), 0);
     __try { memset((void*)v, 0, mxb::VEHICLE_STRIDE); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-// Once a frame from Tick: remember who owns which vehicle, and free the vehicle of a rider
-// who left only when rejoinguard.h's Decide says so. Every verdict but Wait is logged.
-static void RjTick() {
-    if (!g_rjPatched || !g_rjOn.load()) return;
-    const uint64_t now = GetTickCount64();
-    const int ownVeh = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
-    const int ownKey = (ownVeh >= 0 && ownVeh < mxb::VEHICLE_MAX)
-                       ? SafeReadInt((const int*)(VehicleAt(ownVeh) + mxb::VEH_KEY)) : 0;
-    rejoin::VehicleView views[mxb::VEHICLE_MAX];
-    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
-        const uintptr_t v = VehicleAt(i);
-        rejoin::VehicleView& w = views[i];
-        w.live = SafeReadInt((const int*)v) != 0;
-        w.key  = w.live ? SafeReadInt((const int*)(v + mxb::VEH_KEY)) : 0;
-        const uintptr_t q = w.live ? RjRequestOf(i) : 0;
-        w.hasRequest  = q != 0;
-        w.requestConn = q ? SafeReadInt((const int*)(q + 4)) : 0;
-    }
-    int toFree[rejoin::kPendingMax]; int nFree = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_rjMu);
-        for (int i = 0; i < mxb::VEHICLE_MAX; ++i) g_rjTrack.Observe(i, views[i], now);
-        for (int k = 0; k < g_rjTrack.PendingCount(); ) {
-            const rejoin::Pending p = g_rjTrack.PendingAt(k);
-            const rejoin::VehicleView v = (p.veh >= 0 && p.veh < mxb::VEHICLE_MAX)
-                                          ? views[p.veh] : rejoin::VehicleView{};
-            const auto d = rejoin::Decide(p, ownVeh, ownKey, v,
-                                          g_rjTrack.RemovalSeen(p.key, p.since), now);
-            if (d.verdict == rejoin::Verdict::Wait) { ++k; continue; }
-            if (d.verdict == rejoin::Verdict::TearDown) {
-                Log("[rejoin] connection %d left and race %d's entry was removed: freeing their "
-                    "vehicle %d so a rejoin is built fresh (own vehicle %d, race %d)",
-                    p.conn, p.key, p.veh, ownVeh, ownKey);
-                toFree[nFree++] = p.veh;
-                g_rjTrack.Forget(p.veh);
-            } else {
-                Log("[rejoin] connection %d left: vehicle %d (race %d) NOT freed - %s",
-                    p.conn, p.veh, p.key, rejoin::WhyText(d.why));
-            }
-            g_rjTrack.RemovePendingAt(k);
-        }
-    }
-    for (int k = 0; k < nFree; ++k) RjTearDown(toFree[k]);   // outside the lock: bus calls
-}
-
-// Executable bytes the call can actually name: rel32 reaches about 2 GB, so walk outward
-// from the site and take the first free granule, as AfAllocCellNear does for its cell.
-static uint8_t* RjAllocThunkNear(uintptr_t site) {
-    SYSTEM_INFO si{}; GetSystemInfo(&si);
-    const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
-    const uintptr_t limit = 0x70000000ull;
-    for (uintptr_t d = gran; d < limit; d += gran) {
-        for (int up = 0; up < 2; ++up) {
-            if (!up && site < d) continue;
-            uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
-            if (!a) continue;
-            void* p = VirtualAlloc((void*)a, rejoin::kThunkLen,
-                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (p) return (uint8_t*)p;
-        }
-    }
-    return nullptr;
-}
-
-static bool RjApply() {
-    if (g_rjPatched) return true;
-    if (g_game != &GAME_MXB) {
-        Log("[rejoin] not applied: this is %s, the offset is MX Bikes' only",
-            g_game && g_game->display ? g_game->display : "another title");
-        return false;
-    }
-    if (!g_base) { Log("[rejoin] not applied: no module base"); return false; }
-
-    const uintptr_t win  = g_base + rejoin::kRvaWindow;
-    const uintptr_t call = g_base + rejoin::kRvaCall;
-    const uint8_t*  w    = reinterpret_cast<const uint8_t*>(win);
-    if (!rejoin::WindowMatches(w)) {
-        Log("[rejoin] not applied: the bytes at +0x%llX are not the disconnect path we "
-            "expect (game updated?). Nothing patched.", (unsigned long long)rejoin::kRvaWindow);
-        return false;
-    }
-    // The removal we are about to call has to be the function we think it is, too.
-    const uint8_t* rem = reinterpret_cast<const uint8_t*>(g_base + rejoin::kRvaEntityRemove);
-    if (memcmp(rem, rejoin::kEntityRemoveSig, rejoin::kEntityRemoveSigLen) != 0) {
-        Log("[rejoin] not applied: entity removal at +0x%llX does not match",
-            (unsigned long long)rejoin::kRvaEntityRemove);
-        return false;
-    }
-
-    // Call whatever the stock call called, decoded from its own bytes, rather than a second
-    // hardcoded address for memset.
-    const uintptr_t memsetVa =
-        rejoin::CurrentTarget(call, reinterpret_cast<const uint8_t*>(call));
-
-    g_rjThunk = RjAllocThunkNear(call);
-    if (!g_rjThunk) { Log("[rejoin] not applied: no free page within reach"); return false; }
-    if (!rejoin::BuildThunk(g_rjThunk, memsetVa, reinterpret_cast<uintptr_t>(&RjDisconnected))) {
-        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
-        Log("[rejoin] not applied: thunk could not be built");
-        return false;
-    }
-    DWORD tprot = 0;
-    if (!VirtualProtect(g_rjThunk, rejoin::kThunkLen, PAGE_EXECUTE_READ, &tprot)) {
-        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
-        Log("[rejoin] not applied: thunk could not be made executable (%lu)", GetLastError());
-        return false;
-    }
-    FlushInstructionCache(GetCurrentProcess(), g_rjThunk, rejoin::kThunkLen);
-
-    int32_t disp = 0;
-    if (!rejoin::PlanDisp(call, reinterpret_cast<uintptr_t>(g_rjThunk), &disp)) {
-        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
-        Log("[rejoin] not applied: thunk out of rel32 reach");
-        return false;
-    }
-
-    DWORD prot = 0;
-    if (!VirtualProtect((void*)call, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
-        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
-        Log("[rejoin] not applied: VirtualProtect failed (%lu)", GetLastError());
-        return false;
-    }
-    uint8_t* cw = reinterpret_cast<uint8_t*>(call);
-    memcpy(g_rjOrig, cw, rejoin::kCallLen);
-    for (int i = 0; i < 4; ++i)
-        cw[rejoin::kCallDispOff + i] = (uint8_t)((uint32_t)disp >> (8 * i));
-    VirtualProtect((void*)call, rejoin::kCallLen, prot, &prot);
-    FlushInstructionCache(GetCurrentProcess(), (void*)call, rejoin::kCallLen);
-
-    if (rejoin::CurrentTarget(call, cw) != reinterpret_cast<uintptr_t>(g_rjThunk)) {
-        VirtualProtect((void*)call, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot);
-        memcpy(cw, g_rjOrig, rejoin::kCallLen);
-        VirtualProtect((void*)call, rejoin::kCallLen, prot, &prot);
-        FlushInstructionCache(GetCurrentProcess(), (void*)call, rejoin::kCallLen);
-        VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr;
-        Log("[rejoin] not applied: the patch did not verify, reverted");
-        return false;
-    }
-
-    g_rjCall = call; g_rjPatched = true;
-    Log("[rejoin] on: a rider's entity and vehicle are freed when they disconnect, so a "
-        "rejoin is built fresh (at +0x%llX)", (unsigned long long)rejoin::kRvaCall);
-    return true;
-}
-
-// Put the call back exactly as it shipped.
-static void RjRevert() {
-    if (!g_rjPatched) return;
-    DWORD prot = 0;
-    if (VirtualProtect((void*)g_rjCall, rejoin::kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
-        memcpy(reinterpret_cast<uint8_t*>(g_rjCall), g_rjOrig, rejoin::kCallLen);
-        VirtualProtect((void*)g_rjCall, rejoin::kCallLen, prot, &prot);
-        FlushInstructionCache(GetCurrentProcess(), (void*)g_rjCall, rejoin::kCallLen);
-    }
-    if (g_rjThunk) { VirtualFree(g_rjThunk, 0, MEM_RELEASE); g_rjThunk = nullptr; }
-    g_rjPatched = false;
-    Log("[rejoin] off: departed riders keep their entity, as the game ships");
 }
 
 // ---- server announcements: settings ----------------------------------------
@@ -3972,9 +3730,6 @@ static void SaveOverlaySettings() {
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
-    // settingsver=2 marks a file whose rejoinfix line is a choice: before it, every save wrote
-    // rejoinfix=1 because that was the default, so an old 1 says nothing about the rider.
-    fprintf(f, "rejoinfix=%d\nsettingsver=2\n", g_rjOn.load() ? 1 : 0);
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     fclose(f);
 }
@@ -3982,7 +3737,6 @@ static void LoadOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128]; int v;
-    int rjSaved = -1, settingsVer = 1;
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
@@ -3994,21 +3748,14 @@ static void LoadOverlaySettings() {
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
-        else if (sscanf_s(line, "rejoinfix=%d", &v) == 1) rjSaved = (v != 0);
-        else if (sscanf_s(line, "settingsver=%d", &v) == 1) settingsVer = v;
     }
     fclose(f);
-    // rejoinfix defaults OFF. Honoured as on only from a settingsver=2 file (an explicit
-    // choice); an older file's rejoinfix=1 was the old default written back, so it is ignored.
-    if (rjSaved >= 0 && settingsVer >= 2) g_rjOn.store(rjSaved != 0);
-    else if (rjSaved == 1)
-        Log("[overlay] rejoinfix=1 from an older settings file ignored: the rejoin fix is now "
-            "off by default (rejoinfix=1 with settingsver=2 opts in)");
+    // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
+    // fix) match nothing above and are skipped; the next save drops them.
     Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d%s",
         g_uiPct.load(),
         g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(),
         g_devMenu ? " devmenu=1" : "");
-    Log("[overlay] settings loaded: rejoinfix=%d", g_rjOn.load() ? 1 : 0);
 }
 
 // ---- which rider is me ---------------------------------------------------
@@ -5281,7 +5028,6 @@ void Tick() {
     WorldWatch();
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     RaceFilterTick();
-    RjTick();   // rejoin: free the vehicles of riders who left (see RjDisconnected)
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
     // log once a second how many frames we presented vs how many times the game called the
@@ -6840,10 +6586,6 @@ DWORD WINAPI Init(LPVOID) {
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
 
-        // Same moment, same reason: the disconnect path is not running yet.
-        if (g_rjOn.load()) RjApply();
-        else Log("[rejoin] off by config; a rejoining rider may land on their old entity");
-
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
         // is created. Mid-function hook, so gated behind a flag. Scope is cheat/ad ghosts
@@ -7112,14 +6854,12 @@ __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, i
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
-    if (_pData && _iDataSize >= (int)sizeof(int)) RjOnRaceAdd(*(const int*)_pData);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
-    if (_pData && _iDataSize >= (int)sizeof(int)) RjOnRaceRemove(*(const int*)_pData);
     if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
@@ -7196,7 +6936,6 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     }
     frostmod::crash::Note("event opened: track='%s' server='%s'", track,
                           server[0] ? server : "<none>");
-    RjReset("event opened");
 }
 __declspec(dllexport) void EventDeinit() {
     if (g_standDown.load()) return;   // another FrostMod owns this game
@@ -7210,7 +6949,6 @@ __declspec(dllexport) void EventDeinit() {
         ctx.inSession.store(false, std::memory_order_relaxed);
     }
     SessionClear();
-    RjReset("event closed");
 }
 // On MX Bikes this is kept for the track half only: a server on a rotation changes track
 // without a new event, and this is confirmed to carry it. The server name set by EventInit
@@ -7244,7 +6982,6 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
 __declspec(dllexport) void RaceSession(void*, int)  { if (g_standDown.load()) return;
     if (g_sessionOnly) return;
     frostmod::crash::Note("session changed (practice/qualify/race)");
-    RjReset("session changed");
     RadResetRace();
 }
 __declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly && !g_standDown.load()) RadResetRace(); }

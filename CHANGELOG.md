@@ -2,16 +2,13 @@
 
 ## Unreleased
 
-### Fixed
-- **The rejoin fix could free your own bike.** On 2026-10-04 it tore down the local rider's
-  vehicle (race 41) when a connection that was not racing left; opening Garage from the pits
-  then crashed the game. It now frees a vehicle only when that exact rider's race entry was
-  removed, never the vehicle you are on or one carrying your race number, drops its
-  rider-to-vehicle map on every event/session change and on a rejoin, re-checks the index and
-  owner right before acting, and logs every decision (`[rejoin] ... NOT freed - <reason>`).
-- **The rejoin fix is now off by default** until it has been proven in play. `rejoinfix=1` in
-  `frostmod_radar.cfg` together with `settingsver=2` opts in; a bare `rejoinfix=1` from an older
-  version (it was the default then) is ignored, and new saves mark the file `settingsver=2`.
+### Removed
+- **The rejoin fix is gone.** It rewrote a call in the game's disconnect code and freed other
+  riders' vehicle records, and on 2026-10-04 it freed the local rider's own bike. FrostMod no
+  longer touches the disconnect path at all: a rider who leaves and rejoins is handled exactly
+  as the game ships. `rejoinfix=` and `settingsver=` lines in an existing `frostmod_radar.cfg`
+  are ignored and dropped on the next save. The bike-change cleanup (freeing your old bike's
+  record after an accepted change) is unchanged.
 
 ## 2026-10-03 - v0.49.7
 

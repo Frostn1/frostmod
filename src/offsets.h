@@ -587,8 +587,8 @@ constexpr int       PAINT_NAME        = 0x04;
 constexpr uintptr_t RVA_VEHICLES      = 0xF4EE20;
 constexpr int       VEHICLE_MAX       = 50;
 constexpr int       VEHICLE_STRIDE    = 0x5B24;    // +0x00 live
-// Vehicle-record fields session end's per-vehicle teardown (0x71D50) touches; the rejoin fix
-// runs that teardown for a rider who left. Map: game/rider_gfx.c.
+// Vehicle-record fields session end's per-vehicle teardown (0x71D50) touches; the bike-change
+// cleanup runs that teardown on the old own-vehicle record. Map: game/rider_gfx.c.
 constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0;   // int(void* rec+0x274): every gfx object
 constexpr uintptr_t RVA_VEHICLE_SUBFREE  = 0x4FE70;   // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_BIKE_PAINTS_ARG  = 0x109DE94; // the int bus 0xCF takes first
@@ -685,7 +685,7 @@ constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(
 constexpr uintptr_t RVA_RACE_ENTRY_COUNT = 0x5121D8;
 constexpr uintptr_t RVA_RACE_ENTRY_KEY   = 0x5122A4; // first entry's race number; slot at +0xC
 constexpr int       RACE_ENTRY_STRIDE    = 0x178;
-constexpr int VEH_LINK = 0x5B18;   // the index kind 15 links (other VEH_* in the rejoin block)
+constexpr int VEH_LINK = 0x5B18;   // the index kind 15 links (other VEH_* in the teardown block)
 
 } // namespace mxb
 

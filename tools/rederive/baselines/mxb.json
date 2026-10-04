@@ -59,10 +59,6 @@
     "SBE_NAME": "0x86",
     "SBE_MAXPLAYERS": "0xc8",
     "CMD_JOIN": "0x389",
-    "CMD_SESSION_START": "0x310",
-    "CMD_CFG_READ_INT": "0x27",
-    "SESSION_CFG_SIZE": "0x21c",
-    "OFF_OVERJUMP_DISABLED": "0x190",
     "MXB_DEFAULT_PORT": "54200"
   }
 }

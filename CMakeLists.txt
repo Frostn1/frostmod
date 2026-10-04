@@ -234,6 +234,11 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 add_executable(rejoin_test tests/rejoin_test.cpp)
 add_test(NAME rejoin COMMAND rejoin_test)
 
+# Which vehicle the rejoin fix may free (src/rejoinguard.h). Freeing the wrong one took the
+# local rider's own bike on 2026-10-04; that sequence is the regression case. Pure.
+add_executable(rejoinguard_test tests/rejoinguard_test.cpp)
+add_test(NAME rejoinguard COMMAND rejoinguard_test)
+
 # --- world watch test ----------------------------------------------------------
 # When a timed-out master login is the half-open session we can clear and when it is an
 # outage we must not churn at. Neither state is reproducible on demand - it wants a licensed

@@ -2,7 +2,21 @@
 
 ## Unreleased
 
+### Added
+- **Refresh just paints, or just gear, from F8.** The one "Reload mods" row is now three:
+  `1` Refresh paints (the six paint lists, then paints re-applied to riders on track), `2`
+  Refresh gear and paints (rider gear models and every paint list), `3` Reload all mods (as
+  before). The other rows move down one key; Rebuild riders is now `0`. Tracks-only and
+  bikes-only are not offered: only the first tracks row and the first bikes row of the reload
+  table have a known role, so which other rows each would need is unproven.
+
 ### Fixed
+- **No reload under an open chooser.** Three crashes in one player's log were the game's
+  `_stricmp` reading a dead pointer in a bike chooser page's handler, 2.6 to 6.4 s after a full
+  reload, on a menu page: the page still pointed into the lists the reload had freed. Every
+  refresh (F8, MXB App, the console's `R`, a track or model change) now waits while a bike,
+  paint, profile or event-setup page is open (or the online pits, which carry the same
+  chooser), and runs as soon as the player leaves it. Requests made meanwhile merge into one.
 - **MXB Coach: the line follows the ruts.** On a server that digs the track live (mxbserver), the
   line rode over the top of rut walls instead of down in the rut. The game's own ground was
   sampled once per event and never again, and the `.ground` file and the sheet's terrain are the

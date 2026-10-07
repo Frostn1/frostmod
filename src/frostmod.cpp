@@ -53,6 +53,7 @@
 #include "serverfilter.h"
 #include "session.h"
 #include "changefree.h" // bike change: free the old own-vehicle record
+#include "refreshgate.h" // content refresh kinds, and the pages a refresh waits out
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
 #include <io.h>         // _finddata64i32_t (the race filter's find hooks)
 #include <memory>
@@ -2084,7 +2085,7 @@ void AdvanceReload() {
         if (g_fullReloadQueued) {
             g_fullReloadQueued = false;
             Log("[reload] running the full reload that was asked for during the %s", g_refreshWhat);
-            RequestReload();
+            RequestReload();   // through the page gate again: the player may be on a chooser now
         }
     } else {
         g_reloadActive.store(false);
@@ -2101,8 +2102,7 @@ void AdvanceReload() {
     }
 }
 
-void RequestReload() {
-    Log("[ui] reload requested");
+static void StartFullReload() {
     // No table for this title => refuse. The alternative is replaying another game's RVAs,
     // which calls arbitrary code and zeroes arbitrary memory in this process: FrostMod
     // v0.10.0 did exactly that on GP Bikes and took the game down on the first reload.
@@ -2181,11 +2181,10 @@ void RequestReload() {
 // is dropped too. One sync burst therefore costs one refresh.
 // A partial reload: replay only the given rows of the step table, in the table's own order
 // (a model list before the paint lists that index into it), then the live-paints pass.
-static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
-    Log("[ui] %s requested", what);
+static void StartPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
     if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
         Log("[reload] %s not available here - running the full reload instead", what);
-        RequestReload();
+        StartFullReload();
         return;
     }
     if (g_reloadActive.load()) {
@@ -2206,7 +2205,7 @@ static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* 
                 g_reloadPlan[g_reloadPlanN++] = i;
     if (g_reloadPlanN == 0) {
         Log("[reload] no rows for the %s in this title's table - running the full reload instead", what);
-        RequestReload();
+        StartFullReload();
         return;
     }
     g_refreshWhat = what;
@@ -2220,18 +2219,113 @@ static void RequestPartialRefresh(const uintptr_t* rvas, int nrvas, const char* 
         g_game->reload_count);
 }
 
-void RequestPaintRefresh() {
-    RequestPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas), "paint refresh");
+static void StartPaintRefresh() {
+    StartPartialRefresh(mxb::kPaintReloadRvas, (int)_countof(mxb::kPaintReloadRvas), "paint refresh");
 }
 
 // Rider gear models arrived or changed (helmets, boots, rider models, protections, helmet
 // cams) - MXB App sends this for a change under mods\rider that is not only paints. Their
 // model lists and every paint list that indexes into them, and nothing else: tracks, bikes,
 // tyres and series stay as they are.
-void RequestGearRefresh() {
+static void StartGearRefresh() {
     if (!g_reloadActive.load()) SnapshotMissingGear();
-    RequestPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
+    StartPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
 }
+
+// ---- the page gate (see refreshgate.h) ---------------------------------------------------
+// A chooser page holds pointers into the lists a refresh frees; three crashes in one
+// player's log are the game's _stricmp reading one of them, in the bike chooser's handler,
+// seconds after a full reload. So every refresh - menu, MXB App, the reload event, a track
+// or model change - waits while such a page is on the stack, and runs on the first frame
+// after the player leaves it. Requests that arrive meanwhile coalesce (refreshgate.h).
+static frostmod::RefreshKind g_refreshPending = frostmod::RefreshKind::None;
+
+// The pages on the current layer's stack, as names (the same read as ChRiding, which is the
+// stack read live on a server). -1 when unreadable.
+static int ReadPageNames(char (&names)[64][24], const char* (&ptrs)[64]) {
+    const int layer = SafeReadInt((const int*)(g_base + mxb::RVA_PAGE_LAYER));
+    if (layer < 1 || layer > 16) return -1;
+    int n = 0;
+    for (int l = layer - 1; l < layer; ++l) {
+        const uintptr_t st = g_base + mxb::RVA_PAGE_STACKS + (uintptr_t)l * mxb::PAGE_STACK_STRIDE;
+        const int depth = SafeReadInt((const int*)st);
+        if (depth < 0 || depth > mxb::PAGE_STACK_MAX) return -1;
+        for (int i = 0; i < depth && n < 64; ++i) {
+            const int page = SafeReadInt((const int*)(st + 4 + 4 * i));
+            if (page < 1 || page > mxb::PAGE_COUNT) return -1;
+            uintptr_t name = 0;
+            if (SafeReadBytes((const char*)(g_base + mxb::RVA_PAGE_TABLE +
+                                            (uintptr_t)(page - 1) * mxb::PAGE_STRIDE),
+                              (char*)&name, sizeof(name)) != sizeof(name) || !name)
+                return -1;
+            if (!SafeCopyStr((void*)name, names[n], sizeof(names[n]))) return -1;
+            ptrs[n] = names[n];
+            ++n;
+        }
+    }
+    return n;
+}
+
+// The page holding the lists, for the log; nullptr when it is safe to refresh now. Only
+// MX Bikes has the page offsets - another title (no partial refresh, full reload refused
+// unless armed) goes straight through, as before.
+static const char* RefreshBlockedBy(char (&names)[64][24]) {
+    if (g_game != &GAME_MXB || !g_contentInit) return nullptr;
+    const char* ptrs[64] = {};
+    const int n = ReadPageNames(names, ptrs);
+    if (n < 0) return "an unreadable page stack";
+    if (frostmod::RefreshSafeOnPages(ptrs, n)) return nullptr;
+    for (int i = 0; i < n; ++i)
+        if (frostmod::PageListsContent(ptrs[i])) return ptrs[i];
+    return "a content page";
+}
+
+static void StartRefresh(frostmod::RefreshKind k) {
+    switch (k) {
+    case frostmod::RefreshKind::Paints: StartPaintRefresh(); break;
+    case frostmod::RefreshKind::Gear:   StartGearRefresh();  break;
+    case frostmod::RefreshKind::Full:   StartFullReload();   break;
+    default: break;
+    }
+}
+
+void RequestRefresh(frostmod::RefreshKind k, const char* source) {
+    if (k == frostmod::RefreshKind::None) return;
+    Log("[ui] %s refresh requested (%s)", frostmod::RefreshKindName(k), source);
+    char names[64][24] = {};
+    if (const char* page = RefreshBlockedBy(names)) {
+        const frostmod::RefreshKind was = g_refreshPending;
+        g_refreshPending = frostmod::MergeRefresh(g_refreshPending, k);
+        Log("[reload] %s refresh waits: %s is open and holds the content lists (pending: %s)",
+            frostmod::RefreshKindName(k), page, frostmod::RefreshKindName(g_refreshPending));
+        if (was == frostmod::RefreshKind::None)
+            SetStatus("refresh waits until you leave this screen", 4000);
+        return;
+    }
+    // Something was waiting and this request is allowed now: run the merge of both.
+    k = frostmod::MergeRefresh(g_refreshPending, k);
+    g_refreshPending = frostmod::RefreshKind::None;
+    StartRefresh(k);
+}
+
+// Called once per frame on the render thread, before AdvanceReload.
+static void DrainPendingRefresh() {
+    if (g_refreshPending == frostmod::RefreshKind::None) return;
+    static ULONGLONG lastCheck = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastCheck < 250) return;        // the page stack, four times a second
+    lastCheck = now;
+    char names[64][24] = {};
+    if (RefreshBlockedBy(names)) return;
+    const frostmod::RefreshKind k = g_refreshPending;
+    g_refreshPending = frostmod::RefreshKind::None;
+    Log("[reload] the content page closed - running the %s refresh that waited", frostmod::RefreshKindName(k));
+    StartRefresh(k);
+}
+
+void RequestReload()       { RequestRefresh(frostmod::RefreshKind::Full, "reload"); }
+void RequestPaintRefresh() { RequestRefresh(frostmod::RefreshKind::Paints, "paint refresh"); }
+void RequestGearRefresh()  { RequestRefresh(frostmod::RefreshKind::Gear, "gear refresh"); }
 
 // ===========================================================================
 // LIVE PAINTS (add-only)
@@ -3744,14 +3838,17 @@ char                   g_statusText[128] = {0};
 // pressed. `dev` rows show only with devmenu=1 in frostmod_radar.cfg, and sit last.
 struct MenuItem { char key; const char* label; bool showsSize; int action; bool dev; };
 static const MenuItem kMenu[] = {
-    { '1', "Reload mods",                   false, 1  },
-    { '2', "Change bike / gear (pits)",     false, 10 },
-    { '3', "Bike model swap",               false, 3  },
-    { '4', "Server announcements",          false, 8  },
-    { '5', "Overlay size",                  true,  6  },
-    { '6', "Toggle this overlay",           false, 2  },
-    { '7', "Hide overlay (recording)",      false, 7  },
-    { '8', "Rebuild riders (load new gear models)", false, 9 },
+    // Refresh kinds (refreshgate.h): the smaller ones skip the slow lists (tracks, bikes).
+    { '1', "Refresh paints",                false, 11 },
+    { '2', "Refresh gear and paints",       false, 12 },
+    { '3', "Reload all mods",               false, 1  },
+    { '4', "Change bike / gear (pits)",     false, 10 },
+    { '5', "Bike model swap",               false, 3  },
+    { '6', "Server announcements",          false, 8  },
+    { '7', "Overlay size",                  true,  6  },
+    { '8', "Toggle this overlay",           false, 2  },
+    { '9', "Hide overlay (recording)",      false, 7  },
+    { '0', "Rebuild riders (load new gear models)", false, 9 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -4825,6 +4922,8 @@ extern std::atomic<bool> g_chOpen;
 void MenuAction(int d) {   // d = the row's action, not its key
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
+    case 11: RequestPaintRefresh(); g_menuOpen.store(false); break; // the six paint lists only
+    case 12: RequestGearRefresh();  g_menuOpen.store(false); break; // gear models + paint lists
     case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
@@ -5207,6 +5306,7 @@ void Tick() {
     PollCommandFiles();
 
     DrainGameThreadTasks();
+    DrainPendingRefresh();   // a refresh that waited out a chooser page, once it has closed
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 

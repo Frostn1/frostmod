@@ -65,7 +65,10 @@ title, add `--game gpb` or `--game krp`: that picks the process to wait for, the
 folder to list, and the plugin identity to answer with.
 
 - **Reload mods** - drop a `.pkz` into your mods folder, then press **`R`** in the
-  console, or **`F8`** in-game to open the FrostMod menu and pick **Reload**.
+  console, or **`F8`** in-game to open the FrostMod menu and pick **Reload all mods**. For
+  new paints only, **Refresh paints** is much faster; **Refresh gear and paints** covers new
+  helmets, boots and rider models too. A refresh asked for while a bike, paint or event
+  chooser is open waits until you leave that screen.
 - **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.

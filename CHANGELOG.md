@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 2026-10-07 - v0.49.8
+
+Refresh paints, gear, tracks or bikes alone, without crashing under an open chooser; the Coach line follows live ruts; the rejoin fix and the overjump option are removed.
 
 ### Added
 - **Refresh just paints, or just gear, from F8.** The one "Reload mods" row is now three:

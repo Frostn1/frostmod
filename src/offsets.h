@@ -65,10 +65,10 @@ constexpr uintptr_t RVA_REG_COUNT      = 0x396754;  // int32 count
 
 // Per-category content loaders live inside fcn.1400ef210 as repeated
 //   { clear list globals; loader(gameDir); loader(modsDir); } blocks. The TRACK
-//   list is qword_14109de98 (stride 1220, count dword_140f43298). RVA of the track
-//   loader (the sub that writes dword_140f43298) is still to be pinned - then a
-//   surgical reload can rebuild just the track list without the full re-init.
-constexpr uintptr_t RVA_TRACK_LOADER  = 0x000000;  // TODO: xref writer of 0x140f43298
+//   list is qword_14109de98 (stride 1220, count dword_140f43298). The track loader is
+//   the SC row 0x2460 of kReloadSteps (zeroes 0xF43298 and rebuilds the list); the
+//   tracks-only refresh replays just that row (kTrackReloadRvas).
+constexpr uintptr_t RVA_TRACK_LOADER  = 0x2460;
 constexpr uintptr_t RVA_TRACK_COUNT   = 0xf43298;  // int32 track count (dword_140f43298)
 // qword_14109de98 -> RVA 0x109de98. It's a QWORD *pointer* to the heap track array
 // (count*1220 is far too big to be inline), so deref it before indexing. (Was
@@ -506,24 +506,64 @@ constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 // Boot init also carries `cmp/jge` bail-outs between some loaders (e.g. "no bikes found
 // -> abort startup"). Those are deliberately NOT transcribed: they jump out of the
 // routine, which is meaningless when replaying just this section.
+//
+// STEP MAP (beta21e, TimeDateStamp 0x6A21833D; static RE of each loader's call tree,
+// 2026-10-07). Every loader lists its folder through scan_folder 0x158BE0, reached as bus
+// 0x30C (then 0x30D next / 0x30E close) with the folder format and ext shown. "list" is the
+// array pointer / count the row clears and rebuilds. "reads" is the only cross-row input
+// found: a global another row writes, read (not written) anywhere in this row's call tree.
+//   row rva     list (ptr/count)        scans "<fmt>" ext            reads
+//    1 0x2460   tracks 0x109DE98/0xF43298 "%stracks" /  (0x2330, ini per entry in 0x15B0)
+//               + track categories 0xF4EDB8/0xF4EE08 (0x14D0)          -
+//    2 0x1CE00  tyres 0xF48618/0x109DECC  "%styres" /  (0x1CAB0)       -
+//    3 0x1B790  rider cfgs 0xF3DC48/0xF3DC80 "%srider" cfg             -
+//    4 0x3100   bikes 0xF4EDE8/0xF48218   "%sbikes" /  (0x2810)        -
+//               + bike categories 0xF3DB40/0xF3DC88 (0x2740), and the per-bike state
+//               array 0xF48210 (see RVA_BIKE_STATE): a fresh malloc, never initialised here.
+//               The list is sorted by name afterwards (0x3260), so bike INDEXES reorder.
+//    5 0x3FA0   series 0xF3DB38/0xF3DC98  "%sseries" /  (0x3EB0, 0x38B0)
+//               reads bike categories 0xF3DB40/0xF3DC88 (0x4036..0x40C7: adds a series per
+//               bike category) and tyres 0xF48618/0x109DECC (0x38B0).
+//    6 0x171D0  paints\data.ini: resets the paint-date cache 0x109E080/0xF3DB48 (shared by
+//               every paint row, which append to it) and sets the clear flag 0xE54D50.   -
+//    7 0x17320  bike paints 0xF4EDF8/0x109DE88 "%sbikes\%s\paints" pnt, "%spaints\bikes"
+//               reads the bike list 0xF4EDE8/0xF48218: entry +0 is a BIKE INDEX.
+//    8 0x17950  fonts 0xF4EDA0/0xF3DB9C   "%smisc\fonts" /             -
+//    9 0x17F80  helmets 0xF3DC70/0xF3DC64 "%srider\helmets" /          -
+//   10 0x18360  helmet paints 0x109E090/0xF48620 "...helmets\%s\paints" pnt  helmets
+//   11 0x189C0  goggles 0xF3DC28/0x10A30F4 "...helmets\%s\goggles" pnt      helmets
+//   12 0x19060  helmet cams 0xF48610/0xF4EE00 "%srider\helmetcams" /   -
+//   13 0x1BDD0  rider models 0xF3DC68/0xF3DC60 "%srider\riders" /      -
+//   14 0x19330  suits 0xF3DC90/0xF3DB50   "...riders\%s\paints" pnt   rider models
+//   15 0x1AE10  rider fonts 0xF48658/0xF3DC8C "%srider\fonts" /        -
+//   16 0x1B420  animations 0xF3E220/0x109DE8C "%srider\animations" /   -
+//   17 0x19DA0  boots 0xF4EDB0/0xF3DB58   "%srider\boots" /            -
+//   18 0x1A110  boot paints 0xF432A0/0xF48660 "...boots\%s\paints" pnt  boots
+//   19 0x1A770  gloves 0xF48208/0xF3DC58  "...riders\%s\gloves" pnt   rider models
+//   20 0x1C140  protections 0xF432A8/0x106BB28 "%srider\protections" /  -
+//   21 0x1C450  protection paints 0xF4EDD0/0xF432C0 "...protections\%s\paints" pnt  protections
+// Nothing among the rows reads the track globals, so tracks stand alone. The bike list
+// feeds rows 5 and 7 (series by category name, bike paints by index). Outside the table,
+// the bike chooser (0x91570) keeps its filtered view INSIDE the state array (+4 slots,
+// filled by 0x8EF20) with its own count 0x4C2F18; see RVA_BIKE_CHOOSER_N.
 constexpr RLStep kReloadSteps[] = {
-    {0,0,0,0,0x2460}, {0,0,0,0,0x1CE00},                 // tracks
-    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790},
-    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x171D0}, // bikes
-    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320},
-    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950},
-    {0,0,0,0,0x17F80},
-    {1,0xF48620,0xF3DB64,0x109E090,0x18360},
-    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0},
-    {1,0xF4EE00,0x109DE90,0xF48610,0x19060},
-    {0,0,0,0,0x1BDD0},
-    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330},
-    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10},
-    {0,0,0,0,0x1B420}, {0,0,0,0,0x19DA0},
-    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110},
-    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770},
-    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140},
-    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450},
+    {0,0,0,0,0x2460,"tracks"}, {0,0,0,0,0x1CE00,"tyres"},
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790,"rider cfgs"},
+    {0,0,0,0,0x3100,"bikes"}, {0,0,0,0,0x3FA0,"series"}, {0,0,0,0,0x171D0,"paints data.ini"},
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320,"bike paints"},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950,"fonts"},
+    {0,0,0,0,0x17F80,"helmets"},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18360,"helmet paints"},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0,"goggles"},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x19060,"helmet cams"},
+    {0,0,0,0,0x1BDD0,"rider models"},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330,"suits"},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10,"rider fonts"},
+    {0,0,0,0,0x1B420,"animations"}, {0,0,0,0,0x19DA0,"boots"},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110,"boot paints"},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770,"gloves"},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140,"protections"},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450,"protection paints"},
 };
 constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
 
@@ -549,6 +589,23 @@ constexpr uintptr_t kPaintReloadRvas[] = {0x17320, 0x19330, 0x1A770, 0x1A110, 0x
 // are SC rows that come before the paint rows indexing into them in the table.
 constexpr uintptr_t kGearReloadRvas[] = {0x17F80, 0x18360, 0x189C0, 0x19060, 0x1BDD0, 0x19330,
                                          0x19DA0, 0x1A110, 0x1A770, 0x1C140, 0x1C450, 0x17320};
+// Tracks only: nothing else in the table reads the track list (STEP MAP above).
+constexpr uintptr_t kTrackReloadRvas[] = {0x2460};
+// Bikes and what is derived from them: the bike list, the series (one per bike category),
+// and the bike paints, whose entries hold bike indexes the re-sorted list invalidates.
+// Tyres stay: series reads them, but a bikes refresh leaves them as they are.
+constexpr uintptr_t kBikeReloadRvas[] = {0x3100, 0x3FA0, 0x17320};
+constexpr uintptr_t RVA_BIKES_LOADER = 0x3100;
+// Per-bike state, 8 bytes per bike: +0 u8 "available" (memset 0 then set 1 by the caching
+// pass, 0x634BB / 0x63C5B; cleared on a failed load, 0x69EEF), +4 i32 slot (= own index
+// after caching, 0x69EC7; the chooser's filtered list, written by 0x8EF20). Bike load
+// 0x3100 replaces the pointer with an uninitialised malloc and does not free the old one.
+constexpr uintptr_t RVA_BIKE_STATE   = 0xF48210;
+constexpr int       BIKE_STATE_STRIDE = 8;
+// The bike chooser's filtered count. 0x91570's ID_CURBIKE branch (0x92538..0x925BB) walks
+// [0, this) of the state slots as bike indexes and _stricmps each bike's name - the
+// 0x9259F crash. Only 0x8EF20 rebuilds it (from 0x91706 / 0x9232E); 0 is an empty chooser.
+constexpr uintptr_t RVA_BIKE_CHOOSER_N = 0x4C2F18;
 constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
 constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
 constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count

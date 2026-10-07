@@ -1204,6 +1204,8 @@ static void FindPkzRecursive(const std::string& root, const std::string& rel,
 void RequestReload();                          // fwd (defined with the reload code below)
 void RequestPaintRefresh();                    // fwd (same place: paint lists only)
 void RequestGearRefresh();                     // fwd (same place: rider gear lists)
+void RequestTrackRefresh();                    // fwd (same place: the track list)
+void RequestBikeRefresh();                     // fwd (same place: bikes, series, bike paints)
 void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why);  // fwd (bike-apply code below)
 void SetStatus(const char* s, unsigned ms);    // fwd (defined with the overlay below)
 void ClearClean();                             // fwd (defined with the overlay below)
@@ -1984,6 +1986,53 @@ static void RL_Dir(uintptr_t fn, const void* gameDir, const void* mods) {
 
 void SetStatus(const char* s, unsigned ms);   // in-game overlay status (defined below)
 
+// The bikes row (0x3100) hands the game a NEW per-bike state array (offsets.h,
+// RVA_BIKE_STATE): an uninitialised malloc, re-sorted bike indexes, and the bike chooser's
+// filtered count 0x4C2F18 still sized for the old one. The game's caching pass fills the
+// array at the next loading screen; until then the chooser walks garbage indexes - the
+// _stricmp crash at +0x9259F. So after the row, each bike gets what caching would give it:
+// +4 = its own index, +0 = the "available" flag the same folder had before (1 for a new
+// bike), and the chooser count goes to 0 (an empty view, rebuilt by 0x8EF20 when the
+// chooser is entered). 0x3100 nulls the old pointers without freeing them, so the old
+// arrays are still readable here.
+struct BikeStateSnap { uintptr_t list, state; int count; };
+static BikeStateSnap SnapBikeState(uintptr_t b) {
+    BikeStateSnap s = {0, 0, 0};
+    __try {
+        s.list  = *(const uintptr_t*)(b + mxb::RVA_BIKE_LIST);
+        s.state = *(const uintptr_t*)(b + mxb::RVA_BIKE_STATE);
+        s.count = *(const int*)(b + mxb::RVA_BIKE_COUNT);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { s = {0, 0, 0}; }
+    if (s.count < 0 || s.count > 100000) s = {0, 0, 0};
+    return s;
+}
+static int FixBikeStateSeh(uintptr_t b, const BikeStateSnap& old) {
+    int carried = 0;
+    __try {
+        const uintptr_t list  = *(const uintptr_t*)(b + mxb::RVA_BIKE_LIST);
+        const uintptr_t state = *(const uintptr_t*)(b + mxb::RVA_BIKE_STATE);
+        const int n = *(const int*)(b + mxb::RVA_BIKE_COUNT);
+        *(volatile int*)(b + mxb::RVA_BIKE_CHOOSER_N) = 0;
+        if (!list || !state || n <= 0 || n > 100000) return 0;
+        for (int i = 0; i < n; ++i) {
+            const char* name = (const char*)(list + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER);
+            uint8_t avail = 1;
+            if (old.list && old.state)
+                for (int j = 0; j < old.count; ++j)
+                    if (_stricmp(name, (const char*)(old.list + (uintptr_t)j * mxb::BIKE_STRIDE +
+                                                     mxb::BIKE_FOLDER)) == 0) {
+                        avail = *(const uint8_t*)(old.state + (uintptr_t)j * mxb::BIKE_STATE_STRIDE);
+                        ++carried;
+                        break;
+                    }
+            uint8_t* e = (uint8_t*)(state + (uintptr_t)i * mxb::BIKE_STATE_STRIDE);
+            e[0] = avail; e[1] = e[2] = e[3] = 0;
+            *(int*)(e + 4) = i;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return carried;
+}
+
 // The reload is the same surgical content-load as before (each SC/DIR fully rebuilds
 // one content list: SC = self-contained clear+scan; DIR = zero 3 list globals, then
 // scan game dir + mods). But instead of running all of them in one blocking call (the
@@ -2053,8 +2102,16 @@ static void RunReloadStep(int i) {
     // has taken the game down twice with nothing between "reload" and the next process.
     Log("[reload] step %d/%d rva=0x%zx%s%s", i + 1, g_game->reload_count, (size_t)s.rva,
         s.what ? " - " : "", s.what ? s.what : "");
+    const bool bikes = g_game == &GAME_MXB && s.rva == mxb::RVA_BIKES_LOADER;
+    const BikeStateSnap old = bikes ? SnapBikeState(b) : BikeStateSnap{0, 0, 0};
     if (!s.dir) RL_SC(b + s.rva);
     else { RL_Z32(b + s.z1); RL_Z32(b + s.z2); RL_Z64(b + s.z3); RL_Dir(b + s.rva, S, M); }
+    if (bikes) {
+        const int carried = FixBikeStateSeh(b, old);
+        Log("[reload]   bike state rebuilt (%d bike(s), %d carried over%s); chooser view reset",
+            SafeReadInt((const int*)(b + mxb::RVA_BIKE_COUNT)), carried < 0 ? 0 : carried,
+            carried < 0 ? ", FAULTED" : "");
+    }
 }
 
 // Called once per frame on the render thread (from Tick). Runs at most ONE step, so a
@@ -2181,7 +2238,8 @@ static void StartFullReload() {
 // is dropped too. One sync burst therefore costs one refresh.
 // A partial reload: replay only the given rows of the step table, in the table's own order
 // (a model list before the paint lists that index into it), then the live-paints pass.
-static void StartPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what) {
+static void StartPartialRefresh(const uintptr_t* rvas, int nrvas, const char* what,
+                                bool repaint = true) {
     if (g_game != &GAME_MXB || !g_game->reload_verified || !g_contentInit) {
         Log("[reload] %s not available here - running the full reload instead", what);
         StartFullReload();
@@ -2210,7 +2268,7 @@ static void StartPartialRefresh(const uintptr_t* rvas, int nrvas, const char* wh
     }
     g_refreshWhat = what;
     g_reloadPaintsOnly = true;
-    g_reapplyAll = true;
+    g_reapplyAll = repaint;   // a tracks refresh leaves every paint list as it was
     g_reloadCur = 0; g_reloadStart = 0; g_reloadDone.store(0); g_reloadPrimed = false;
     SnapshotMissingPaints();
     g_reloadActive.store(true);
@@ -2230,6 +2288,20 @@ static void StartPaintRefresh() {
 static void StartGearRefresh() {
     if (!g_reloadActive.load()) SnapshotMissingGear();
     StartPartialRefresh(mxb::kGearReloadRvas, (int)_countof(mxb::kGearReloadRvas), "gear refresh");
+}
+
+// New or changed tracks: the track list alone. No other row of the table reads it (STEP MAP
+// in offsets.h), so bikes, gear, paints, tyres and series stay as they are.
+static void StartTrackRefresh() {
+    StartPartialRefresh(mxb::kTrackReloadRvas, (int)_countof(mxb::kTrackReloadRvas), "track refresh",
+                        false);
+}
+
+// New or changed bikes: the bike list, the series (one per bike category), and the bike
+// paints, whose entries are indexes into the re-sorted bike list. The bikes row is followed
+// by the bike state fix-up (RunReloadStep), then the live-paints pass as for paints.
+static void StartBikeRefresh() {
+    StartPartialRefresh(mxb::kBikeReloadRvas, (int)_countof(mxb::kBikeReloadRvas), "bike refresh");
 }
 
 // ---- the page gate (see refreshgate.h) ---------------------------------------------------
@@ -2284,6 +2356,8 @@ static void StartRefresh(frostmod::RefreshKind k) {
     switch (k) {
     case frostmod::RefreshKind::Paints: StartPaintRefresh(); break;
     case frostmod::RefreshKind::Gear:   StartGearRefresh();  break;
+    case frostmod::RefreshKind::Tracks: StartTrackRefresh(); break;
+    case frostmod::RefreshKind::Bikes:  StartBikeRefresh();  break;
     case frostmod::RefreshKind::Full:   StartFullReload();   break;
     default: break;
     }
@@ -2326,6 +2400,8 @@ static void DrainPendingRefresh() {
 void RequestReload()       { RequestRefresh(frostmod::RefreshKind::Full, "reload"); }
 void RequestPaintRefresh() { RequestRefresh(frostmod::RefreshKind::Paints, "paint refresh"); }
 void RequestGearRefresh()  { RequestRefresh(frostmod::RefreshKind::Gear, "gear refresh"); }
+void RequestTrackRefresh() { RequestRefresh(frostmod::RefreshKind::Tracks, "track refresh"); }
+void RequestBikeRefresh()  { RequestRefresh(frostmod::RefreshKind::Bikes, "bike refresh"); }
 
 // ===========================================================================
 // LIVE PAINTS (add-only)
@@ -3841,6 +3917,8 @@ static const MenuItem kMenu[] = {
     // Refresh kinds (refreshgate.h): the smaller ones skip the slow lists (tracks, bikes).
     { '1', "Refresh paints",                false, 11 },
     { '2', "Refresh gear and paints",       false, 12 },
+    { 'T', "Refresh tracks",                false, 13 },
+    { 'B', "Refresh bikes",                 false, 14 },
     { '3', "Reload all mods",               false, 1  },
     { '4', "Change bike / gear (pits)",     false, 10 },
     { '5', "Bike model swap",               false, 3  },
@@ -4924,6 +5002,8 @@ void MenuAction(int d) {   // d = the row's action, not its key
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
     case 11: RequestPaintRefresh(); g_menuOpen.store(false); break; // the six paint lists only
     case 12: RequestGearRefresh();  g_menuOpen.store(false); break; // gear models + paint lists
+    case 13: RequestTrackRefresh(); g_menuOpen.store(false); break; // the track list only
+    case 14: RequestBikeRefresh();  g_menuOpen.store(false); break; // bikes, series, bike paints
     case 2: { bool on = !g_overlayOn.load(); g_overlayOn.store(on);
               Log("[overlay] hint %s", on ? "shown" : "hidden"); g_menuOpen.store(false); } break;
     case 3: g_menuOpen.store(false); OpenModelSwap();    break;   // swap a bike's model.edf (list UI)
@@ -5075,7 +5155,7 @@ void Tick() {
 
     // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
-    static bool prevF8 = false, prevEsc = false, prevDigit[10] = {false};
+    static bool prevF8 = false, prevEsc = false, prevKey[128] = {false};
     bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8 && !prevF8) {
         ClearClean();                                    // never open something invisible
@@ -5099,11 +5179,11 @@ void Tick() {
     prevF8 = f8;
     if (g_menuOpen.load()) {
         for (int i = 0; i < MenuCount(); ++i) {              // a row's key -> its action
-            const int d = kMenu[i].key - '0';
-            if (d < 0 || d > 9) continue;
-            bool k = (GetAsyncKeyState(kMenu[i].key) & 0x8000) != 0;
-            if (k && !prevDigit[d]) MenuAction(kMenu[i].action);
-            prevDigit[d] = k;
+            const int d = kMenu[i].key;                      // a digit or an upper-case letter
+            if (!((d >= '0' && d <= '9') || (d >= 'A' && d <= 'Z'))) continue;
+            bool k = (GetAsyncKeyState(d) & 0x8000) != 0;   // VK code == the character
+            if (k && !prevKey[d]) MenuAction(kMenu[i].action);
+            prevKey[d] = k;
         }
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
         if (esc && !prevEsc) g_menuOpen.store(false);
@@ -5755,6 +5835,14 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         RaceFilterLoad("race_filter");
         RaceFilterEnsureHooks();
         RequestReload();
+    } else if (verb == "refresh_tracks") {
+        // MXB App: only tracks changed (installed, removed, unlocked).
+        Log("[cmd] track refresh requested by MXB App");
+        RequestTrackRefresh();
+    } else if (verb == "refresh_bikes") {
+        // MXB App: a bike changed - its list, the series and the bike paints rebuild.
+        Log("[cmd] bike refresh requested by MXB App");
+        RequestBikeRefresh();
     } else if (verb == "refresh_gear") {
         Log("[cmd] gear refresh requested by MXB App");
         RequestGearRefresh();

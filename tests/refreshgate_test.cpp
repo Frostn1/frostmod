@@ -29,6 +29,14 @@ int main() {
     CHECK(MergeRefresh(RefreshKind::Full, RefreshKind::Paints) == RefreshKind::Full, "full wins");
     CHECK(MergeRefresh(RefreshKind::Paints, RefreshKind::Full) == RefreshKind::Full, "full wins (2)");
     CHECK(MergeRefresh(RefreshKind::None, RefreshKind::None) == RefreshKind::None, "nothing");
+    CHECK(MergeRefresh(RefreshKind::Tracks, RefreshKind::Tracks) == RefreshKind::Tracks, "tracks+tracks");
+    CHECK(MergeRefresh(RefreshKind::None, RefreshKind::Bikes) == RefreshKind::Bikes, "none+bikes");
+    CHECK(MergeRefresh(RefreshKind::Bikes, RefreshKind::None) == RefreshKind::Bikes, "bikes+none");
+    CHECK(MergeRefresh(RefreshKind::Tracks, RefreshKind::Bikes) == RefreshKind::Full, "tracks+bikes -> full");
+    CHECK(MergeRefresh(RefreshKind::Bikes, RefreshKind::Paints) == RefreshKind::Full,
+          "bikes+paints -> full (bikes rebuilds the bike paints only)");
+    CHECK(MergeRefresh(RefreshKind::Gear, RefreshKind::Tracks) == RefreshKind::Full, "gear+tracks -> full");
+    CHECK(MergeRefresh(RefreshKind::Full, RefreshKind::Bikes) == RefreshKind::Full, "full covers bikes");
 
     // Kind names from the command channel.
     CHECK(ParseRefreshKind("paints") == RefreshKind::Paints, "paints");
@@ -36,8 +44,10 @@ int main() {
     CHECK(ParseRefreshKind("gear") == RefreshKind::Gear, "gear");
     CHECK(ParseRefreshKind("full") == RefreshKind::Full, "full");
     CHECK(ParseRefreshKind("ALL") == RefreshKind::Full, "all");
-    CHECK(ParseRefreshKind("tracks") == RefreshKind::None, "tracks is not a kind (unproven rows)");
-    CHECK(ParseRefreshKind("bikes") == RefreshKind::None, "bikes is not a kind (unproven rows)");
+    CHECK(ParseRefreshKind("tracks") == RefreshKind::Tracks, "tracks");
+    CHECK(ParseRefreshKind("Track") == RefreshKind::Tracks, "track, any case");
+    CHECK(ParseRefreshKind("bikes") == RefreshKind::Bikes, "bikes");
+    CHECK(ParseRefreshKind("BIKE") == RefreshKind::Bikes, "bike, any case");
     CHECK(ParseRefreshKind("") == RefreshKind::None, "empty");
     CHECK(ParseRefreshKind("paintsx") == RefreshKind::None, "no prefix match");
     CHECK(ParseRefreshKind(nullptr) == RefreshKind::None, "null");

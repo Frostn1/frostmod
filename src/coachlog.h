@@ -63,6 +63,46 @@ inline bool ShouldRestart(size_t have, size_t adding) {
     return have + adding > kMaxBytes;
 }
 
+/// Full, the log is rotated rather than stopped (after 0.49.7). Until then a full log simply stopped
+/// writing, so a long evening lost everything after its first hours: on 10-05 the cap was hit at
+/// 22:56 and the session Sean then reported on had no lines at all. Now the full file becomes
+/// `mxbcoach.log.1` (replacing the one before) and a fresh one starts with the newest lines, its
+/// first lines a copy of the startup ones (Head), which are the decisions worth having in every
+/// file: the version, the paths, what hud.ini said.
+constexpr size_t      kHeadBytes  = 8 * 1024;
+constexpr const char* kRotatedExt = ".1";
+
+/// The log's first lines, up to kHeadBytes; the first one that does not fit ends it.
+class Head {
+public:
+    void add(const std::string& line) {
+        if (full_) return;
+        if (bytes_ + line.size() > kHeadBytes) {
+            full_ = true;
+            return;
+        }
+        lines_.push_back(line);
+        bytes_ += line.size();
+    }
+    const std::vector<std::string>& lines() const { return lines_; }
+    size_t                          bytes() const { return bytes_; }
+    bool                            full() const { return full_; }
+    void                            clear() { lines_.clear(), bytes_ = 0, full_ = false; }
+
+private:
+    std::vector<std::string> lines_;
+    size_t                   bytes_ = 0;
+    bool                     full_  = false;
+};
+
+/// What a rotated log starts with: a line saying so, then the startup lines again.
+inline std::string RotatedStart(const std::string& stamp, const Head& head) {
+    std::string s = Line(stamp, "log", std::string("full; the older lines are in mxbcoach.log") + kRotatedExt +
+                                           ". The startup lines again:");
+    for (const std::string& l : head.lines()) s += l;
+    return s;
+}
+
 // ---------------------------------------------------------------------------------------
 // The lines that answer the questions we actually get asked. Composed here, and pinned by the
 // test, so the wording cannot drift into something that reads the same but says less.

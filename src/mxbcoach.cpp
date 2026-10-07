@@ -110,6 +110,7 @@ std::string           g_grid_bad;  // the stamp of a grid file that didn't parse
 coachline::GroundGrid        g_live;
 coachline::AlignCheck        g_live_align;
 const coachline::GroundGrid* g_ground_was = nullptr;  // the ground the line used last frame
+int                          g_ground_said = -1;      // the GroundSource last logged this session, -1 none
 // The sampler's own: touched only by LiveGroundStep, on the telemetry thread, and never under
 // g_mu. The game's Draw waits on g_mu, so nothing that asks the game anything may hold it (0.46.0
 // held it from the first telemetry tick and the game hung).
@@ -336,6 +337,23 @@ bool                     g_log_stop = false;
 std::vector<std::string> g_log_spill;
 DWORD                    g_render_tid = 0;  // the thread that presents frames, once known
 
+coachlog::Head           g_log_head;  // the writer thread's: the startup lines, for each rotated file
+
+std::string LogStamp();
+/// The writer thread's: the full log becomes mxbcoach.log.1 and a fresh one starts (coachlog.h).
+void LogRotate() {
+    std::fclose(g_log);
+    g_log                  = nullptr;
+    g_log_bytes            = 0;
+    const std::string path = g_base + "mxbcoach.log";
+    MoveFileExA(path.c_str(), (path + coachlog::kRotatedExt).c_str(), MOVEFILE_REPLACE_EXISTING);
+    g_log = std::fopen(path.c_str(), "wb");
+    if (!g_log) return;
+    const std::string start = coachlog::RotatedStart(LogStamp(), g_log_head);
+    std::fwrite(start.data(), 1, start.size(), g_log);
+    g_log_bytes = start.size();
+}
+
 std::string LogStamp() {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -356,13 +374,15 @@ DWORD WINAPI LogWriter(LPVOID) {
         }
         if (g_log && !batch.empty()) {
             for (const std::string& line : batch) {
-                // Full: stop writing rather than grow without limit. The head of the log holds the
-                // startup decisions, which are the ones worth keeping.
-                if (coachlog::ShouldRestart(g_log_bytes, line.size())) break;
+                // Full: rotated (coachlog::Head), not stopped - the newest lines are the ones a
+                // report is about. The startup lines open every file.
+                if (coachlog::ShouldRestart(g_log_bytes, line.size())) LogRotate();
+                if (!g_log) break;
+                g_log_head.add(line);
                 std::fwrite(line.data(), 1, line.size(), g_log);
                 g_log_bytes += line.size();
             }
-            std::fflush(g_log);
+            if (g_log) std::fflush(g_log);
         }
         batch.clear();
         if (stop) return 0;
@@ -394,6 +414,7 @@ void LogOpen() {
     LogClose();
     g_log       = std::fopen((g_base + "mxbcoach.log").c_str(), "wb");
     g_log_bytes = 0;
+    g_log_head.clear();
     g_log_stop  = false;
     if (g_log) g_log_thread = CreateThread(nullptr, 0, LogWriter, nullptr, 0, nullptr);
 }
@@ -948,8 +969,6 @@ void ResetLiveGround() {
     g_live_req.store(1);
 }
 
-/// The game's ground, once it lines up with the rider (or until the check says).
-bool LiveGroundOn() { return g_live.ready() && (!g_live_align.result().done || g_live_align.result().ok); }
 
 /// A marker kept on disk only while a grid is being asked for (it holds the version, nothing of
 /// the ground). Still there when the game next starts means the game hung or died mid-way: the
@@ -994,13 +1013,96 @@ int NextLiveSlot() {
 struct LiveIn {
     bool      on        = false;  // asked for, a practice run, telemetry flowing
     ULONGLONG riding_ms = 0;      // how long the rider has been riding
+    // Where the rider is and where they are going, for the refresh near them (after 0.49.7).
+    bool      have_pos  = false;
+    float     x = 0, z = 0, vx = 0, vz = 0;
 };
+/// The rider's position and travel straight off the telemetry sample (SPluginsBikeData_t).
+void LiveFillPos(LiveIn& in, const void* data, int size) {
+    if (!data || size < int(kDataVelX + 12)) return;
+    const auto* b = static_cast<const uint8_t*>(data);
+    in.x = coachcue::F32(b + kDataPosX), in.z = coachcue::F32(b + kDataPosZ);
+    in.vx = coachcue::F32(b + kDataVelX), in.vz = coachcue::F32(b + kDataVelX + 8);
+    in.have_pos = std::isfinite(in.x) && std::isfinite(in.z);
+    if (!std::isfinite(in.vx) || !std::isfinite(in.vz)) in.vx = in.vz = 0;
+}
 /// What a slice hands back, applied under g_mu.
 struct LiveOut {
-    std::vector<std::string> said;
-    bool                     publish = false, clear = false;
-    coachline::GroundGrid    grid;
+    std::vector<std::string>        said;
+    bool                            publish = false, clear = false;
+    coachline::GroundGrid           grid;
+    std::vector<coachterrain::Cell> patch;  // a refresh near the rider: the heights the game gives now
+    double                          refresh_ms = 0;  // the asking that took
 };
+
+// The refresh near the rider (coachterrain::Refresher): the sampler's own, like g_live_b.
+coachterrain::Refresher g_live_r;
+coachterrain::Pacer     g_live_rpace{coachterrain::Pacer::kRefreshDuty, coachterrain::Pacer::kNoTotal};
+coachterrain::Plan      g_live_plan;  // the lattice g_live was made on
+double                  g_live_r_ms = 0;  // asking this pass so far
+// Under g_mu: what the refreshes changed since the last summary line, and the line's clock.
+struct RefreshTally {
+    uint64_t  passes = 0, changed = 0;
+    float     most   = 0;
+    double    ms     = 0;
+    ULONGLONG since  = 0;
+} g_rtally;
+bool g_live_dirty = false;  // under g_mu: g_live changed under the line, rebuild it
+
+/// The refresh drops whatever it was doing (a new grid, a new event).
+void LiveRefreshReset() {
+    g_live_r.reset();
+    g_live_rpace.reset();
+    g_live_r_ms = 0;
+}
+
+/// One slice of re-asking the game near the rider, once the grid is made. Same 0.3 ms slices as
+/// the build, at most kRefreshDuty of wall time; a slice far over its cap turns it off for the
+/// event and the line keeps the ground it has.
+void LiveRefreshSlice(const LiveIn& in, LiveOut& out) {
+    if (!in.have_pos || g_live_rpace.tripped() || !g_live_plan.w) return;
+    LARGE_INTEGER f, t0, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    const double ms_per_tick = 1000.0 / double(f.QuadPart);
+    const double start_ms    = double(t0.QuadPart) * ms_per_tick;
+    if (!g_live_r.running()) {
+        if (!g_live_r.due(start_ms) || !g_live_r.start(g_live_plan, in.x, in.z, in.vx, in.vz, start_ms)) return;
+        g_live_r_ms = 0;
+    }
+    if (!g_live_rpace.may_run(start_ms)) return;
+    const uint8_t* slot = coachterrain::game::Slot(g_terrain, g_live_slot);
+    const LONGLONG cap  = LONGLONG(coachterrain::Pacer::kSliceMs / ms_per_tick);
+    const auto     ask  = [&](float x, float z, float& y) { return coachterrain::game::Ask(g_terrain, slot, x, z, y); };
+    long           got  = 0;
+    do {
+        got = g_live_r.run(ask, 64);
+        QueryPerformanceCounter(&t);
+    } while (got >= 0 && g_live_r.running() && t.QuadPart - t0.QuadPart < cap);
+    const double slice_ms = double(t.QuadPart - t0.QuadPart) * ms_per_tick;
+    g_live_r_ms += slice_ms;
+    if (got < 0) {
+        out.said.push_back("the game's height query faulted while refreshing near the rider; off until the game "
+                           "restarts. The line keeps the ground it has");
+        g_terrain_state = -1;
+        LiveRefreshReset();
+        return;
+    }
+    if (!g_live_rpace.done(start_ms + slice_ms, slice_ms)) {
+        char msg[220];
+        std::snprintf(msg, sizeof(msg),
+                      "refresh near the rider off for this event: the game took %.1f ms to answer one slice. The line "
+                      "keeps the ground it has, without newer ruts",
+                      slice_ms);
+        out.said.push_back(msg);
+        g_live_r.reset();
+        return;
+    }
+    if (!g_live_r.running()) {
+        out.patch      = g_live_r.take();
+        out.refresh_ms = g_live_r_ms;
+    }
+}
 
 /// One slice of the game's ground. Not under g_mu (see g_terrain). Only once the rider has been
 /// riding a few seconds and the slot's heightfield has settled; at most a millisecond of asking a
@@ -1026,16 +1128,21 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
     }
     const ULONGLONG now = GetTickCount64();
     // Built: still the slot's heightfield? A track reloaded under us is a different one.
+    // Built: kept current near the rider, where the ruts are dug (LiveRefreshSlice).
     if (g_live_built) {
-        if (now - g_live_check_ms < 1000) return;
-        g_live_check_ms = now;
-        if (coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, g_live_slot)) != g_live_hd) {
-            out.said.push_back("the game's ground changed under the line (track reloaded); sampling it again");
-            out.clear    = true;
-            g_live_built = false;
-            g_live_slot  = 0;
-            g_live_seen  = {};
+        if (now - g_live_check_ms >= 1000) {
+            g_live_check_ms = now;
+            if (coachterrain::ReadHeader(coachterrain::game::Slot(g_terrain, g_live_slot)) != g_live_hd) {
+                out.said.push_back("the game's ground changed under the line (track reloaded); sampling it again");
+                out.clear    = true;
+                g_live_built = false;
+                g_live_slot  = 0;
+                g_live_seen  = {};
+                LiveRefreshReset();
+                return;
+            }
         }
+        LiveRefreshSlice(in, out);
         return;
     }
     if (g_live_b.state() != coachterrain::Builder::RUNNING) {
@@ -1106,6 +1213,8 @@ void LiveGroundSlice(const LiveIn& in, LiveOut& out) {
         case coachterrain::Builder::DONE: {
             const double share = 100.0 * double(g_live_b.answered()) / double(g_live_b.total());
             g_live_hd          = g_live_b.header();
+            g_live_plan        = g_live_b.plan();
+            LiveRefreshReset();
             out.grid           = g_live_b.take();
             out.publish        = true;
             g_live_built       = true;
@@ -1150,12 +1259,16 @@ void LiveGroundStep(const LiveIn& in) {
             g_live_b.reset();
             g_live_built = g_live_said = false;
             g_live_seen  = {};
+            g_live_plan  = {};
+            LiveRefreshReset();
             break;
         case 2:
             if (g_live_built) ++g_live_slot;
             g_live_b.reset();
             g_live_built = g_live_said = false;
             g_live_seen  = {};
+            g_live_plan  = {};
+            LiveRefreshReset();
             break;
         default: break;
     }
@@ -1165,8 +1278,13 @@ void LiveGroundStep(const LiveIn& in) {
     static bool    has_pending = false;
     LiveOut        out;
     LiveGroundSlice(in, out);
-    if (!out.said.empty() || out.publish || out.clear) {
+    static coachterrain::Applied early;  // a refresh written into a grid not handed over yet
+    static uint64_t              early_passes = 0;
+    static double                early_ms     = 0;
+    const bool                   refreshed    = !out.patch.empty();
+    if (!out.said.empty() || out.publish || out.clear || refreshed) {
         for (std::string& m : out.said) pending.said.push_back(std::move(m));
+        if (out.clear || out.publish) pending.patch.clear();  // made for the grid being replaced
         if (out.clear) {
             pending.clear   = true;
             pending.publish = false;
@@ -1174,6 +1292,18 @@ void LiveGroundStep(const LiveIn& in) {
         if (out.publish) {
             pending.publish = true;
             pending.grid    = std::move(out.grid);
+        }
+        if (refreshed) {
+            if (pending.publish) {
+                // The grid it was asked for is still here: written straight into it.
+                const coachterrain::Applied a = coachterrain::Apply(pending.grid, out.patch);
+                early.changed += a.changed;
+                if (std::fabs(a.most) > std::fabs(early.most)) early.most = a.most;
+            } else {
+                pending.patch.insert(pending.patch.end(), out.patch.begin(), out.patch.end());
+            }
+            ++early_passes;
+            early_ms += out.refresh_ms;
         }
         has_pending = true;
     }
@@ -1190,7 +1320,35 @@ void LiveGroundStep(const LiveIn& in) {
         g_live = std::move(pending.grid);
         g_live_align.reset();
     }
+    // The ruts near the rider, as the game has them now.
+    if (!stale && !pending.clear && g_live.ready()) {
+        coachterrain::Applied a = coachterrain::Apply(g_live, pending.patch);
+        a.changed += early.changed;
+        if (std::fabs(early.most) > std::fabs(a.most)) a.most = early.most;
+        if (a.changed) g_live_dirty = true;
+        g_rtally.passes += early_passes;
+        g_rtally.changed += a.changed;
+        g_rtally.ms += early_ms;
+        if (std::fabs(a.most) > std::fabs(g_rtally.most)) g_rtally.most = a.most;
+    }
+    early        = {};
+    early_passes = 0;
+    early_ms     = 0;
     for (const std::string& m : pending.said) Log("terrain", m);
+    // What the refresh has been doing, every half minute while it runs.
+    const ULONGLONG now = GetTickCount64();
+    if (!g_rtally.since) g_rtally.since = now;
+    if (g_rtally.passes && now - g_rtally.since >= 30000) {
+        char msg[240];
+        std::snprintf(msg, sizeof(msg),
+                      "refreshed near the rider: %llu passes in %.0f s, %llu cells moved (most %+.2f m), %.0f ms of "
+                      "asking",
+                      (unsigned long long)g_rtally.passes, double(now - g_rtally.since) / 1000.0,
+                      (unsigned long long)g_rtally.changed, double(g_rtally.most), g_rtally.ms);
+        Log("terrain", msg);
+        g_rtally = RefreshTally{};
+        g_rtally.since = now;
+    }
     pending     = LiveOut{};
     has_pending = false;
 }
@@ -3651,9 +3809,18 @@ BOOL WINAPI hkSwap(HDC hdc) {
                     }
                     // The game's own ground first, then the track's grid file, each once it is known to
                     // line up (or until the check says). A change of ground remakes what was read off it.
-                    g_extras.grid = LiveGroundOn() ? &g_live
-                                    : g_grid.ready() && (!g_align.result().done || g_align.result().ok) ? &g_grid
-                                                                                                         : nullptr;
+                    // The live ground wins whenever it is there (coachline::PickGround): it is the only one
+                    // with the ruts in it.
+                    const coachline::GroundSource gsrc = coachline::PickGround(
+                        g_live.ready(), g_live_align.result(), g_grid.ready(), g_align.result(), g_extras.terrain_k != 0);
+                    g_extras.grid = gsrc == coachline::GroundSource::LIVE   ? &g_live
+                                    : gsrc == coachline::GroundSource::FILE ? &g_grid
+                                                                            : nullptr;
+                    // Ruts the refresh found under the line: rebuilt on them now, not two metres on.
+                    if (g_live_dirty) {
+                        g_live_dirty = false;
+                        if (g_extras.grid == &g_live) g_ribbon.invalidate();
+                    }
                     if (g_extras.grid != g_ground_was) {
                         g_ground_was     = g_extras.grid;
                         g_jump_ver       = ~0u;
@@ -3682,6 +3849,11 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         if (!std::isfinite(g_ground_s) || std::fabs(target - g_ground_s) > 5.0f) g_ground_s = target;
                         else g_ground_s += (std::max)(-0.02f, (std::min)(0.02f, target - g_ground_s));
                         at.ground = g_ground_s;
+                        // Which ground the line stands on, said once a session and again when it changes.
+                        if (int(gsrc) != g_ground_said) {
+                            g_ground_said = int(gsrc);
+                            Log("ground", std::string("the line stands on ") + coachline::GroundSourceText(gsrc));
+                        }
                         // With a pace hint showing, the line's colours carry it (coachpace::Recolour).
                         const bool pace = PaceOn() && g_pace_hint.kind != coachpace::NONE;
                         g_pace_ex.grid  = g_extras.grid;  // the same ground under both
@@ -4047,6 +4219,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     g_have_sample = false;
     g_cam_since   = 0;
     g_dsnap_reset = true;
+    g_ground_said = -1;  // the line's ground is said again for each session
     // The bottomed marks belong to the stint, not to the session.
     g_susp[0] = g_susp[1] = g_susp_deep[0] = g_susp_deep[1] = 0;
     g_have_susp = false;
@@ -4206,6 +4379,7 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
     LiveIn live;
     live.on        = g_hud_set.enabled && g_hud_set.ground && g_practice && g_have_sample;
     live.riding_ms = g_ride_since ? GetTickCount64() - g_ride_since : 0;
+    LiveFillPos(live, _pData, _iDataSize);
     return live;
 }
 
@@ -4298,6 +4472,7 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
         in.on                 = g_live_on.load();
         const ULONGLONG since = g_live_ride_since.load();
         in.riding_ms          = since ? GetTickCount64() - since : 0;
+        LiveFillPos(in, _pData, _iDataSize);
         LiveGroundStep(in);
     } else {
         // No worker (it could not be started): as before.

@@ -59,6 +59,8 @@
 #include <memory>
 #include "crashreport.h"
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
+#include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
+#include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
 static frostmod::session::Block* g_sessionBlock = nullptr;
@@ -3783,6 +3785,10 @@ static void OverlaySettingsPath(char* out, size_t n) {
 // devmenu=1 in frostmod_radar.cfg shows the developer rows of the F8 menu (the
 // experimental rider rebuild). Off for players.
 static bool g_devMenu = false;
+// memdiag=1 in frostmod_radar.cfg: the GL memory diagnostic (MEMDIAG section). Read early
+// by MdFlagSet() so the hooks go in before the game uploads anything; kept here so a save
+// of the overlay settings does not drop it.
+static std::atomic<bool> g_memDiag{false};
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3792,6 +3798,7 @@ static void SaveOverlaySettings() {
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     if (g_devMenu) fprintf(f, "devmenu=1\n");
+    if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3801,6 +3808,8 @@ static void LoadOverlaySettings() {
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
+        // Only kept for the next save: whether the hooks went in was decided at load.
+        else if (sscanf_s(line, "memdiag=%d",  &v) == 1) g_memDiag.store(v != 0);
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -5026,6 +5035,248 @@ void MenuAction(int d) {   // d = the row's action, not its key
     //   DumpTrackList()                  - track list -> log   OpenDirectConnect() - direct connect
 }
 
+// ===========================================================================
+// MEMDIAG  -  where the game's system RAM goes (opt-in: memdiag=1 in frostmod_radar.cfg)
+//
+// A stock game was seen at 9 GB. MX Bikes renders with OpenGL, and the driver keeps a
+// system-RAM copy of what it is handed, so the question is how much of that is texture /
+// buffer data (which compressed textures would shrink) and how much is the game's own heap.
+// These hooks only count: every one calls the game's function first, unchanged, and then
+// records what was uploaded (src/memdiag.h). Every 10 s and on each track load the log gets
+// the live GL totals next to the process's PrivateUsage / WorkingSet / PagefileUsage.
+//
+// The entry points are the ones the game actually uses. Imported from OPENGL32.dll (its
+// import table): glTexImage2D, glTexSubImage2D, glDeleteTextures. Resolved by name through
+// wglGetProcAddress (the names are in the exe): glCompressedTexImage2DARB, glBufferDataARB,
+// glDeleteBuffersARB. It imports nothing from GLU32, so gluBuild2DMipmaps is not used.
+// The ARB ones are the driver's own addresses, so they are hooked on the render thread with
+// the context current, the way mxbcoach hooks its shader entry points.
+// ===========================================================================
+static std::atomic<bool> g_mdLive{false};       // hooks in and recording
+static std::mutex        g_mdMutex;             // guards g_mdTracker
+static memdiag::Tracker  g_mdTracker;
+static std::atomic<uint64_t> g_mdSubCalls{0};   // glTexSubImage2D: counted without the lock
+static std::atomic<uint64_t> g_mdSubBytes{0};
+
+using MdTexImage2D_t  = void(APIENTRY*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+using MdTexSub2D_t    = void(APIENTRY*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+using MdDeleteNames_t = void(APIENTRY*)(GLsizei, const GLuint*);
+using MdCompTex2D_t   = void(APIENTRY*)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void*);
+using MdBufferData_t  = void(APIENTRY*)(GLenum, ptrdiff_t, const void*, GLenum);
+static MdTexImage2D_t  g_mdoTexImage2D   = nullptr;
+static MdTexSub2D_t    g_mdoTexSub2D     = nullptr;
+static MdDeleteNames_t g_mdoDeleteTex    = nullptr;
+static MdCompTex2D_t   g_mdoCompTex2D    = nullptr;
+static MdBufferData_t  g_mdoBufferData   = nullptr;
+static MdDeleteNames_t g_mdoDeleteBufs   = nullptr;
+
+// The texture an upload to `target` lands in, read from the current context's binding. A
+// target we do not follow (rectangle, 3D, proxies) gives false and is counted as traffic only.
+static bool MdBoundTexture(GLenum target, GLuint* id, int* face) {
+    GLenum q;
+    if (target == GL_TEXTURE_2D) { q = 0x8069 /*GL_TEXTURE_BINDING_2D*/; *face = 0; }
+    else if (target >= 0x8515 && target <= 0x851A) { q = 0x8514 /*CUBE_MAP*/; *face = (int)(target - 0x8515); }
+    else return false;
+    GLint v = 0;
+    glGetIntegerv(q, &v);
+    *id = (GLuint)v;
+    return true;
+}
+static GLuint MdBoundBuffer(GLenum target) {
+    GLenum q;
+    switch (target) {
+    case 0x8892: q = 0x8894; break;   // ARRAY_BUFFER
+    case 0x8893: q = 0x8895; break;   // ELEMENT_ARRAY_BUFFER
+    case 0x88EB: q = 0x88ED; break;   // PIXEL_PACK_BUFFER
+    case 0x88EC: q = 0x88EF; break;   // PIXEL_UNPACK_BUFFER
+    default: return 0;
+    }
+    GLint v = 0;
+    glGetIntegerv(q, &v);
+    return (GLuint)v;
+}
+
+// Any failure in here (an allocation, say) turns the diagnostic off rather than the game.
+static void MdRecordLevel(GLenum target, GLint level, uint32_t fmt, GLsizei w, GLsizei h,
+                          uint64_t bytes, bool precompressed) {
+    if (target == 0x8064 /*PROXY_2D*/ || target == 0x851B /*PROXY_CUBE*/) return;
+    GLuint id = 0; int face = 0;
+    if (!MdBoundTexture(target, &id, &face)) id = 0;
+    try {
+        std::lock_guard<std::mutex> lk(g_mdMutex);
+        g_mdTracker.TexLevel(id, face, level, fmt, w, h, bytes, precompressed);
+    } catch (...) { g_mdLive.store(false); }
+}
+
+static void APIENTRY hkMdTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
+                                    GLint border, GLenum format, GLenum type, const void* px) {
+    g_mdoTexImage2D(target, level, ifmt, w, h, border, format, type, px);
+    if (g_mdLive.load(std::memory_order_relaxed))
+        MdRecordLevel(target, level, (uint32_t)ifmt, w, h, memdiag::LevelBytes((uint32_t)ifmt, w, h), false);
+}
+static void APIENTRY hkMdCompTex2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
+                                   GLint border, GLsizei imageSize, const void* data) {
+    g_mdoCompTex2D(target, level, ifmt, w, h, border, imageSize, data);
+    if (g_mdLive.load(std::memory_order_relaxed))
+        MdRecordLevel(target, level, (uint32_t)ifmt, w, h, imageSize > 0 ? (uint64_t)imageSize : 0, true);
+}
+static void APIENTRY hkMdTexSub2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                                  GLenum format, GLenum type, const void* px) {
+    g_mdoTexSub2D(target, level, x, y, w, h, format, type, px);
+    if (g_mdLive.load(std::memory_order_relaxed)) {
+        g_mdSubCalls.fetch_add(1, std::memory_order_relaxed);
+        g_mdSubBytes.fetch_add(memdiag::TransferBytes(format, type, w, h), std::memory_order_relaxed);
+    }
+}
+static void APIENTRY hkMdDeleteTex(GLsizei n, const GLuint* ids) {
+    // Recorded first, while the names still mean what the game meant by them.
+    if (g_mdLive.load(std::memory_order_relaxed) && ids && n > 0 && n < (1 << 20)) {
+        try {
+            std::lock_guard<std::mutex> lk(g_mdMutex);
+            for (GLsizei i = 0; i < n; ++i) g_mdTracker.DeleteTexture(ids[i]);
+        } catch (...) { g_mdLive.store(false); }
+    }
+    g_mdoDeleteTex(n, ids);
+}
+static void APIENTRY hkMdBufferData(GLenum target, ptrdiff_t size, const void* data, GLenum usage) {
+    g_mdoBufferData(target, size, data, usage);
+    if (g_mdLive.load(std::memory_order_relaxed)) {
+        const GLuint id = MdBoundBuffer(target);
+        try {
+            std::lock_guard<std::mutex> lk(g_mdMutex);
+            g_mdTracker.BufferData(id, (int64_t)size);
+        } catch (...) { g_mdLive.store(false); }
+    }
+}
+static void APIENTRY hkMdDeleteBufs(GLsizei n, const GLuint* ids) {
+    if (g_mdLive.load(std::memory_order_relaxed) && ids && n > 0 && n < (1 << 20)) {
+        try {
+            std::lock_guard<std::mutex> lk(g_mdMutex);
+            for (GLsizei i = 0; i < n; ++i) g_mdTracker.DeleteBuffer(ids[i]);
+        } catch (...) { g_mdLive.store(false); }
+    }
+    g_mdoDeleteBufs(n, ids);
+}
+
+// memdiag=1 in frostmod_radar.cfg, read on its own because the hooks must go in before
+// LoadOverlaySettings runs.
+static bool MdFlagSet() {
+    char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return false;
+    FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return false;
+    char line[128]; int v = 0; bool on = false;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf_s(line, "memdiag=%d", &v) == 1) on = (v != 0);
+    fclose(f);
+    return on;
+}
+
+// One report: the process counters, the GL totals, and (when asked, or when the texture
+// totals moved) the breakdown by size and by internal format.
+static void MdReport(const char* why, bool detail) {
+    static int64_t lastTex = -1;
+    memdiag::Snapshot s;
+    try {
+        std::lock_guard<std::mutex> lk(g_mdMutex);
+        s = g_mdTracker.Snap();
+    } catch (...) { return; }
+    s.subUploaded = g_mdSubBytes.load(std::memory_order_relaxed);
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    pmc.cb = sizeof(pmc);
+    const bool havePmc = GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)) != 0;
+    const double gl = memdiag::MB(s.texLive.bytes + s.bufLive.bytes);
+    const double priv = havePmc ? (double)pmc.PrivateUsage / (1024.0 * 1024.0) : 0.0;
+    Log("[memdiag] %s: process private=%.0f MB workingset=%.0f MB pagefile=%.0f MB | GL live tex+buf=%.0f MB "
+        "(%.0f%% of private)%s",
+        why, priv, havePmc ? (double)pmc.WorkingSetSize / (1024.0 * 1024.0) : 0.0,
+        havePmc ? (double)pmc.PagefileUsage / (1024.0 * 1024.0) : 0.0, gl,
+        priv > 0 ? 100.0 * gl / priv : 0.0, g_mdLive.load() ? "" : " [recording stopped after an error]");
+    char line[900];
+    memdiag::FormatSummary(s, line, sizeof(line));
+    Log("[memdiag]   %s sub calls=%llu", line, (unsigned long long)g_mdSubCalls.load(std::memory_order_relaxed));
+    if (detail || s.texLive.bytes != lastTex) {
+        memdiag::FormatDetail(s, line, sizeof(line));
+        Log("[memdiag]   %s", line);
+    }
+    lastTex = s.texLive.bytes;
+}
+
+// Every 10 s, and when the track changes (EventInit / RaceEvent in the plugin copy, the
+// mirrored session block in the injected one - both land in the crash context's track).
+static DWORD WINAPI MdThread(LPVOID) {
+    char last[96] = {0};
+    uint64_t next = GetTickCount64() + 10000;
+    for (;;) {
+        Sleep(1000);
+        char track[96];
+        memcpy(track, frostmod::crash::TheContext().track, sizeof(track));
+        track[sizeof(track) - 1] = 0;
+        if (strcmp(track, last) != 0) {
+            strcpy_s(last, track);
+            if (track[0]) {
+                char why[128];
+                sprintf_s(why, "track load '%s'", track);
+                MdReport(why, true);
+                next = GetTickCount64() + 10000;
+                continue;
+            }
+        }
+        if (GetTickCount64() >= next) {
+            next = GetTickCount64() + 10000;
+            MdReport("10s", false);
+        }
+    }
+}
+
+// At Init: the three OPENGL32 exports the game imports, and the reporting thread.
+static void MdInstallCore() {
+    if (!MdFlagSet()) return;
+    g_memDiag.store(true);
+    HMODULE gl = GetModuleHandleA("opengl32.dll");
+    if (!gl) { Log("[memdiag] opengl32 not loaded - diagnostic off"); return; }
+    int ok = 0;
+    if (auto p = GetProcAddress(gl, "glTexImage2D"))
+        ok += InstallHook((void*)p, (void*)&hkMdTexImage2D, (void**)&g_mdoTexImage2D, "memdiag opengl32!glTexImage2D");
+    if (auto p = GetProcAddress(gl, "glTexSubImage2D"))
+        ok += InstallHook((void*)p, (void*)&hkMdTexSub2D, (void**)&g_mdoTexSub2D, "memdiag opengl32!glTexSubImage2D");
+    if (auto p = GetProcAddress(gl, "glDeleteTextures"))
+        ok += InstallHook((void*)p, (void*)&hkMdDeleteTex, (void**)&g_mdoDeleteTex, "memdiag opengl32!glDeleteTextures");
+    g_mdLive.store(true);
+    if (HANDLE t = CreateThread(nullptr, 0, MdThread, nullptr, 0, nullptr)) CloseHandle(t);
+    Log("[memdiag] ON (memdiag=1): %d of 3 texture hooks in; the ARB entry points follow on the "
+        "first frame. Reports every 10 s and on track load. Textures uploaded before this line "
+        "are not counted (their deletes show as 'untracked').", ok);
+}
+
+// First frame, render thread, context current: the extension entry points by the names the
+// game asks for. A pointer we already hooked under another name is not hooked twice.
+static void MdRenderTick() {
+    static bool done = false;
+    if (done || !g_mdLive.load(std::memory_order_relaxed)) return;
+    done = true;
+    struct H { const char* n; void* d; void** o; };
+    const H hs[] = {{"glCompressedTexImage2DARB", (void*)&hkMdCompTex2D, (void**)&g_mdoCompTex2D},
+                    {"glBufferDataARB", (void*)&hkMdBufferData, (void**)&g_mdoBufferData},
+                    {"glDeleteBuffersARB", (void*)&hkMdDeleteBufs, (void**)&g_mdoDeleteBufs}};
+    void* made[3] = {};
+    int ok = 0;
+    for (int i = 0; i < 3; ++i) {
+        void* t = (void*)wglGetProcAddress(hs[i].n);
+        // Drivers report a missing entry as 0, 1, 2, 3 or -1.
+        if (reinterpret_cast<uintptr_t>(t) <= 3 || t == (void*)-1) {
+            Log("[memdiag] %s not available from the driver - not counted", hs[i].n);
+            continue;
+        }
+        bool dup = false;
+        for (void* m : made) dup = dup || m == t;
+        if (dup) continue;
+        char name[96];
+        sprintf_s(name, "memdiag %s", hs[i].n);
+        if (InstallHook(t, hs[i].d, hs[i].o, name)) { made[i] = t; ++ok; }
+    }
+    Log("[memdiag] %d of 3 driver entry points hooked", ok);
+    MdReport("first frame", true);
+}
+
 // Crash context for the INJECTED copy, out of the plugin copy's block.
 //
 // The two copies are separate modules with separate statics, and the split runs straight
@@ -5091,6 +5342,7 @@ void Tick() {
     // at the 10 Hz the telemetry callback runs at, which is audible as stepping when you
     // ride past someone.
     SessionPublish();
+    MdRenderTick();   // memdiag=1 only: one-time hook of the driver entry points
 
     // One int read per frame, watching for the server browser's login to wedge. Cheap enough
     // to do here rather than on a timer, and the window it watches for is only five seconds
@@ -6434,6 +6686,7 @@ DWORD WINAPI Init(LPVOID) {
     } else {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
     }
+    MdInstallCore();   // memdiag=1 only (frostmod_radar.cfg): GL upload accounting
 
     // OPT-IN (frostmod.exe --dump-serverlist): hook the master opcode handler
     // (signature-validated, clean prologue) and dump the server-list blob once per

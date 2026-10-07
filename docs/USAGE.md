@@ -81,6 +81,14 @@ F-key per feature.
 With `devmenu=1` in `frostmod_radar.cfg`, an `8` row appears: **Rebuild riders
 (experimental)**, for testing.
 
+With `memdiag=1` in `frostmod_radar.cfg` (read at game start; off by default), FrostMod
+counts what the game uploads to OpenGL (textures by internal format and size, buffer
+objects) and every 10 s and on each track load writes `[memdiag]` lines to `frostmod.log`
+with those live totals next to the process's PrivateUsage / WorkingSet / PagefileUsage. It
+only counts; nothing the game does changes. For the rest of the address space,
+`scripts\memmap.ps1 -ProcessId <pid>` sums the live game's committed memory by Image
+(per module), Mapped and Private, read-only.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

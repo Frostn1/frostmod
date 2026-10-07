@@ -201,6 +201,11 @@ add_test(NAME refreshgate COMMAND refreshgate_test)
 
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.
+# memdiag=1's accounting (src/memdiag.h): texture sizes per format, live totals across
+# respecification and delete, and the log lines. Pure, so it runs anywhere.
+add_executable(memdiag_test tests/memdiag_test.cpp)
+add_test(NAME memdiag COMMAND memdiag_test)
+
 add_executable(crashreport_test tests/crashreport_test.cpp)
 add_test(NAME crashreport COMMAND crashreport_test)
 

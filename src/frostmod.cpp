@@ -60,6 +60,8 @@
 #include "crashreport.h"
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
+#include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
+#include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
 // The block MXB App reads. Null until Init maps it; every writer checks.
@@ -3789,6 +3791,13 @@ static bool g_devMenu = false;
 // by MdFlagSet() so the hooks go in before the game uploads anything; kept here so a save
 // of the overlay settings does not drop it.
 static std::atomic<bool> g_memDiag{false};
+// texcompress=1: store the game's big raw RGB/RGBA textures as DXT (MEMDIAG section,
+// src/texcompress.h). texcompressdebug=1 checks glGetError after each swap and logs every
+// one; texcompressmin=N is the smallest side swapped (default 256). Read early by
+// MdFlagSet() so the hooks go in before the game uploads anything; kept here for the save.
+static std::atomic<bool> g_texCompress{false};
+static std::atomic<bool> g_tcDebug{false};
+static std::atomic<int>  g_tcMinDim{256};
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3799,6 +3808,9 @@ static void SaveOverlaySettings() {
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
+    if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
+    if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
+    if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3810,6 +3822,9 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
         // Only kept for the next save: whether the hooks went in was decided at load.
         else if (sscanf_s(line, "memdiag=%d",  &v) == 1) g_memDiag.store(v != 0);
+        else if (sscanf_s(line, "texcompress=%d", &v) == 1) g_texCompress.store(v != 0);
+        else if (sscanf_s(line, "texcompressdebug=%d", &v) == 1) g_tcDebug.store(v != 0);
+        else if (sscanf_s(line, "texcompressmin=%d", &v) == 1 && v >= 4 && v <= 16384) g_tcMinDim.store(v);
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -5108,11 +5123,188 @@ static void MdRecordLevel(GLenum target, GLint level, uint32_t fmt, GLsizei w, G
     } catch (...) { g_mdLive.store(false); }
 }
 
+// ---------------------------------------------------------------------------
+// TEXCOMPRESS (texcompress=1): the same glTexImage2D hook asks the driver for DXT1 / DXT5
+// instead of the raw RGB / RGBA the game asks for, so the driver compresses on upload and
+// its system-RAM copy is 8x / 4x smaller. Which uploads, and why the rest are left alone,
+// is src/texcompress.h. A swapped texture that later gets glTexSubImage2D is turned back
+// into what the game asked for (read back decompressed, re-uploaded) before the update
+// lands, and its name is never swapped again while it lives.
+// ---------------------------------------------------------------------------
+static std::atomic<bool>   g_tcLive{false};
+static std::mutex          g_tcMutex;            // guards g_tcTable and the tallies
+static texcompress::Table  g_tcTable;
+static std::atomic<int>    g_tcSupported{-1};    // GL_EXT_texture_compression_s3tc: -1 not asked yet
+static uintptr_t           g_tcExeLo = 0, g_tcExeHi = 0;   // mxbikes.exe's image
+struct TcTally { uint64_t n = 0, raw = 0, dxt = 0; };
+static TcTally             g_tcSwapped[2];       // [0] DXT1, [1] DXT5: levels swapped
+static uint64_t            g_tcSkip[texcompress::SK_COUNT] = {};
+static uint64_t            g_tcSkipBytes[texcompress::SK_COUNT] = {};
+static uint64_t            g_tcUndone = 0, g_tcGlErrors = 0, g_tcLogged = 0;
+static std::atomic<uint64_t> g_tcChanges{0};     // bumps on every decision, for the reporter
+
+static bool TcSupported() {
+    const int s = g_tcSupported.load(std::memory_order_relaxed);
+    if (s >= 0) return s == 1;
+    if (!wglGetCurrentContext()) return false;   // no context on this thread: ask later
+    const char* ext = (const char*)glGetString(GL_EXTENSIONS);
+    const int now = (ext && strstr(ext, "GL_EXT_texture_compression_s3tc")) ? 1 : 0;
+    int expect = -1;
+    if (g_tcSupported.compare_exchange_strong(expect, now))
+        Log("[texcompress] GL_EXT_texture_compression_s3tc %s", now ? "supported - swapping on"
+                                                                    : "NOT supported - texcompress off");
+    return g_tcSupported.load() == 1;
+}
+
+// Decide the internal format for this upload. `idOut` gets the bound texture (0 if none).
+static GLint TcChoose(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border,
+                      GLenum format, GLenum type, const void* px, void* caller, GLuint* idOut) {
+    *idOut = 0;
+    if (target != GL_TEXTURE_2D) return ifmt;     // cheap out before any GL query
+    if (!TcSupported()) {
+        if (g_tcSupported.load(std::memory_order_relaxed) == 0) g_tcLive.store(false);
+        return ifmt;
+    }
+    GLint bound = 0;
+    glGetIntegerv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &bound);
+    *idOut = (GLuint)bound;
+    texcompress::Request r{};
+    r.target = target; r.ifmt = (uint32_t)ifmt; r.format = format; r.type = type;
+    r.level = level; r.w = w; r.h = h; r.border = border;
+    r.fromGame = (uintptr_t)caller >= g_tcExeLo && (uintptr_t)caller < g_tcExeHi;
+    GLint pbo = 0;
+    if (!px) glGetIntegerv(0x88EF /*GL_PIXEL_UNPACK_BUFFER_BINDING*/, &pbo);
+    r.hasPixels = px != nullptr || pbo != 0;
+    r.px = nullptr; r.tightRgba = false;
+    if (level == 0 && px && type == GL_UNSIGNED_BYTE && (format == GL_RGBA || format == 0x80E1 /*BGRA*/)) {
+        GLint rl = 0, sr = 0, sp = 0;
+        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rl);
+        glGetIntegerv(GL_UNPACK_SKIP_ROWS, &sr);
+        glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &sp);
+        if ((rl == 0 || rl == w) && sr == 0 && sp == 0) { r.tightRgba = true; r.px = (const uint8_t*)px; }
+    }
+    texcompress::Decision d;
+    {
+        std::lock_guard<std::mutex> lk(g_tcMutex);
+        d = g_tcTable.Choose(*idOut, r);
+        if (d.skip == texcompress::SK_NONE) {
+            TcTally& t = g_tcSwapped[d.ifmt == texcompress::kDxt5 ? 1 : 0];
+            ++t.n; t.raw += texcompress::RawBytes(w, h); t.dxt += texcompress::DxtBytes(d.ifmt, w, h);
+        } else if (d.skip > 0 && d.skip < texcompress::SK_COUNT && level == 0) {
+            ++g_tcSkip[d.skip];
+            g_tcSkipBytes[d.skip] += texcompress::RawBytes(w, h);
+        }
+    }
+    g_tcChanges.fetch_add(1, std::memory_order_relaxed);
+    return (GLint)d.ifmt;
+}
+
+// A swapped texture is about to get glTexSubImage2D: give every level we swapped back its
+// original format with its current (decompressed) texels, so the update lands on what the
+// game made. The texture is bound (the update is about to use it).
+static void TcUndo(GLenum target, GLuint id, const texcompress::Entry& e) {
+    GLint pack = 0, unpack = 0;
+    glGetIntegerv(0x88ED /*PIXEL_PACK_BUFFER_BINDING*/, &pack);
+    glGetIntegerv(0x88EF /*PIXEL_UNPACK_BUFFER_BINDING*/, &unpack);
+    using BindBuf_t = void(APIENTRY*)(GLenum, GLuint);
+    static BindBuf_t bindBuf = (BindBuf_t)wglGetProcAddress("glBindBufferARB");
+    if ((pack || unpack) && (!bindBuf || reinterpret_cast<uintptr_t>(bindBuf) <= 3)) {
+        Log("[texcompress] tex %u: sub-image update with a pixel buffer bound and no glBindBufferARB - left compressed", id);
+        return;
+    }
+    if (pack) bindBuf(0x88EB, 0);
+    if (unpack) bindBuf(0x88EC, 0);
+    glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);   glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    int n = 0;
+    std::vector<uint8_t> buf;
+    for (int lvl = 0; lvl < 32; ++lvl) {
+        if (!(e.levels & (1u << lvl))) continue;
+        GLint w = 0, h = 0;
+        glGetTexLevelParameteriv(target, lvl, GL_TEXTURE_WIDTH, &w);
+        glGetTexLevelParameteriv(target, lvl, GL_TEXTURE_HEIGHT, &h);
+        if (w <= 0 || h <= 0) continue;
+        try { buf.resize((size_t)w * (size_t)h * 4); } catch (...) { break; }
+        glGetTexImage(target, lvl, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        g_mdoTexImage2D(target, lvl, (GLint)e.origIfmt, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        if (g_mdLive.load(std::memory_order_relaxed))
+            MdRecordLevel(target, lvl, e.origIfmt, w, h, memdiag::LevelBytes(e.origIfmt, w, h), false);
+        ++n;
+    }
+    glPopClientAttrib();
+    if (pack) bindBuf(0x88EB, (GLuint)pack);
+    if (unpack) bindBuf(0x88EC, (GLuint)unpack);
+    {
+        std::lock_guard<std::mutex> lk(g_tcMutex);
+        ++g_tcUndone;
+    }
+    Log("[texcompress] tex %u (%dx%d) is updated with glTexSubImage2D: %d level(s) back to 0x%X uncompressed",
+        id, e.w0, e.h0, n, e.origIfmt);
+}
+
 static void APIENTRY hkMdTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                                     GLint border, GLenum format, GLenum type, const void* px) {
-    g_mdoTexImage2D(target, level, ifmt, w, h, border, format, type, px);
+    GLint use = ifmt;
+    GLuint id = 0;
+    if (g_tcLive.load(std::memory_order_relaxed)) {
+        try {
+            use = TcChoose(target, level, ifmt, w, h, border, format, type, px, _ReturnAddress(), &id);
+        } catch (...) { use = ifmt; g_tcLive.store(false); Log("[texcompress] error - swapping off"); }
+    }
+    if (use != ifmt && g_tcDebug.load(std::memory_order_relaxed)) {
+        // Debug: errors already pending are the game's, not ours - drain and say so.
+        for (int i = 0; i < 8; ++i) {
+            const GLenum pre = glGetError();
+            if (pre == GL_NO_ERROR) break;
+            Log("[texcompress] note: GL error 0x%X was already pending before tex %u's upload", pre, id);
+        }
+    }
+    g_mdoTexImage2D(target, level, use, w, h, border, format, type, px);
+    if (use != ifmt && g_tcDebug.load(std::memory_order_relaxed)) {
+        const GLenum err = glGetError();
+        bool log;
+        {
+            std::lock_guard<std::mutex> lk(g_tcMutex);
+            if (err != GL_NO_ERROR) { ++g_tcGlErrors; g_tcTable.Revert(id); }
+            log = g_tcLogged++ < 2000;
+        }
+        if (err != GL_NO_ERROR) {
+            Log("[texcompress] GL error 0x%X swapping tex %u level %d %dx%d to 0x%X - uploaded as given instead",
+                err, id, level, w, h, (unsigned)use);
+            g_mdoTexImage2D(target, level, ifmt, w, h, border, format, type, px);
+            use = ifmt;
+        } else if (log) {
+            Log("[texcompress] tex %u level %d %dx%d 0x%X -> %s ok", id, level, w, h, (unsigned)ifmt,
+                use == (GLint)texcompress::kDxt5 ? "DXT5" : "DXT1");
+        }
+    }
     if (g_mdLive.load(std::memory_order_relaxed))
-        MdRecordLevel(target, level, (uint32_t)ifmt, w, h, memdiag::LevelBytes((uint32_t)ifmt, w, h), false);
+        MdRecordLevel(target, level, (uint32_t)use, w, h, memdiag::LevelBytes((uint32_t)use, w, h), false);
+}
+
+// The texcompress line: what was swapped, what it saved, and why the rest was left.
+static void TcReport(const char* why) {
+    TcTally s[2]; uint64_t sk[texcompress::SK_COUNT], skb[texcompress::SK_COUNT], undone, errs;
+    {
+        std::lock_guard<std::mutex> lk(g_tcMutex);
+        s[0] = g_tcSwapped[0]; s[1] = g_tcSwapped[1];
+        memcpy(sk, g_tcSkip, sizeof(sk)); memcpy(skb, g_tcSkipBytes, sizeof(skb));
+        undone = g_tcUndone; errs = g_tcGlErrors;
+    }
+    char line[700];
+    int k = sprintf_s(line, "[texcompress] %s: swapped DXT1 %llu levels %.0f->%.0f MB, DXT5 %llu levels %.0f->%.0f MB "
+                      "(saved %.0f MB) | undone by sub-image %llu | GL errors %llu | left as given (level 0):",
+                      why, (unsigned long long)s[0].n, memdiag::MBu(s[0].raw), memdiag::MBu(s[0].dxt),
+                      (unsigned long long)s[1].n, memdiag::MBu(s[1].raw), memdiag::MBu(s[1].dxt),
+                      memdiag::MBu(s[0].raw - s[0].dxt + s[1].raw - s[1].dxt),
+                      (unsigned long long)undone, (unsigned long long)errs);
+    for (int i = 1; i < texcompress::SK_COUNT && k > 0 && k < (int)sizeof(line); ++i)
+        if (sk[i]) k += sprintf_s(line + k, sizeof(line) - k, " %s %llu/%.0fMB", texcompress::SkipName(i),
+                                  (unsigned long long)sk[i], memdiag::MBu(skb[i]));
+    Log("%s", line);
 }
 static void APIENTRY hkMdCompTex2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
                                    GLint border, GLsizei imageSize, const void* data) {
@@ -5122,6 +5314,17 @@ static void APIENTRY hkMdCompTex2D(GLenum target, GLint level, GLenum ifmt, GLsi
 }
 static void APIENTRY hkMdTexSub2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
                                   GLenum format, GLenum type, const void* px) {
+    if (g_tcLive.load(std::memory_order_relaxed) && target == GL_TEXTURE_2D) {
+        GLint bound = 0;
+        glGetIntegerv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &bound);
+        texcompress::Entry undo{};
+        bool have = false;
+        try {
+            std::lock_guard<std::mutex> lk(g_tcMutex);
+            if (const texcompress::Entry* e = g_tcTable.SubImage((uint32_t)bound)) { undo = *e; have = true; }
+        } catch (...) { g_tcLive.store(false); }
+        if (have) TcUndo(target, (GLuint)bound, undo);
+    }
     g_mdoTexSub2D(target, level, x, y, w, h, format, type, px);
     if (g_mdLive.load(std::memory_order_relaxed)) {
         g_mdSubCalls.fetch_add(1, std::memory_order_relaxed);
@@ -5135,6 +5338,10 @@ static void APIENTRY hkMdDeleteTex(GLsizei n, const GLuint* ids) {
             std::lock_guard<std::mutex> lk(g_mdMutex);
             for (GLsizei i = 0; i < n; ++i) g_mdTracker.DeleteTexture(ids[i]);
         } catch (...) { g_mdLive.store(false); }
+    }
+    if (g_tcLive.load(std::memory_order_relaxed) && ids && n > 0 && n < (1 << 20)) {
+        std::lock_guard<std::mutex> lk(g_tcMutex);
+        for (GLsizei i = 0; i < n; ++i) g_tcTable.Delete(ids[i]);
     }
     g_mdoDeleteTex(n, ids);
 }
@@ -5158,16 +5365,20 @@ static void APIENTRY hkMdDeleteBufs(GLsizei n, const GLuint* ids) {
     g_mdoDeleteBufs(n, ids);
 }
 
-// memdiag=1 in frostmod_radar.cfg, read on its own because the hooks must go in before
-// LoadOverlaySettings runs.
+// memdiag=1 / texcompress=1 (and texcompress's knobs) in frostmod_radar.cfg, read on their
+// own because the hooks must go in before LoadOverlaySettings runs. True if either is on.
 static bool MdFlagSet() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return false;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return false;
-    char line[128]; int v = 0; bool on = false;
-    while (fgets(line, sizeof(line), f))
-        if (sscanf_s(line, "memdiag=%d", &v) == 1) on = (v != 0);
+    char line[128]; int v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if      (sscanf_s(line, "memdiag=%d", &v) == 1) g_memDiag.store(v != 0);
+        else if (sscanf_s(line, "texcompress=%d", &v) == 1) g_texCompress.store(v != 0);
+        else if (sscanf_s(line, "texcompressdebug=%d", &v) == 1) g_tcDebug.store(v != 0);
+        else if (sscanf_s(line, "texcompressmin=%d", &v) == 1 && v >= 4 && v <= 16384) g_tcMinDim.store(v);
+    }
     fclose(f);
-    return on;
+    return g_memDiag.load() || g_texCompress.load();
 }
 
 // One report: the process counters, the GL totals, and (when asked, or when the texture
@@ -5215,14 +5426,18 @@ static DWORD WINAPI MdThread(LPVOID) {
             if (track[0]) {
                 char why[128];
                 sprintf_s(why, "track load '%s'", track);
-                MdReport(why, true);
+                if (g_memDiag.load()) MdReport(why, true);
+                if (g_texCompress.load()) TcReport(why);
                 next = GetTickCount64() + 10000;
                 continue;
             }
         }
         if (GetTickCount64() >= next) {
             next = GetTickCount64() + 10000;
-            MdReport("10s", false);
+            if (g_memDiag.load()) MdReport("10s", false);
+            static uint64_t tcSeen = 0;   // texcompress: only when something was decided
+            const uint64_t tc = g_tcChanges.load(std::memory_order_relaxed);
+            if (g_texCompress.load() && tc != tcSeen) { tcSeen = tc; TcReport("10s"); }
         }
     }
 }
@@ -5230,9 +5445,22 @@ static DWORD WINAPI MdThread(LPVOID) {
 // At Init: the three OPENGL32 exports the game imports, and the reporting thread.
 static void MdInstallCore() {
     if (!MdFlagSet()) return;
-    g_memDiag.store(true);
     HMODULE gl = GetModuleHandleA("opengl32.dll");
-    if (!gl) { Log("[memdiag] opengl32 not loaded - diagnostic off"); return; }
+    if (!gl) { Log("[memdiag] opengl32 not loaded - memdiag / texcompress off"); return; }
+    if (g_texCompress.load()) {
+        // Only uploads from the game itself are swapped: plugin HUD textures stay as they are.
+        HMODULE exe = GetModuleHandleA(nullptr);
+        MODULEINFO mi = {};
+        if (exe && GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof(mi))) {
+            g_tcExeLo = (uintptr_t)mi.lpBaseOfDll;
+            g_tcExeHi = g_tcExeLo + mi.SizeOfImage;
+        }
+        g_tcTable.SetMinDim(g_tcMinDim.load());
+        g_tcLive.store(g_tcExeHi != 0);
+        Log("[texcompress] ON (texcompress=1): raw RGB/RGBA textures from mxbikes.exe, power of two, "
+            ">= %d px a side, uploaded with pixels -> DXT1 (opaque) / DXT5 (alpha)%s", g_tcTable.MinDim(),
+            g_tcDebug.load() ? "; debug: glGetError after each swap" : "");
+    }
     int ok = 0;
     if (auto p = GetProcAddress(gl, "glTexImage2D"))
         ok += InstallHook((void*)p, (void*)&hkMdTexImage2D, (void**)&g_mdoTexImage2D, "memdiag opengl32!glTexImage2D");
@@ -5240,8 +5468,9 @@ static void MdInstallCore() {
         ok += InstallHook((void*)p, (void*)&hkMdTexSub2D, (void**)&g_mdoTexSub2D, "memdiag opengl32!glTexSubImage2D");
     if (auto p = GetProcAddress(gl, "glDeleteTextures"))
         ok += InstallHook((void*)p, (void*)&hkMdDeleteTex, (void**)&g_mdoDeleteTex, "memdiag opengl32!glDeleteTextures");
-    g_mdLive.store(true);
     if (HANDLE t = CreateThread(nullptr, 0, MdThread, nullptr, 0, nullptr)) CloseHandle(t);
+    if (!g_memDiag.load()) return;
+    g_mdLive.store(true);
     Log("[memdiag] ON (memdiag=1): %d of 3 texture hooks in; the ARB entry points follow on the "
         "first frame. Reports every 10 s and on track load. Textures uploaded before this line "
         "are not counted (their deletes show as 'untracked').", ok);

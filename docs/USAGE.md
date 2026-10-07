@@ -89,6 +89,18 @@ only counts; nothing the game does changes. For the rest of the address space,
 `scripts\memmap.ps1 -ProcessId <pid>` sums the live game's committed memory by Image
 (per module), Mapped and Private, read-only.
 
+With `texcompress=1` in `frostmod_radar.cfg` (read at game start; off by default, still
+experimental), FrostMod asks the graphics driver to store MX Bikes's big uncompressed
+textures as DXT (DXT1 when the texture is opaque, DXT5 when it has alpha), which shrinks the
+driver's copy in system RAM 4-8x. Only textures the game itself uploads with their pixels,
+a power of two and at least 256 px on a side (`texcompressmin=N` to change it) are touched;
+render targets, small textures, alpha/luminance and float formats, screen-sized art and
+anything a plugin draws are left as they are. A texture the game later updates in place is
+turned back into its original format before the update. The log gets a `[texcompress]`
+line every 10 s while it works, with what was swapped and why the rest was left;
+`texcompressdebug=1` also checks for a GL error after every swap (and undoes that swap if
+there is one) and logs each one.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

@@ -205,6 +205,10 @@ add_test(NAME refreshgate COMMAND refreshgate_test)
 # respecification and delete, and the log lines. Pure, so it runs anywhere.
 add_executable(memdiag_test tests/memdiag_test.cpp)
 add_test(NAME memdiag COMMAND memdiag_test)
+# texcompress=1's decision (src/texcompress.h): which uploads become DXT, one format per
+# mip chain, and sub-image updates undoing a swap. Pure, so it runs anywhere.
+add_executable(texcompress_test tests/texcompress_test.cpp)
+add_test(NAME texcompress COMMAND texcompress_test)
 
 add_executable(crashreport_test tests/crashreport_test.cpp)
 add_test(NAME crashreport COMMAND crashreport_test)

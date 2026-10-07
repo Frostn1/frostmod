@@ -109,6 +109,37 @@ static void live_paints_match_the_paints_row() {
         }
 }
 
+// Tracks-only and bikes-only replay rows of the verified table (STEP MAP in offsets.h). Each
+// row must exist; the bikes kind must hold the bike row, the series row that reads its
+// categories, and the paints row whose entries index it; tracks is the track loader alone.
+static int mx_row(uintptr_t rva) {
+    for (int i = 0; i < mxb::kReloadStepCount; ++i)
+        if (mxb::kReloadSteps[i].rva == rva) return i;
+    return -1;
+}
+static void track_and_bike_kinds_are_table_rows() {
+    for (uintptr_t rva : mxb::kTrackReloadRvas)
+        CHECK(mx_row(rva) >= 0, "track row 0x%zx is not in the reload table", (size_t)rva);
+    for (uintptr_t rva : mxb::kBikeReloadRvas)
+        CHECK(mx_row(rva) >= 0, "bike row 0x%zx is not in the reload table", (size_t)rva);
+    CHECK(sizeof(mxb::kTrackReloadRvas) / sizeof(uintptr_t) == 1 &&
+              mxb::kTrackReloadRvas[0] == mxb::RVA_TRACK_LOADER,
+          "the tracks kind is the track loader alone");
+    bool bikes = false, series = false, paints = false;
+    for (uintptr_t rva : mxb::kBikeReloadRvas) {
+        bikes |= rva == mxb::RVA_BIKES_LOADER;
+        series |= rva == 0x3FA0;
+        paints |= rva == mxb::RVA_PAINTS_LOADER;
+    }
+    CHECK(bikes && series && paints, "the bikes kind needs the bikes, series and bike paints rows");
+    // Table order runs the bike list before the rows that read it.
+    CHECK(mx_row(mxb::RVA_BIKES_LOADER) < mx_row(0x3FA0) &&
+              mx_row(mxb::RVA_BIKES_LOADER) < mx_row(mxb::RVA_PAINTS_LOADER),
+          "bikes must come before series and bike paints in the table");
+    CHECK(mxb::kReloadSteps[mx_row(mxb::RVA_BIKES_LOADER)].dir == 0, "the bikes row is SC");
+    CHECK(mxb::BIKE_STATE_STRIDE == 8, "bike state entries are 8 bytes");
+}
+
 // GP's loaders each clear their own lists and scan both directories, so every step is SC.
 // A DIR step appearing here would need z-globals and the two operands, which GP has not
 // had derived - so it would run with zeros. Fail loudly rather than let that ship.
@@ -436,6 +467,7 @@ int main() {
     detours_are_recognised_before_the_signature_check();
     mx_table_is_unchanged();
     live_paints_match_the_paints_row();
+    track_and_bike_kinds_are_table_rows();
     gp_table_is_all_self_contained();
     unconfirmed_tables_label_every_step();
     only_confirmed_tables_run_unprompted();

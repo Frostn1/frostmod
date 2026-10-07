@@ -6,9 +6,12 @@
 - **Refresh just paints, or just gear, from F8.** The one "Reload mods" row is now three:
   `1` Refresh paints (the six paint lists, then paints re-applied to riders on track), `2`
   Refresh gear and paints (rider gear models and every paint list), `3` Reload all mods (as
-  before). The other rows move down one key; Rebuild riders is now `0`. Tracks-only and
-  bikes-only are not offered: only the first tracks row and the first bikes row of the reload
-  table have a known role, so which other rows each would need is unproven.
+  before). The other rows move down one key; Rebuild riders is now `0`.
+- **Refresh tracks / Refresh bikes** (F8 `T` / `B`, and MXB App's `refresh_tracks` /
+  `refresh_bikes`). Every row of the reload table is now mapped (the STEP MAP in `offsets.h`):
+  nothing reads the track list, so tracks rebuild alone; bikes rebuild with the series (one per
+  bike category) and the bike paints (which hold bike indexes). Two waiting requests of
+  different kinds merge into the full reload.
 
 ### Fixed
 - **No reload under an open chooser.** Three crashes in one player's log were the game's
@@ -17,6 +20,10 @@
   refresh (F8, MXB App, the console's `R`, a track or model change) now waits while a bike,
   paint, profile or event-setup page is open (or the online pits, which carry the same
   chooser), and runs as soon as the player leaves it. Requests made meanwhile merge into one.
+  The cause, now traced: the bikes loader replaces the per-bike state array with an
+  uninitialised one, while the chooser keeps its old count of entries in it. After the bikes
+  row FrostMod now fills the array the way the game's caching pass does and empties the
+  chooser's view, which the game rebuilds when the chooser opens.
 - **MXB Coach: the line follows the ruts.** On a server that digs the track live (mxbserver), the
   line rode over the top of rut walls instead of down in the rut. The game's own ground was
   sampled once per event and never again, and the `.ground` file and the sheet's terrain are the

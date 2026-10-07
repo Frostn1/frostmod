@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-07 - v0.49.9
+
+Less RAM for MX Bikes: an opt-in setting uploads big textures compressed, and a memory diagnostic shows where the game's RAM goes.
+
+### Added
+- **Compressed textures (opt-in, `texcompress=1` in frostmod_radar.cfg).** MX Bikes renders with
+  OpenGL, and the driver keeps a copy of every texture in normal RAM. With this on, big RGB/RGBA
+  textures from the game are uploaded as DXT1/DXT5, so the driver's copy is 4 to 8 times
+  smaller. Measured on Cooper MX: committed memory 6,589 -> 5,253 MB, driver memory in RAM
+  3,961 -> 2,596 MB, no GL errors. Skipped: render targets, textures under 256 px or not a
+  power of two, alpha/luminance/float/depth formats, cube maps, anything a plugin uploads, and
+  any texture the game later updates in place (put back to its original format). Off by
+  default until it has been checked by eye: DXT can show blocky artifacts on some maps.
+- **Memory diagnostic (opt-in, `memdiag=1`).** Every 10 s and on track load, frostmod.log gets
+  a `[memdiag]` line: live texture bytes by format, buffer bytes, and the process's private and
+  working-set memory. `scripts/memmap.ps1` breaks a running game's memory down by type.
+
 ## 2026-10-07 - v0.49.8
 
 Refresh paints, gear, tracks or bikes alone, without crashing under an open chooser; the Coach line follows live ruts; the rejoin fix and the overjump option are removed.

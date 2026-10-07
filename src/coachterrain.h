@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace coachterrain {
 
@@ -206,26 +207,178 @@ constexpr double kSettleMs = 3000.0;
 /// and slices are spread out to a kDuty share of wall time, so a burst of telemetry calls (the
 /// game catching up after a hitch) cannot add up to a stall. A slice far over its cap (one query
 /// that took far too long) or too much asking in all trips it: off for the event.
+///
+/// The refresh near the rider (Refresher, below) runs for as long as the rider rides, so it has no
+/// total: its cost is held down by a smaller duty instead (kRefreshDuty), and one slice far over
+/// its cap still trips it.
 class Pacer {
 public:
     static constexpr double kSliceMs = 0.3, kDuty = 0.1, kOverrunMs = 8.0, kTotalMs = 2000.0;
+    static constexpr double kRefreshDuty = 0.03;  // at most 3% of wall time re-asking
+    static constexpr double kNoTotal     = 1e300;
 
-    void reset() { *this = Pacer{}; }
+    explicit Pacer(double duty = kDuty, double total_ms = kTotalMs) : duty_(duty), total_ms_(total_ms) {}
+    void reset() { next_ms_ = busy_ms_ = 0, tripped_ = false; }
     bool may_run(double now_ms) const { return !tripped_ && now_ms >= next_ms_; }
     /// A slice of `slice_ms` ended at `now_ms`. False once tripped.
     bool done(double now_ms, double slice_ms) {
         busy_ms_ += slice_ms;
-        next_ms_ = now_ms + slice_ms / kDuty;
-        if (slice_ms > kOverrunMs || busy_ms_ > kTotalMs) tripped_ = true;
+        next_ms_ = now_ms + slice_ms / duty_;
+        if (slice_ms > kOverrunMs || busy_ms_ > total_ms_) tripped_ = true;
         return !tripped_;
     }
     bool   tripped() const { return tripped_; }
     double busy_ms() const { return busy_ms_; }
 
 private:
+    double duty_, total_ms_;
     double next_ms_ = 0, busy_ms_ = 0;
     bool   tripped_ = false;
 };
+
+// ---------------------------------------------------------------------------------------
+// Keeping the grid current: the ruts (after 0.49.7)
+//
+// The grid above is made once per event, but the ground does not stay put. The game's heights
+// (track +0x750, what the sampler reads) are the .trh's base less the rut layer (+0x7A8, 16.16
+// fixed, recomputed at 0x1F6030 as rut blocks arrive), and on a server that digs the track live
+// (mxbserver) the ruts deepen all session. A grid made in the first minute keeps the ground as
+// it was then, and the line rides over the top of every rut wall dug since (Sean, 10-06: the
+// line should be down in the rut, not on top of the wall). So the square of ground the line is
+// about to cross is asked again about once a second, and whatever moved is written over the old
+// heights. The same sampler, the same 0.3 ms slices, at most kRefreshDuty of wall time, on the
+// same thread.
+
+/// Half the side of the square asked again, and how far ahead of the rider its centre is. The
+/// line is drawn kAhead (60 m) on; the near part is what the rider is about to ride and where a
+/// floating line shows, so the square runs from behind the rider to ~45 m ahead.
+constexpr float  kRefreshHalfM   = 28.0f;
+constexpr float  kRefreshLeadM   = 16.0f;
+constexpr double kRefreshEveryMs = 1000.0;
+/// A cell that moved less than this has not been dug: not counted as changed.
+constexpr float  kRefreshMovedM  = 0.01f;
+
+/// Cells (c0..c1, r0..r1 inclusive) of a plan's lattice.
+struct Window {
+    uint32_t c0 = 0, r0 = 0, c1 = 0, r1 = 0;
+    bool     ok = false;
+    uint64_t cells() const { return ok ? uint64_t(c1 - c0 + 1) * (r1 - r0 + 1) : 0; }
+};
+
+/// The lattice cells within `half` metres (a square) of (x, z), clipped to the grid; not ok when
+/// none are on it.
+inline Window WindowAround(const Plan& p, float x, float z, float half) {
+    Window w;
+    if (!p.w || !p.h || !(p.step > 0) || !std::isfinite(x) || !std::isfinite(z) || !(half > 0)) return w;
+    const float lo_c = std::ceil((x - half - p.x0) / p.step), hi_c = std::floor((x + half - p.x0) / p.step);
+    const float lo_r = std::ceil((z - half - p.z0) / p.step), hi_r = std::floor((z + half - p.z0) / p.step);
+    if (hi_c < 0 || hi_r < 0 || lo_c > float(p.w - 1) || lo_r > float(p.h - 1) || hi_c < lo_c || hi_r < lo_r) return w;
+    w.c0 = uint32_t((std::max)(0.0f, lo_c)), w.c1 = uint32_t((std::min)(float(p.w - 1), hi_c));
+    w.r0 = uint32_t((std::max)(0.0f, lo_r)), w.r1 = uint32_t((std::min)(float(p.h - 1), hi_r));
+    w.ok = true;
+    return w;
+}
+
+/// Where the square is centred: ahead of the rider along their travel, or on them standing still.
+inline void RefreshCentre(float x, float z, float vx, float vz, float& cx, float& cz) {
+    cx = x, cz = z;
+    const float v = std::sqrt(vx * vx + vz * vz);
+    if (std::isfinite(v) && v > 1.0f) cx += vx / v * kRefreshLeadM, cz += vz / v * kRefreshLeadM;
+}
+
+struct Cell {
+    uint32_t c = 0, r = 0;
+    float    y = 0;
+};
+
+/// One pass over a window, a slice at a time, into a patch: the heights the game gives now.
+/// Passes start no more often than kRefreshEveryMs apart (from start to start).
+class Refresher {
+public:
+    void reset() {
+        running_ = false;
+        next_    = 0;
+        last_ms_ = -1e300;
+        patch_.clear();
+        passes_ = 0;
+    }
+    bool running() const { return running_; }
+    bool due(double now_ms) const { return !running_ && now_ms - last_ms_ >= kRefreshEveryMs; }
+    /// A pass over the square ahead of (x, z), moving at (vx, vz). False, and nothing started,
+    /// when that square is off the grid.
+    bool start(const Plan& p, float x, float z, float vx, float vz, double now_ms) {
+        float cx, cz;
+        RefreshCentre(x, z, vx, vz, cx, cz);
+        const Window w = WindowAround(p, cx, cz, kRefreshHalfM);
+        last_ms_       = now_ms;  // a miss waits its second too
+        if (!w.ok) return false;
+        plan_ = p, win_ = w, next_ = 0, running_ = true;
+        patch_.clear();
+        patch_.reserve(size_t(w.cells()));
+        return true;
+    }
+    /// Up to `budget` samples, as Builder::run: `ask` 1 answered, 0 no answer, else it faulted.
+    /// Returns how many it asked; -1 when the sampler faulted (the pass is dropped).
+    template <class Ask>
+    long run(Ask&& ask, size_t budget) {
+        if (!running_) return 0;
+        const uint64_t total = win_.cells();
+        const uint32_t ww    = win_.c1 - win_.c0 + 1;
+        size_t         n     = 0;
+        for (; n < budget && next_ < total; ++n, ++next_) {
+            const uint32_t c = win_.c0 + uint32_t(next_ % ww), r = win_.r0 + uint32_t(next_ / ww);
+            float          x, z, y = NAN;
+            SamplePoint(plan_, c, r, x, z);
+            const int got = ask(x, z, y);
+            if (got == 1 && std::isfinite(y)) {
+                patch_.push_back({c, r, y});
+            } else if (got != 0) {
+                running_ = false;
+                patch_.clear();
+                return -1;
+            }
+        }
+        if (next_ >= total) running_ = false, ++passes_;
+        return long(n);
+    }
+    /// The finished pass's heights, handed over (empty while a pass runs).
+    std::vector<Cell> take() {
+        std::vector<Cell> p;
+        if (!running_) p.swap(patch_);
+        return p;
+    }
+    const Window& window() const { return win_; }
+    uint64_t      passes() const { return passes_; }
+
+private:
+    bool              running_ = false;
+    Plan              plan_;
+    Window            win_;
+    uint64_t          next_    = 0;
+    double            last_ms_ = -1e300;
+    std::vector<Cell> patch_;
+    uint64_t          passes_ = 0;
+};
+
+/// A patch written into the grid it was asked for. How many known cells moved by more than
+/// kRefreshMovedM, and the most any moved (signed: negative is dug down).
+struct Applied {
+    uint64_t changed = 0;
+    float    most    = 0;
+};
+inline Applied Apply(coachline::GroundGrid& g, const std::vector<Cell>& patch) {
+    Applied a;
+    for (const Cell& k : patch) {
+        const float was = g.cell(k.c, k.r);
+        if (std::isfinite(was)) {
+            if (std::fabs(k.y - was) <= kRefreshMovedM) continue;
+            ++a.changed;
+            if (std::fabs(k.y - was) > std::fabs(a.most)) a.most = k.y - was;
+        }
+        g.set(k.c, k.r, k.y);
+    }
+    return a;
+}
 
 // ---------------------------------------------------------------------------------------
 // In the game's process (coachterrain.cpp).

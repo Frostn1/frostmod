@@ -255,8 +255,116 @@ static void slices_are_spread_out_and_the_watchdog_trips() {
     CHECK(p.tripped() && p.busy_ms() > Pacer::kTotalMs, "too much asking in all trips it: %.0f ms", p.busy_ms());
 }
 
+// ---- after 0.49.7: the ruts, re-asked near the rider --------------------------------------------
+
+static void the_refresh_pacer_has_no_total_and_a_small_duty() {
+    Pacer p(Pacer::kRefreshDuty, Pacer::kNoTotal);
+    CHECK(p.done(0.3, 0.3) && !p.may_run(9.0) && p.may_run(10.4), "a 0.3 ms slice waits 10 ms: 3%% of wall time");
+    // An hour of riding at its full duty never trips it...
+    double now = 0;
+    for (int i = 0; i < 360000 && !p.tripped(); ++i) p.done(now += 10.0, 0.3);
+    CHECK(!p.tripped() && p.busy_ms() > 100000.0, "no total: %.0f ms asked", p.busy_ms());
+    // ...but one slice far over its cap still does.
+    CHECK(!p.done(now + 10, Pacer::kOverrunMs + 1) && p.tripped(), "a stalled slice trips it");
+}
+
+static void the_window_is_the_ground_ahead_clipped_to_the_grid() {
+    const Plan p = PlanFor(Track550());  // 1101 x 1101 at 0.5 m from (0, 0)
+    Window     w = WindowAround(p, 100, 200, kRefreshHalfM);
+    CHECK(w.ok && w.c0 == 144 && w.c1 == 256 && w.r0 == 344 && w.r1 == 456, "a square of 56 m: %u..%u x %u..%u", w.c0,
+          w.c1, w.r0, w.r1);
+    CHECK(w.cells() == 113u * 113u, "%llu cells", (unsigned long long)w.cells());
+    w = WindowAround(p, 5, 545, kRefreshHalfM);
+    CHECK(w.ok && w.c0 == 0 && w.r1 == p.h - 1, "clipped at the edges");
+    CHECK(!WindowAround(p, -100, 200, kRefreshHalfM).ok, "off the grid: nothing");
+    CHECK(!WindowAround(p, NAN, 200, kRefreshHalfM).ok && !WindowAround(Plan{}, 1, 1, kRefreshHalfM).ok, "no position, no plan");
+    float cx, cz;
+    RefreshCentre(100, 200, 0, 10, cx, cz);
+    CHECK(cx == 100 && std::fabs(cz - (200 + kRefreshLeadM)) < 1e-4f, "centred ahead along the travel");
+    RefreshCentre(100, 200, 0.2f, 0.1f, cx, cz);
+    CHECK(cx == 100 && cz == 200, "standing still: on the rider");
+}
+
+// The game's ground: base, less a rut dug at (x 100..102, z 210..212) once `dug` is set.
+static bool g_dug = false;
+static float Rutted(float x, float z) {
+    const bool in = x >= 100 && x <= 102 && z >= 210 && z <= 212;
+    return Ground(x, z) - (g_dug && in ? 0.35f : 0.0f);
+}
+
+static void a_rut_dug_after_the_grid_was_made_is_picked_up() {
+    g_dug = false;
+    Builder b;
+    b.start(Track550());
+    auto ask = [](float x, float z, float& y) {
+        y = Rutted(x, z);
+        return 1;
+    };
+    while (b.state() == Builder::RUNNING) b.run(ask, 1 << 20);
+    const Plan            plan = b.plan();
+    coachline::GroundGrid g    = b.take();
+    float                 y;
+    CHECK(g.at(101, 211, y) && std::fabs(y - Ground(101, 211)) < 1e-3f, "made before the rut");
+    // The rut is dug. The grid made once still has the old ground: what Sean saw.
+    g_dug = true;
+    CHECK(g.at(101, 211, y) && y - Rutted(101, 211) > 0.3f, "the old grid floats over the rut");
+
+    Refresher r;
+    CHECK(r.due(0), "the first pass is due at once");
+    // Riding along +z at (101, 190): the square ahead covers the rut 21 m on.
+    CHECK(r.start(plan, 101, 190, 0, 15, 0) && r.running() && !r.due(0), "a pass started");
+    size_t slices = 0, asked = 0;
+    while (r.running() && slices < 1000) {
+        const long n = r.run(ask, 64);
+        CHECK(n >= 0, "no fault");
+        asked += size_t(n);
+        ++slices;
+    }
+    CHECK(asked == r.window().cells() && slices == (asked + 63) / 64, "the window in slices of 64: %zu in %zu", asked, slices);
+    CHECK(!r.due(999) && r.due(1000), "the next pass a second after this one started");
+    std::vector<Cell> patch = r.take();
+    CHECK(patch.size() == asked && r.take().empty(), "the patch handed over once");
+    const Applied a = Apply(g, patch);
+    // 2 x 2 m at 0.5 m: 5 x 5 lattice cells dug.
+    CHECK(a.changed == 25 && std::fabs(a.most + 0.35f) < 1e-3f, "25 cells moved, most %+.3f m (%llu)", double(a.most),
+          (unsigned long long)a.changed);
+    CHECK(g.at(101, 211, y) && std::fabs(y - Rutted(101, 211)) < 1e-3f, "the line's ground is down in the rut now");
+    CHECK(g.at(150, 211, y) && std::fabs(y - Ground(150, 211)) < 1e-3f, "outside the square, untouched");
+    CHECK(Apply(g, patch).changed == 0, "asked again with nothing dug: nothing moved");
+    g_dug = false;
+}
+
+static void a_refresh_off_the_grid_waits_and_a_fault_drops_the_pass() {
+    const Plan p = PlanFor(Track550());
+    Refresher  r;
+    CHECK(!r.start(p, -500, -500, 0, 0, 0) && !r.running(), "off the grid: no pass");
+    CHECK(!r.due(500) && r.due(1000), "and it waits its second before looking again");
+    CHECK(r.start(p, 100, 100, 0, 0, 1000), "on the grid");
+    size_t calls = 0;
+    auto   bad   = [&](float x, float z, float& y) {
+        if (++calls == 100) return -1;
+        y = Ground(x, z);
+        return 1;
+    };
+    CHECK(r.run(bad, 64) == 64 && r.running(), "still going");
+    CHECK(r.run(bad, 64) == -1 && !r.running() && r.take().empty(), "a fault drops the pass, nothing handed over");
+    CHECK(r.run(bad, 64) == 0 && calls == 100, "never asked again for that pass");
+    // A miss is no answer, not a height: the old height stays.
+    coachline::GroundGrid g;
+    g.make(4, 4, 1, 0, 0);
+    g.set(1, 1, 5.0f);
+    const Applied a = Apply(g, {{1, 1, 5.005f}, {2, 2, 7.0f}});
+    float         y;
+    CHECK(a.changed == 0 && g.cell(1, 1) == 5.0f && g.cell(2, 2) == 7.0f, "under 1 cm is not a rut; an unknown cell is filled");
+    CHECK(std::isnan(g.cell(9, 9)) && !g.at(10, 10, y), "off the grid is unknown");
+}
+
 int main() {
     slices_are_spread_out_and_the_watchdog_trips();
+    the_refresh_pacer_has_no_total_and_a_small_duty();
+    the_window_is_the_ground_ahead_clipped_to_the_grid();
+    a_rut_dug_after_the_grid_was_made_is_picked_up();
+    a_refresh_off_the_grid_waits_and_a_fault_drops_the_pass();
     the_sampler_is_recognised_bare_and_behind_the_guard();
     the_slots_come_out_of_the_accessors_own_lea();
     a_slot_is_read_as_the_sampler_reads_it();

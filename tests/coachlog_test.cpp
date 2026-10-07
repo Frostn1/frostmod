@@ -54,6 +54,28 @@ static void TheLogIsCapped() {
     CHECK(ShouldRestart(kMaxBytes - 10, 11), "one byte over restarts");
 }
 
+// after 0.49.7: full, the log rotates and the new file opens with the startup lines again.
+static void AFullLogRotatesWithItsStartupLines() {
+    CHECK(kHeadBytes < kMaxBytes / 4, "the head is a small part of a file");
+    Head h;
+    const std::string first = Line("20261006-100000", "mxbcoach", "0.49.7 starting");
+    const std::string ini   = Line("20261006-100000", "hud.ini", "found enabled=1 ground=1");
+    h.add(first);
+    h.add(ini);
+    CHECK(h.lines().size() == 2 && h.bytes() == first.size() + ini.size() && !h.full(), "the first lines kept");
+    // Filled: the first line that does not fit ends it, and nothing later gets in.
+    h.add(std::string(kHeadBytes, 'x'));
+    CHECK(h.full() && h.lines().size() == 2, "a line past the head ends it");
+    h.add(Line("20261006-110000", "perf", "frames=1"));
+    CHECK(h.lines().size() == 2, "nothing after it");
+    const std::string start = RotatedStart("20261006-120000", h);
+    CHECK(start.find("[20261006-120000] log: full; the older lines are in mxbcoach.log.1") == 0, "%s", start.c_str());
+    CHECK(start.find(first) != std::string::npos && start.find(ini) > start.find(first), "then the startup lines, in order");
+    CHECK(start.size() < kMaxBytes, "a rotated file has room for new lines");
+    h.clear();
+    CHECK(h.lines().empty() && !h.full(), "cleared for the next open");
+}
+
 // Whether cues and the HUD can ever show comes down to the event type and the session, so both
 // are written down in words, not just numbers.
 static void TheEventAndWhetherItIsPractice() {
@@ -174,6 +196,7 @@ int main() {
     ValuesAreMadeSafe();
     OneLine();
     TheLogIsCapped();
+    AFullLogRotatesWithItsStartupLines();
     TheEventAndWhetherItIsPractice();
     WhatDrawInitRegistered();
     WhatWasDrawn();

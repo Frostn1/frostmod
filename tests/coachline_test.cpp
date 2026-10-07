@@ -712,6 +712,23 @@ static void CameraRideTests() {
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // --- after 0.49.7: which ground the line stands on ------------------------------------------
+    {
+        Alignment pending, passed, failed;
+        passed.done = passed.ok = true;
+        failed.done = true;
+        CHECK(PickGround(true, pending, true, passed, true) == GroundSource::LIVE,
+              "the live ground wins over a grid file that loaded and aligned first");
+        CHECK(PickGround(true, passed, true, passed, true) == GroundSource::LIVE, "live, aligned");
+        CHECK(PickGround(true, failed, true, passed, true) == GroundSource::FILE, "live refused by its check: the file");
+        CHECK(PickGround(false, pending, true, pending, true) == GroundSource::FILE, "no live yet: the file, while it checks");
+        CHECK(PickGround(false, pending, true, failed, true) == GroundSource::TRRN, "file refused: the sheet's terrain");
+        CHECK(PickGround(false, pending, false, pending, true) == GroundSource::TRRN, "only the sheet's terrain");
+        CHECK(PickGround(false, pending, false, pending, false) == GroundSource::LAP, "nothing: the lap and the snap");
+        CHECK(std::string(GroundSourceText(GroundSource::LIVE)).find("ruts included") != std::string::npos &&
+                  std::string(GroundSourceText(GroundSource::FILE)).find("no ruts") != std::string::npos,
+              "the log line says which has the ruts");
+    }
     // --- v0.45.4: depth reads only while riding, at most once a second ---------------------
     {
         CHECK(!Riding(5000, 0, 0), "nothing seen yet: not riding");

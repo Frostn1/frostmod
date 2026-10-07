@@ -1240,6 +1240,8 @@ public:
     void set(uint32_t c, uint32_t r, float y) {
         if (c < w_ && r < h_) hs_[size_t(r) * w_ + c] = std::isfinite(y) ? y : NAN;
     }
+    /// One cell as stored, NaN where unknown or off the grid.
+    float cell(uint32_t c, uint32_t r) const { return c < w_ && r < h_ ? hs_[size_t(r) * w_ + c] : NAN; }
 
     /// The ground at world (x, z), bilinear; false off the grid or where it is unknown.
     bool at(float x, float z, float& y) const {
@@ -1289,6 +1291,34 @@ struct Alignment {
     int   on_grid = 0;
     int   off_grid = 0;  // samples that had no ground under them on the grid, and didn't count
 };
+
+/// Which ground the line stands on, best first (after 0.49.7):
+///  LIVE  the game's own heights, sampled in memory and refreshed near the rider: the only one
+///        with the ruts in it, so it wins whenever it is there and not refused by its check -
+///        even when the track's grid file was loaded first;
+///  FILE  `<track>.ground`, from the .trh: the track as built, no ruts;
+///  TRRN  the sheet's own terrain across the line, from the same .trh: no ruts either;
+///  LAP   none of those: the lap's own heights and the depth snap.
+enum class GroundSource { LIVE, FILE, TRRN, LAP };
+
+/// A grid is used once it is ready, while its alignment check is still running or once it passed.
+inline bool GridUsable(bool ready, const Alignment& a) { return ready && (!a.done || a.ok); }
+
+inline GroundSource PickGround(bool live_ready, const Alignment& live_al, bool file_ready, const Alignment& file_al,
+                               bool has_trrn) {
+    if (GridUsable(live_ready, live_al)) return GroundSource::LIVE;
+    if (GridUsable(file_ready, file_al)) return GroundSource::FILE;
+    return has_trrn ? GroundSource::TRRN : GroundSource::LAP;
+}
+
+inline const char* GroundSourceText(GroundSource s) {
+    switch (s) {
+        case GroundSource::LIVE: return "the game's own ground, refreshed near the rider (ruts included)";
+        case GroundSource::FILE: return "the track's grid file (the .trh as built: no ruts)";
+        case GroundSource::TRRN: return "the sheet's terrain (the .trh as built: no ruts)";
+        default: return "the lap's own heights and the depth snap (no ground known)";
+    }
+}
 
 class AlignCheck {
 public:

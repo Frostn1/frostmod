@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed
+- **MXB Coach: the line follows the ruts.** On a server that digs the track live (mxbserver), the
+  line rode over the top of rut walls instead of down in the rut. The game's own ground was
+  sampled once per event and never again, and the `.ground` file and the sheet's terrain are the
+  `.trh` as built, with no ruts. Now the square of ground the line is about to cross (56 m, centred
+  16 m ahead) is sampled again about once a second, through the same game height query (which
+  reads the current heights, ruts included). It runs on the same thread, in the same 0.3 ms
+  slices, using at most 3% of wall time. A slice far over its cap turns the refresh off for the
+  event, and the line keeps the ground it has. Moved cells rebuild the line straight away.
+- **MXB Coach: the live ground always wins** over the `.ground` file and the sheet's terrain when
+  it is there and lines up (`coachline::PickGround`). The log says which ground the line stands on,
+  once a session and again whenever it changes. Every 30 s it also gives the refresh's passes,
+  cells moved and time spent.
+- **MXB Coach: the log rotates instead of stopping when full.** At 256 KB it used to stop writing,
+  so later sessions left no lines at all. Now the full file becomes `mxbcoach.log.1` and a new one
+  starts with a copy of the startup lines.
+
 ### Removed
 - **The overjump option is gone.** It wrote a flag into the game's session settings and swapped
   the engine's command-bus pointer to do it. FrostMod no longer touches either: `--probe-overjump`,

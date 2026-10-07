@@ -194,6 +194,11 @@ add_test(NAME racefilter COMMAND racefilter_test)
 add_executable(changefree_test tests/changefree_test.cpp)
 add_test(NAME changefree COMMAND changefree_test)
 
+# --- content refresh: which kind, and when it may start (src/refreshgate.h) -------
+# Starting a reload under a bike chooser crashed a player's game three times.
+add_executable(refreshgate_test tests/refreshgate_test.cpp)
+add_test(NAME refreshgate COMMAND refreshgate_test)
+
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.
 add_executable(crashreport_test tests/crashreport_test.cpp)

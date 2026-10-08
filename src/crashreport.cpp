@@ -418,6 +418,15 @@ int CaptureStack(char (*out)[160], int max) {
     return Unwind(ctx, out, max, 2);
 }
 
+int UnwindFrom(const void* context, char (*out)[160], int max) {
+    if (!context || !out || max <= 0) return 0;
+    return Unwind(*(const CONTEXT*)context, out, max, 0);
+}
+
+void DescribeAddr(const void* addr, char* out, size_t n) { DescribeAddress(addr, out, n); }
+const char* ReportDir() { return g_dumpDir; }
+const char* Version() { return g_version; }
+
 Trail& TheTrail() { static Trail t; return t; }
 Context& TheContext() { static Context c; return c; }
 

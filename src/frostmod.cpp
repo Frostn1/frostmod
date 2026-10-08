@@ -61,6 +61,7 @@
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
+#include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -3798,6 +3799,10 @@ static std::atomic<bool> g_memDiag{false};
 static std::atomic<bool> g_texCompress{false};
 static std::atomic<bool> g_tcDebug{false};
 static std::atomic<int>  g_tcMinDim{256};
+// nantrap=1 (and nantrapmax=N): the NaN first-fault trap around the sim step (NANTRAP section,
+// src/nantrap.h). Off unless the file says exactly 1. Read early by NtReadCfg() before the hook
+// goes in; kept here so a save of the overlay settings does not drop it.
+static nantrap::Config g_ntCfg;
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3811,6 +3816,8 @@ static void SaveOverlaySettings() {
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
     if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
+    if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
+    if (g_ntCfg.max != 1) fprintf(f, "nantrapmax=%d\n", g_ntCfg.max);
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3825,6 +3832,8 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "texcompress=%d", &v) == 1) g_texCompress.store(v != 0);
         else if (sscanf_s(line, "texcompressdebug=%d", &v) == 1) g_tcDebug.store(v != 0);
         else if (sscanf_s(line, "texcompressmin=%d", &v) == 1 && v >= 4 && v <= 16384) g_tcMinDim.store(v);
+        // Only kept for the next save: whether the trap went in was decided at load.
+        else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -6691,6 +6700,77 @@ static void InstallTerrainGuard(intptr_t delta) {
             "now returns nothing instead of reading off the grid.", (size_t)(fn - g_base));
 }
 
+// ===========================================================================
+// NANTRAP  -  where the physics NaN is made (opt-in: nantrap=1 in frostmod_radar.cfg)
+//
+// The terrain guard above refuses a NaN position; it cannot say where the NaN came from,
+// because by then the code that made it has returned. This can. Around each call of the sim
+// step it unmasks only the invalid-operation exception, so the first 0/0, inf-inf or
+// sqrt(-x) in the step faults on the instruction that did it. src/nantrap.cpp records that
+// instruction, the registers and the stack, masks the exception again and resumes the same
+// instruction, which then gives the same NaN a stock game gets. One report per session (or
+// nantrapmax=N distinct sites), then the trap disarms and the step runs as stock.
+//
+// Default off. Nothing here runs, and the step is not hooked, unless the file says nantrap=1.
+// ===========================================================================
+using SimStepFn = int32_t (*)(int32_t, float);
+static SimStepFn g_origSimStep = nullptr;
+
+static int32_t hkSimStep(int32_t slot, float dt) {
+    if (!nantrap::Armed()) return g_origSimStep(slot, dt);
+    const uint32_t saved = nantrap::Enter();
+    const int32_t rc = g_origSimStep(slot, dt);
+    nantrap::Leave(saved);   // the game's MXCSR, exactly as it was
+    return rc;
+}
+
+// nantrap= / nantrapmax= straight from the file: the hook goes in before LoadOverlaySettings.
+static void NtReadCfg() {
+    char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
+    FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) nantrap::ParseCfgLine(line, g_ntCfg);
+    fclose(f);
+}
+
+static void InstallNanTrap(intptr_t delta) {
+    NtReadCfg();
+    if (!g_ntCfg.on) return;   // the default: no hook, no handler, nothing
+    if (!g_game->offsets_complete) {
+        Log("[nantrap] off for %s - the sim step is MX Bikes' and has no twin here.", g_game->display);
+        return;
+    }
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[nantrap] off: can't read the module's sections to place it.");
+        return;
+    }
+    uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_SIM_STEP + delta);
+    if (fn < begin || fn >= end || !MatchAt(fn, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK)) {
+        uint8_t* found = PatternScan(begin, end, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK);
+        if (!found) {
+            Log("[nantrap] off: the sim step's bytes are not in this build's .text (game "
+                "updated?). Re-derive RVA_SIM_STEP before turning it on again.");
+            return;
+        }
+        Log("[nantrap] sim step RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
+            (size_t)(found - g_base), (size_t)mxb::RVA_SIM_STEP);
+        fn = found;
+    }
+    if (mxb::LooksDetoured(fn)) {
+        Log("[nantrap] off: the sim step is already hooked (%02X %02X %02X %02X %02X).",
+            fn[0], fn[1], fn[2], fn[3], fn[4]);
+        return;
+    }
+    // Handler first, then the hook: a step must never run armed with nothing to catch it.
+    nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
+    if (!nantrap::Armed()) return;
+    if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)"))
+        Log("[nantrap] ON (nantrap=1): the first invalid FP op in the sim step is logged and "
+            "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
+            "same values it does without it.", g_ntCfg.max);
+}
+
 // Verify, decode, hook. MX Bikes only: both the RVA and the signature are mxbikes.exe's.
 static void InstallGhsGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
@@ -6866,6 +6946,7 @@ DWORD WINAPI Init(LPVOID) {
             InstallGhsGuard(delta);
             InstallTerrainGuard(delta);
             InstallTrainerGuard(delta);
+            InstallNanTrap(delta);   // nantrap=1 only (frostmod_radar.cfg): diagnostic
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
                 "no twin here.", g_game->display);

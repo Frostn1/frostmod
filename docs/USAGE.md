@@ -101,6 +101,16 @@ line every 10 s while it works, with what was swapped and why the rest was left;
 `texcompressdebug=1` also checks for a GL error after every swap (and undoes that swap if
 there is one) and logs each one.
 
+With `nantrap=1` in `frostmod_radar.cfg` (read at game start; off by default, a diagnostic),
+FrostMod watches MX Bikes's physics step for the first invalid floating-point operation (a
+0/0, inf-inf or square root of a negative: where a NaN is made) and logs where it happened,
+with the registers and the stack, as `[nantrap]` lines. The same record goes in a
+`frostmod-crash-*-nan1.json` file that MXB App sends with the crash reports, as kind
+`nan_first_fault`, even if the game does not crash. The game computes the same values it
+does without it. One report a session (`nantrapmax=N`, up to 8, for N different places);
+after that the trap turns itself off until the next start. If the game has updated and the
+step's bytes no longer match, it stays off and says so in the log.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

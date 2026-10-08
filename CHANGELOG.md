@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-08 - v0.49.10
+
+NaN crash trap for physics crashes.
+
+### Added
+- NaN crash trap (`nantrap=1`, off by default). Logs where a physics NaN starts and sends it with crash reports.
+
 ## 2026-10-07 - v0.49.9
 
 Less RAM for MX Bikes: an opt-in setting uploads big textures compressed, and a memory diagnostic shows where the game's RAM goes.

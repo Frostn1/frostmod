@@ -92,7 +92,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
-add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp ${FROSTMOD_DLL_RC})
+add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp src/nantrap.cpp ${FROSTMOD_DLL_RC})
 target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32 winhttp)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
@@ -209,6 +209,16 @@ add_test(NAME memdiag COMMAND memdiag_test)
 # mip chain, and sub-image updates undoing a swap. Pure, so it runs anywhere.
 add_executable(texcompress_test tests/texcompress_test.cpp)
 add_test(NAME texcompress COMMAND texcompress_test)
+# nantrap=1 (src/nantrap.h): the MXCSR arithmetic, the cfg keys, the sim-step signature, the
+# opcode hint and the report layout. Pure, so it runs anywhere.
+add_executable(nantrap_test tests/nantrap_test.cpp)
+add_test(NAME nantrap COMMAND nantrap_test)
+# And the live trap on a real 0/0: it fires, resumes with the stock NaN, restores MXCSR exactly,
+# disarms, leaves other threads' faults alone and writes the sidecar. Prints the per-step cost.
+if(WIN32)
+    add_executable(nantrap_harness tests/nantrap_harness.cpp src/nantrap.cpp src/crashreport.cpp)
+    add_test(NAME nantrap_harness COMMAND nantrap_harness)
+endif()
 
 add_executable(crashreport_test tests/crashreport_test.cpp)
 add_test(NAME crashreport COMMAND crashreport_test)

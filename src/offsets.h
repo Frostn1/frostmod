@@ -401,6 +401,24 @@ constexpr char SIG_TERRAIN_SAMPLE2[] =
     "\x4C\x89\x44\x24\x18\x41\x57\x48\x81\xEC\xC0\x00\x00\x00\x48\x83\xB9\x50\x07"
     "\x00\x00\x00\x44\x0F\x29\x74\x24\x10\x4C\x8B\xFA\x44\x0F\x28\xF3\x4C\x8B\xD9";
 constexpr char SIG_TERRAIN_SAMPLE2_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// ---- the sim step: where nantrap=1 arms its MXCSR trap (beta21e, 2026-10-08) ----
+// 0x1BE8A0 is the sim loop: `idiv [0x396B48]` turns elapsed ms into a step count, then each
+// step calls 0x1BE3A0 with dt = step * 0.001f (0x1BE917-0x1BE91E) and afterwards dispatches
+// the plugin callbacks through [0x396B40]. 0x1BE3A0 is the step itself, and its only caller is
+// 0x1BE91E, so wrapping it covers every physics step and keeps third-party plugin code out of
+// the armed window. The bike sim (0x1ADA40, called at 0x1BE685) runs inside it.
+//
+//   int32 f(int32 slot /*ecx, 1..3*/, float dt /*xmm1*/)   ; returns 1 for a bad slot
+//
+// No ldmxcsr / stmxcsr anywhere in the exe, and no _controlfp/_statusfp import: the game
+// never reads or sets MXCSR itself, so what the trap does to it is invisible to the game.
+constexpr uintptr_t RVA_SIM_STEP = 0x1BE3A0;
+// The prologue through the slot check, the ja's rel32 masked. Unique in beta21e's .text.
+constexpr char SIG_SIM_STEP[] =
+    "\x40\x55\x48\x83\xEC\x50\xFF\xC9\x0F\x29\x74\x24\x30\x0F\x28\xF1\x83\xF9\x02\x0F\x87"
+    "\x00\x00\x00\x00\x48\x89\x5C\x24\x60\x48\x89\x74\x24\x68\x48\x89\x7C\x24\x70"
+    "\x48\x63\xF9";
+constexpr char SIG_SIM_STEP_MASK[] = "xxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxx";
 // ---- the terrain sampler, called rather than guarded: MXB Coach's ground (2026-10-02) ----
 // Read off a running beta21e on a licensed copy (read-only, nothing written), for the Coach's
 // line on tracks it may not read from disk. 0x1F1720 in full:

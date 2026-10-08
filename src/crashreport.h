@@ -466,6 +466,16 @@ int CaptureStack(char (*out)[160], int max);
 /// GetTickCount64 - the report subtracts them.
 unsigned long long ElapsedMs();
 
+/// The same unwind, from a CONTEXT the caller already has (a vectored handler's), passed as
+/// a pointer so this header stays free of windows.h. Nearest first; returns the count.
+int UnwindFrom(const void* context, char (*out)[160], int max);
+/// "module+0xRVA" for an address, as every frame above is written.
+void DescribeAddr(const void* addr, char* out, size_t n);
+/// The folder reports go to (the log's), or "" in a copy that writes none.
+const char* ReportDir();
+/// FrostMod's version as Install() was given it.
+const char* Version();
+
 #else   // non-Windows hosts: the tests build the portable half only
 
 inline Trail& TheTrail() { static Trail t; return t; }

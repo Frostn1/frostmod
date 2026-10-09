@@ -77,6 +77,7 @@ F-key per feature.
 | `5` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
 | `6` | Toggle the corner hint overlay |
 | `7` | Hide overlay — everything FrostMod draws, for recording (see below) |
+| `G` | Watch gfx.cfg — a saved bike `gfx.cfg` goes onto the bike without a restart (see below) |
 
 With `devmenu=1` in `frostmod_radar.cfg`, an `8` row appears: **Rebuild riders
 (experimental)**, for testing.
@@ -158,6 +159,15 @@ the bike left intact and asks you to exit the bike first.
 Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
 immediately — no restart, no loading screen.
 
+### Watch gfx.cfg (menu `G`)
+
+Off by default. When on, saving the loose `gfx.cfg` of a bike you have loaded puts its grip
+positions, lever axes and angles, chain ratio, shock link and rider offset onto the bike within
+a second, in the pits or on track. Each changed value is logged as a `[gfx]` line. Names, files,
+textures and the exhaust still need a rejoin; the status line says so when you change one. The
+setting is kept as `gfxwatch=1` in `frostmod_radar.cfg`. Keys, units and frames:
+[GFX_CFG.md](GFX_CFG.md).
+
 ## Files
 
 All of these live **next to the binaries** (the folder containing `frostmod.exe`
@@ -168,7 +178,7 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 | `frostmod.log` | The live log, streamed into the console. Falls back to `%TEMP%\frostmod.log` if that folder is read-only. |
 | `frostmod_serverfilter.yaml` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
 | `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag`, `frostmod_unsafe_reload.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
-| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync), `refresh_gear` (a gear model changed), `refresh_tracks` (only tracks changed), `refresh_bikes` (a bike changed: bikes, series and bike paints) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
+| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync), `refresh_gear` (a gear model changed), `refresh_tracks` (only tracks changed), `refresh_bikes` (a bike changed: bikes, series and bike paints), `reload_bike_gfx` (a bike's `gfx.cfg` was saved; `bikeId` = the bike folder) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
 
 ### Running inside a Wine prefix (Linux and macOS)
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Tune a bike's gfx.cfg without restarting the game.
+
+### Added
+- **Watch gfx.cfg (F8 → `G`, off by default).** Saving a loaded bike's loose `gfx.cfg` puts its
+  grip positions, lever axes and angles, chain ratio, shock link and rider offset onto the bike
+  within a second, bike and cockpit, in the pits or on track. The game reads these fields every
+  frame, so FrostMod writes the new values where the game's own parser put them. Names, files,
+  textures and the exhaust still need a rejoin, and the status line says so. Off on any game build
+  whose code differs from the one checked.
+- `reload_bike_gfx` command verb: the same, once, for MXB App and Frost's Studio after a save.
+- `docs/GFX_CFG.md`: the gfx.cfg keys for rider contact points and moving parts, their units,
+  frames and where the game keeps them. Footpegs have no key; the rider animation places the feet.
+
 ## 2026-10-08 - v0.49.11
 
 Fix for a menu crash caused by a broken tyre mod.

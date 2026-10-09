@@ -263,6 +263,13 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 add_executable(tyrefallback_test tests/tyrefallback_test.cpp)
 add_test(NAME tyrefallback COMMAND tyrefallback_test)
 
+# --- live bike gfx.cfg test ----------------------------------------------------
+# The cfg parser, the key -> descriptor offsets, and the instruction bytes each offset was
+# read from (src/gfxcfg.h). A wrong offset is a float in the wrong field of a live vehicle on
+# every save, so each one is proved. Pure, so it runs on any host.
+add_executable(gfxcfg_test tests/gfxcfg_test.cpp)
+add_test(NAME gfxcfg COMMAND gfxcfg_test)
+
 # --- world watch test ----------------------------------------------------------
 # When a timed-out master login is the half-open session we can clear and when it is an
 # outage we must not churn at. Neither state is reproducible on demand - it wants a licensed

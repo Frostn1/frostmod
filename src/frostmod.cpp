@@ -61,6 +61,7 @@
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
+#include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
@@ -3778,6 +3779,9 @@ static void VehTearDown(int i) {
 static std::atomic<bool> g_msgOn{true};        // a rider can mute a server's overlay
 static std::atomic<int>  g_msgAnchor{150};     // design px up from the bottom of the screen
 static std::atomic<int>  g_msgPort{54210};     // FrostServer's API port; its own default
+// gfxwatch=1: re-apply the ridden bike's gfx.cfg when it is saved (LIVE BIKE GFX.CFG). Off by
+// default; F8 -> G toggles it and the choice is kept here.
+static std::atomic<bool> g_gfxWatch{false};
 
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
 // Radar/outline toggles and the overlay size. The filename stays as it was so an
@@ -3819,6 +3823,7 @@ static void SaveOverlaySettings() {
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     if (g_devMenu) fprintf(f, "devmenu=1\n");
+    if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
@@ -3835,6 +3840,7 @@ static void LoadOverlaySettings() {
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
+        else if (sscanf_s(line, "gfxwatch=%d", &v) == 1) g_gfxWatch.store(v == 1);
         // Only kept for the next save: whether the hooks went in was decided at load.
         else if (sscanf_s(line, "memdiag=%d",  &v) == 1) g_memDiag.store(v != 0);
         else if (sscanf_s(line, "texcompress=%d", &v) == 1) g_texCompress.store(v != 0);
@@ -3965,6 +3971,7 @@ static const MenuItem kMenu[] = {
     { '4', "Change bike / gear (pits)",     false, 10 },
     { '5', "Bike model swap",               false, 3  },
     { '6', "Server announcements",          false, 8  },
+    { 'G', "Watch gfx.cfg",                 false, 15 },
     { '7', "Overlay size",                  true,  6  },
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
@@ -5036,6 +5043,8 @@ void SeedCommandFiles();               // fwd (same block: what to ignore at loa
 // Run a FrostMod menu action by its digit key. Add a case + a kMenu[] row to expose
 // a new feature - no new global F-key needed. Most actions close the menu after.
 void RebuildRiders();   // fwd (RIDER REBUILD, with the live paints)
+void GfxWatchToggle();  // fwd (LIVE BIKE GFX.CFG)
+void GfxWatchTick();    // fwd (same place)
 void ArrivedGearTick(); // fwd (same place)
 void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
 extern std::atomic<bool> g_chOpen;
@@ -5059,6 +5068,7 @@ void MenuAction(int d) {   // d = the row's action, not its key
     case 8: { bool on = !g_msgOn.load(); g_msgOn.store(on); SaveOverlaySettings();
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
+    case 15: g_menuOpen.store(false); GfxWatchToggle(); break;   // live bike gfx.cfg
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
     case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // change bike / gear
     default: break;
@@ -5883,6 +5893,7 @@ void Tick() {
     // The same command channel for an app that can't pulse an event at us — MXB App on
     // Linux, which is outside the Wine prefix we're running in. Rate-limited internally.
     PollCommandFiles();
+    GfxWatchTick();   // gfxwatch=1 only: a saved bike gfx.cfg goes straight onto the bike
 
     DrainGameThreadTasks();
     DrainPendingRefresh();   // a refresh that waited out a chooser page, once it has closed
@@ -6220,6 +6231,215 @@ void NoteModelNeedsCategorySwitch(const char* bikeId, const char* why) {
     SetStatus("model swapped - switch bike category away and back", 6000);
 }
 
+// ===========================================================================
+// LIVE BIKE GFX.CFG (F8 -> G watches; the reload_bike_gfx verb applies once)
+//
+// Tuning a model swap's grips, levers and chain used to be edit, restart, look, repeat.
+// The game parses gfx.cfg into a descriptor inside the vehicle record (vehicle +0x274, a
+// bike part and a cockpit part) and its frame code reads those fields again every frame, so
+// writing the new numbers there is all it takes: the next frame draws them. src/gfxcfg.h has
+// the RE, the key -> offset table and the parser; docs/GFX_CFG.md has the keys for modders.
+//
+// What is written is what the game's own parser would have written for the same text, into
+// the same fields, from the render thread the game draws on. Nothing is allocated or rebuilt.
+// Before the first write every instruction the offsets came from is compared with the
+// running exe; one difference and the feature stays off.
+//
+// Names, files, textures and the exhaust are not carried: they are handles and objects the
+// parse made once. Those need the game to build the vehicle again (a rejoin).
+// ===========================================================================
+static int g_gfxSitesOk = -1;   // -1 not checked yet, 0 this build differs, 1 matches
+
+static bool GfxSupported() {
+    if (g_game != &GAME_MXB || !g_game->offsets_complete || !g_base) return false;
+    if (g_gfxSitesOk < 0) {
+        int bad = 0;
+        for (int i = 0; i < gfxcfg::kSiteCount; ++i) {
+            const gfxcfg::Site& s = gfxcfg::kSites[i];
+            unsigned char got[sizeof(s.bytes)] = {0};
+            if (SafeReadBytes((const char*)(g_base + s.rva), (char*)got, (size_t)s.len) != (size_t)s.len ||
+                memcmp(got, s.bytes, (size_t)s.len) != 0) {
+                if (bad++ < 3) Log("[gfx] code at 0x%zx differs from beta21e", (size_t)s.rva);
+            }
+        }
+        g_gfxSitesOk = bad ? 0 : 1;
+        Log(bad ? "[gfx] live gfx.cfg off: %d of %d checked instructions differ (game updated?)"
+                : "[gfx] live gfx.cfg ready: %d of %d checked instructions match",
+            bad ? bad : gfxcfg::kSiteCount, gfxcfg::kSiteCount);
+    }
+    return g_gfxSitesOk == 1;
+}
+
+// One 4-byte field of a live descriptor: the old value out, the new one in. POD only (SEH).
+static bool GfxStore(uintptr_t addr, uint32_t bits, uint32_t* old) {
+    __try {
+        *old = *(volatile uint32_t*)addr;
+        if (*old != bits) *(volatile uint32_t*)addr = bits;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool GfxFileExists(const std::string& p) {
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// The gfx.cfg the game read for this bike folder, if it is a loose file. 0x45020 builds the
+// path as "%sbikes\%s\gfx.cfg" from the bike entry's root (+0x4C0) and folder (+0x00). The
+// mods folder is the fallback for a root this process cannot resolve. "" = packed in a .pkz.
+static std::string GfxCfgPath(const char* folder) {
+    const int idx = BikeIndexOf(folder);
+    uintptr_t arr = ReadPtr(mxb::RVA_BIKE_LIST);
+    if (idx >= 0 && arr) {
+        char root[MAX_PATH] = {0};
+        if (SafeCopyStr((void*)(arr + (uintptr_t)idx * mxb::BIKE_STRIDE + mxb::BIKE_CFGNAME), root, sizeof(root))) {
+            std::string p = std::string(root) + "bikes\\" + folder + "\\gfx.cfg";
+            if (GfxFileExists(p)) return p;
+        }
+    }
+    if (g_modsPath[0]) {
+        std::string p = std::string(g_modsPath) + "\\bikes\\" + folder + "\\gfx.cfg";
+        if (GfxFileExists(p)) return p;
+    }
+    return std::string();
+}
+
+static bool GfxReadText(const std::string& path, std::string& out) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    out.clear();
+    char buf[4096];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < (1u << 20)) out.append(buf, got);
+    fclose(f);
+    return true;
+}
+
+// Last text seen per path, so a save can say which of its changes need a rejoin.
+static std::map<std::string, gfxcfg::Flat> g_gfxLast;
+
+// Put one descriptor's writes in. Returns how many fields changed; logs each one.
+static int GfxApplyDesc(int slot, uintptr_t desc, const std::vector<gfxcfg::Write>& writes, bool* fault) {
+    int changed = 0;
+    for (const gfxcfg::Write& w : writes) {
+        uint32_t old = 0;
+        if (!GfxStore(desc + (uintptr_t)w.off, w.bits, &old)) { *fault = true; return changed; }
+        if (old == w.bits) continue;
+        ++changed;
+        if (w.field->kind == gfxcfg::Kind::Float) {
+            float a, b;
+            memcpy(&a, &old, 4); memcpy(&b, &w.bits, 4);
+            Log("[gfx] slot %d %s: %g -> %g", slot, w.key.c_str(), a, b);
+        } else {
+            Log("[gfx] slot %d %s: %u -> %u", slot, w.key.c_str(), old, w.bits);
+        }
+    }
+    return changed;
+}
+
+// Read the gfx.cfg of every loaded bike (or only `onlyBike`) and put the live keys onto it.
+void GfxApply(const char* onlyBike, const char* why) {
+    if (!GfxSupported()) {
+        Log("[gfx] %s: not applied, this game build is not supported", why);
+        SetStatus("gfx.cfg: game version not supported", 4000);
+        return;
+    }
+    std::map<std::string, gfxcfg::Flat> read;     // path -> parsed, once per call
+    std::vector<std::string> notLive;
+    int bikes = 0, changed = 0, noFile = 0;
+    bool fault = false;
+    for (int i = 0; i < mxb::VEHICLE_MAX && !fault; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        if (SafeReadInt((const int*)v) == 0) continue;
+        char bike[32] = {0};
+        if (!SafeCopyStr((void*)(v + mxb::VEH_BIKE), bike, sizeof(bike)) || !bike[0]) continue;
+        if (onlyBike && onlyBike[0] && _stricmp(onlyBike, bike) != 0) continue;
+        const uintptr_t blk = v + gfxcfg::kVehGfx;
+        // Built: the chassis and steer models are loaded, so 0x45020 has filled the block.
+        if (SafeReadInt((const int*)(blk + gfxcfg::kChassisModel)) <= 0 ||
+            SafeReadInt((const int*)(blk + gfxcfg::kSteerModel)) <= 0) continue;
+        const std::string path = GfxCfgPath(bike);
+        if (path.empty()) { ++noFile; Log("[gfx] slot %d %s: no loose gfx.cfg", i, bike); continue; }
+        auto it = read.find(path);
+        if (it == read.end()) {
+            std::string text;
+            if (!GfxReadText(path, text)) { ++noFile; Log("[gfx] %s: cannot read", path.c_str()); continue; }
+            it = read.emplace(path, gfxcfg::Parse(text)).first;
+            auto last = g_gfxLast.find(path);
+            if (last != g_gfxLast.end()) {
+                for (auto& k : gfxcfg::NotLive(last->second, it->second)) notLive.push_back(k);
+            }
+            g_gfxLast[path] = it->second;
+        }
+        std::vector<std::string> bad;
+        changed += GfxApplyDesc(i, blk, gfxcfg::Plan(it->second, "", &bad), &fault);
+        if (!fault && SafeReadInt((const int*)(blk + gfxcfg::kCockpitParsed)) == 1)
+            changed += GfxApplyDesc(i, blk + gfxcfg::kCockpitDesc,
+                                    gfxcfg::Plan(it->second, "cockpit/", &bad), &fault);
+        for (const auto& k : bad) Log("[gfx] %s: '%s' has a value the game cannot use, skipped", bike, k.c_str());
+        ++bikes;
+    }
+    for (const auto& k : notLive) Log("[gfx] %s changed: needs a rejoin to show", k.c_str());
+    Log("[gfx] %s: %d bike(s), %d value(s) changed, %d without a loose gfx.cfg%s", why, bikes,
+        changed, noFile, fault ? ", stopped on a fault" : "");
+    if (fault)                      SetStatus("gfx.cfg: write failed", 4000);
+    else if (!bikes && noFile)      SetStatus("gfx.cfg: no loose file for this bike", 4000);
+    else if (!bikes)                SetStatus("gfx.cfg: no bike loaded", 3000);
+    else if (!notLive.empty())      SetStatus("gfx.cfg applied, some keys need a rejoin", 4000);
+    else                            SetStatus("gfx.cfg applied", 2500);
+}
+
+// The watch: every half second, the loose gfx.cfg of each loaded bike is stat'ed, and a new
+// write time or size re-applies that bike. A file is only recorded the first time it is seen,
+// so turning the watch on never changes anything by itself.
+struct GfxSeen { uint64_t time; uint64_t size; };
+static std::map<std::string, GfxSeen> g_gfxSeen;
+
+void GfxWatchToggle() {
+    const bool on = !g_gfxWatch.load();
+    g_gfxWatch.store(on);
+    g_gfxSeen.clear();
+    SaveOverlaySettings();
+    if (on && !GfxSupported()) SetStatus("gfx.cfg: game version not supported", 4000);
+    else SetStatus(on ? "gfx.cfg watch: on" : "gfx.cfg watch: off", 2000);
+    Log("[gfx] watch %s", on ? "on" : "off");
+}
+
+void GfxWatchTick() {
+    if (!g_gfxWatch.load()) return;
+    static uint64_t next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < next) return;
+    next = now + 500;
+    if (!GfxSupported()) return;
+    std::set<std::string> bikes;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        if (SafeReadInt((const int*)v) == 0) continue;
+        char bike[32] = {0};
+        if (SafeCopyStr((void*)(v + mxb::VEH_BIKE), bike, sizeof(bike)) && bike[0]) bikes.insert(bike);
+    }
+    for (const std::string& bike : bikes) {
+        const std::string path = GfxCfgPath(bike.c_str());
+        if (path.empty()) continue;
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) continue;
+        const GfxSeen s{((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime,
+                        ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow};
+        auto it = g_gfxSeen.find(path);
+        if (it == g_gfxSeen.end()) {
+            g_gfxSeen[path] = s;
+            std::string text;
+            if (GfxReadText(path, text)) g_gfxLast[path] = gfxcfg::Parse(text);
+            Log("[gfx] watching %s", path.c_str());
+            continue;
+        }
+        if (it->second.time == s.time && it->second.size == s.size) continue;
+        it->second = s;
+        GfxApply(bike.c_str(), "gfx.cfg saved");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // COMMAND CHANNEL from MXB App.
 //
@@ -6351,6 +6571,11 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // were missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
         Log("[cmd] paint refresh requested by MXB App");
         RequestPaintRefresh();
+    } else if (verb == "reload_bike_gfx") {
+        // MXB App / Frost's Studio saved a bike's gfx.cfg: put its grips, levers, chain and
+        // rider offset onto the bike now (LIVE BIKE GFX.CFG). bikeId narrows it to that bike
+        // folder; without one every loaded bike is re-read.
+        GfxApply(bikeId.c_str(), "MXB App");
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike

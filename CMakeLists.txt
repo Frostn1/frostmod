@@ -257,6 +257,12 @@ add_test(NAME lean COMMAND lean_test)
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
 
+# --- tyre fallback patch test --------------------------------------------------
+# The guarded span, the three not-found sites in it, and the jump/stub bytes written over
+# them (src/tyrefallback.h). Pure, so it runs on any host.
+add_executable(tyrefallback_test tests/tyrefallback_test.cpp)
+add_test(NAME tyrefallback COMMAND tyrefallback_test)
+
 # --- world watch test ----------------------------------------------------------
 # When a timed-out master login is the half-open session we can clear and when it is an
 # outage we must not churn at. Neither state is reproducible on demand - it wants a licensed

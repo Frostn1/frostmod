@@ -63,6 +63,7 @@
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
+#include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -3620,7 +3621,7 @@ static bool              g_afPatched = false;
 // from itself, so a cell more than ~2 GB away cannot be addressed at all, and VirtualAlloc
 // left to choose will happily return a page far outside that. So walk outward from the site
 // one allocation granule at a time and take the first slot that is free.
-static double* AfAllocCellNear(uintptr_t site) {
+static void* AllocNear(uintptr_t site, size_t size, DWORD protect) {
     SYSTEM_INFO si{}; GetSystemInfo(&si);
     const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
     const uintptr_t limit = 0x70000000ull;                 // stay well inside rel32 reach
@@ -3629,12 +3630,14 @@ static double* AfAllocCellNear(uintptr_t site) {
             if (!up && site < d) continue;                  // would underflow past zero
             uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
             if (!a) continue;
-            void* p = VirtualAlloc((void*)a, sizeof(double),
-                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (p) return (double*)p;
+            void* p = VirtualAlloc((void*)a, size, MEM_RESERVE | MEM_COMMIT, protect);
+            if (p) return p;
         }
     }
     return nullptr;
+}
+static double* AfAllocCellNear(uintptr_t site) {
+    return (double*)AllocNear(site, sizeof(double), PAGE_READWRITE);
 }
 
 // Apply, or just retune if we are already applied. Retuning is a plain store to our own
@@ -6631,6 +6634,110 @@ static void InstallTrainerGuard(intptr_t delta) {
         Log("[trainer] save guard live. No new trainer is written with the stack in it.");
 }
 
+// ===========================================================================
+// TYRE FALLBACK  -  a bike naming a tyre that is not loaded crashes the bike list
+//
+// tyrefallback.h has the chain. The three "tyre not found" exits of the bike-list build load
+// the tyre index from an uninitialised stack slot; the junk index then reaches sprintf as a
+// string pointer (msvcr90+0x36EDE). An empty mods\tyres\p_mx folder (or one holding only a
+// desktop.ini) is enough: it shadows the stock p_mx and every bike that uses p_mx crashes the
+// menu. Each exit now jumps to a stub that hands back the first loaded tyre instead.
+// ===========================================================================
+static std::atomic<unsigned> g_tyreFallbacks{0};
+static uintptr_t g_tyreSpan = 0;   // VA of the patched span, 0 = not patched
+
+// Put the game's own bytes back. Called from Shutdown(): the game unloads the plugin at exit,
+// and a jump into a stub that calls into an unloaded dll would be a crash of our own making.
+static void TyreFallbackRevert() {
+    if (!g_tyreSpan) return;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)g_tyreSpan, tyrefallback::kSpanLen, PAGE_EXECUTE_READWRITE, &prot))
+        return;
+    memcpy((void*)g_tyreSpan, tyrefallback::kSpanBytes, tyrefallback::kSpanLen);
+    VirtualProtect((void*)g_tyreSpan, tyrefallback::kSpanLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)g_tyreSpan, tyrefallback::kSpanLen);
+    g_tyreSpan = 0;
+}
+
+// Called from the stub on the game thread, with the game's frame. Returns the index the game
+// continues with. No C++ objects with destructors here: SafeCopyStr does the SEH.
+static int TyreFallbackPick(int site, const uint8_t* gameRsp, int bikeIndex) {
+    using namespace tyrefallback;
+    const int gameValue = SafeReadInt((const int*)(gameRsp + kJunkSlot));
+    const int count     = SafeReadInt((const int*)(g_base + kRvaTyreCount));
+    uint8_t* table = nullptr;
+    SafeReadBytes((const char*)(g_base + kRvaTyreTable), (char*)&table, sizeof(table));
+    const int pick = table ? PickIndex(count, gameValue) : gameValue;
+
+    const unsigned n = g_tyreFallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 20) return pick;   // a whole bike list can miss; the first lines say enough
+
+    char bike[64] = "?", want[64] = "?", used[64] = "?";
+    const int bikes = SafeReadInt((const int*)(g_base + kRvaBikeCount));
+    uint8_t* btab = nullptr;
+    SafeReadBytes((const char*)(g_base + kRvaBikeTable), (char*)&btab, sizeof(btab));
+    if (btab && bikeIndex >= 0 && bikeIndex < bikes)
+        SafeCopyStr(btab + (size_t)bikeIndex * kBikeStride, bike, sizeof(bike));
+    if (site == kCfgTyreMissing) SafeCopyStr(gameRsp + kCfgTyreSlot, want, sizeof(want));
+    else if (site == kPickedTyreMissing) SafeCopyStr((const void*)(g_base + kRvaPickedTyre), want, sizeof(want));
+
+    if (count <= 0 || !table) {
+        Log("[tyres] bike %s: no tyres are loaded at all, so there is no tyre to fall back on "
+            "(game's own value kept).", bike);
+        return pick;
+    }
+    SafeCopyStr(table + (size_t)pick * kTyreStride, used, sizeof(used));
+    if (site == kNoTyres)
+        Log("[tyres] bike %s: tyre list is empty; using '%s'.", bike, used);
+    else
+        Log("[tyres] bike %s asked for tyre '%s' which isn't loaded; using '%s'.", bike, want, used);
+    frostmod::crash::Note("tyre fallback for bike %s (%u so far)", bike, n);
+    return pick;
+}
+
+static void InstallTyreFallback(intptr_t delta) {
+    using namespace tyrefallback;
+    if (g_game != &GAME_MXB) {
+        Log("[tyres] fallback off for %s - the offsets are MX Bikes' only.", g_game->display);
+        return;
+    }
+    const uintptr_t span = g_base + kRvaSpan + delta;
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te) || (uint8_t*)span < tb || (uint8_t*)span + kSpanLen > te ||
+        !SpanMatches((const uint8_t*)span)) {
+        Log("[tyres] fallback not applied: the bytes at +0x%llX are not the tyre lookup we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)(kRvaSpan + delta));
+        return;
+    }
+    uint8_t* stubs = (uint8_t*)AllocNear(span, kSiteCount * 0x60, PAGE_EXECUTE_READWRITE);
+    if (!stubs) { Log("[tyres] fallback not applied: no free page within reach"); return; }
+
+    uint8_t patch[kSiteCount][kSiteLen];
+    for (int i = 0; i < kSiteCount; ++i) {
+        uint8_t* stub = stubs + i * 0x60;
+        BuildStub(stub, i, (uint64_t)&TyreFallbackPick, (uint64_t)(g_base + kRvaJoin + delta));
+        const uintptr_t site = g_base + kRvaSites[i] + delta;
+        if (!BuildSitePatch(site, (uintptr_t)stub, patch[i])) {
+            VirtualFree(stubs, 0, MEM_RELEASE);
+            Log("[tyres] fallback not applied: stub out of rel32 reach");
+            return;
+        }
+    }
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)span, kSpanLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        VirtualFree(stubs, 0, MEM_RELEASE);
+        Log("[tyres] fallback not applied: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    for (int i = 0; i < kSiteCount; ++i)
+        memcpy((void*)(g_base + kRvaSites[i] + delta), patch[i], kSiteLen);
+    VirtualProtect((void*)span, kSpanLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)span, kSpanLen);
+    g_tyreSpan = span;
+    Log("[tyres] fallback live: a bike naming a tyre that isn't loaded gets the first loaded "
+        "tyre instead of crashing the bike list (+0x%llX).", (unsigned long long)(kRvaSpan + delta));
+}
+
 // The sibling sampler 0x1F1D10 (see offsets.h): same NaN escape, other grid. It answers
 // "no answer" with 1, so that is what a refused query returns here.
 using TerrainSample2Fn = int32_t (*)(void*, void*, void*, float, float);
@@ -7184,6 +7291,7 @@ DWORD WINAPI Init(LPVOID) {
             InstallGhsGuard(delta);
             InstallTerrainGuard(delta);
             InstallTrainerGuard(delta);
+            InstallTyreFallback(delta);
             InstallNanTrap(delta);   // nantrap=1 only (frostmod_radar.cfg): diagnostic
         } else {
             Log("[init] registryReset capture off for %s - that RVA is MX Bikes' and has "
@@ -7636,6 +7744,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 __declspec(dllexport) void Shutdown() {
     Log("[plugin] Shutdown() requested by game.");
     MsgFeedStop();   // no-op in the plugin copy, which never started one
+    TyreFallbackRevert();   // byte patch into this dll's code: undone before we unload
     // MinHook hooks are torn down with the process; nothing required here.
 }
 

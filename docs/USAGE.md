@@ -111,6 +111,13 @@ does without it. One report a session (`nantrapmax=N`, up to 8, for N different 
 after that the trap turns itself off until the next start. If the game has updated and the
 step's bytes no longer match, it stays off and says so in the log.
 
+With `nantrap=1` FrostMod also keeps the last 2 seconds of your bike's tyre state (wheel spin,
+tyre sample radius, a sample point, ground contact, chassis speed) and writes them to a
+`frostmod-nan-ring-*.csv` file next to the log when the trap fires, when the first NaN height
+query is refused, or when the game crashes. It only reads; the game runs the same. The crash
+report names the file as `nanRing`. `tyrelog=0` keeps the trap and drops the ring. The newest
+12 files are kept.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

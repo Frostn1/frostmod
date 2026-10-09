@@ -304,6 +304,7 @@ struct Meta {
     const char* version = "";   // FrostMod's
     const char* game = "";      // the exe
     const char* whenUtc = "";
+    const char* ringFile = "";  // tyrelog's CSV beside this, or empty (key left out)
 };
 
 /// The sidecar MXB App posts: the crash-report shape (so the existing /v1/diagnostics/crash
@@ -323,6 +324,10 @@ inline void WriteJson(const Record& r, const Meta& m, const crash::Context& ctx,
     std::snprintf(line, sizeof(line), "  \"when\": \"%s\",", esc); emit(user, line);
     std::snprintf(line, sizeof(line), "  \"uptimeMs\": %llu,", r.uptimeMs); emit(user, line);
     emit(user, "  \"dump\": \"\",");
+    if (m.ringFile && m.ringFile[0]) {
+        crash::Escape(m.ringFile, esc, sizeof(esc));
+        std::snprintf(line, sizeof(line), "  \"nanRing\": \"%s\",", esc); emit(user, line);
+    }
 
     emit(user, "  \"fault\": {");
     emit(user, "    \"kind\": \"nan_first_fault\",");
@@ -418,6 +423,9 @@ bool Armed();
 /// back to Leave, which restores it exactly and writes any pending report.
 uint32_t Enter();
 void Leave(uint32_t saved);
+/// Leave without the flush: restores MXCSR and counts the step. For a caller that wants to do
+/// something between the step and the report (tyrelog samples the step first), then Flush().
+void Restore(uint32_t saved);
 /// Writes a pending report (log + sidecar). Leave calls it; safe to call from anywhere.
 void Flush();
 /// For the harness: how many reports this session, and the last one.

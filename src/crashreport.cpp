@@ -396,6 +396,9 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
         char dumpName[80] = "";
         if (WriteDump(ep)) _snprintf_s(dumpName, sizeof(dumpName), _TRUNCATE, "%s.dmp", g_stem);
         fault.dumpFile = dumpName;
+        // nantrap=1's tyre ring (tyrelog): the last ~2 s of the bike, if it is on.
+        char ringName[MAX_PATH] = "";
+        if (WriteRing("crash", ringName, sizeof(ringName))) fault.ringFile = ringName;
         WriteSidecar(fault);
         Say("[crash] end of report - the game process is going down.");
     }
@@ -426,6 +429,17 @@ int UnwindFrom(const void* context, char (*out)[160], int max) {
 void DescribeAddr(const void* addr, char* out, size_t n) { DescribeAddress(addr, out, n); }
 const char* ReportDir() { return g_dumpDir; }
 const char* Version() { return g_version; }
+
+namespace {
+std::atomic<RingWriter> g_ringWriter{nullptr};
+}
+void SetRingWriter(RingWriter fn) { g_ringWriter.store(fn, std::memory_order_release); }
+bool WriteRing(const char* reason, char* name, size_t n) {
+    if (name && n) name[0] = 0;
+    const RingWriter fn = g_ringWriter.load(std::memory_order_acquire);
+    if (!fn || !name || !n) return false;
+    return fn(reason, name, n);
+}
 
 Trail& TheTrail() { static Trail t; return t; }
 Context& TheContext() { static Context c; return c; }

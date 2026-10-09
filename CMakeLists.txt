@@ -220,6 +220,12 @@ if(WIN32)
     add_test(NAME nantrap_harness COMMAND nantrap_harness)
 endif()
 
+# tyrelog (src/tyrelog.h), nantrap=1's tyre ring: the cfg key, the copy out of a bike laid out
+# like the game's, the ring, the CSV, the byte checks vs the layout and the "nanRing" key. Pure.
+# Prints the per-step sampling cost.
+add_executable(tyrelog_test tests/tyrelog_test.cpp)
+add_test(NAME tyrelog COMMAND tyrelog_test)
+
 add_executable(crashreport_test tests/crashreport_test.cpp)
 add_test(NAME crashreport COMMAND crashreport_test)
 

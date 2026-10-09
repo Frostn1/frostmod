@@ -62,6 +62,7 @@
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
+#include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -3803,6 +3804,9 @@ static std::atomic<int>  g_tcMinDim{256};
 // src/nantrap.h). Off unless the file says exactly 1. Read early by NtReadCfg() before the hook
 // goes in; kept here so a save of the overlay settings does not drop it.
 static nantrap::Config g_ntCfg;
+// tyrelog=0 turns nantrap's tyre ring off (TYRELOG section, src/tyrelog.h). It is on with
+// nantrap=1 otherwise; without nantrap=1 the key does nothing.
+static tyrelog::Config g_tlCfg;
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3818,6 +3822,7 @@ static void SaveOverlaySettings() {
     if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
     if (g_ntCfg.max != 1) fprintf(f, "nantrapmax=%d\n", g_ntCfg.max);
+    if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3834,6 +3839,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "texcompressmin=%d", &v) == 1 && v >= 4 && v <= 16384) g_tcMinDim.store(v);
         // Only kept for the next save: whether the trap went in was decided at load.
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
+        else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -6716,12 +6722,217 @@ static void InstallTerrainGuard(intptr_t delta) {
 using SimStepFn = int32_t (*)(int32_t, float);
 static SimStepFn g_origSimStep = nullptr;
 
+static void TlAfterStep(int32_t slot, float dt);
+static std::atomic<bool> g_tlOn{false};
+
 static int32_t hkSimStep(int32_t slot, float dt) {
-    if (!nantrap::Armed()) return g_origSimStep(slot, dt);
+    if (!nantrap::Armed()) {
+        const int32_t rc = g_origSimStep(slot, dt);
+        if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
+        return rc;
+    }
     const uint32_t saved = nantrap::Enter();
     const int32_t rc = g_origSimStep(slot, dt);
-    nantrap::Leave(saved);   // the game's MXCSR, exactly as it was
+    nantrap::Restore(saved);   // the game's MXCSR, exactly as it was
+    // The ring takes this step before a trap report goes out, so the report's CSV ends on the
+    // step that made the NaN.
+    if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
+    nantrap::Flush();          // a pending report, if the step trapped; nothing otherwise
     return rc;
+}
+
+// ===========================================================================
+// TYRELOG  -  the last ~2 s of the bike's tyres, for the NaN (nantrap=1; tyrelog=0 drops it)
+//
+// After each sim step returns, copy the first active bike's wheel spin, tyre sample radius,
+// first sample point and ground gap, and its chassis position and velocities, into a
+// 1,000-step ring (src/tyrelog.h). Write the ring out as frostmod-nan-ring-*.csv when the trap
+// fires, when the first NaN height query is refused, and on a crash; the crash and trap
+// reports name it as "nanRing". Read-only: plain loads, nothing written to the game, no hook
+// of its own. Every offset is checked against the exe's bytes before it turns on.
+// ===========================================================================
+static tyrelog::Ring<tyrelog::kSteps> g_tlRing;
+static const uint8_t* g_tlWorlds = nullptr;    // the world slot array the sim step indexes
+static uint64_t g_tlSteps = 0;
+static bool g_tlRefusalDumped = false;
+static std::atomic<int> g_tlDumps{0};
+static constexpr int kTlMaxDumps = 6;          // a session's worth: refusal, trap(s), crash
+static constexpr int kTlKeepFiles = 12;        // ring CSVs kept in the folder, newest first
+static constexpr unsigned kTlTimedSteps = 5000;
+
+// No C++ objects with destructors in here: the caller wraps it in __try.
+static void TlSampleRaw(int32_t slot, float dt) {
+    if (slot < 1 || slot > 3 || !g_tlWorlds) return;
+    const uint8_t* world = g_tlWorlds + (size_t)(slot - 1) * tyrelog::kWorldStride;
+    const uint8_t* list = nullptr;
+    memcpy(&list, world + tyrelog::kWorldBikeList, sizeof(list));
+    const int n = tyrelog::ListCount(list);
+    if (n <= 0 || n > tyrelog::kMaxBikes) return;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t* bike = tyrelog::ListItem(list, i);
+        if (!bike) continue;
+        int32_t active = 0;
+        memcpy(&active, bike + tyrelog::kBikeActive, 4);
+        if (!active) continue;
+        const uint8_t* body = nullptr;
+        memcpy(&body, bike + tyrelog::kBikeChassis, sizeof(body));
+        tyrelog::Step& s = g_tlRing.Next();
+        s.step = ++g_tlSteps;
+        s.dt = dt;
+        s.slot = (int16_t)slot;
+        s.bikes = (int16_t)n;
+        s.index = (int16_t)i;
+        tyrelog::ReadBike(bike, body, s);
+        g_tlRing.Commit();
+        return;   // the first active bike: offline, the player's
+    }
+}
+
+static bool TlSample(int32_t slot, float dt) {
+    __try {
+        TlSampleRaw(slot, dt);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void TlPrune() {
+    const char* dir = frostmod::crash::ReportDir();
+    if (!dir || !dir[0]) return;
+    struct Found { char name[MAX_PATH]; FILETIME when; };
+    static Found found[64];
+    int n = 0;
+    char pattern[MAX_PATH];
+    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s\\frostmod-nan-ring-*.csv", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (n < 64) { strcpy_s(found[n].name, fd.cFileName); found[n].when = fd.ftLastWriteTime; ++n; }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    while (n > kTlKeepFiles) {
+        int oldest = 0;
+        for (int i = 1; i < n; ++i)
+            if (CompareFileTime(&found[i].when, &found[oldest].when) < 0) oldest = i;
+        char path[MAX_PATH];
+        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, found[oldest].name);
+        DeleteFileA(path);
+        found[oldest] = found[--n];
+    }
+}
+
+// crash::RingWriter: the trap report, the crash filter and the refusal below all come here.
+// Names the file it wrote (a leaf) in `name`. No logging: the crash filter calls it.
+static bool TlWrite(const char* reason, char* name, size_t n) {
+    if (!g_tlOn.load(std::memory_order_relaxed) || !name || !n) return false;
+    name[0] = 0;
+    if (g_tlRing.Count() == 0) return false;
+    if (g_tlDumps.fetch_add(1) >= kTlMaxDumps) return false;
+    const char* dir = frostmod::crash::ReportDir();
+    if (!dir || !dir[0]) return false;
+    SYSTEMTIME local, utc;
+    GetLocalTime(&local);
+    GetSystemTime(&utc);
+    tyrelog::FileName(local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute,
+                      local.wSecond, reason, name, n);
+    char path[MAX_PATH], whenUtc[32];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, name);
+    _snprintf_s(whenUtc, sizeof(whenUtc), _TRUNCATE, "%04d-%02d-%02dT%02d:%02d:%02dZ", utc.wYear,
+                utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, path, "wb") != 0 || !fp) { name[0] = 0; return false; }
+    setvbuf(fp, nullptr, _IOFBF, 1 << 16);
+    tyrelog::Meta m;
+    m.reason = reason;
+    m.version = frostmod::crash::Version();
+    m.whenUtc = whenUtc;
+    m.track = frostmod::crash::TheContext().track;   // the folder name; no rider, no server
+    tyrelog::WriteCsv(g_tlRing, m,
+                      [](void* user, const char* line) {
+                          std::fputs(line, (FILE*)user);
+                          std::fputc('\n', (FILE*)user);
+                      },
+                      fp);
+    std::fclose(fp);
+    TlPrune();
+    return true;
+}
+
+static void TlAfterStep(int32_t slot, float dt) {
+    // The cost, measured on the player's own machine: the first few thousand samples are
+    // timed and the mean goes in the log once.
+    static unsigned timed = 0;
+    static long long ticks = 0;
+    LARGE_INTEGER a{}, b{};
+    const bool timing = timed < kTlTimedSteps;
+    if (timing) QueryPerformanceCounter(&a);
+    const bool ok = TlSample(slot, dt);
+    if (timing) {
+        QueryPerformanceCounter(&b);
+        ticks += b.QuadPart - a.QuadPart;
+        if (++timed == kTlTimedSteps) {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            const double ns =
+                f.QuadPart ? (double)ticks * 1e9 / (double)f.QuadPart / kTlTimedSteps : 0.0;
+            Log("[tyrelog] sampling costs %.0f ns a step (mean of %u steps; a step is 2 ms).", ns,
+                kTlTimedSteps);
+        }
+    }
+    if (!ok) {
+        g_tlOn.store(false, std::memory_order_relaxed);
+        Log("[tyrelog] a read faulted - the ring is off for the rest of this session.");
+        return;
+    }
+    // The first refused NaN height query: the ring now ends a step or so after it.
+    if (!g_tlRefusalDumped && g_terrainGuarded.load(std::memory_order_relaxed) > 0) {
+        g_tlRefusalDumped = true;
+        char name[MAX_PATH];
+        if (TlWrite("refusal", name, sizeof(name)))
+            Log("[tyrelog] first refused NaN height query: the last %zu steps are in %s",
+                g_tlRing.Count(), name);
+    }
+}
+
+// After the sim-step hook is in. `fn` is the sim step as found; a relocated step means another
+// build, and the byte checks below then decide.
+static void TlInstall(const uint8_t* fn) {
+    if (!tyrelog::Enabled(g_ntCfg.on, g_tlCfg)) {
+        Log("[tyrelog] off (tyrelog=0): the trap runs without the tyre ring.");
+        return;
+    }
+    const intptr_t delta = (intptr_t)(fn - (const uint8_t*)g_base) - (intptr_t)mxb::RVA_SIM_STEP;
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) { Log("[tyrelog] off: no .text range."); return; }
+    for (const tyrelog::Check& c : tyrelog::kChecks) {
+        const uint8_t* p = (const uint8_t*)(g_base + c.rva + delta);
+        if (p < begin || p + c.len > end || memcmp(p, c.bytes, (size_t)c.len) != 0) {
+            Log("[tyrelog] off: %s does not match at RVA 0x%zx (game updated?). The trap still "
+                "runs.", c.what, (size_t)(c.rva + delta));
+            return;
+        }
+    }
+    // The world slot array, off the sim step's own lea.
+    int32_t rel = 0;
+    memcpy(&rel, fn + tyrelog::kSimStepLeaAt + 3, 4);
+    const uint8_t* worlds = fn + tyrelog::kSimStepLeaAt + 7 + rel;
+    auto dos = (const IMAGE_DOS_HEADER*)g_base;
+    auto nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)g_base + dos->e_lfanew);
+    const uint8_t* lo = (const uint8_t*)g_base;
+    const uint8_t* hi = lo + nt->OptionalHeader.SizeOfImage;
+    if (worlds < lo || worlds + 3 * tyrelog::kWorldStride > hi) {
+        Log("[tyrelog] off: the world array the sim step points at is outside the exe.");
+        return;
+    }
+    g_tlWorlds = worlds;
+    frostmod::crash::SetRingWriter(&TlWrite);
+    g_tlOn.store(true, std::memory_order_release);
+    Log("[tyrelog] ON (with nantrap=1): the last %zu physics steps of tyre spin, sample radius, "
+        "sample point and chassis speed are kept and written to frostmod-nan-ring-*.csv on the "
+        "trap, the first refused NaN height query, or a crash. Read-only.", tyrelog::kSteps);
 }
 
 // nantrap= / nantrapmax= straight from the file: the hook goes in before LoadOverlaySettings.
@@ -6729,7 +6940,9 @@ static void NtReadCfg() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128];
-    while (fgets(line, sizeof(line), f)) nantrap::ParseCfgLine(line, g_ntCfg);
+    while (fgets(line, sizeof(line), f)) {
+        if (!nantrap::ParseCfgLine(line, g_ntCfg)) tyrelog::ParseCfgLine(line, g_tlCfg);
+    }
     fclose(f);
 }
 
@@ -6765,10 +6978,12 @@ static void InstallNanTrap(intptr_t delta) {
     // Handler first, then the hook: a step must never run armed with nothing to catch it.
     nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
     if (!nantrap::Armed()) return;
-    if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)"))
+    if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
         Log("[nantrap] ON (nantrap=1): the first invalid FP op in the sim step is logged and "
             "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
             "same values it does without it.", g_ntCfg.max);
+        TlInstall(fn);
+    }
 }
 
 // Verify, decode, hook. MX Bikes only: both the RVA and the signature are mxbikes.exe's.

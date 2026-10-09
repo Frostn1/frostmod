@@ -168,10 +168,14 @@ uint32_t Enter() {
     return saved;
 }
 
-void Leave(uint32_t saved) {
+void Restore(uint32_t saved) {
     _mm_setcsr(saved);
     --t_depth;
     g_steps.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Leave(uint32_t saved) {
+    Restore(saved);
     if (g_pending.load(std::memory_order_acquire)) Flush();
 }
 
@@ -198,7 +202,11 @@ void Flush() {
                     local.wSecond, r.index);
         FILE* fp = nullptr;
         if (fopen_s(&fp, path, "wb") == 0 && fp) {
+            // nantrap=1's tyre ring (tyrelog), if it is on: the ~2 s that led up to this.
+            char ringName[MAX_PATH] = "";
+            crash::WriteRing("trap", ringName, sizeof(ringName));
             Meta m;
+            m.ringFile = ringName;
             m.version = crash::Version();
             m.game = g_exeLeaf;
             m.whenUtc = whenUtc;

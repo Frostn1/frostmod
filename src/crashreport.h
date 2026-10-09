@@ -278,6 +278,7 @@ struct Fault {
     const char* game = "";        // the exe we are inside
     const char* whenUtc = "";     // ISO 8601, so two machines' reports sort together
     const char* dumpFile = "";    // the .dmp beside this, or empty
+    const char* ringFile = "";    // tyrelog's frostmod-nan-ring-*.csv beside this, or empty
     unsigned long long uptimeMs = 0;
 };
 
@@ -303,6 +304,12 @@ inline void WriteJson(const Fault& f, const Context& ctx, const Trail& trail,
     Escape(f.dumpFile, esc, sizeof(esc));
     std::snprintf(line, sizeof(line), "  \"dump\": \"%s\",", esc);
     emit(user, line);
+    // Only with nantrap=1's tyre ring on: absent otherwise, so every other report is unchanged.
+    if (f.ringFile && f.ringFile[0]) {
+        Escape(f.ringFile, esc, sizeof(esc));
+        std::snprintf(line, sizeof(line), "  \"nanRing\": \"%s\",", esc);
+        emit(user, line);
+    }
 
     emit(user, "  \"fault\": {");
     Escape(f.kind, esc, sizeof(esc));
@@ -475,6 +482,13 @@ void DescribeAddr(const void* addr, char* out, size_t n);
 const char* ReportDir();
 /// FrostMod's version as Install() was given it.
 const char* Version();
+/// An extra file written beside a report: nantrap=1's tyre ring (src/tyrelog.h). The writer
+/// names the file it wrote into `name` (a leaf, no folder) and returns true. Unset by default;
+/// the crash filter and nantrap's report then write nothing extra and name nothing.
+using RingWriter = bool (*)(const char* reason, char* name, size_t n);
+void SetRingWriter(RingWriter fn);
+/// Calls the writer if one is set. False (and `name` empty) when none is or it wrote nothing.
+bool WriteRing(const char* reason, char* name, size_t n);
 
 #else   // non-Windows hosts: the tests build the portable half only
 

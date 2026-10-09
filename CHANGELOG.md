@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-08 - v0.49.11
+
+Fix for a menu crash caused by a broken tyre mod.
+
+### Fixed
+- A bike that names a tyre that isn't loaded (for example an empty `mods\tyres\p_mx` folder) no longer crashes the bike list. FrostMod uses the first loaded tyre and logs which one was missing.
+
+### Added
+- Tyre-state log for the physics NaN crash. Rides on `nantrap=1`, off by default.
+
 ## 2026-10-08 - v0.49.10
 
 NaN crash trap for physics crashes.

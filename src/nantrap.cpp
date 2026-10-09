@@ -159,6 +159,11 @@ void Install(void (*log)(const char*), const Config& cfg) {
     g_armed.store(true, std::memory_order_release);
 }
 
+void Uninstall() {
+    g_armed.store(false, std::memory_order_release);
+    if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
+}
+
 bool Armed() { return g_armed.load(std::memory_order_relaxed); }
 
 uint32_t Enter() {

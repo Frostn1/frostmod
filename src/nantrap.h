@@ -416,6 +416,8 @@ inline void WriteJson(const Record& r, const Meta& m, const crash::Context& ctx,
 #ifdef _WIN32
 /// Registers the vectored handler (first in line) and arms the trap. `log` takes one line.
 void Install(void (*log)(const char*), const Config& cfg);
+/// Disarms and removes the vectored handler. Called before the dll unloads.
+void Uninstall();
 /// Whether a step should be wrapped. False until Install, and again once the session's reports
 /// are written.
 bool Armed();

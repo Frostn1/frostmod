@@ -476,4 +476,12 @@ void Rearm() {
          "and will chain to theirs.");
 }
 
+void Uninstall() {
+    if (!g_ours) return;
+    LPTOP_LEVEL_EXCEPTION_FILTER now = SetUnhandledExceptionFilter(g_prev);
+    // Someone installed over us since the last Rearm: theirs stays on top.
+    if (now != g_ours) SetUnhandledExceptionFilter(now);
+    g_ours = nullptr;
+}
+
 }  // namespace frostmod::crash

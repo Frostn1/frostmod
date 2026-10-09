@@ -452,6 +452,11 @@ void Install(void (*log)(const char*), const char* dumpDir, const char* version)
 /// (one SetUnhandledExceptionFilter); call it from the periodic tick.
 void Rearm();
 
+/// Hands the top of the filter chain back to whoever had it before us, if it is still
+/// ours, and stops Rearm from taking it again. Called before the dll unloads: a filter
+/// pointing into an unmapped module turns any later crash into a second one.
+void Uninstall();
+
 /// The shared trail + context. Note() timestamps for you.
 Trail&   TheTrail();
 Context& TheContext();

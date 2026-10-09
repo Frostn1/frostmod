@@ -6338,16 +6338,18 @@ static int GfxApplyDesc(int slot, uintptr_t desc, const std::vector<gfxcfg::Writ
 }
 
 // Read the gfx.cfg of every loaded bike (or only `onlyBike`) and put the live keys onto it.
-void GfxApply(const char* onlyBike, const char* why) {
+// False when a file could not be read (an editor still holding it) or a write faulted: the
+// watch tries that save again.
+bool GfxApply(const char* onlyBike, const char* why) {
     if (!GfxSupported()) {
         Log("[gfx] %s: not applied, this game build is not supported", why);
         SetStatus("gfx.cfg: game version not supported", 4000);
-        return;
+        return true;   // nothing a retry would change
     }
     std::map<std::string, gfxcfg::Flat> read;     // path -> parsed, once per call
     std::vector<std::string> notLive;
     int bikes = 0, changed = 0, noFile = 0;
-    bool fault = false;
+    bool fault = false, readFail = false;
     for (int i = 0; i < mxb::VEHICLE_MAX && !fault; ++i) {
         const uintptr_t v = VehicleAt(i);
         if (SafeReadInt((const int*)v) == 0) continue;
@@ -6363,7 +6365,11 @@ void GfxApply(const char* onlyBike, const char* why) {
         auto it = read.find(path);
         if (it == read.end()) {
             std::string text;
-            if (!GfxReadText(path, text)) { ++noFile; Log("[gfx] %s: cannot read", path.c_str()); continue; }
+            if (!GfxReadText(path, text)) {
+                readFail = true;
+                Log("[gfx] %s: cannot read", path.c_str());
+                continue;
+            }
             it = read.emplace(path, gfxcfg::Parse(text)).first;
             auto last = g_gfxLast.find(path);
             if (last != g_gfxLast.end()) {
@@ -6383,16 +6389,20 @@ void GfxApply(const char* onlyBike, const char* why) {
     Log("[gfx] %s: %d bike(s), %d value(s) changed, %d without a loose gfx.cfg%s", why, bikes,
         changed, noFile, fault ? ", stopped on a fault" : "");
     if (fault)                      SetStatus("gfx.cfg: write failed", 4000);
+    else if (!bikes && readFail)    SetStatus("gfx.cfg: file busy", 3000);
     else if (!bikes && noFile)      SetStatus("gfx.cfg: no loose file for this bike", 4000);
     else if (!bikes)                SetStatus("gfx.cfg: no bike loaded", 3000);
     else if (!notLive.empty())      SetStatus("gfx.cfg applied, some keys need a rejoin", 4000);
     else                            SetStatus("gfx.cfg applied", 2500);
+    return !fault && !readFail;
 }
 
 // The watch: every half second, the loose gfx.cfg of each loaded bike is stat'ed, and a new
 // write time or size re-applies that bike. A file is only recorded the first time it is seen,
-// so turning the watch on never changes anything by itself.
-struct GfxSeen { uint64_t time; uint64_t size; };
+// so turning the watch on never changes anything by itself. A save that could not be applied
+// (file still locked) is tried again on the next polls, up to kGfxRetries times.
+struct GfxSeen { uint64_t time; uint64_t size; int tries; };
+static const int kGfxRetries = 6;
 static std::map<std::string, GfxSeen> g_gfxSeen;
 
 void GfxWatchToggle() {
@@ -6425,7 +6435,7 @@ void GfxWatchTick() {
         WIN32_FILE_ATTRIBUTE_DATA fa;
         if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) continue;
         const GfxSeen s{((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime,
-                        ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow};
+                        ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow, 0};
         auto it = g_gfxSeen.find(path);
         if (it == g_gfxSeen.end()) {
             g_gfxSeen[path] = s;
@@ -6434,9 +6444,12 @@ void GfxWatchTick() {
             Log("[gfx] watching %s", path.c_str());
             continue;
         }
-        if (it->second.time == s.time && it->second.size == s.size) continue;
+        const bool fresh = it->second.time != s.time || it->second.size != s.size;
+        if (!fresh && it->second.tries == 0) continue;            // seen and applied
+        const int tries = fresh ? 1 : it->second.tries + 1;
+        const bool done = GfxApply(bike.c_str(), "gfx.cfg saved");
         it->second = s;
-        GfxApply(bike.c_str(), "gfx.cfg saved");
+        it->second.tries = (done || tries >= kGfxRetries) ? 0 : tries;
     }
 }
 
@@ -6575,7 +6588,7 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         // MXB App / Frost's Studio saved a bike's gfx.cfg: put its grips, levers, chain and
         // rider offset onto the bike now (LIVE BIKE GFX.CFG). bikeId narrows it to that bike
         // folder; without one every loaded bike is re-read.
-        GfxApply(bikeId.c_str(), "MXB App");
+        (void)GfxApply(bikeId.c_str(), "MXB App");
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike

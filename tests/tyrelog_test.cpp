@@ -118,6 +118,14 @@ static void checks() {
     k = find(0x1ADA4B); CHECK(k && (uint8_t)k->bytes[2] == kBikeActive, "bike active");
     k = find(0x1BE3DC); CHECK(k && disp32(*k, 3) == kWorldStride, "world stride");
     k = find(0x1BE657); CHECK(k && (uint8_t)k->bytes[3] == kWorldBikeList, "bike list");
+    k = find(0x1BF0DD); CHECK(k && (uint8_t)k->bytes[3] == kWorldBikeList, "bikes created in that list");
+    k = find(0x1BF1BC); CHECK(k && (uint8_t)k->bytes[9] == kWorldBikeList, "handles resolve into it");
+    k = find(0x1BF13C); CHECK(k && (uint8_t)k->bytes[1] == 0x07 && kBikeHandle == 0, "handle at +0");
+    k = find(0x21F6E); CHECK(k && (uint8_t)k->bytes[2] == kVehicleBikeHandle, "vehicle +4");
+    // The vehicle records are the ones FrostMod already indexes by RVA_OWN_VEHICLE.
+    k = find(0x21E66); CHECK(k && disp32(*k, 3) == (uint32_t)mxb::VEHICLE_STRIDE, "vehicle stride");
+    k = find(0x21E75);
+    CHECK(k && 0x21E75 + 7 + (int32_t)disp32(*k, 3) == mxb::RVA_VEHICLES, "vehicle records RVA");
     // The lea the world array comes from sits where the live code reads it: sim step + 0x2B.
     k = find(0x1BE3CB);
     CHECK(k && k->rva == mxb::RVA_SIM_STEP + kSimStepLeaAt, "world lea at sim step + 0x2B");
@@ -183,6 +191,25 @@ static void bike_list() {
     CHECK(!ListItem(nullptr, 0) && ListCount(nullptr) == 0, "no list");
 }
 
+static void pick() {
+    const int32_t h[6] = {5, 9, 7, 3, 8, 6};
+    bool on[6] = {true, true, true, true, true, true};
+    int out[kMaxTagged];
+    bool local = false;
+    CHECK(PickBikes(h, on, 6, 7, out, &local) == 1 && out[0] == 2 && local, "own handle found");
+    CHECK(PickBikes(h, on, 6, 0, out, &local) == kMaxTagged && !local && out[0] == 0 && out[3] == 3,
+          "no own record: first 4 active, not local");
+    CHECK(PickBikes(h, on, 6, 99, out, &local) == kMaxTagged && !local, "own not in list: fallback");
+    on[2] = false;
+    CHECK(PickBikes(h, on, 6, 7, out, &local) == kMaxTagged && !local && out[2] == 3,
+          "own inactive: fallback skips inactive");
+    bool none[6] = {};
+    CHECK(PickBikes(h, none, 6, 0, out, &local) == 0, "nothing active");
+    // Offline there is one bike and it is recorded either way.
+    CHECK(PickBikes(h, on, 1, 0, out, &local) == 1 && out[0] == 0, "single bike");
+    CHECK(kRows == kSteps * kMaxTagged, "2 s even at 4 bikes a step");
+}
+
 static void ring() {
     auto r = std::make_unique<Ring<8>>();
     CHECK(r->Count() == 0, "empty");
@@ -215,6 +242,8 @@ static void csv() {
         s.wheel[1].spin = i == 6 ? std::numeric_limits<double>::infinity() : 1.0;
         s.wheel[1].radius = i == 6 ? std::numeric_limits<double>::quiet_NaN() : 0.3;
         s.wheel[1].hit = 1;
+        s.handle = 4242;
+        s.local = 1;
         r->Commit();
     }
     Meta m;
@@ -232,7 +261,7 @@ static void csv() {
     CHECK(ls[1][0] == '#', "second meta line");
     CHECK(ls[2] == kHeader, "header");
     const int cols = commas(kHeader);
-    CHECK(cols == 32, "33 columns (got %d)", cols + 1);
+    CHECK(cols == 34, "35 columns (got %d)", cols + 1);
     for (size_t i = 3; i < ls.size(); ++i)
         CHECK(commas(ls[i]) == cols, "row %zu has %d commas", i, commas(ls[i]));
     const auto first = fields(ls[3]), last = fields(ls[6]);
@@ -242,16 +271,44 @@ static void csv() {
     CHECK(std::fabs(std::atof(first[0].c_str()) + 6.0) < 1e-3, "oldest at -6 ms (got %s)",
           first[0].c_str());
     CHECK(std::fabs(std::atof(first[2].c_str()) - 2.0) < 1e-4, "dt in ms (got %s)", first[2].c_str());
-    CHECK(first[14] == "5", "speed = |lvel| (got %s)", first[14].c_str());
-    CHECK(last[19] == "600" && first[19] == "300", "w0 spin (got %s / %s)", first[19].c_str(),
-          last[19].c_str());
-    CHECK(last[26] == "inf" && last[27] == "nan", "w1 inf/nan spelled out (got %s %s)",
-          last[26].c_str(), last[27].c_str());
-    CHECK(last[32] == "1", "w1 hit");
+    CHECK(first[16] == "5", "speed = |lvel| (got %s)", first[16].c_str());
+    CHECK(last[21] == "600" && first[21] == "300", "w0 spin (got %s / %s)", first[21].c_str(),
+          last[21].c_str());
+    CHECK(last[28] == "inf" && last[29] == "nan", "w1 inf/nan spelled out (got %s %s)",
+          last[28].c_str(), last[29].c_str());
+    CHECK(last[34] == "1", "w1 hit");
+    CHECK(last[6] == "4242" && last[7] == "1", "handle and local tag (got %s %s)", last[6].c_str(),
+          last[7].c_str());
     // Nothing identifying: only the folder of the track. No rider, server, Steam ID or GUID
     // field exists to be filled.
     CHECK(out.find("7656") == std::string::npos && out.find("rider") == std::string::npos,
           "no ids");
+
+    // Several bikes in one step (the local one unknown): t_ms advances once per step.
+    {
+        auto m4 = std::make_unique<Ring<16>>();
+        for (int st = 1; st <= 3; ++st)
+            for (int b = 0; b < 2; ++b) {
+                Step& s = m4->Next();
+                s = Step{};
+                s.step = (uint64_t)st;
+                s.dt = 0.002f;
+                s.index = (int16_t)b;
+                s.handle = 10 + b;
+                m4->Commit();
+            }
+        std::string o4;
+        WriteCsv(*m4, m, collect, &o4);
+        const auto l4 = lines(o4);
+        CHECK(l4.size() == 3 + 6, "6 rows");
+        if (l4.size() == 9) {
+            const auto r0 = fields(l4[3]), r1 = fields(l4[4]), r5 = fields(l4[8]);
+            CHECK(r0[0] == r1[0], "same step, same t (%s vs %s)", r0[0].c_str(), r1[0].c_str());
+            CHECK(std::fabs(std::atof(r0[0].c_str()) + 4.0) < 1e-3, "two steps back: -4 ms (got %s)",
+                  r0[0].c_str());
+            CHECK(r5[0] == "0" && r5[6] == "11" && r5[7] == "0", "last row: t 0, handle 11, local 0");
+        }
+    }
 
     std::string empty;
     WriteCsv(Ring<4>{}, m, collect, &empty);
@@ -294,7 +351,7 @@ static void reports() {
 // runners vary. The bound only catches something gone badly wrong.
 static void cost() {
     std::vector<uint8_t> bike(kBikeSpan + 64, 0), body(kBodySpan + 16, 0);
-    auto r = std::make_unique<Ring<kSteps>>();
+    auto r = std::make_unique<Ring<kRows>>();
     const int n = 2000000;
     volatile const uint8_t* vb = bike.data();   // keep the reads from being hoisted
     const auto t0 = std::chrono::steady_clock::now();
@@ -308,7 +365,7 @@ static void cost() {
     const auto t1 = std::chrono::steady_clock::now();
     const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / n;
     std::printf("tyrelog: %.1f ns per sampled step (%zu-byte row, %zu KB ring), %.4f%% of a 2 ms step\n",
-                ns, sizeof(Step), sizeof(Ring<kSteps>) / 1024, ns / 2e6 * 100.0);
+                ns, sizeof(Step), sizeof(Ring<kRows>) / 1024, ns / 2e6 * 100.0);
     CHECK(ns < 2000.0, "a sample under 2 us (got %.1f ns)", ns);
 
     std::string out;
@@ -326,6 +383,7 @@ int main() {
     checks();
     read_bike();
     bike_list();
+    pick();
     ring();
     csv();
     reports();

@@ -34,6 +34,18 @@
 //   world slot   = lea at sim step + 0x2B (0x1BE3CB) + (slot-1) * 0x6160 (0x1BE3DC)
 //   bike list    = [world + 0x28] (0x1BE657): int count at +0, item i's pointer at
 //                  +4 + 16*i + 8 (0x15C350: imul rcx, 0x10 / lea [rax+rcx+4] / mov rax, [rax+8])
+//
+// Which bike is the player's. A bike object starts with its global handle: the creator
+// 0x1BF0B0 allocates it in [world+0x28] and stores the handle from the global table at +0
+// (0x1BF13C mov [rdi], eax) and hands the same handle back (0x1BF142). Every bike job takes
+// that handle and resolves it through the same table into [world+0x28] (0x1BF1A0, used by
+// place-bike 0x197060). The vehicle records (0xF4EE20, stride 0x5B24) hold it at +4: the
+// respawn path 0x21E30 indexes the record (0x21E66/0x21E75) and passes [rec+4] to place-bike
+// (0x21F6E -> 0x1187E0 -> job 0x25A -> 0x197060). FrostMod already knows the player's record:
+// [0xE62710] = own vehicle + 1 (offsets.h RVA_OWN_VEHICLE). So the local bike is the one
+// whose +0 equals [own record + 4]. When there is no own record (0) or no bike matches, up
+// to kMaxTagged active bikes are recorded instead, each row tagged with its handle and
+// local = 0, so nothing is guessed.
 #pragma once
 
 #include <atomic>
@@ -67,6 +79,9 @@ inline constexpr size_t kWorldStride   = 0x6160;
 inline constexpr size_t kWorldBikeList = 0x28;
 inline constexpr int    kSimStepLeaAt  = 0x2B;   // sim step + 0x2B: lea rax, [rip + rel32]
 inline constexpr int    kMaxBikes      = 64;     // a list longer than this is not a bike list
+inline constexpr size_t kBikeHandle    = 0x00;   // int: the bike's global handle
+inline constexpr size_t kVehicleBikeHandle = 0x04;   // int in a vehicle record: its bike's handle
+inline constexpr int    kMaxTagged     = 4;      // bikes per step when the local one is unknown
 
 /// One byte check against the running exe. Every RVA here is beta21e's.
 struct Check {
@@ -94,6 +109,12 @@ inline constexpr Check kChecks[] = {
     {0x15C3B6, "\x48\x6B\xC9\x10", 4, "list item stride 16"},
     {0x15C3BF, "\x48\x8D\x44\x08\x04", 5, "list items at +4"},
     {0x15C3E1, "\x48\x8B\x40\x08", 4, "item pointer at +8"},
+    {0x1BF0DD, "\x48\x8D\x48\x28", 4, "bike created in [world+0x28]"},
+    {0x1BF13C, "\x89\x07\x8B\x44\x24\x30\x89\x06", 8, "bike +0 = its handle"},
+    {0x1BF1BC, "\x48\x8B\x48\x08\x8B\x10\x48\x8B\x49\x28", 10, "handle -> [world+0x28]"},
+    {0x21E66, "\x48\x69\xFF\x24\x5B\x00\x00", 7, "vehicle record stride"},
+    {0x21E75, "\x48\x8D\x05\xA4\xCF\xF2\x00", 7, "vehicle records lea (0xF4EE20)"},
+    {0x21F6E, "\x8B\x4F\x04", 3, "vehicle +4 = bike handle"},
 };
 
 // ---- frostmod_radar.cfg ----------------------------------------------------------------------
@@ -136,6 +157,8 @@ struct Step {
     int16_t bikes = 0;    // bikes in that slot's list
     int16_t index = -1;   // which of them this is
     int16_t body = 0;     // 1 if the chassis body was read
+    int32_t handle = 0;   // the bike's global handle ([bike+0])
+    int32_t local = 0;    // 1: matched the player's own vehicle record; 0: not known
     float pos[3] = {0, 0, 0};
     float lvel[3] = {0, 0, 0};
     float avel[3] = {0, 0, 0};
@@ -185,6 +208,23 @@ inline int ListCount(const uint8_t* list) {
 
 // ---- the ring ------------------------------------------------------------------------------------
 inline constexpr size_t kSteps = 1000;   // 2 s at the game's fixed 2 ms step
+/// Rows held: 2 s even when the local bike is unknown and up to kMaxTagged bikes go in a step.
+inline constexpr size_t kRows = kSteps * kMaxTagged;
+
+/// Which bikes to record this step, given the list's handles and active flags. Writes indexes
+/// into `out` and returns how many; `*local` says whether it is the player's (one row) or the
+/// fallback (up to kMaxTagged, local unknown). `own` is 0 when the player has no record.
+inline int PickBikes(const int32_t* handles, const bool* active, int n, int32_t own, int* out,
+                     bool* local) {
+    *local = false;
+    if (own != 0)
+        for (int i = 0; i < n; ++i)
+            if (active[i] && handles[i] == own) { out[0] = i; *local = true; return 1; }
+    int k = 0;
+    for (int i = 0; i < n && k < kMaxTagged; ++i)
+        if (active[i]) out[k++] = i;
+    return k;
+}
 
 /// One writer (the physics thread), readers at dump time. The writer fills the next slot in
 /// place and then publishes it; a reader on another thread (a crash elsewhere) can see the
@@ -230,14 +270,15 @@ struct Meta {
 };
 
 inline const char* kHeader =
-    "t_ms,step,dt_ms,slot,bikes,bike,bike_t,body,pos_x,pos_y,pos_z,lvel_x,lvel_y,lvel_z,speed,"
+    "t_ms,step,dt_ms,slot,bikes,bike,handle,local,bike_t,body,pos_x,pos_y,pos_z,lvel_x,lvel_y,lvel_z,speed,"
     "avel_x,avel_y,avel_z,aspeed,"
     "w0_spin,w0_radius,w0_s0_x,w0_s0_y,w0_s0_z,w0_gap,w0_hit,"
     "w1_spin,w1_radius,w1_s0_x,w1_s0_y,w1_s0_z,w1_gap,w1_hit";
 
-/// The ring, oldest first. t_ms is the time before the newest row (0 on the last line), summed
-/// from each step's dt so it holds even when steps bunch up on a slow frame. Lines starting
-/// with '#' are metadata. No Steam ID, GUID or name goes in here: only the track folder.
+/// The ring, oldest first. t_ms is the time before the newest step (0 on its rows), summed from
+/// each step's dt (once per step, however many bikes it has rows for) so it holds even when
+/// steps bunch up on a slow frame. Lines starting with '#' are metadata. No Steam ID, GUID or
+/// name goes in here: only the track folder and the game's own bike handles.
 template <size_t N>
 inline void WriteCsv(const Ring<N>& r, const Meta& m, Emit emit, void* user) {
     char line[1024];
@@ -246,17 +287,19 @@ inline void WriteCsv(const Ring<N>& r, const Meta& m, Emit emit, void* user) {
     emit(user, line);
     const size_t n = r.Count();
     std::snprintf(line, sizeof(line),
-                  "# %zu step(s), oldest first. spin rad/s, radius/gap/pos m, lvel m/s, avel rad/s. "
-                  "gap < 0 is into the ground.", n);
+                  "# %zu row(s), oldest first. local=1: the player's bike; local=0: not known, up "
+                  "to 4 bikes a step. spin rad/s, radius/gap/pos m, lvel m/s, avel rad/s. gap < 0 is "
+                  "into the ground.", n);
     emit(user, line);
     emit(user, kHeader);
     // Time back from the newest row: walk newest to oldest once to sum, then emit oldest first.
     double total = 0;
-    for (size_t i = 1; i < n; ++i) total += r.At(i).dt;   // the gaps between rows
-    double prefix = 0;   // summed in the same order, so the newest row lands on exactly 0
+    for (size_t i = 1; i < n; ++i)   // the gaps between steps
+        if (r.At(i).step != r.At(i - 1).step) total += r.At(i).dt;
+    double prefix = 0;   // summed in the same order, so the newest step lands on exactly 0
     for (size_t i = 0; i < n; ++i) {
         const Step& s = r.At(i);
-        if (i > 0) prefix += s.dt;
+        if (i > 0 && s.step != r.At(i - 1).step) prefix += s.dt;
         const double t = prefix - total;
         char f[32][32];
         int k = 0;
@@ -276,9 +319,10 @@ inline void WriteCsv(const Ring<N>& r, const Meta& m, Emit emit, void* user) {
             Num(o.gap, f[k++], 32);
         }
         std::snprintf(line, sizeof(line),
-                      "%s,%llu,%s,%d,%d,%d,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                      "%s,%llu,%s,%d,%d,%d,%d,%d,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
                       "%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s,%s,%s,%d",
-                      f[0], (unsigned long long)s.step, f[1], s.slot, s.bikes, s.index, f[2], s.body,
+                      f[0], (unsigned long long)s.step, f[1], s.slot, s.bikes, s.index, (int)s.handle,
+                      (int)s.local, f[2], s.body,
                       f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
                       f[14], f[15], f[16], f[17], f[18], f[19], s.wheel[0].hit,
                       f[20], f[21], f[22], f[23], f[24], f[25], s.wheel[1].hit);

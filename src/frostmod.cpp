@@ -6744,14 +6744,16 @@ static int32_t hkSimStep(int32_t slot, float dt) {
 // ===========================================================================
 // TYRELOG  -  the last ~2 s of the bike's tyres, for the NaN (nantrap=1; tyrelog=0 drops it)
 //
-// After each sim step returns, copy the first active bike's wheel spin, tyre sample radius,
+// After each sim step returns, copy the player's bike's wheel spin, tyre sample radius,
 // first sample point and ground gap, and its chassis position and velocities, into a
-// 1,000-step ring (src/tyrelog.h). Write the ring out as frostmod-nan-ring-*.csv when the trap
-// fires, when the first NaN height query is refused, and on a crash; the crash and trap
+// 1,000-step ring (src/tyrelog.h). The player's bike is the one whose handle is in their own
+// vehicle record; when that is not known, up to 4 active bikes go in, each tagged. Write the
+// ring out as frostmod-nan-ring-*.csv when the trap fires, when the first NaN height query is
+// refused, and on a crash; the crash and trap
 // reports name it as "nanRing". Read-only: plain loads, nothing written to the game, no hook
 // of its own. Every offset is checked against the exe's bytes before it turns on.
 // ===========================================================================
-static tyrelog::Ring<tyrelog::kSteps> g_tlRing;
+static tyrelog::Ring<tyrelog::kRows> g_tlRing;   // 2 s, up to 4 bikes a step
 static const uint8_t* g_tlWorlds = nullptr;    // the world slot array the sim step indexes
 static uint64_t g_tlSteps = 0;
 static bool g_tlRefusalDumped = false;
@@ -6768,23 +6770,44 @@ static void TlSampleRaw(int32_t slot, float dt) {
     memcpy(&list, world + tyrelog::kWorldBikeList, sizeof(list));
     const int n = tyrelog::ListCount(list);
     if (n <= 0 || n > tyrelog::kMaxBikes) return;
+    // The player's bike handle, from their own vehicle record (0 when there is none).
+    int32_t own = 0;
+    int32_t ownRec = 0;
+    memcpy(&ownRec, (const void*)(g_base + mxb::RVA_OWN_VEHICLE), 4);
+    if (ownRec >= 1 && ownRec <= mxb::VEHICLE_MAX)
+        memcpy(&own, (const void*)(VehicleAt(ownRec - 1) + tyrelog::kVehicleBikeHandle), 4);
+    const uint8_t* bikes[tyrelog::kMaxBikes];
+    int32_t handles[tyrelog::kMaxBikes];
+    bool active[tyrelog::kMaxBikes];
     for (int i = 0; i < n; ++i) {
-        const uint8_t* bike = tyrelog::ListItem(list, i);
-        if (!bike) continue;
-        int32_t active = 0;
-        memcpy(&active, bike + tyrelog::kBikeActive, 4);
-        if (!active) continue;
+        bikes[i] = tyrelog::ListItem(list, i);
+        int32_t on = 0;
+        handles[i] = 0;
+        if (bikes[i]) {
+            memcpy(&on, bikes[i] + tyrelog::kBikeActive, 4);
+            memcpy(&handles[i], bikes[i] + tyrelog::kBikeHandle, 4);
+        }
+        active[i] = bikes[i] && on != 0;
+    }
+    int pick[tyrelog::kMaxTagged];
+    bool local = false;
+    const int k = tyrelog::PickBikes(handles, active, n, own, pick, &local);
+    if (k == 0) return;
+    const uint64_t step = ++g_tlSteps;
+    for (int j = 0; j < k; ++j) {
+        const int i = pick[j];
         const uint8_t* body = nullptr;
-        memcpy(&body, bike + tyrelog::kBikeChassis, sizeof(body));
+        memcpy(&body, bikes[i] + tyrelog::kBikeChassis, sizeof(body));
         tyrelog::Step& s = g_tlRing.Next();
-        s.step = ++g_tlSteps;
+        s.step = step;
         s.dt = dt;
         s.slot = (int16_t)slot;
         s.bikes = (int16_t)n;
         s.index = (int16_t)i;
-        tyrelog::ReadBike(bike, body, s);
+        s.handle = handles[i];
+        s.local = local ? 1 : 0;
+        tyrelog::ReadBike(bikes[i], body, s);
         g_tlRing.Commit();
-        return;   // the first active bike: offline, the player's
     }
 }
 
@@ -6930,8 +6953,8 @@ static void TlInstall(const uint8_t* fn) {
     g_tlWorlds = worlds;
     frostmod::crash::SetRingWriter(&TlWrite);
     g_tlOn.store(true, std::memory_order_release);
-    Log("[tyrelog] ON (with nantrap=1): the last %zu physics steps of tyre spin, sample radius, "
-        "sample point and chassis speed are kept and written to frostmod-nan-ring-*.csv on the "
+    Log("[tyrelog] ON (with nantrap=1): the last %zu physics steps of your bike's tyre spin, "
+        "sample radius, sample point and chassis speed are kept and written to frostmod-nan-ring-*.csv on the "
         "trap, the first refused NaN height query, or a crash. Read-only.", tyrelog::kSteps);
 }
 

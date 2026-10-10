@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.49.10")
+set(FROSTMOD_VERSION "0.49.11")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -270,6 +270,13 @@ add_test(NAME tyrefallback COMMAND tyrefallback_test)
 add_executable(unload_test tests/unload_test.cpp)
 target_compile_definitions(unload_test PRIVATE FROSTMOD_SRC="${CMAKE_SOURCE_DIR}/src")
 add_test(NAME unload COMMAND unload_test)
+
+# --- live bike gfx.cfg test ----------------------------------------------------
+# The cfg parser, the key -> descriptor offsets, and the instruction bytes each offset was
+# read from (src/gfxcfg.h). A wrong offset is a float in the wrong field of a live vehicle on
+# every save, so each one is proved. Pure, so it runs on any host.
+add_executable(gfxcfg_test tests/gfxcfg_test.cpp)
+add_test(NAME gfxcfg COMMAND gfxcfg_test)
 
 # --- world watch test ----------------------------------------------------------
 # When a timed-out master login is the half-open session we can clear and when it is an

@@ -263,6 +263,14 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 add_executable(tyrefallback_test tests/tyrefallback_test.cpp)
 add_test(NAME tyrefallback COMMAND tyrefallback_test)
 
+# --- unload teardown test ------------------------------------------------------
+# The game FreeLibrary()s the plugin after Shutdown(); nothing may point into it after that.
+# Proves src/unload.h's order (threads, hooks, patches, handlers; once), and reads
+# src/frostmod.cpp to check every hook, code patch, thread and handler still has a way out.
+add_executable(unload_test tests/unload_test.cpp)
+target_compile_definitions(unload_test PRIVATE FROSTMOD_SRC="${CMAKE_SOURCE_DIR}/src")
+add_test(NAME unload COMMAND unload_test)
+
 # --- live bike gfx.cfg test ----------------------------------------------------
 # The cfg parser, the key -> descriptor offsets, and the instruction bytes each offset was
 # read from (src/gfxcfg.h). A wrong offset is a float in the wrong field of a live vehicle on

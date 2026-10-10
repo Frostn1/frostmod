@@ -65,6 +65,7 @@
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
+#include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -150,6 +151,10 @@ char g_logPath[MAX_PATH] = {0};
 // exactly once (guarded), then install the same hooks.
 std::atomic<bool> g_initStarted{false};
 HMODULE g_selfModule = nullptr;
+HANDLE  g_initThread = nullptr;       // joined (bounded) at Shutdown
+// Set first thing at Shutdown: from then on no hook goes in, so an Init still running or a
+// lazy first-frame install cannot put one back after the teardown took them all out.
+std::atomic<bool> g_unloading{false};
 char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin mode)
 char    g_modsPath[MAX_PATH] = {0};   // mods folder (from frostmod_mods.txt the launcher writes)
 char    g_inactivePath[MAX_PATH] = {0}; // <MX Bikes>\FrostMod Inactive Tracks (deactivated .pkz store)
@@ -1902,6 +1907,7 @@ bool InstallServerFilterHook() {
         return false;
     }
 
+    if (g_unloading.load()) { Log("[filter] not installed: the plugin is unloading"); return false; }
     auto stub = (unsigned char*)VirtualAlloc(nullptr, 0x100, MEM_COMMIT | MEM_RESERVE,
                                              PAGE_EXECUTE_READWRITE);
     if (!stub) { Log("[filter] stub alloc failed"); return false; }
@@ -4412,9 +4418,9 @@ static void MsgFeedStart() {
     Log("[servermsg] poll thread %s", g_msgThread ? "started" : "could NOT start");
 }
 
-static void MsgFeedStop() {
+static void MsgFeedStop(bool canBlock) {
     g_msgQuit.store(true);
-    if (g_msgThread) {
+    if (g_msgThread && canBlock) {
         WaitForSingleObject(g_msgThread, 2000);
         CloseHandle(g_msgThread);
         g_msgThread = nullptr;
@@ -5441,11 +5447,16 @@ static void MdReport(const char* why, bool detail) {
 
 // Every 10 s, and when the track changes (EventInit / RaceEvent in the plugin copy, the
 // mirrored session block in the injected one - both land in the crash context's track).
+static std::atomic<bool> g_mdQuit{false};
+static HANDLE            g_mdThread = nullptr;
+
 static DWORD WINAPI MdThread(LPVOID) {
     char last[96] = {0};
     uint64_t next = GetTickCount64() + 10000;
-    for (;;) {
-        Sleep(1000);
+    while (!g_mdQuit.load()) {
+        // Sliced so Shutdown does not wait a whole second for us.
+        for (int slept = 0; slept < 1000 && !g_mdQuit.load(); slept += 250) Sleep(250);
+        if (g_mdQuit.load()) break;
         char track[96];
         memcpy(track, frostmod::crash::TheContext().track, sizeof(track));
         track[sizeof(track) - 1] = 0;
@@ -5467,6 +5478,16 @@ static DWORD WINAPI MdThread(LPVOID) {
             const uint64_t tc = g_tcChanges.load(std::memory_order_relaxed);
             if (g_texCompress.load() && tc != tcSeen) { tcSeen = tc; TcReport("10s"); }
         }
+    }
+    return 0;
+}
+
+static void MdStop(bool canBlock) {
+    g_mdQuit.store(true);
+    if (g_mdThread && canBlock) {
+        WaitForSingleObject(g_mdThread, 2000);
+        CloseHandle(g_mdThread);
+        g_mdThread = nullptr;
     }
 }
 
@@ -5496,7 +5517,7 @@ static void MdInstallCore() {
         ok += InstallHook((void*)p, (void*)&hkMdTexSub2D, (void**)&g_mdoTexSub2D, "memdiag opengl32!glTexSubImage2D");
     if (auto p = GetProcAddress(gl, "glDeleteTextures"))
         ok += InstallHook((void*)p, (void*)&hkMdDeleteTex, (void**)&g_mdoDeleteTex, "memdiag opengl32!glDeleteTextures");
-    if (HANDLE t = CreateThread(nullptr, 0, MdThread, nullptr, 0, nullptr)) CloseHandle(t);
+    if (!g_mdThread) g_mdThread = CreateThread(nullptr, 0, MdThread, nullptr, 0, nullptr);
     if (!g_memDiag.load()) return;
     g_mdLive.store(true);
     Log("[memdiag] ON (memdiag=1): %d of 3 texture hooks in; the ARB entry points follow on the "
@@ -6644,6 +6665,10 @@ void PollCommandFiles() {
 // setup
 // ---------------------------------------------------------------------------
 bool InstallHook(void* target, void* detour, void** original, const char* name) {
+    if (g_unloading.load()) {
+        Log("[hook] %s not hooked: the plugin is unloading", name);
+        return false;
+    }
     if (MH_CreateHook(target, detour, original) != MH_OK) {
         Log("[hook] FAILED to create hook for %s @ %p", name, target);
         return false;
@@ -7882,6 +7907,66 @@ static bool ClaimProcess() {
     if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); return false; }
     return true;                                // held for the life of the process
 }
+// Keep this module mapped until the process ends. The game FreeLibrary()s the plugin right
+// after Shutdown(), and Shutdown() cannot prove that no game thread is still inside one of our
+// detours (a blocking recvfrom, a CreateFileW) - it can only stop new entries. Pinned, such a
+// call returns into code that is still there. Hooks still come out at Shutdown; this only
+// covers the calls already in flight.
+static void PinSelf() {
+    HMODULE h = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&PinSelf), &h))
+        Log("[unload] could not pin the module (error %lu)", GetLastError());
+}
+
+// ---- teardown (src/unload.h has the order and why) -------------------------------------------
+static void TdStopThreads(bool canBlock) {
+    MsgFeedStop(canBlock);   // no-op in the plugin copy, which never started one
+    MdStop(canBlock);
+    // Init can sit up to 30 s waiting for the scanner; g_unloading already stops it hooking.
+    if (g_initThread && canBlock) {
+        if (WaitForSingleObject(g_initThread, 2000) != WAIT_OBJECT_0)
+            Log("[unload] init thread still running; it can install nothing from here on");
+        CloseHandle(g_initThread);
+        g_initThread = nullptr;
+    }
+}
+// Every MinHook hook: the ~25 InstallHook() targets and the server-filter loop-top. Each target
+// gets its original bytes back. Trampolines stay allocated (no MH_Uninitialize): a thread that
+// is inside a detour right now still calls through one on its way out.
+static void TdDisableHooks(bool) {
+    const MH_STATUS st = MH_DisableHook(MH_ALL_HOOKS);
+    if (st != MH_OK && st != MH_ERROR_NOT_INITIALIZED)
+        Log("[unload] MH_DisableHook(all) failed: %s", MH_StatusToString(st));
+}
+static void TdRevertPatches(bool) {
+    TyreFallbackRevert();   // jumps into a stub that calls this dll
+    AfRevert();             // points at our cell, not our code, but the game gets its bytes back
+}
+static void TdRemoveHandlers(bool) {
+    nantrap::Uninstall();
+    frostmod::crash::Uninstall();
+}
+
+static unload::Teardown& TheTeardown() {
+    static unload::Teardown t;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        t.Add(unload::Stage::Threads,  "threads",  &TdStopThreads);
+        t.Add(unload::Stage::Hooks,    "minhook",  &TdDisableHooks);
+        t.Add(unload::Stage::Patches,  "patches",  &TdRevertPatches);
+        t.Add(unload::Stage::Handlers, "handlers", &TdRemoveHandlers);
+    }
+    return t;
+}
+
+static void RunTeardown(bool canBlock, const char* why) {
+    g_unloading.store(true);
+    const int ran = TheTeardown().Run(canBlock);
+    if (ran) Log("[unload] %s: threads stopped, hooks disabled, patches reverted, handlers removed", why);
+}
+
 void EnsureInit() {
     bool expected = false;
     if (!g_initStarted.compare_exchange_strong(expected, true)) return;
@@ -7894,8 +7979,9 @@ void EnsureInit() {
             "the injector.", GetCurrentProcessId(), self[0] ? self : "?");
         return;
     }
-    if (HANDLE t = CreateThread(nullptr, 0, Init, nullptr, 0, nullptr)) CloseHandle(t);
-    else Log("[init] could not start the init thread (error %lu) - FrostMod stops here: no hooks, "
+    PinSelf();   // hooks are about to point into this module
+    g_initThread = CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
+    if (!g_initThread) Log("[init] could not start the init thread (error %lu) - FrostMod stops here: no hooks, "
              "no overlay, no filter.", GetLastError());
 }
 
@@ -7906,7 +7992,7 @@ void EnsureInit() {
 // the game when we're a plugin). We kick off Init here so the injector path
 // works with no plugin support on the game's side.
 // ---------------------------------------------------------------------------
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_selfModule = hModule;
@@ -7917,6 +8003,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         // hooks in one process is how a plugin takes the game down. Everything this mode
         // does waits for `Startup`, which the game calls on its own thread.
         if (!g_sessionOnly) EnsureInit();
+    } else if (reason == DLL_PROCESS_DETACH && unload::DetachIsUnload(reserved)) {
+        // FreeLibrary without Shutdown() first. A copy that installed anything is pinned and
+        // never gets here; this is the backstop. Loader lock: threads are signalled, not joined.
+        RunTeardown(false, "unload");
     }
     return TRUE;
 }
@@ -7964,6 +8054,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         // This copy never runs Init, so it would otherwise have no crash filter at all -
         // and it is the copy the game delivers the event callbacks to, which makes it the
         // one that knows where the rider was. Its report goes to its own log.
+        PinSelf();   // the crash filter is about to point into this module
         InstallCrashReports();
         frostmod::crash::Note("session plugin loaded");
         // Mapped here rather than in DllMain: it only has to exist before the first
@@ -7981,9 +8072,8 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
 
 __declspec(dllexport) void Shutdown() {
     Log("[plugin] Shutdown() requested by game.");
-    MsgFeedStop();   // no-op in the plugin copy, which never started one
-    TyreFallbackRevert();   // byte patch into this dll's code: undone before we unload
-    // MinHook hooks are torn down with the process; nothing required here.
+    // The game FreeLibrary()s us next. Nothing may point into this dll after that.
+    RunTeardown(true, "Shutdown");
 }
 
 // Optional. Called each frame while on track (0), spectating (1), or in a replay

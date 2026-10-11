@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 2026-10-11 - v0.49.12
 
-Tune a bike's gfx.cfg without restarting the game.
+Tune a bike's gfx.cfg without restarting the game, no crash on quit, and a NaN trap that reaches the real crash.
 
 ### Added
 - **Watch gfx.cfg (F8 → `G`, off by default).** Saving a loaded bike's loose `gfx.cfg` puts its
@@ -16,6 +16,8 @@ Tune a bike's gfx.cfg without restarting the game.
   frames and where the game keeps them. Footpegs have no key; the rider animation places the feet.
 
 ### Fixed
+- No crash when quitting the game. Two background parts of FrostMod were still running after the
+  game unloaded it.
 - `nantrap=1` no longer spends its report on a bike's first physics step. The game makes a
   harmless 0 * inf there on every spawn, and every trap report so far was that one. A bike's
   first 20 ms now run untrapped; the trap stays armed for the rest of the session.

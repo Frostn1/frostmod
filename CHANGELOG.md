@@ -15,6 +15,11 @@ Tune a bike's gfx.cfg without restarting the game.
 - `docs/GFX_CFG.md`: the gfx.cfg keys for rider contact points and moving parts, their units,
   frames and where the game keeps them. Footpegs have no key; the rider animation places the feet.
 
+### Fixed
+- `nantrap=1` no longer spends its report on a bike's first physics step. The game makes a
+  harmless 0 * inf there on every spawn, and every trap report so far was that one. A bike's
+  first 20 ms now run untrapped; the trap stays armed for the rest of the session.
+
 ## 2026-10-08 - v0.49.11
 
 Fix for a menu crash caused by a broken tyre mod.

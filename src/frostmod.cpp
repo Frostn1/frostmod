@@ -7093,10 +7093,13 @@ using SimStepFn = int32_t (*)(int32_t, float);
 static SimStepFn g_origSimStep = nullptr;
 
 static void TlAfterStep(int32_t slot, float dt);
+static bool NtSpawnStep(int32_t slot);
 static std::atomic<bool> g_tlOn{false};
 
 static int32_t hkSimStep(int32_t slot, float dt) {
-    if (!nantrap::Armed()) {
+    // A bike's first steps run stock: the game's own throwaway 0 * inf there is not the NaN we
+    // want, and it would use up the report (tyrelog::kSpawnSettle).
+    if (!nantrap::Armed() || NtSpawnStep(slot)) {
         const int32_t rc = g_origSimStep(slot, dt);
         if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
         return rc;
@@ -7179,6 +7182,42 @@ static void TlSampleRaw(int32_t slot, float dt) {
         tyrelog::ReadBike(bikes[i], body, s);
         g_tlRing.Commit();
     }
+}
+
+// Whether any active bike in this world slot is in its first steps (tyrelog::JustSpawned).
+// Needs the world array, so it only works with the ring's byte checks passed (tyrelog on, the
+// default); without it every step is armed, as before. No C++ objects: wrapped in __try below.
+static bool NtSpawnStepRaw(int32_t slot) {
+    if (slot < 1 || slot > 3 || !g_tlWorlds) return false;
+    const uint8_t* world = g_tlWorlds + (size_t)(slot - 1) * tyrelog::kWorldStride;
+    const uint8_t* list = nullptr;
+    memcpy(&list, world + tyrelog::kWorldBikeList, sizeof(list));
+    const int n = tyrelog::ListCount(list);
+    if (n <= 0 || n > tyrelog::kMaxBikes) return false;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t* bike = tyrelog::ListItem(list, i);
+        if (!bike) continue;
+        int32_t on = 0;
+        float t = 0;
+        memcpy(&on, bike + tyrelog::kBikeActive, 4);
+        memcpy(&t, bike + tyrelog::kBikeTime, 4);
+        if (on != 0 && tyrelog::JustSpawned(t)) return true;
+    }
+    return false;
+}
+
+static bool NtSpawnStep(int32_t slot) {
+    bool spawn = false;
+    __try {
+        spawn = NtSpawnStepRaw(slot);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        spawn = false;
+    }
+    static std::atomic<bool> said{false};
+    if (spawn && !said.exchange(true))
+        Log("[nantrap] a bike's first %.0f ms run untrapped (the game's own 0*inf on a new bike "
+            "is not the crash NaN). Trap stays armed for the rest.", tyrelog::kSpawnSettle * 1000.0f);
+    return spawn;
 }
 
 static bool TlSample(int32_t slot, float dt) {

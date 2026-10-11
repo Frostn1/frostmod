@@ -191,6 +191,15 @@ static void bike_list() {
     CHECK(!ListItem(nullptr, 0) && ListCount(nullptr) == 0, "no list");
 }
 
+static void spawn() {
+    CHECK(JustSpawned(0.0f), "first step (bike_t 0) is a spawn step");
+    CHECK(JustSpawned(0.018f), "9th step still settling");
+    CHECK(!JustSpawned(kSpawnSettle), "settled at kSpawnSettle");
+    CHECK(!JustSpawned(163.47f), "mid-ride (a crash's bike_t) is armed");
+    CHECK(!JustSpawned(std::nanf("")), "NaN bike time: armed");
+    CHECK(!JustSpawned(-1.0f), "negative: armed");
+}
+
 static void pick() {
     const int32_t h[6] = {5, 9, 7, 3, 8, 6};
     bool on[6] = {true, true, true, true, true, true};
@@ -383,6 +392,7 @@ int main() {
     checks();
     read_bike();
     bike_list();
+    spawn();
     pick();
     ring();
     csv();

@@ -206,6 +206,18 @@ inline int ListCount(const uint8_t* list) {
     return n;
 }
 
+// ---- spawn steps (for nantrap) ---------------------------------------------------------------
+// The game makes a throwaway invalid op on a bike's first step: 0x19F695 scales a point by
+// r / |point| where the point comes from the wheel matrix at [wheel+0x141E8], still all zero
+// before the first step, so r / 0 = inf and 0x267CF6 does 0 * inf. A second one, 0/0 at
+// 0x1A0A8D, fires on the first step too. Both are gone by the next step and nothing crashes,
+// but with nantrapmax=1 they used up the session's report: all 9 trap reports from 0.49.11
+// (2 players, 10-10..10-11) were one of these, at bike_t 0.002 s. So the trap skips a step in
+// which any active bike in the list is younger than this.
+inline constexpr float kSpawnSettle = 0.02f;   // 10 steps of 2 ms
+/// `t` is [bike+0x40] before the step: 0 on the first step. NaN or negative: not a spawn.
+inline bool JustSpawned(float t) { return t >= 0.0f && t < kSpawnSettle; }
+
 // ---- the ring ------------------------------------------------------------------------------------
 inline constexpr size_t kSteps = 1000;   // 2 s at the game's fixed 2 ms step
 /// Rows held: 2 s even when the local bike is unknown and up to kMaxTagged bikes go in a step.

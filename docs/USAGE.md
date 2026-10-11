@@ -109,7 +109,8 @@ with the registers and the stack, as `[nantrap]` lines. The same record goes in 
 `frostmod-crash-*-nan1.json` file that MXB App sends with the crash reports, as kind
 `nan_first_fault`, even if the game does not crash. The game computes the same values it
 does without it. One report a session (`nantrapmax=N`, up to 8, for N different places);
-after that the trap turns itself off until the next start. If the game has updated and the
+after that the trap turns itself off until the next start. A bike's first 20 ms on track run
+untrapped: the game makes a harmless invalid op there on every spawn. If the game has updated and the
 step's bytes no longer match, it stays off and says so in the log.
 
 With `nantrap=1` FrostMod also keeps the last 2 seconds of your bike's tyre state (wheel spin,

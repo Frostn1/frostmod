@@ -475,7 +475,7 @@ rider is on in yellow with its number, red dots and numbers where they were cut,
 
 Files, under `<save path>\mxbcoach\cuts\`: `<track>.markers.json` (every marker's id, world
 x/z and metres past the start line, written on `TrackCenterline`) and `cuts.jsonl`, one JSON line
-per cut: `at`, `track`, `rider`, `self`, `source`, `confirmed`, `lap`, `marker`, `to`, `x`, `z`,
+per cut: `at`, `session` (the event's stamp), `track`, `rider`, `self`, `source`, `confirmed`, `lap`, `marker`, `to`, `x`, `z`,
 `pos`, `gain_m`, `penalty_ms`. MXB Coach reads both.
 
 ### The font (why text needs `DrawInit`)

@@ -167,7 +167,7 @@ static void tally_and_files() {
     CHECK(t.Line(4) == "#12 x3  #27 x1", "line '%s'", t.Line(4).c_str());
     Cut c;
     c.source = SRC_GAME, c.confirmed = true, c.lap = 2, c.from_id = 12, c.to_id = 13, c.penalty_ms = 5000;
-    const std::string j = CutLine(c, "2026-10-13 10:00:00", "My \"Track\"", "Benny", true);
+    const std::string j = CutLine(c, "20261013-100000-000", "20261013-095500-000", "My \"Track\"", "Benny", true);
     CHECK(j.find("\"marker\":12") != std::string::npos && j.find("\"to\":13") != std::string::npos, "%s", j.c_str());
     CHECK(j.find("My \\\"Track\\\"") != std::string::npos && j.find("\"source\":\"game\"") != std::string::npos, "%s",
           j.c_str());

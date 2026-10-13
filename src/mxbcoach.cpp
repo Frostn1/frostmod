@@ -172,6 +172,7 @@ coachcuts::Cut       g_cut_flash;
 ULONGLONG            g_cut_flash_ms = 0;
 int                  g_marker_now   = -1;
 int                  g_local_num    = -1;
+std::string          g_cut_session;  // the stamp of the event the cuts belong to
 struct RacePos {
     float x = 0, z = 0, pos = 0;
 };
@@ -2244,7 +2245,7 @@ void RecordCut(const coachcuts::Cut& c, const std::string& rider, bool self) {
                   double(c.z));
     Log("cuts", msg);
     if (g_base.empty()) return;
-    const std::string line = coachcuts::CutLine(c, Stamp(), g_event.track, rider, self) + "\n";
+    const std::string line = coachcuts::CutLine(c, Stamp(), g_cut_session, g_event.track, rider, self) + "\n";
     if (std::FILE* f = std::fopen((CutsDir() + "cuts.jsonl").c_str(), "ab")) {
         std::fwrite(line.data(), 1, line.size(), f);
         std::fclose(f);
@@ -4330,6 +4331,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     g_cut_tally.clear();
     g_cut_watch.reset();
     g_cut_flash_ms = 0;
+    g_cut_session  = Stamp();
     g_race_pos.clear();
     g_local_num = -1;
 }

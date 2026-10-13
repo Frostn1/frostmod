@@ -291,13 +291,14 @@ inline std::string JsonEscape(const std::string& s) {
 }
 
 /// One line of `<save>\mxbcoach\cuts\cuts.jsonl`.
-inline std::string CutLine(const Cut& c, const std::string& stamp, const std::string& track, const std::string& rider,
-                           bool self) {
-    char b[512];
+/// `session` is the stamp of the event the cut came in (EventInit), so a reader can show one ride.
+inline std::string CutLine(const Cut& c, const std::string& stamp, const std::string& session, const std::string& track,
+                           const std::string& rider, bool self) {
+    char b[1024];
     std::snprintf(b, sizeof(b),
-                  "{\"at\":\"%s\",\"track\":\"%s\",\"rider\":\"%s\",\"self\":%s,\"source\":\"%s\",\"confirmed\":%s,"
+                  "{\"at\":\"%s\",\"session\":\"%s\",\"track\":\"%s\",\"rider\":\"%s\",\"self\":%s,\"source\":\"%s\",\"confirmed\":%s,"
                   "\"lap\":%d,\"marker\":%d,\"to\":%d,\"x\":%.1f,\"z\":%.1f,\"pos\":%.4f,\"gain_m\":%.1f,\"penalty_ms\":%d}",
-                  JsonEscape(stamp).c_str(), JsonEscape(track).c_str(), JsonEscape(rider).c_str(), self ? "true" : "false",
+                  JsonEscape(stamp).c_str(), JsonEscape(session).c_str(), JsonEscape(track).c_str(), JsonEscape(rider).c_str(), self ? "true" : "false",
                   SourceName(c.source), c.confirmed ? "true" : "false", c.lap, c.from_id, c.to_id, double(c.x),
                   double(c.z), double(c.pos), double(c.gain_m), c.penalty_ms);
     return b;

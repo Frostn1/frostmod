@@ -432,6 +432,7 @@ map=1
 setup=1
 susp=0        ; the suspension bars. Off unless asked for
 trail=0       ; Coach's line ahead of you, in blue on the map. Off unless asked for
+cuts=0        ; cut markers on the map, for track makers. Off unless asked for
 cue_x=0.5     ; centre of the cue box, a screen fraction 0-1
 cue_y=0.285   ; its top edge
 ```
@@ -451,6 +452,31 @@ it, rather than going somewhere it can't be read.
 
 The plugin reads the file at `Startup` and `RunInit`, then checks its write time at most once a
 second from `RunTelemetry` (never from `Draw`).
+
+### Cut markers (for track makers)
+
+A track's centreline is the list of straights and arcs the game hands `TrackCenterline`, the
+same records its `.trh` holds. **Marker N is the start of segment N**, numbered from 0 in the
+game's order. The game follows each rider along that line; a cut is the rider's place on it
+moving on further than the ground they rode explains. `src/coachcuts.h` has the rules,
+`tests/coachcuts_test.cpp` pins them.
+
+Three sources, best first:
+
+| Source | From | When |
+|---|---|---|
+| `game` | `RaceCommunication`, `m_iCommunication` 2 (penalty), `m_iOffence` 2 (cutting) | race events; any rider, exact lap and penalty |
+| `lap` | `RunLap`'s `m_iInvalid` with nothing seen on the lap | testing and practice; the spot is the lap's biggest skip |
+| `watch` | `RunTelemetry`: lap progress minus ground ridden over 4 s reaches 25 m | live; confirmed by an invalid lap or a penalty, else written as possible |
+
+With `cuts=1` in `hud.ini` the map shows (even with `map=0`) a dot per marker, the marker the
+rider is on in yellow with its number, red dots and numbers where they were cut, "Marker N" and
+"Cuts #12 x3 #27 x1" above the map, and a red "CUT marker 12 > 13" box for 4 s on each cut.
+
+Files, under `<save path>\mxbcoach\cuts\`: `<track>.markers.json` (every marker's id, world
+x/z and metres past the start line, written on `TrackCenterline`) and `cuts.jsonl`, one JSON line
+per cut: `at`, `session` (the event's stamp), `track`, `rider`, `self`, `source`, `confirmed`, `lap`, `marker`, `to`, `x`, `z`,
+`pos`, `gain_m`, `penalty_ms`. MXB Coach reads both.
 
 ### The font (why text needs `DrawInit`)
 

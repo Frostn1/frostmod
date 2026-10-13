@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
         "DrawInit", "Draw",
         "TrackCenterline",
         "RaceEvent", "RaceDeinit", "RaceAddEntry", "RaceRemoveEntry",
-        "RaceTrackPosition", "RaceLap", "RaceSplit",
+        "RaceTrackPosition", "RaceLap", "RaceSplit", "RaceCommunication",
     };
 
     int failures = 0;

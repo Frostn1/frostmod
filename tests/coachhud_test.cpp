@@ -861,8 +861,15 @@ static void ASheetSwapKeepsTheLineStable() {
     std::vector<RefPoint> back = Loop(R, 0, 600);
     std::swap(back[100].pos, back[101].pos);
     CHECK(CheckRef(back, cur, len).kind == RefVerdict::REJECT, "positions running backwards are refused");
-    // A lap on another line, 40 m off for a stretch: refused; 3 m off: replaced.
-    CHECK(CheckRef(Loop(R, 0, 600, 0, 40.0f), cur, len).kind == RefVerdict::REJECT, "a lap 40 m off the line is refused");
+    // A stretch stepped 40 m off the line in one point: a reset in the lap, refused.
+    CHECK(CheckRef(Loop(R, 0, 600, 0, 40.0f), cur, len).kind == RefVerdict::REJECT, "a lap stepping 40 m is refused");
+    // A whole lap on another line, up to 25 m away: replaced, without a fade. The line in use can
+    // be the bad one (a crashed lap Coach drew before), and it must not stay for the session.
+    v = CheckRef(Loop(R, 25.0f, 600), cur, len);
+    CHECK(v.kind == RefVerdict::REPLACE && v.from.empty(), "a whole lap 25 m off the line replaces it, no fade");
+    // An empty lap is Coach saying there is no clean lap: the line in use is dropped.
+    CHECK(CheckRef({}, cur, len).kind == RefVerdict::REPLACE, "an empty sheet clears the line");
+    // 3 m off: replaced, faded.
     v = CheckRef(Loop(R, 0, 600, 0, 3.0f), cur, len);
     CHECK(v.kind == RefVerdict::REPLACE && v.dev_max > 2.9f && v.dev_max < 3.1f, "a lap 3 m off replaces it, dev %.2f", double(v.dev_max));
     // The fade from the old line to the new one never steps more than a small share of the gap.

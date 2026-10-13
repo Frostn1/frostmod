@@ -253,14 +253,18 @@ struct RefVerdict {
 
 /// Whether `cand`, the reference lap of a sheet that appeared while the rider rides, may replace
 /// `cur`, the one being drawn. Coach rewrites the sheet after laps, and the lap it picks can be a
-/// partial one, one with a crash or a reset in it, or one on a different line; swapping any of
-/// those in mid-ride is the line glitching under the rider. Pure, so it runs off the frame thread.
+/// partial one or one with a crash or a reset in it; swapping one of those in mid-ride is the
+/// line glitching under the rider. A whole lap on another line replaces it (Coach 0.1.25 only
+/// sends its fastest clean lap), and an empty one clears it. Pure, so it runs off the frame thread.
 inline RefVerdict CheckRef(const std::vector<RefPoint>& cand, const std::vector<RefPoint>& cur, float track_len) {
     RefVerdict v;
     constexpr float kMaxStep = 50.0f;   // as coachline::kMaxGapM: further apart is not one stretch
     constexpr float kMaxDev  = 20.0f;   // a lap this far from the line in use is another line
     constexpr float kMinLen = 0.8f, kMaxLen = 1.25f;
     const size_t n = cand.size();
+    // No points at all is Coach saying there is no clean lap to draw (Coach 0.1.25): the line in
+    // use is dropped rather than kept, since it may be the bad lap Coach no longer stands behind.
+    if (n == 0) return v;
     if (n < 30) return v.kind = RefVerdict::REJECT, v.why = "too few points", v;
     float len = 0, close = 0;
     // The lap's own spacing says what a gap is: a few metres between points, so a stretch ten times
@@ -298,13 +302,24 @@ inline RefVerdict CheckRef(const std::vector<RefPoint>& cand, const std::vector<
             const float d = std::hypot(cur[j].x - cand[i].x, cur[j].z - cand[i].z);
             if (d < best) best = d, bj = j;
         }
-        if (best > 1e29f) return v.kind = RefVerdict::REJECT, v.why = "not where the line in use runs", v;
+        // Nowhere near the line in use: a lap on another line, or the line in use is the bad one (a
+        // crash Coach drew before 0.1.25). The candidate passed every check of its own above, and
+        // Coach only sends a faster clean lap, so it is taken - at the line, with no fade.
+        if (best > 1e29f) {
+            v.from.clear();
+            return v;
+        }
         v.dev_max = (std::max)(v.dev_max, best);
         v.from[i] = cur[bj];
         v.from[i].pos = cand[i].pos;
         if (same && (best > 0.05f || std::fabs(cur[i].t - cand[i].t) > 1e-3f)) same = false;
     }
-    if (v.dev_max > kMaxDev) return v.kind = RefVerdict::REJECT, v.why = "far from the line in use", v;
+    // Far from the line in use: taken all the same, without a fade (see above). Kept from it, a
+    // line made of a crashed lap stayed on the track for the whole session (GAMING PROFI 2).
+    if (v.dev_max > kMaxDev) {
+        v.from.clear();
+        return v;
+    }
     if (same) v.kind = RefVerdict::SAME;
     return v;
 }

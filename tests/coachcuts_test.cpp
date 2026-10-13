@@ -3,6 +3,7 @@
 // MXB Coach reads, and the HUD layer. Pure C++, runs anywhere.
 
 #include "../src/coachhud.h"
+#include "../src/coachcutmarks.h"
 
 #include <cmath>
 #include <cstdio>
@@ -212,8 +213,35 @@ static void hud() {
     CHECK(g.texts.empty() && g.quads.empty(), "cuts off by default: nothing");
 }
 
+static void gates() {
+    using namespace coachcutmarks;
+    CHECK(Fade(10) == 1.0f && Fade(kFar) == 0.0f && Fade(1000) == 0.0f, "fade ends");
+    CHECK(Fade(60) > 0.0f && Fade(60) < 1.0f, "fading between, %.2f", double(Fade(60)));
+    CHECK(Fade(1) < Fade(kNear + 1), "faded right under the bike");
+    // Three markers north of the rider at 10, 60 and 100 m, the line heading north.
+    std::vector<Pose> ps(3);
+    const float at[3] = {10, 60, 100};
+    for (int i = 0; i < 3; ++i) ps[i].id = i, ps[i].x = 0, ps[i].y = 5, ps[i].z = at[i], ps[i].heading = 0;
+    Tally t;
+    t.add(1);
+    std::vector<coachmark::Quad> q;
+    CHECK(Build(q, ps, 0, 0, 0, &t) == 2, "the one 100 m away is not drawn");
+    // Each gate: two posts, a bar, then its number's quads.
+    CHECK(q.size() > 6, "posts, bars and numbers, %d quads", int(q.size()));
+    // Marker 0: the posts stand 4 m either side across the line (east-west for a line heading north).
+    CHECK(std::fabs(q[0].p[0][0] + kHalfGate) < 0.2f && std::fabs(q[1].p[0][0] - kHalfGate) < 0.2f, "posts across");
+    CHECK(std::fabs(q[0].p[2][1] - (5 + kPostH)) < 1e-3f && std::fabs(q[0].p[0][1] - 5) < 1e-3f, "post height");
+    CHECK(q[0].rgba[1] < 1.0f && q[0].rgba[3] > 0.8f, "the current one is amber and solid");
+    bool red = false;
+    for (const auto& k : q) red |= k.rgba[1] < 0.3f && k.p[0][2] > 50;
+    CHECK(red, "the cut one is red");
+    q.clear();
+    CHECK(Build(q, ps, 0, 0, -1, nullptr) == 2 && q[0].rgba[3] < 0.4f, "others are faint white");
+}
+
 int main() {
     markers();
+    gates();
     watch();
     payloads();
     tally_and_files();

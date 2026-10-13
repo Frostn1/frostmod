@@ -457,6 +457,9 @@ struct Settings {
     // the marker the rider is on, and a flash naming the marker when they get a cut. For track
     // makers; off until asked for. On, it shows the map even where map=0.
     bool  cuts = false;
+    // The same markers standing on the track (coachcutmarks.h): a post either side and the number
+    // over the middle, drawn through the line's camera. Off until asked for, like `cuts`.
+    bool  cuts_track = false;
     // The blue line painted on the track ground in the 3D view (coachline.h). It follows the
     // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
     // the one on the track, and found nothing there when only the map drew it.
@@ -526,6 +529,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
     s.cuts    = flag("cuts", false);
+    s.cuts_track = flag("cuts_track", false);
     s.ground  = flag("ground", s.trail);
     s.jumps   = flag("jumps", true);
     s.pace    = flag("pace", true);
@@ -833,6 +837,14 @@ public:
         if (i >= segs_.size() || !(total_ > 0)) return false;
         x = segs_[i].x, z = segs_[i].y;
         m = std::fmod(segs_[i].from - sf_ + total_, total_);
+        return true;
+    }
+
+    /// Segment `i`'s start pose: world x/z, the line's heading there (degrees, 0 north) and the
+    /// centreline's stated height.
+    bool segment_pose(size_t i, float& x, float& z, float& heading, float& h) const {
+        if (i >= segs_.size()) return false;
+        x = segs_[i].x, z = segs_[i].y, heading = segs_[i].heading, h = segs_[i].h;
         return true;
     }
 

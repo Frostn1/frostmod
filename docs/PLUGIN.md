@@ -433,6 +433,7 @@ setup=1
 susp=0        ; the suspension bars. Off unless asked for
 trail=0       ; Coach's line ahead of you, in blue on the map. Off unless asked for
 cuts=0        ; cut markers on the map, for track makers. Off unless asked for
+cuts_track=0  ; the same markers standing on the track. Off unless asked for
 cue_x=0.5     ; centre of the cue box, a screen fraction 0-1
 cue_y=0.285   ; its top edge
 ```
@@ -472,6 +473,12 @@ Three sources, best first:
 With `cuts=1` in `hud.ini` the map shows (even with `map=0`) a dot per marker, the marker the
 rider is on in yellow with its number, red dots and numbers where they were cut, "Marker N" and
 "Cuts #12 x3 #27 x1" above the map, and a red "CUT marker 12 > 13" box for 4 s on each cut.
+
+With `cuts_track=1` the markers also stand on the track, drawn through the line's camera
+(`src/coachcutmarks.h`): two thin posts 4 m either side of the centreline, a faint bar on the
+ground between them and the number 2 m up. White at low alpha, amber for the marker the rider is
+on, red where they were cut; solid within 45 m, gone past 80 m, faded right under the bike. It
+works without the line (`ground=0`) and without a Coach sheet.
 
 Files, under `<save path>\mxbcoach\cuts\`: `<track>.markers.json` (every marker's id, world
 x/z and metres past the start line, written on `TrackCenterline`) and `cuts.jsonl`, one JSON line

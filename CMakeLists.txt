@@ -348,6 +348,9 @@ add_test(NAME trainer COMMAND trainer_test)
 # the gap to Coach's lap, the track map and where every part goes on screen.
 add_executable(coachhud_test tests/coachhud_test.cpp)
 add_test(NAME coachhud COMMAND coachhud_test)
+# Whether MXB Coach is open: the recorder clears what it draws once Coach is closed or gone.
+add_executable(coachlink_test tests/coachlink_test.cpp)
+add_test(NAME coachlink COMMAND coachlink_test)
 # The ground line: camera capture, projection, height and the ribbon, against known camera poses
 # and Coach's real 755 Compound sheet (tests/data).
 add_executable(coachline_test tests/coachline_test.cpp)

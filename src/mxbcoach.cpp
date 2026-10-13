@@ -45,6 +45,7 @@
 #include "coachperf.h"
 #include "coachline.h"
 #include "coachhud.h"
+#include "coachlink.h"
 #include "coachgear.h"
 #include "coachjump.h"
 #include "coachpace.h"
@@ -189,6 +190,14 @@ bool                 g_have_susp      = false;
 // hud.ini as last read: whether it was there and when it was written.
 bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
+// hud.ini's own `enabled`. g_hud_set.enabled is this and MXB Coach being open (coachlink.h).
+bool                 g_hud_file_on = true;
+// coach.ini (coachlink.h): whether MXB Coach is open, as last read, and when it was last looked at.
+coachlink::State     g_link = coachlink::NONE;
+std::string          g_link_text;
+FILETIME             g_link_time = {};
+bool                 g_link_seen = false;
+ULONGLONG            g_link_checked = 0;
 // A part being dragged with the right button, and where in it the rider took hold.
 struct DragState {
     coachhud::Part held = coachhud::PART_NONE;
@@ -492,6 +501,8 @@ void LoadCues(bool quiet = false) {
 /// Take a sheet the app has written since the last look; coachcue::ShouldLook says when.
 void StartSheetJob(bool cue, bool hud);
 void LookForCues(bool at_line) {
+    // MXB Coach closed: its cues were cleared and stay so until it is back (CheckLink).
+    if (!coachlink::Draws(g_link)) return;
     const ULONGLONG now = GetTickCount64();
     if (!coachcue::ShouldLook(!g_cue_file.empty(), at_line, now, g_cue_looked)) return;
     g_cue_looked = now;
@@ -687,6 +698,7 @@ bool OpenVoice() {
 // Says the cue that has just come up, by its kind. Never waits on the device.
 void Speak(const coachcue::Cue& c) {
     if (!g_voice.settings.enabled || g_voice.settings.volume <= 0) return;
+    if (!coachlink::Draws(g_link)) return;  // MXB Coach closed: nothing it left behind is said
     const int clip = coachvoice::ClipFor(c.kind);
     if (clip < 0 || g_voice.clips[clip].empty() || !OpenVoice()) return;
     Drain();  // whatever has finished is ours again before we go looking for a buffer
@@ -1540,6 +1552,8 @@ void StartSheetJob(bool cue, bool hud) {
 
 void LookForHud(bool at_line) {
     ApplySheetJob(at_line || (g_pos >= 0.0f && g_pos < 0.03f));
+    // The HUD off, or MXB Coach closed: the sheet was cleared and is read again once it is on.
+    if (!g_hud_set.enabled) return;
     const ULONGLONG now = GetTickCount64();
     if (!coachcue::ShouldLook(!g_hud_file.empty(), at_line, now, g_hud_looked)) return;
     g_hud_looked = now;
@@ -1591,6 +1605,24 @@ void UpdateSafe() {
     Log("safe", std::string(on ? "on (" : "off (") + why + ")" + (on ? std::string(": leaves out ") + coachperf::SafeDrops() : ""));
 }
 
+/// Drop the sheets in use: the line, the ghost, the hints and the sections now (and with `cues` the
+/// cues and anything being said), not whenever a newer sheet turns up. A Coach switched off or
+/// closed left them all on the track before (GAMING PROFI 2, 0.49.7). LookForHud / LookForCues
+/// read them afresh once the HUD is on and Coach is open again.
+void ClearSheets(bool cues, const std::string& why) {
+    ++g_job_gen;  // a sheet being read right now belongs to before
+    if (!g_hud_file.empty() || !g_hud_sheet.ref.empty()) ApplyHud(coachhud::Sheet{}, std::string(), false, nullptr);
+    g_hud_seen.clear();
+    g_fade_on = false;
+    if (cues) {
+        g_cues.clear();
+        g_cue_file.clear();
+        g_cue_seen.clear();
+        StopVoice();
+    }
+    Log("clear", why);
+}
+
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
 // own map, in the same plugins folder, turns ours off unless the file asks for it.
 void ReadHudSettings(bool force) {
@@ -1601,9 +1633,44 @@ void ReadHudSettings(bool force) {
     g_ini_seen = seen;
     if (seen) g_ini_time = a.ftLastWriteTime;
     const bool mxbmrp3 = !g_plugins.empty() && GetFileAttributesA((g_plugins + "mxbmrp3.dlo").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool was_on = g_hud_set.enabled;
     g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
+    g_hud_file_on     = g_hud_set.enabled;
+    g_hud_set.enabled = g_hud_file_on && coachlink::Draws(g_link);
     ApplyLook();
     UpdateSafe();
+    // Switched off in Coach: cleared at once rather than only no longer drawn.
+    if (!force && was_on && !g_hud_set.enabled) ClearSheets(false, "hud.ini says enabled=0: the HUD and the line are cleared");
+}
+
+/// coach.ini (coachlink.h), at most once a second or always with `force`: whether MXB Coach is
+/// open. Closed, or silent for longer than coachlink::kTimeoutMs, the HUD, the line and the cues
+/// are cleared and stay off until Coach writes the file again.
+void CheckLink(bool force) {
+    const ULONGLONG now = GetTickCount64();
+    if (!force && now - g_link_checked < 1000) return;
+    g_link_checked = now;
+    const std::string         path = g_base + "coach.ini";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    const bool seen = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a) != 0;
+    if (seen && (!g_link_seen || CompareFileTime(&a.ftLastWriteTime, &g_link_time) != 0)) g_link_text = ReadText(path);
+    g_link_seen = seen;
+    if (seen) g_link_time = a.ftLastWriteTime;
+    FILETIME sys{};
+    GetSystemTimeAsFileTime(&sys);
+    const auto ticks = [](const FILETIME& f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    const int64_t          age  = seen ? coachlink::AgeMs(ticks(a.ftLastWriteTime), ticks(sys)) : 0;
+    const coachlink::State next = coachlink::Decide(seen, g_link_text, age);
+    if (next == g_link && !force) return;
+    const bool drew = coachlink::Draws(g_link);
+    g_link          = next;
+    static int said = -1;
+    if (int(next) != said) {
+        said = int(next);
+        Log("link", coachlink::Name(next));
+    }
+    g_hud_set.enabled = g_hud_file_on && coachlink::Draws(g_link);
+    if (drew && !coachlink::Draws(g_link)) ClearSheets(true, coachlink::Name(next));
 }
 
 /// hud.ini as it ended up, since a part switched off looks exactly like a part that is broken.
@@ -4076,6 +4143,7 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         Log("mxbcoach", std::string(FROSTMOD_VERSION) + " starting");
         Log("paths", "save=" + g_user + " plugins=" + g_plugins);
         WriteRecorderInfo();
+        CheckLink(true);
         ReadHudSettings(true);
         LogHudSettings();
         LiveBusyCheck();
@@ -4223,6 +4291,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     // The bottomed marks belong to the stint, not to the session.
     g_susp[0] = g_susp[1] = g_susp_deep[0] = g_susp_deep[1] = 0;
     g_have_susp = false;
+    CheckLink(true);
     ReadHudSettings(true);
 }
 
@@ -4371,6 +4440,7 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
     }
     PollStance(_fTime, _fPos, crashed);
     PollLean(_fTime, _fPos);
+    CheckLink(false);
     MaybeReloadHudSettings();
     // Only does anything while a sheet is missing: see coachcue::ShouldLook.
     LookForCues(false);

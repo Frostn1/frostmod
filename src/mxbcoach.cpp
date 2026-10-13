@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "coachcue.h"
+#include "coachcuts.h"
 #include "coachperf.h"
 #include "coachline.h"
 #include "coachhud.h"
@@ -162,6 +163,19 @@ coachhud::RefLap     g_ref;
 coachhud::LapClock   g_clock;
 coachhud::StopWatch  g_stop;
 coachhud::Track      g_track;
+// Cut markers (coachcuts.h): the track's markers, the live watch, the session's count per
+// marker, the cut being flashed, and who the local rider is in the Race* callbacks.
+std::vector<coachcuts::Marker> g_markers;
+coachcuts::Watch     g_cut_watch;
+coachcuts::Tally     g_cut_tally;
+coachcuts::Cut       g_cut_flash;
+ULONGLONG            g_cut_flash_ms = 0;
+int                  g_marker_now   = -1;
+int                  g_local_num    = -1;
+struct RacePos {
+    float x = 0, z = 0, pos = 0;
+};
+std::map<int32_t, RacePos> g_race_pos;
 coachhud::Settings   g_hud_set;
 coachhud::Frame      g_frame;
 coachjump::ScreenLabel        g_jump_screen;     // the call to show fixed on screen, from the last BuildMarks
@@ -1681,7 +1695,7 @@ void LogHudSettings() {
                        " enabled=" + on(s.enabled) + " cue=" + on(s.cue) + " section=" + on(s.section) +
                        " gap=" + on(s.gap) + " stance=" + on(s.stance) + " map=" + on(s.map) +
                        " setup=" + on(s.setup) + " trail=" + on(s.trail) + " ground=" + on(s.ground) +
-                       " pace=" + on(s.pace) + " gear=" + on(s.gear));
+                       " pace=" + on(s.pace) + " gear=" + on(s.gear) + " cuts=" + on(s.cuts));
 }
 
 // At most once a second, from the telemetry callback rather than Draw.
@@ -2185,6 +2199,101 @@ void WriteRoster() {
         g_rec.record(coachrec::ENTRY, kv.second.data(), uint32_t(kv.second.size()));
 }
 
+// ---------------------------------------------------------------------------------------
+// Cut markers (coachcuts.h). Every cut goes to <save>\mxbcoach\cuts\cuts.jsonl, one JSON line
+// each, for MXB Coach's list; the markers go to cuts\<track>.markers.json for its map.
+
+std::string CutsDir() {
+    const std::string dir = g_base + "cuts\\";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir;
+}
+
+/// The markers of the track just loaded, kept and written for MXB Coach. Under g_mu.
+void BuildMarkers() {
+    g_markers    = coachhud::Markers(g_track);
+    g_marker_now = -1;
+    if (g_markers.empty() || g_base.empty() || g_event.track.empty()) return;
+    const std::string path = CutsDir() + coachcuts::FileSafe(g_event.track) + ".markers.json";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        const std::string j = coachcuts::MarkersJson(g_event.track, g_track.length(), g_markers);
+        std::fwrite(j.data(), 1, j.size(), f);
+        std::fclose(f);
+    }
+    Log("cuts", std::to_string(g_markers.size()) + " markers on " + g_event.track);
+}
+
+std::string RiderName(int race_num) {
+    for (const auto& kv : g_others.roster())
+        if (kv.first == race_num) {
+            const auto& e = kv.second;
+            size_t n = 0;
+            while (n < others::kNameLen - 1 && e[8 + n]) ++n;
+            return std::string(reinterpret_cast<const char*>(&e[8]), n);
+        }
+    return std::string();
+}
+
+/// A cut for the file and the log; the local rider's confirmed ones count on the HUD too.
+void RecordCut(const coachcuts::Cut& c, const std::string& rider, bool self) {
+    if (self && c.confirmed) g_cut_tally.add(c.from_id);
+    char msg[200];
+    std::snprintf(msg, sizeof(msg), "%s%s cut (%s) marker %d > %d, %.0f m skipped, lap %d at %.0f,%.0f",
+                  self ? "" : (rider + ": ").c_str(), c.confirmed ? "confirmed" : "possible",
+                  coachcuts::SourceName(c.source), c.from_id, c.to_id, double(c.gain_m), c.lap, double(c.x),
+                  double(c.z));
+    Log("cuts", msg);
+    if (g_base.empty()) return;
+    const std::string line = coachcuts::CutLine(c, Stamp(), g_event.track, rider, self) + "\n";
+    if (std::FILE* f = std::fopen((CutsDir() + "cuts.jsonl").c_str(), "ab")) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fclose(f);
+    }
+}
+
+void FlashCut(const coachcuts::Cut& c) {
+    g_cut_flash    = c;
+    g_cut_flash_ms = GetTickCount64();
+}
+
+/// The lap ended (RunLap): what the watch saw on it is confirmed by an invalid lap, or written
+/// as possible. An invalid lap with nothing seen gets the biggest skip of the lap.
+void CutsOnLap(const void* data, int size) {
+    std::vector<coachcuts::Cut> seen;
+    coachcuts::Cut best;
+    bool has_best = false;
+    g_cut_watch.end_lap(seen, best, has_best);
+    int  lap     = -1;
+    bool invalid = false;
+    if (!coachcuts::LapInvalid(data, size, lap, invalid)) return;
+    const std::string me = RiderName(g_local_num);
+    for (coachcuts::Cut c : seen) {
+        c.lap       = lap;
+        c.confirmed = invalid;
+        RecordCut(c, me, true);
+    }
+    if (invalid && seen.empty()) {
+        coachcuts::Cut c;
+        if (has_best && best.gain_m >= 10.0f) c = best;
+        c.source    = coachcuts::SRC_LAP;
+        c.lap       = lap;
+        c.confirmed = true;
+        RecordCut(c, me, true);
+        if (c.from_id >= 0) FlashCut(c);
+    }
+}
+
+/// A stint ended mid-lap: what the watch saw since the last line is written as possible.
+void CutsOnStintEnd() {
+    std::vector<coachcuts::Cut> seen;
+    coachcuts::Cut best;
+    bool has_best = false;
+    g_cut_watch.end_lap(seen, best, has_best);
+    const std::string me = RiderName(g_local_num);
+    for (const coachcuts::Cut& c : seen) RecordCut(c, me, true);
+    g_cut_watch.reset();
+}
+
 // Everything the HUD shows this frame. Under g_mu.
 void BuildHud() {
     coachhud::View v;
@@ -2228,6 +2337,18 @@ void BuildHud() {
     for (int i = 0; i < 2; ++i) {
         v.susp[i]     = g_susp[i];
         v.susp_max[i] = g_susp_deep[i];
+    }
+    if (g_hud_set.cuts) {
+        v.markers    = &g_markers;
+        v.marker_now = g_marker_now;
+        v.tally      = &g_cut_tally;
+        // Solid for 3 s, then gone over one more.
+        const ULONGLONG age = g_cut_flash_ms ? GetTickCount64() - g_cut_flash_ms : ULONGLONG(~0ull);
+        if (age < 4000) {
+            v.has_flash = true;
+            v.flash_cut = g_cut_flash;
+            v.flash     = age < 3000 ? 1.0f : float(4000 - age) / 1000.0f;
+        }
     }
     coachhud::Build(v, g_frame);
 }
@@ -4205,6 +4326,12 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     // Before any stint, only a testing event is practice; a race event waits for its session.
     g_practice = g_event.type == 1;
     g_cues.set_practice(g_practice);
+    // Cuts count per event: a track maker's session is the event they ride.
+    g_cut_tally.clear();
+    g_cut_watch.reset();
+    g_cut_flash_ms = 0;
+    g_race_pos.clear();
+    g_local_num = -1;
 }
 
 __declspec(dllexport) void EventDeinit() {
@@ -4256,6 +4383,7 @@ __declspec(dllexport) void TrackCenterline(int _iNumSegments, void* _pasSegment,
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_centreline(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize);
     g_track.build(_iNumSegments, _pasSegment, coachrec::kTrackSegmentSize, static_cast<const float*>(_pRaceData));
+    BuildMarkers();
     g_height.reset();
     g_ribbon.clear();
 }
@@ -4291,6 +4419,7 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     // The bottomed marks belong to the stint, not to the session.
     g_susp[0] = g_susp[1] = g_susp_deep[0] = g_susp_deep[1] = 0;
     g_have_susp = false;
+    g_cut_watch.reset();
     CheckLink(true);
     ReadHudSettings(true);
 }
@@ -4301,6 +4430,7 @@ __declspec(dllexport) void RunDeinit() {
     g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
+    CutsOnStintEnd();
     g_cues.set_practice(false);
     StopVoice();
     // The whole stint in one line, and the one that separates the two worlds: frames=0 means
@@ -4329,6 +4459,7 @@ __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
     PerfScope perf_cb(coachperf::CB_OTHER);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_lap(_pData, _iDataSize);
+    CutsOnLap(_pData, _iDataSize);
     g_cues.on_lap();
     // The line: a newer sheet is swapped in where every cue is re-armed and the gap restarts.
     LookForCues(true);
@@ -4390,6 +4521,16 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
         g_rider       = here;
         g_time        = _fTime;
         g_pos         = _fPos;
+        // Cut markers: the one the rider is on, and the live watch for a skip.
+        if (!g_markers.empty() && g_track.ready()) {
+            g_marker_now = coachcuts::MarkerAt(g_markers, _fPos * g_track.length());
+            coachcuts::Cut cut;
+            if (g_cut_watch.sample(_fTime, _fPos, here.x, here.y, crashed, g_track.length(), g_markers, cut)) {
+                FlashCut(cut);
+                Log("cuts", "possible cut at marker " + std::to_string(cut.from_id) + " > " +
+                                std::to_string(cut.to_id) + ", " + std::to_string(int(cut.gain_m)) + " m skipped");
+            }
+        }
         g_rider_y     = coachcue::F32(b + kDataPosY);
         // SPluginsBikeData_t m_fVelocityX/Y/Z follow the position (mxb_api.h).
         if (_iDataSize >= int(kDataVelX + 12))
@@ -4588,7 +4729,24 @@ __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, i
     // Called many times a second on the game's own thread: never waits for g_mu (v0.49.4). A
     // sample that finds it busy is left out of the recording; the next one is a moment away.
     std::unique_lock<std::mutex> lock(g_mu, std::try_to_lock);
-    if (!lock.owns_lock() || !g_rec.recording()) return;
+    if (!lock.owns_lock()) return;
+    // Where everyone is, for a cut penalty's position, and which entry is the local rider.
+    if (_pArray && _iNumVehicles > 0 && _iNumVehicles <= others::kMaxBikes &&
+        _iElemSize >= int(sizeof(sdk::TrackPositionPrefix))) {
+        float best  = others::kLocalRadius * others::kLocalRadius;
+        int   local = -1;
+        for (int i = 0; i < _iNumVehicles; ++i) {
+            sdk::TrackPositionPrefix t;
+            std::memcpy(&t, static_cast<const uint8_t*>(_pArray) + size_t(i) * size_t(_iElemSize), sizeof(t));
+            g_race_pos[t.m_iRaceNum] = RacePos{t.m_fPosX, t.m_fPosZ, t.m_fTrackPos};
+            if (g_have_sample) {
+                const float dx = t.m_fPosX - g_rider.x, dz = t.m_fPosZ - g_rider.y;
+                if (dx * dx + dz * dz < best) best = dx * dx + dz * dz, local = t.m_iRaceNum;
+            }
+        }
+        if (local >= 0) g_local_num = local;
+    }
+    if (!g_rec.recording()) return;
     std::vector<uint8_t> p;
     if (g_others.positions(_iNumVehicles, _pArray, _iElemSize, p))
         g_rec.record(coachrec::POSITIONS, p.data(), uint32_t(p.size()));
@@ -4608,6 +4766,34 @@ __declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
     std::vector<uint8_t> p;
     if (g_rec.recording() && g_others.split(_pData, _iDataSize, p))
         g_rec.record(coachrec::RACE_SPLIT, p.data(), uint32_t(p.size()));
+}
+
+// Penalties and state changes. A cut penalty (offence 2) is the game's own word that a rider
+// cut: it is logged with the marker they were at, and the local rider's is flashed on the HUD.
+__declspec(dllexport) void RaceCommunication(void* _pData, int _iDataSize) {
+    PerfScope perf_cb(coachperf::CB_OTHER);
+    std::lock_guard<std::mutex> lock(g_mu);
+    int num = -1, lap = -1, ms = 0;
+    if (!coachcuts::CutPenalty(_pData, _iDataSize, num, lap, ms)) return;
+    const bool     self = num == g_local_num;
+    coachcuts::Cut c;
+    // The local rider's own skip, when the watch saw one just now, says where it was.
+    if (self && !g_cut_watch.pending().empty() && g_time - g_cut_watch.pending().back().time < 10.0f)
+        c = g_cut_watch.take_last();
+    c.source     = coachcuts::SRC_GAME;
+    c.confirmed  = true;
+    c.lap        = lap;
+    c.penalty_ms = ms;
+    if (c.from_id < 0) {
+        c.time = g_time;
+        auto it = g_race_pos.find(num);
+        if (it != g_race_pos.end()) {
+            c.x = it->second.x, c.z = it->second.z, c.pos = it->second.pos;
+            if (g_track.ready()) c.from_id = c.to_id = coachcuts::MarkerAt(g_markers, c.pos * g_track.length());
+        }
+    }
+    RecordCut(c, RiderName(num), self);
+    if (self) FlashCut(c);
 }
 
 // Called once when the game starts, to register the sprites and fonts this plugin draws with.

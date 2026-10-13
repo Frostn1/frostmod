@@ -348,6 +348,9 @@ add_test(NAME trainer COMMAND trainer_test)
 # the gap to Coach's lap, the track map and where every part goes on screen.
 add_executable(coachhud_test tests/coachhud_test.cpp)
 add_test(NAME coachhud COMMAND coachhud_test)
+# Cut markers: which centreline marker a cut is on, the live watch, the game's penalty.
+add_executable(coachcuts_test tests/coachcuts_test.cpp)
+add_test(NAME coachcuts COMMAND coachcuts_test)
 # Whether MXB Coach is open: the recorder clears what it draws once Coach is closed or gone.
 add_executable(coachlink_test tests/coachlink_test.cpp)
 add_test(NAME coachlink COMMAND coachlink_test)

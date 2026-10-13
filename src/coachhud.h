@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "coachcue.h"
+#include "coachcuts.h"
 #include "coachglyph.h"
 #include "coachperf.h"
 #include "stance.h"
@@ -452,6 +453,10 @@ struct Settings {
     // Off by default: they are additions, and a HUD that grows parts on its own after an
     // update is a worse surprise than one that waits to be asked.
     bool  susp = false, trail = false;
+    // Cut markers (coachcuts.h): the track's centreline markers on the map with their numbers,
+    // the marker the rider is on, and a flash naming the marker when they get a cut. For track
+    // makers; off until asked for. On, it shows the map even where map=0.
+    bool  cuts = false;
     // The blue line painted on the track ground in the 3D view (coachline.h). It follows the
     // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
     // the one on the track, and found nothing there when only the map drew it.
@@ -520,6 +525,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.setup   = flag("setup", true);
     s.susp    = flag("susp", false);
     s.trail   = flag("trail", false);
+    s.cuts    = flag("cuts", false);
     s.ground  = flag("ground", s.trail);
     s.jumps   = flag("jumps", true);
     s.pace    = flag("pace", true);
@@ -820,6 +826,16 @@ public:
         return true;
     }
 
+    /// How many centreline segments there are: the track's markers, one at each segment start.
+    size_t segment_count() const { return segs_.size(); }
+    /// Segment `i`'s start: world x/z and metres past the start line.
+    bool segment_start(size_t i, float& x, float& z, float& m) const {
+        if (i >= segs_.size() || !(total_ > 0)) return false;
+        x = segs_[i].x, z = segs_[i].y;
+        m = std::fmod(segs_[i].from - sf_ + total_, total_);
+        return true;
+    }
+
     /// World x/z `m` metres past the line (a lap position times the length).
     bool at(float m, float& x, float& z) const {
         if (!ready() || !std::isfinite(m)) return false;
@@ -846,6 +862,18 @@ private:
     float            total_ = 0, sf_ = 0;
     Pt               min_, max_;
 };
+
+/// The track's cut markers (coachcuts.h): one per centreline segment, numbered from 0.
+inline std::vector<coachcuts::Marker> Markers(const Track& t) {
+    std::vector<coachcuts::Marker> out;
+    out.reserve(t.segment_count());
+    for (size_t i = 0; i < t.segment_count(); ++i) {
+        coachcuts::Marker k;
+        k.id = int(i);
+        if (t.segment_start(i, k.x, k.z, k.at_m)) out.push_back(k);
+    }
+    return out;
+}
 
 struct Box {
     float x0, y0, x1, y1;
@@ -897,7 +925,7 @@ struct Text {
 // left, and `Frame::reserved` spends it for the markers that must never go missing.
 constexpr size_t kMaxQuads = 512;
 constexpr size_t kReserve  = 12;
-constexpr size_t kMaxTexts = 16;
+constexpr size_t kMaxTexts = 24;
 constexpr size_t kMaxChars = 99;  // SPluginString_t holds 100 bytes
 
 struct Frame {
@@ -1400,6 +1428,14 @@ struct View {
     std::string              jump_top, jump_hint;
     float                    jump_rgb[3] = {1, 1, 1};
     float                    jump_alpha  = 0;
+    // Cut markers (set.cuts): every marker, the one the rider is on, the cut count per marker
+    // this session, and the last cut while it is still being flashed (`flash` 0..1, 0 = none).
+    const std::vector<coachcuts::Marker>* markers = nullptr;
+    int                      marker_now = -1;
+    const coachcuts::Tally*  tally      = nullptr;
+    bool                     has_flash  = false;
+    coachcuts::Cut           flash_cut;
+    float                    flash      = 0;
 };
 
 /// A motocrosser from its right-hand side, drawn small enough to sit in a corner of the screen:
@@ -1481,6 +1517,58 @@ inline std::string GapText(float gap) {
     char s[32];
     std::snprintf(s, sizeof(s), "vs Coach %+.2f", double(gap));
     return s;
+}
+
+/// Most marker dots drawn on the map; a longer list is thinned, never the ones that matter.
+constexpr size_t kMarkerDots = 160;
+constexpr float  kFlashSize  = 0.034f;
+/// The cut flash, a red box under the cue block.
+constexpr Box    kFlashBox   = {0.36f, 0.415f, 0.64f, 0.465f};
+
+/// The cut markers on the map `b`: a dot at every marker (red where the rider has been cut,
+/// yellow the one they are on), numbers by the one they are on, the next one and the worst
+/// three, and above the map the marker they are on and the cuts so far. Then the flash.
+inline void CutMarkers(const View& v, const Track& t, const Box& b, Frame& f) {
+    if (!v.markers || v.markers->empty()) return;
+    const std::vector<coachcuts::Marker>& ms = *v.markers;
+    const size_t step = (std::max)(size_t(1), (ms.size() + kMarkerDots - 1) / kMarkerDots);
+    const int    next = v.marker_now >= 0 ? (v.marker_now + 1) % int(ms.size()) : -1;
+    std::vector<int> labelled;
+    if (v.marker_now >= 0) labelled.push_back(v.marker_now);
+    if (next >= 0 && next != v.marker_now) labelled.push_back(next);
+    if (v.tally)
+        for (const auto& kv : v.tally->top(3))
+            if (std::find(labelled.begin(), labelled.end(), kv.first) == labelled.end()) labelled.push_back(kv.first);
+    for (size_t i = 0; i < ms.size(); ++i) {
+        const coachcuts::Marker& k = ms[i];
+        const bool cut  = v.tally && v.tally->count(k.id) > 0;
+        const bool here = k.id == v.marker_now;
+        if (!cut && !here && i % step) continue;
+        const Pt p = Project(t, b, k.x, k.z);
+        Dot(f, p.x, p.y, here ? kAmber : cut ? kRed : kWhite, here || cut ? 0.007f : 0.004f);
+    }
+    for (int id : labelled) {
+        if (id < 0 || size_t(id) >= ms.size()) continue;
+        const Pt p = Project(t, b, ms[size_t(id)].x, ms[size_t(id)].z);
+        const bool cut = v.tally && v.tally->count(id) > 0;
+        Say(f, std::to_string(id), p.x + 0.004f, p.y - 0.006f, 0.016f, 0,
+            id == v.marker_now ? kAmber : cut ? kRed : kWhite);
+    }
+    // Above the map: where the rider is, and the cuts so far.
+    const float top = b.y0 - 0.024f;
+    std::string here = v.marker_now >= 0 ? "Marker " + std::to_string(v.marker_now) : std::string("Marker -");
+    Say(f, here, b.x0, top - (v.tally && v.tally->total() ? 0.022f : 0.0f), kSmallSize, 0, kAmber);
+    if (v.tally && v.tally->total())
+        Say(f, Fit("Cuts " + v.tally->Line(4), kSmallSize, 0.30f), b.x0, top, kSmallSize, 0, kRed);
+    if (v.has_flash && v.flash > 0) {
+        const coachcuts::Cut& c = v.flash_cut;
+        const Box& fb = kFlashBox;
+        const uint32_t a = uint32_t(std::lround(255.0f * (std::min)(1.0f, v.flash))) << 24;
+        Rect(f, fb.x0, fb.y0, fb.x1, fb.y1, (a & 0xFF000000u) | 0x00202090u);
+        std::string s = "CUT  marker " + std::to_string(c.from_id);
+        if (c.to_id >= 0 && c.to_id != c.from_id) s += " > " + std::to_string(c.to_id);
+        Say(f, s, (fb.x0 + fb.x1) * 0.5f, fb.y0 + (fb.y1 - fb.y0 - kFlashSize) * 0.5f, kFlashSize, 1, kWhite);
+    }
 }
 
 inline void Build(const View& v, Frame& f) {
@@ -1627,7 +1715,7 @@ inline void Build(const View& v, Frame& f) {
 
     // 5. The map, bottom left: the line, the cue spots ahead, Coach's line to take, then the
     //    ghost and the rider on top of it.
-    if (v.set.map && v.track && v.track->ready()) {
+    if ((v.set.map || v.set.cuts) && v.track && v.track->ready()) {
         const Track& t = *v.track;
         const Box    b = MapBoxAt(v.set);
         Rect(f, b.x0, b.y0, b.x1, b.y1, 0x80000000u);
@@ -1678,6 +1766,7 @@ inline void Build(const View& v, Frame& f) {
                 started = true;
             }
         }
+        if (v.set.cuts) CutMarkers(v, t, b, f);
         // On the reserve: whatever else ran out of room, the rider has to be able to see
         // themselves and the lap they are chasing.
         Reserved hold(f);

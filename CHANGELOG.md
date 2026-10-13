@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-13 - v0.49.13
+
+MXB Coach cut markers, and the Coach line clears when it should.
+
+### Added
+- Cut markers on the minimap, and each cut is saved with the marker it was at (`cuts.jsonl`).
+- Cut markers standing on the track: gates with numbers that fade with distance.
+
+### Fixed
+- The Coach racing line and hints clear when Coach is turned off or closed, or its heartbeat stops. A new clean lap replaces the old line.
+
 ## 2026-10-11 - v0.49.12
 
 Tune a bike's gfx.cfg without restarting the game, no crash on quit, and a NaN trap that reaches the real crash.

@@ -49,6 +49,29 @@ inline uint32_t ResumeMxcsr(uint32_t trapped) { return (trapped | kIM) & ~kFlags
 inline bool IsArmed(uint32_t mxcsr) { return (mxcsr & kIM) == 0; }
 inline bool IsTrapCode(uint32_t code) { return code == kStatusInvalid || code == kStatusMultiple; }
 
+// ---- invalid ops the game throws away ---------------------------------------------------------
+/// A trap here is not the NaN. In beta21e, 0x1AD835..0x1AD873 is
+///     x = [obj+23A04] / [obj+239F8]  ; 0/0 when both are 0
+///     x = min(x, 1); y = (1 - x) * [obj+239FC]
+///     [obj+2D8] = y > [obj+2D8] ? y : [obj+2D8]
+/// and both compares take the "keep" branch on a NaN, so the NaN never leaves the block. With
+/// the default one report a session, this site used the report up in every capture we had
+/// from it (5 of 32 by 2026-10-14), and the trap turned off before the real NaN.
+/// Matched by the bytes from rip on (divss, comiss, jbe, movaps), so a build that moved it
+/// still matches and one that changed it does not.
+inline constexpr uint8_t kDiscardedDivide[] = {0xF3, 0x0F, 0x5E, 0x81, 0xF8, 0x39, 0x02, 0x00,
+                                               0x0F, 0x2F, 0xC1, 0x76, 0x03, 0x0F, 0x28, 0xC1};
+
+/// Whether the `n` bytes at the trapping rip are a site whose NaN the game discards.
+inline bool IsDiscarded(const uint8_t* at, size_t n) {
+    return at && n >= sizeof(kDiscardedDivide) &&
+           std::memcmp(at, kDiscardedDivide, sizeof(kDiscardedDivide)) == 0;
+}
+
+/// Discarded traps are not reported and do not count toward kMaxTraps, but each still costs an
+/// exception, so past this many in a session the trap disarms anyway.
+inline constexpr unsigned kMaxDiscarded = 256;
+
 // ---- frostmod_radar.cfg -------------------------------------------------------------------
 inline constexpr int kMaxReportsCap = 8;     // nantrapmax= is clamped to 1..8
 /// Past this many traps in a session the trap disarms even if fewer reports were written:

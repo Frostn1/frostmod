@@ -23,6 +23,7 @@ Config g_cfg;
 std::atomic<bool> g_armed{false};
 std::atomic<unsigned> g_reports{0};     // records captured this session
 std::atomic<unsigned> g_traps{0};       // traps seen this session, reported or not
+std::atomic<unsigned> g_discarded{0};   // traps at a site whose NaN the game discards
 std::atomic<bool> g_pending{false};     // a captured record not yet written out
 std::atomic<unsigned long long> g_steps{0};
 PVOID g_veh = nullptr;
@@ -113,8 +114,20 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
     t_inHandler = true;
     _mm_setcsr(_mm_getcsr() | 0x1F80u);
 
-    const unsigned traps = g_traps.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t rip = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+    uint8_t at[sizeof(kDiscardedDivide)];
+    if (ReadBytes((const uint8_t*)rip, at, (int)sizeof(at)) && IsDiscarded(at, sizeof(at))) {
+        // Not the NaN: resume as stock and keep watching, without spending a report on it.
+        if (g_discarded.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxDiscarded)
+            g_armed.store(false, std::memory_order_relaxed);
+        const DWORD m = ResumeMxcsr(ep->ContextRecord->MxCsr);
+        ep->ContextRecord->MxCsr = m;
+        ep->ContextRecord->FltSave.MxCsr = m;
+        t_inHandler = false;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    const unsigned traps = g_traps.fetch_add(1, std::memory_order_relaxed) + 1;
     const unsigned have = g_reports.load(std::memory_order_relaxed);
     bool seen = false;
     for (unsigned i = 0; i < have && i < (unsigned)kMaxReportsCap; ++i) seen |= g_seenRip[i] == rip;

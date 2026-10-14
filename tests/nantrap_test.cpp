@@ -232,12 +232,33 @@ static void report() {
     CHECK(log.find("nearest game frame: mxbikes.exe+0x1A3FBD") != std::string::npos, "game frame:\n%s", log.c_str());
 }
 
+static void discarded() {
+    // The bytes at 0x1AD83D in beta21e, as five player reports captured them after the bar.
+    static const uint8_t kAt[] = {0xF3, 0x0F, 0x5E, 0x81, 0xF8, 0x39, 0x02, 0x00,
+                                  0x0F, 0x2F, 0xC1, 0x76, 0x03, 0x0F, 0x28, 0xC1, 0x0F};
+    CHECK(IsDiscarded(kAt, sizeof(kAt)), "the discarded 0/0 matches");
+    CHECK(!IsDiscarded(kAt, 15), "too few bytes");
+    CHECK(!IsDiscarded(nullptr, 16), "null");
+    // 0x1A2E60, the shock fraction feeding +0x1A29AE: a real NaN, never skipped.
+    static const uint8_t kShock[] = {0xF2, 0x45, 0x0F, 0x5E, 0xE9, 0xF2, 0x0F, 0x10,
+                                     0x05, 0x00, 0x00, 0x00, 0x00, 0xF2, 0x41, 0x0F};
+    CHECK(!IsDiscarded(kShock, sizeof(kShock)), "divsd xmm13, xmm9 is not skipped");
+    // Any change - another field, another compare, another branch - is a different site.
+    for (size_t i = 0; i < sizeof(kDiscardedDivide); ++i) {
+        uint8_t moved[sizeof(kAt)];
+        std::memcpy(moved, kAt, sizeof(moved));
+        moved[i] ^= 0x01;
+        CHECK(!IsDiscarded(moved, sizeof(moved)), "byte %zu changed", i);
+    }
+}
+
 int main() {
     mxcsr();
     cfg();
     signature();
     ophint();
     report();
+    discarded();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

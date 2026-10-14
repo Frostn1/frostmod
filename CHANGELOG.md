@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-14 - v0.49.14
+
+The NaN trap no longer stops at a harmless 0/0.
+
+### Fixed
+- **NaN trap (`nantrap=1`).** A 0/0 in the game's physics that the game throws away straight after was using up the one report a session, so the trap turned itself off before it reached the NaN behind the most common crash. It is now skipped and the trap keeps watching.
+
 ## 2026-10-13 - v0.49.13
 
 MXB Coach cut markers, and the Coach line clears when it should.

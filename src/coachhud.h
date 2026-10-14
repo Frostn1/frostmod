@@ -488,6 +488,9 @@ struct Settings {
     TextItem cue_item, pace_item, gear_item;
     // Right-drag a part to move it. On by default - it is how the rider finds out they can.
     bool  move = true;
+    // Draw Coach's overlay from the sheets on disk with no Coach running (coachlink.h). Off:
+    // nothing Coach drew is on screen unless Coach is open.
+    bool  standalone = false;
     // safe_mode=auto|1|0 (coachperf.h): auto, the default, turns it on when MXBMRP3 is loaded.
     coachperf::SafeSetting safe = coachperf::SAFE_AUTO;
     // line_fallback=1: with no camera found in the game's GL, draw the line through a helmet view
@@ -543,6 +546,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.row_x   = fraction("row_x", kRowDefaultX);
     s.row_y   = fraction("row_y", kRowDefaultY);
     s.move    = flag("move", true);
+    s.standalone = flag("standalone", false);
     s.safe    = coachperf::ParseSafe(stance::IniValue(ini, "hud", "safe_mode"));
     s.fallback = flag("line_fallback", false);
     // The line's look. A number past its range is clamped into it (the rider asked for more or

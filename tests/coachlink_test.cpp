@@ -20,9 +20,16 @@ static int g_failures = 0;
 
 using namespace coachlink;
 
-static void AnOlderCoachKeepsDrawing() {
+static void NoCoachDrawsNothing() {
     CHECK(Decide(false, "", 0) == NONE, "no file");
-    CHECK(Draws(NONE), "no file is a Coach from before it: draw as always");
+    CHECK(!Draws(NONE), "no coach.ini means nothing says Coach is running: nothing is drawn");
+}
+
+static void StandaloneDrawsWithoutCoach() {
+    CHECK(Draws(NONE, true), "no coach.ini, standalone");
+    CHECK(Draws(OFF, true), "Coach closed, standalone");
+    CHECK(Draws(GONE, true), "Coach gone, standalone");
+    CHECK(!Draws(OFF) && !Draws(GONE), "off by default");
 }
 
 static void AnOpenCoachDraws() {
@@ -51,7 +58,8 @@ static void Ages() {
 }
 
 int main() {
-    AnOlderCoachKeepsDrawing();
+    NoCoachDrawsNothing();
+    StandaloneDrawsWithoutCoach();
     AnOpenCoachDraws();
     ClosingCoachClears();
     ACoachThatStopsAnsweringClears();

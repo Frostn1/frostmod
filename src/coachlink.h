@@ -5,8 +5,11 @@
 // in a Coach that was no longer running could reach it (GAMING PROFI 2, 0.49.7). Coach 0.1.25
 // rewrites <save path>\mxbcoach\coach.ini every 2 s while it runs ([coach] on=1) and writes on=0
 // on the way out. The recorder clears what it draws and stops drawing when the file says on=0,
-// or hasn't been written for kTimeoutMs (Coach closed, crashed or hung). With no file at all it
-// draws as before: that is a Coach from before the file, which must keep working.
+// or hasn't been written for kTimeoutMs (Coach closed, crashed or hung). With no file at all
+// there is nothing to say Coach is running, so it draws nothing either (it used to draw as
+// before, for a Coach from before the file, and a rider whose Coach was off got the old line,
+// minimap and banner back, GAMING PROFI 2, 2026-10-14). Only `standalone=1` in hud.ini draws
+// without Coach.
 //
 // Pure, so tests/coachlink_test.cpp runs it anywhere.
 #pragma once
@@ -23,7 +26,7 @@ namespace coachlink {
 constexpr int64_t kTimeoutMs = 6000;
 
 enum State {
-    NONE,  // no coach.ini: a Coach from before it, which never says. Drawn as always.
+    NONE,  // no coach.ini: Coach has not run, or is from before the file. Nothing is drawn.
     ON,    // Coach is open and says so
     OFF,   // Coach said on=0: it was closed
     GONE,  // Coach stopped writing: crashed, hung or killed
@@ -37,12 +40,13 @@ inline State Decide(bool exists, const std::string& text, int64_t age_ms) {
     return ON;
 }
 
-/// Whether the recorder may draw Coach's line, hints and cues in this state.
-inline bool Draws(State s) { return s == NONE || s == ON; }
+/// Whether the recorder may draw Coach's line, hints and cues in this state. Only an open Coach
+/// does, unless the rider turned on `standalone` (hud.ini): then whatever sheets are on disk.
+inline bool Draws(State s, bool standalone = false) { return s == ON || standalone; }
 
 inline const char* Name(State s) {
     switch (s) {
-        case NONE: return "no coach.ini (an older Coach): drawing as before";
+        case NONE: return "no coach.ini (Coach has not run): nothing is drawn";
         case ON: return "Coach is open";
         case OFF: return "Coach was closed: the line, hints and cues are cleared";
         case GONE: return "Coach stopped answering: the line, hints and cues are cleared";

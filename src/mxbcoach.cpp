@@ -209,12 +209,18 @@ bool                 g_ini_seen = false;
 FILETIME             g_ini_time = {};
 // hud.ini's own `enabled`. g_hud_set.enabled is this and MXB Coach being open (coachlink.h).
 bool                 g_hud_file_on = true;
+// The rider hid the overlay in game (Ctrl+Shift+H); not kept across game starts.
+bool                 g_hidden = false;
 // coach.ini (coachlink.h): whether MXB Coach is open, as last read, and when it was last looked at.
 coachlink::State     g_link = coachlink::NONE;
 std::string          g_link_text;
 FILETIME             g_link_time = {};
 bool                 g_link_seen = false;
 ULONGLONG            g_link_checked = 0;
+/// Whether anything Coach left may be drawn or said: Coach is open (or `standalone=1`), and the
+/// rider has not hidden it.
+bool LinkDraws();
+bool GameFocused();
 // A part being dragged with the right button, and where in it the rider took hold.
 struct DragState {
     coachhud::Part held = coachhud::PART_NONE;
@@ -519,7 +525,7 @@ void LoadCues(bool quiet = false) {
 void StartSheetJob(bool cue, bool hud);
 void LookForCues(bool at_line) {
     // MXB Coach closed: its cues were cleared and stay so until it is back (CheckLink).
-    if (!coachlink::Draws(g_link)) return;
+    if (!LinkDraws()) return;
     const ULONGLONG now = GetTickCount64();
     if (!coachcue::ShouldLook(!g_cue_file.empty(), at_line, now, g_cue_looked)) return;
     g_cue_looked = now;
@@ -715,7 +721,7 @@ bool OpenVoice() {
 // Says the cue that has just come up, by its kind. Never waits on the device.
 void Speak(const coachcue::Cue& c) {
     if (!g_voice.settings.enabled || g_voice.settings.volume <= 0) return;
-    if (!coachlink::Draws(g_link)) return;  // MXB Coach closed: nothing it left behind is said
+    if (!LinkDraws()) return;  // MXB Coach closed or the overlay hidden: nothing it left behind is said
     const int clip = coachvoice::ClipFor(c.kind);
     if (clip < 0 || g_voice.clips[clip].empty() || !OpenVoice()) return;
     Drain();  // whatever has finished is ours again before we go looking for a buffer
@@ -1643,6 +1649,23 @@ void ClearSheets(bool cues, const std::string& why) {
     Log("clear", why);
 }
 
+bool LinkDraws() { return !g_hidden && coachlink::Draws(g_link, g_hud_set.standalone); }
+
+/// Ctrl+Shift+H, with the game focused: hide the whole Coach overlay (line, hints, map, cues,
+/// voice) or bring it back. Kept for this game start only.
+void PollHideKey() {
+    static bool was = false;
+    const bool  now = GameFocused() && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+                     (GetAsyncKeyState('H') & 0x8000);
+    if (now && !was) {
+        g_hidden          = !g_hidden;
+        g_hud_set.enabled = g_hud_file_on && LinkDraws();
+        if (g_hidden) ClearSheets(true, "hidden with Ctrl+Shift+H");
+        Log("hide", g_hidden ? "Coach overlay hidden" : "Coach overlay shown");
+    }
+    was = now;
+}
+
 // hud.ini, when it's new or changed since the last read (or always, with `force`). MXBMRP3's
 // own map, in the same plugins folder, turns ours off unless the file asks for it.
 void ReadHudSettings(bool force) {
@@ -1656,7 +1679,7 @@ void ReadHudSettings(bool force) {
     const bool was_on = g_hud_set.enabled;
     g_hud_set = coachhud::ParseSettings(seen ? ReadText(path) : std::string(), mxbmrp3);
     g_hud_file_on     = g_hud_set.enabled;
-    g_hud_set.enabled = g_hud_file_on && coachlink::Draws(g_link);
+    g_hud_set.enabled = g_hud_file_on && LinkDraws();
     ApplyLook();
     UpdateSafe();
     // Switched off in Coach: cleared at once rather than only no longer drawn.
@@ -1682,15 +1705,15 @@ void CheckLink(bool force) {
     const int64_t          age  = seen ? coachlink::AgeMs(ticks(a.ftLastWriteTime), ticks(sys)) : 0;
     const coachlink::State next = coachlink::Decide(seen, g_link_text, age);
     if (next == g_link && !force) return;
-    const bool drew = coachlink::Draws(g_link);
+    const bool drew = LinkDraws();
     g_link          = next;
     static int said = -1;
     if (int(next) != said) {
         said = int(next);
         Log("link", coachlink::Name(next));
     }
-    g_hud_set.enabled = g_hud_file_on && coachlink::Draws(g_link);
-    if (drew && !coachlink::Draws(g_link)) ClearSheets(true, coachlink::Name(next));
+    g_hud_set.enabled = g_hud_file_on && LinkDraws();
+    if (drew && !LinkDraws()) ClearSheets(true, coachlink::Name(next));
 }
 
 /// hud.ini as it ended up, since a part switched off looks exactly like a part that is broken.
@@ -4918,6 +4941,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
     }
     try {
         ++g_draw_calls;
+        PollHideKey();
         if (_iState == 0) g_track_draw_ms = GetTickCount64();
         if (_iState == 0 && g_practice) {
             // Before the frame is built, so a part picked up this frame is drawn where the

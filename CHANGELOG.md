@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Coach overlay with no Coach running.** The racing line, banner, minimap and gap showed from the files Coach left behind when there was no `coach.ini` to say Coach had closed. Nothing is drawn now unless Coach is open. `standalone=1` in `hud.ini` draws it anyway.
+
+### Added
+- **Ctrl+Shift+H** hides the Coach overlay in game and brings it back.
+
 ## 2026-10-14 - v0.49.14
 
 The NaN trap no longer stops at a harmless 0/0.

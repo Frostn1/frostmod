@@ -438,6 +438,11 @@ cue_x=0.5     ; centre of the cue box, a screen fraction 0-1
 cue_y=0.285   ; its top edge
 ```
 
+**Without Coach.** Nothing Coach drew is shown unless Coach is open (`coach.ini`, see
+`src/coachlink.h`). A missing `coach.ini` counts as not open. `standalone=1` draws the sheets
+left on disk with no Coach running; it is off unless set. **Ctrl+Shift+H** in game hides the
+whole overlay and brings it back, until the game is restarted.
+
 A missing file or key means on, with three exceptions. The **map** defaults to off when
 `plugins\mxbmrp3.dlo` sits next to `mxbcoach.dlo`, because MXBMRP3 draws its own, unless
 `map=1` is set. **`susp`** and **`trail`** default to off: they are additions, and a HUD that

@@ -276,6 +276,8 @@ static void HudIni() {
     // The line on the track follows the trail unless it has a key of its own.
     CHECK(s.ground, "trail=1 turns the line on the track on too");
     CHECK(!ParseSettings("", false).ground, "no trail, no line on the track");
+    CHECK(!ParseSettings("", false).standalone, "the overlay without Coach is off unless asked for");
+    CHECK(ParseSettings("[hud]\nstandalone=1\n", false).standalone, "standalone=1 asks for it");
     CHECK(!ParseSettings("[hud]\ntrail=1\nground=0\n", false).ground, "ground=0 keeps it off with the trail on");
     CHECK(ParseSettings("[hud]\nground=1\n", false).ground, "ground=1 on its own");
     CHECK(std::fabs(s.cue_x - 0.2f) < 1e-6f && std::fabs(s.cue_y - 0.75f) < 1e-6f, "cue at %f %f", s.cue_x, s.cue_y);

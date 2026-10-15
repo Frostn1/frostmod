@@ -325,58 +325,59 @@ struct Trip {
 /// order. Returns how many were written (at most `max`).
 inline int Check(const tyrelog::Step& s, const Extra& x, const Limits& L, Trip* out, int max) {
     int k = 0;
-    Trip nf[48], lim[48];
+    Trip nf[16], lim[16];
     int nn = 0, nl = 0;
-    auto test = [&](const char* name, double v, double limit, bool over) {
-        if (!std::isfinite(v)) {
-            if (nn < 48) { Trip& t = nf[nn++]; std::snprintf(t.field, sizeof(t.field), "%s", name);
-                           t.value = v; t.limit = std::nan(""); t.nonfinite = true; }
-        } else if (over ? v > limit : v < limit) {
-            if (nl < 48) { Trip& t = lim[nl++]; std::snprintf(t.field, sizeof(t.field), "%s", name);
-                           t.value = v; t.limit = limit; }
-        }
+    // `fmt` takes one int (a wheel, a body or an axis index); the name is only built for a trip,
+    // so a clean step (every step but a few) costs a few dozen compares.
+    auto test = [&](const char* fmt, int a, double v, double limit, bool over) {
+        const bool bad = !std::isfinite(v);
+        if (!bad && !(over ? v > limit : v < limit)) return;
+        Trip* t = bad ? (nn < 16 ? &nf[nn++] : nullptr) : (nl < 16 ? &lim[nl++] : nullptr);
+        if (!t) return;
+        static const char* axis[3] = {"x", "y", "z"};
+        if (std::strstr(fmt, "%s")) std::snprintf(t->field, sizeof(t->field), fmt, axis[a]);
+        else std::snprintf(t->field, sizeof(t->field), fmt, a);
+        t->value = v;
+        t->limit = bad ? std::nan("") : limit;
+        t->nonfinite = bad;
     };
-    static const char* axis[3] = {"x", "y", "z"};
-    char name[24];
     if (s.body) {
-        for (int c = 0; c < 3; ++c) { std::snprintf(name, sizeof(name), "pos_%s", axis[c]); test(name, std::fabs((double)s.pos[c]), L.pos, true); }
-        for (int c = 0; c < 3; ++c) { std::snprintf(name, sizeof(name), "lvel_%s", axis[c]); test(name, std::fabs((double)s.lvel[c]), L.vel, true); }
-        for (int c = 0; c < 3; ++c) { std::snprintf(name, sizeof(name), "avel_%s", axis[c]); test(name, std::fabs((double)s.avel[c]), L.avelChassis, true); }
+        for (int c = 0; c < 3; ++c) test("pos_%s", c, std::fabs((double)s.pos[c]), L.pos, true);
+        for (int c = 0; c < 3; ++c) test("lvel_%s", c, std::fabs((double)s.lvel[c]), L.vel, true);
+        for (int c = 0; c < 3; ++c) test("avel_%s", c, std::fabs((double)s.avel[c]), L.avelChassis, true);
     }
+    static const char* sampleFmt[2][3] = {{"w0_s0_x", "w0_s0_y", "w0_s0_z"}, {"w1_s0_x", "w1_s0_y", "w1_s0_z"}};
     for (int w = 0; w < tyrelog::kWheels; ++w) {
         const tyrelog::Wheel& o = s.wheel[w];
-        std::snprintf(name, sizeof(name), "w%d_spin", w); test(name, std::fabs(o.spin), L.spin, true);
+        test("w%d_spin", w, std::fabs(o.spin), L.spin, true);
         const double r0 = x.have ? x.wheel[w].radius0 : 0.0;
-        std::snprintf(name, sizeof(name), "w%d_radius", w);
-        test(name, o.radius, r0 > 0 ? r0 + L.radiusGrow : 1e9, true);
-        for (int c = 0; c < 3; ++c) { std::snprintf(name, sizeof(name), "w%d_s0_%s", w, axis[c]); test(name, std::fabs((double)o.sample[c]), L.pos, true); }
-        std::snprintf(name, sizeof(name), "w%d_gap", w); test(name, o.gap, L.gap, false);
+        test("w%d_radius", w, o.radius, r0 > 0 ? r0 + L.radiusGrow : 1e9, true);
+        for (int c = 0; c < 3; ++c) test(sampleFmt[w][c], 0, std::fabs((double)o.sample[c]), L.pos, true);
+        test("w%d_gap", w, o.gap, L.gap, false);
         if (x.have) {
             const WheelX& e = x.wheel[w];
-            std::snprintf(name, sizeof(name), "w%d_defl", w); test(name, e.defl, -1e9, false);
-            if (e.torus > 0) {
-                std::snprintf(name, sizeof(name), "w%d_flat", w); test(name, FlatRatio(e.defl, e.torus), L.flatOver, true);
-            }
-            std::snprintf(name, sizeof(name), "w%d_defl_rate", w); test(name, e.deflRate, -1e9, false);
+            test("w%d_defl", w, e.defl, -1e9, false);
+            if (e.torus > 0) test("w%d_flat", w, FlatRatio(e.defl, e.torus), L.flatOver, true);
+            test("w%d_defl_rate", w, e.deflRate, -1e9, false);
         }
     }
     if (x.have) {
         // Extension 0 is the bump stop fully squashed; below it the shock has a negative
         // length (PiBoSo: by then the sim has already exploded).
-        test("shock_ext", x.shockExt, 0.0, false);
-        test("shock_ext_max", x.shockExt, x.stroke + L.shockOver, true);
-        test("shock_vel", std::fabs(x.shockVel), L.shockVel, true);
-        test("bump_pen_mm", (double)x.bumpPen, -1e9, false);
+        test("shock_ext", 0, x.shockExt, 0.0, false);
+        test("shock_ext_max", 0, x.shockExt, x.stroke + L.shockOver, true);
+        test("shock_vel", 0, std::fabs(x.shockVel), L.shockVel, true);
+        test("bump_pen_mm", 0, (double)x.bumpPen, -1e9, false);
         const Bodies& b = x.bodies;
-        if (b.nonfinite > 0 && nn < 48) {
+        if (b.nonfinite > 0 && nn < 16) {
             Trip& t = nf[nn++];
             std::snprintf(t.field, sizeof(t.field), "body%d", (int)b.firstBad);
             t.value = std::nan(""); t.limit = std::nan(""); t.nonfinite = true;
         }
         if (b.n > 0) {
-            std::snprintf(name, sizeof(name), "body%d_pos", (int)b.iPos); test(name, b.maxPos, L.pos, true);
-            std::snprintf(name, sizeof(name), "body%d_vel", (int)b.iVel); test(name, b.maxVel, L.vel, true);
-            std::snprintf(name, sizeof(name), "body%d_avel", (int)b.iAvel); test(name, b.maxAvel, L.avelBody, true);
+            test("body%d_pos", b.iPos, b.maxPos, L.pos, true);
+            test("body%d_vel", b.iVel, b.maxVel, L.vel, true);
+            test("body%d_avel", b.iAvel, b.maxAvel, L.avelBody, true);
         }
     }
     for (int i = 0; i < nn && k < max; ++i) out[k++] = nf[i];

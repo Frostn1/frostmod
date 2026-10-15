@@ -6,6 +6,7 @@
 #include "../src/nanwatch.h"
 #include "../src/nantrap.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -391,6 +392,30 @@ static void ring_csv() {
     CHECK(plain.find(kExtraHeader) == std::string::npos, "plain CSV unchanged");
 }
 
+// What a clean step pays for the check (every step but a few). Printed; the bound only
+// catches something gone badly wrong.
+static void cost() {
+    Fake f;
+    const uint8_t* bl[kMaxBodies];
+    const int nb = WorldBodies(f.bodies[0].data(), bl, kMaxBodies);
+    Extra x;
+    tyrelog::Step s = sane();
+    Limits L;
+    Trip t[16];
+    const int n = 200000;
+    int trips = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n; ++i) {
+        ReadExtra(f.bike.data(), bl, nb, x);
+        trips += Check(s, x, L, t, 16);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / n;
+    std::printf("nanwatch: %.0f ns per clean step (read + check, %d bodies), %.3f%% of a 2 ms step\n", ns, nb,
+                ns / 2e6 * 100.0);
+    CHECK(trips == 0 && ns < 20000.0, "clean and cheap (%d trips, %.0f ns)", trips, ns);
+}
+
 int main() {
     cfg();
     trapcfg();
@@ -401,6 +426,7 @@ int main() {
     flat();
     stress();
     ring_csv();
+    cost();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

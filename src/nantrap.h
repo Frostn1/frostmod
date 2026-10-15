@@ -36,18 +36,29 @@ namespace crash = frostmod::crash;
 inline constexpr uint32_t kIE    = 1u << 0;   // invalid-operation flag (sticky)
 inline constexpr uint32_t kFlags = 0x3Fu;     // IE DE ZE OE UE PE, all sticky
 inline constexpr uint32_t kIM    = 1u << 7;   // invalid-operation mask
+inline constexpr uint32_t kOM    = 1u << 10;  // overflow mask
 inline constexpr uint32_t kStatusInvalid  = 0xC0000090u;  // STATUS_FLOAT_INVALID_OPERATION
+inline constexpr uint32_t kStatusOverflow = 0xC0000091u;  // STATUS_FLOAT_OVERFLOW
 inline constexpr uint32_t kStatusMultiple = 0xC00002B5u;  // STATUS_FLOAT_MULTIPLE_TRAPS
 
 /// What the step runs under: the game's MXCSR with the sticky flags cleared and only the
-/// invalid-operation exception unmasked. Rounding, FTZ/DAZ and every other mask are kept.
-inline uint32_t ArmedMxcsr(uint32_t saved) { return (saved & ~kFlags) & ~kIM; }
-/// What the faulting instruction is resumed under: invalid masked again, flags cleared, so it
-/// completes with the default NaN as it would have on a stock game.
-inline uint32_t ResumeMxcsr(uint32_t trapped) { return (trapped | kIM) & ~kFlags; }
+/// invalid-operation exception unmasked (and overflow too with nantrapov=1: the first finite
+/// value that becomes an infinity, which is where an integration runaway turns into the inf
+/// that a later inf-inf or 0*inf makes NaN). Rounding, FTZ/DAZ and every other mask are kept.
+inline uint32_t ArmedMxcsr(uint32_t saved, bool overflow = false) {
+    return (saved & ~kFlags) & ~kIM & ~(overflow ? kOM : 0u);
+}
+/// What the faulting instruction is resumed under: invalid and overflow masked again, flags
+/// cleared, so it completes with the default NaN (or the inf) a stock game gets.
+inline uint32_t ResumeMxcsr(uint32_t trapped) { return (trapped | kIM | kOM) & ~kFlags; }
 /// Whether a context's MXCSR is one we armed (invalid unmasked). The game never unmasks it.
 inline bool IsArmed(uint32_t mxcsr) { return (mxcsr & kIM) == 0; }
-inline bool IsTrapCode(uint32_t code) { return code == kStatusInvalid || code == kStatusMultiple; }
+inline bool IsTrapCode(uint32_t code) {
+    return code == kStatusInvalid || code == kStatusMultiple || code == kStatusOverflow;
+}
+inline const char* TrapName(uint32_t code) {
+    return code == kStatusOverflow ? "overflow" : code == kStatusInvalid ? "invalid" : "multiple";
+}
 
 // ---- invalid ops the game throws away ---------------------------------------------------------
 /// A trap here is not the NaN. In beta21e, 0x1AD835..0x1AD873 is
@@ -68,6 +79,27 @@ inline bool IsDiscarded(const uint8_t* at, size_t n) {
            std::memcmp(at, kDiscardedDivide, sizeof(kDiscardedDivide)) == 0;
 }
 
+/// The spawn 0*inf. Every new bike (and again around 20 ms in, the step after the spawn skip
+/// below lets go) runs 0x19F695 `divss xmm2, [r12]`, a point scaled by r / |point| where the
+/// point comes from a wheel matrix that is still zero, so r / 0 = inf, then calls the vector
+/// scale 0x267CF0, whose `mulss xmm0, [rdx]` (0x267CF6) is 0 * inf. Nothing crashes and the
+/// NaN goes nowhere, but it was 25 of the 32 trap reports by 2026-10-14 (16 at 0x267CF6 and 9
+/// more at the same bytes, reported as 0x247506). Matched by bytes, not by address: the
+/// faulting bytes are the scale's (mulss [rdx]; movss [rcx]; mulss [rdx+4]) AND the return
+/// address on the stack comes straight after `divss xmm2, [r12]; call rel32` - so the same
+/// scale called from anywhere else still traps.
+inline constexpr uint8_t kSpawnScaleAt[] = {0xF3, 0x0F, 0x59, 0x02, 0xF3, 0x0F, 0x11, 0x01,
+                                            0xF3, 0x0F, 0x59, 0x4A, 0x04};
+/// The 11 bytes before the return address: divss xmm2, [r12]; call rel32 (rel32 not compared).
+inline constexpr uint8_t kSpawnScaleCaller[] = {0xF3, 0x41, 0x0F, 0x5E, 0x14, 0x24, 0xE8};
+inline constexpr int kSpawnCallerLen = 11;
+
+inline bool IsSpawnScale(const uint8_t* at, size_t n, const uint8_t* beforeRet, size_t m) {
+    return at && beforeRet && n >= sizeof(kSpawnScaleAt) && m >= (size_t)kSpawnCallerLen &&
+           std::memcmp(at, kSpawnScaleAt, sizeof(kSpawnScaleAt)) == 0 &&
+           std::memcmp(beforeRet, kSpawnScaleCaller, sizeof(kSpawnScaleCaller)) == 0;
+}
+
 /// Discarded traps are not reported and do not count toward kMaxTraps, but each still costs an
 /// exception, so past this many in a session the trap disarms anyway.
 inline constexpr unsigned kMaxDiscarded = 256;
@@ -79,10 +111,24 @@ inline constexpr int kMaxReportsCap = 8;     // nantrapmax= is clamped to 1..8
 /// the session.
 inline constexpr unsigned kMaxTraps = 64;
 
+inline constexpr int kMaxSkips = 8;
+
 struct Config {
     bool on = false;   // nantrap=1. Anything else, or no line at all, is off.
     int max = 1;       // nantrapmax=N: distinct sites reported per session (default 1)
+    bool overflow = false;   // nantrapov=1: unmask overflow as well as invalid
+    // nantrapskip=0x1A0A8D,0x... : game RVAs whose traps are resumed without a report (a
+    // harmless site found on an earlier ride). Up to kMaxSkips.
+    uint32_t skip[kMaxSkips] = {};
+    int skips = 0;
 };
+
+/// Whether `rva` is on the skip list.
+inline bool Skipped(const Config& c, uint32_t rva) {
+    for (int i = 0; i < c.skips && i < kMaxSkips; ++i)
+        if (c.skip[i] == rva) return true;
+    return false;
+}
 
 /// One cfg line. Returns true if it was one of ours. `nantrap=1` exactly turns it on; `0`, a
 /// typo, a comment or a missing line leave it off.
@@ -103,6 +149,35 @@ inline bool ParseCfgLine(const char* line, Config& c) {
         return true;
     };
     int v = 0;
+    if (std::strncmp(line, "nantrapskip", 11) == 0) {
+        const char* p = line + 11;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p != '=') return false;
+        ++p;
+        c.skips = 0;
+        while (*p && c.skips < kMaxSkips) {
+            while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+            uint32_t x = 0;
+            int digits = 0;
+            for (;; ++p, ++digits) {
+                const char ch = *p;
+                const int d = ch >= '0' && ch <= '9' ? ch - '0'
+                            : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                            : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+                if (d < 0 || digits >= 8) break;
+                x = x * 16 + (uint32_t)d;
+            }
+            if (!digits) break;
+            c.skip[c.skips++] = x;
+        }
+        return true;
+    }
+    if (std::strncmp(line, "nantrapov", 9) == 0) {
+        if (!value(line + 9, v)) return false;
+        c.overflow = (v == 1);
+        return true;
+    }
     if (std::strncmp(line, "nantrapmax", 10) == 0) {
         if (!value(line + 10, v)) return false;
         c.max = v < 1 ? 1 : v > kMaxReportsCap ? kMaxReportsCap : v;
@@ -251,9 +326,9 @@ inline void WriteLog(const Record& r, crash::Emit emit, void* user) {
     char line[512], op[64], hex[160];
     OpHint(r, op, sizeof(op));
     std::snprintf(line, sizeof(line),
-                  "[nantrap] FIRST invalid FP op #%u (0x%08X) at %s: %s - thread %lu, %llu ms "
+                  "[nantrap] FIRST %s FP op #%u (0x%08X) at %s: %s - thread %lu, %llu ms "
                   "into the run, %llu armed steps in",
-                  r.index, r.code, r.site, op, r.thread, r.uptimeMs, r.steps);
+                  TrapName(r.code), r.index, r.code, r.site, op, r.thread, r.uptimeMs, r.steps);
     emit(user, line);
     if (r.gameSite[0] && std::strcmp(r.gameSite, r.site) != 0) {
         std::snprintf(line, sizeof(line), "[nantrap] nearest game frame: %s", r.gameSite);
@@ -296,7 +371,7 @@ inline int TrailNotes(const Record& r, char (*out)[crash::kCrumbLen], int max) {
     int k = 0;
     char op[64];
     OpHint(r, op, sizeof(op));
-    if (k < max) std::snprintf(out[k++], crash::kCrumbLen, "nantrap: first invalid op at %s %s", r.site, op);
+    if (k < max) std::snprintf(out[k++], crash::kCrumbLen, "nantrap: first %s op at %s %s", TrapName(r.code), r.site, op);
     for (int base = 0; base < 8 && k < max; base += 2) {
         char a[24], b[24], c[24], d[24];
         Num(XmmF(r, base, 0), a, sizeof(a));
@@ -371,6 +446,7 @@ inline void WriteJson(const Record& r, const Meta& m, const crash::Context& ctx,
 
     emit(user, "  \"nan\": {");
     std::snprintf(line, sizeof(line), "    \"index\": %u,", r.index); emit(user, line);
+    std::snprintf(line, sizeof(line), "    \"trap\": \"%s\",", TrapName(r.code)); emit(user, line);
     crash::Escape(r.gameSite, esc, sizeof(esc));
     std::snprintf(line, sizeof(line), "    \"gameSite\": \"%s\",", esc); emit(user, line);
     OpHint(r, tmp, sizeof(tmp));
@@ -447,6 +523,9 @@ bool Armed();
 /// Around one call of the sim step, on the thread that runs it. Enter returns the MXCSR to hand
 /// back to Leave, which restores it exactly and writes any pending report.
 uint32_t Enter();
+/// Spawn 0*inf traps resumed this session without a report (IsSpawnScale), and skip-list ones.
+unsigned SpawnSkips();
+unsigned ListSkips();
 void Leave(uint32_t saved);
 /// Leave without the flush: restores MXCSR and counts the step. For a caller that wants to do
 /// something between the step and the report (tyrelog samples the step first), then Flush().

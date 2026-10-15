@@ -24,6 +24,8 @@ std::atomic<bool> g_armed{false};
 std::atomic<unsigned> g_reports{0};     // records captured this session
 std::atomic<unsigned> g_traps{0};       // traps seen this session, reported or not
 std::atomic<unsigned> g_discarded{0};   // traps at a site whose NaN the game discards
+std::atomic<unsigned> g_spawnSkips{0};  // the spawn 0*inf (IsSpawnScale), resumed unreported
+std::atomic<unsigned> g_listSkips{0};   // nantrapskip= sites, resumed unreported
 std::atomic<bool> g_pending{false};     // a captured record not yet written out
 std::atomic<unsigned long long> g_steps{0};
 PVOID g_veh = nullptr;
@@ -115,6 +117,27 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
     _mm_setcsr(_mm_getcsr() | 0x1F80u);
 
     const uint64_t rip = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+    // The spawn 0*inf and the cfg's skip list: resumed as stock, never disarm the trap. The
+    // spawn one is a leaf, so the return address is the first qword on the stack.
+    {
+        uint8_t here[sizeof(kSpawnScaleAt)];
+        uint8_t retBytes[kSpawnCallerLen];
+        uint64_t ret = 0;
+        const bool spawn =
+            ReadBytes((const uint8_t*)rip, here, (int)sizeof(here)) &&
+            ReadBytes((const uint8_t*)ep->ContextRecord->Rsp, (uint8_t*)&ret, 8) && ret > kSpawnCallerLen &&
+            ReadBytes((const uint8_t*)(ret - kSpawnCallerLen), retBytes, kSpawnCallerLen) &&
+            IsSpawnScale(here, sizeof(here), retBytes, sizeof(retBytes));
+        const bool listed = !spawn && rip >= g_exeLo && rip < g_exeHi && Skipped(g_cfg, (uint32_t)(rip - g_exeLo));
+        if (spawn || listed) {
+            (spawn ? g_spawnSkips : g_listSkips).fetch_add(1, std::memory_order_relaxed);
+            const DWORD m = ResumeMxcsr(ep->ContextRecord->MxCsr);
+            ep->ContextRecord->MxCsr = m;
+            ep->ContextRecord->FltSave.MxCsr = m;
+            t_inHandler = false;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     uint8_t at[sizeof(kDiscardedDivide)];
     if (ReadBytes((const uint8_t*)rip, at, (int)sizeof(at)) && IsDiscarded(at, sizeof(at))) {
         // Not the NaN: resume as stock and keep watching, without spending a report on it.
@@ -182,7 +205,7 @@ bool Armed() { return g_armed.load(std::memory_order_relaxed); }
 uint32_t Enter() {
     const uint32_t saved = _mm_getcsr();
     ++t_depth;
-    _mm_setcsr(ArmedMxcsr(saved));
+    _mm_setcsr(ArmedMxcsr(saved, g_cfg.overflow));
     return saved;
 }
 
@@ -249,6 +272,8 @@ void Flush() {
 }
 
 unsigned Reports() { return g_reports.load(std::memory_order_relaxed); }
+unsigned SpawnSkips() { return g_spawnSkips.load(std::memory_order_relaxed); }
+unsigned ListSkips() { return g_listSkips.load(std::memory_order_relaxed); }
 const Record& Last() { return g_rec; }
 
 }  // namespace nantrap

@@ -7,6 +7,8 @@
 
 ### Added
 - **Ctrl+Shift+H** hides the Coach overlay in game and brings it back.
+- **NaN workshop (diagnostic, off by default).** `nanwatch=1` checks the bike after every physics step and logs the first value that goes bad. `nanflat=1` logs near-flat tyres. `nanstress=1` throws the bike around offline. `nanring=N` keeps a longer ring. `nantrapov=1` also traps overflows. `nantrapskip=` lets known sites through.
+- **NaN trap.** The spawn's own 0*inf no longer uses up a report.
 
 ## 2026-10-14 - v0.49.14
 

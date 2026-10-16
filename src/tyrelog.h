@@ -245,19 +245,38 @@ template <size_t N>
 struct Ring {
     Step buf[N];
     std::atomic<uint64_t> written{0};
+    /// Rows in use. nanring=N (src/nanwatch.h) sets it once, before the first row: up to N in
+    /// `buf`, or any number in an outside array (zeroed memory the caller owns) so the static
+    /// ring stays the 2 s it always was and a longer one costs nothing unless asked for.
+    size_t cap = N;
+    Step* ext = nullptr;
 
-    Step& Next() { return buf[written.load(std::memory_order_relaxed) % N]; }
+    void SetCap(size_t n, Step* outside = nullptr) {
+        ext = outside;
+        cap = n < 1 ? 1 : (!outside && n > N) ? N : n;
+        Clear();
+    }
+    Step* Rows() { return ext ? ext : buf; }
+    const Step* Rows() const { return ext ? ext : buf; }
+    /// Row storage by slot (for a parallel array kept beside the ring).
+    Step& Row(size_t slot) { return Rows()[slot]; }
+    const Step& Row(size_t slot) const { return Rows()[slot]; }
+    /// The slot the next row goes in.
+    size_t NextSlot() const { return (size_t)(written.load(std::memory_order_relaxed) % cap); }
+    Step& Next() { return Rows()[NextSlot()]; }
     void Commit() { written.store(written.load(std::memory_order_relaxed) + 1, std::memory_order_release); }
     size_t Count() const {
         const uint64_t w = written.load(std::memory_order_acquire);
-        return w < N ? (size_t)w : N;
+        return w < cap ? (size_t)w : cap;
+    }
+    /// The slot of row i, i = 0 the oldest still held.
+    size_t Slot(size_t i) const {
+        const uint64_t w = written.load(std::memory_order_acquire);
+        const uint64_t first = w < cap ? 0 : w - cap;
+        return (size_t)((first + i) % cap);
     }
     /// i = 0 is the oldest step still held.
-    const Step& At(size_t i) const {
-        const uint64_t w = written.load(std::memory_order_acquire);
-        const uint64_t first = w < N ? 0 : w - N;
-        return buf[(first + i) % N];
-    }
+    const Step& At(size_t i) const { return Rows()[Slot(i)]; }
     void Clear() { written.store(0, std::memory_order_release); }
 };
 
@@ -279,6 +298,13 @@ struct Meta {
     const char* version = "";   // FrostMod's
     const char* whenUtc = "";
     const char* track = "";
+    /// Extra columns after the fixed ones (nanwatch=1): their header, and one row's values for
+    /// ring slot `slot`. Both null: the fixed 35 columns only.
+    const char* extraHeader = nullptr;
+    void (*extraRow)(size_t slot, char* out, size_t n) = nullptr;
+    /// Only the newest this many steps (0: every row the ring holds). A ring sized for four
+    /// bikes a step holds four times as many steps when there is one.
+    uint64_t maxSteps = 0;
 };
 
 inline const char* kHeader =
@@ -293,25 +319,36 @@ inline const char* kHeader =
 /// name goes in here: only the track folder and the game's own bike handles.
 template <size_t N>
 inline void WriteCsv(const Ring<N>& r, const Meta& m, Emit emit, void* user) {
-    char line[1024];
+    char line[2048];
     std::snprintf(line, sizeof(line), "# frostmod nan ring: reason=%s frostmod=%s when=%s track=%s",
                   m.reason, m.version, m.whenUtc, m.track);
     emit(user, line);
-    const size_t n = r.Count();
+    const size_t all = r.Count();
+    size_t begin = 0;
+    if (m.maxSteps && all) {
+        const uint64_t newest = r.At(all - 1).step;
+        while (begin < all && r.At(begin).step + m.maxSteps <= newest) ++begin;
+    }
+    const size_t n = all - begin;
     std::snprintf(line, sizeof(line),
                   "# %zu row(s), oldest first. local=1: the player's bike; local=0: not known, up "
                   "to 4 bikes a step. spin rad/s, radius/gap/pos m, lvel m/s, avel rad/s. gap < 0 is "
                   "into the ground.", n);
     emit(user, line);
-    emit(user, kHeader);
+    if (m.extraHeader && m.extraRow) {
+        std::snprintf(line, sizeof(line), "%s,%s", kHeader, m.extraHeader);
+        emit(user, line);
+    } else {
+        emit(user, kHeader);
+    }
     // Time back from the newest row: walk newest to oldest once to sum, then emit oldest first.
     double total = 0;
-    for (size_t i = 1; i < n; ++i)   // the gaps between steps
+    for (size_t i = begin + 1; i < all; ++i)   // the gaps between steps
         if (r.At(i).step != r.At(i - 1).step) total += r.At(i).dt;
     double prefix = 0;   // summed in the same order, so the newest step lands on exactly 0
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = begin; i < all; ++i) {
         const Step& s = r.At(i);
-        if (i > 0 && s.step != r.At(i - 1).step) prefix += s.dt;
+        if (i > begin && s.step != r.At(i - 1).step) prefix += s.dt;
         const double t = prefix - total;
         char f[32][32];
         int k = 0;
@@ -338,6 +375,13 @@ inline void WriteCsv(const Ring<N>& r, const Meta& m, Emit emit, void* user) {
                       f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
                       f[14], f[15], f[16], f[17], f[18], f[19], s.wheel[0].hit,
                       f[20], f[21], f[22], f[23], f[24], f[25], s.wheel[1].hit);
+        if (m.extraHeader && m.extraRow) {
+            const size_t used = std::strlen(line);
+            if (used + 2 < sizeof(line)) {
+                line[used] = ',';
+                m.extraRow(r.Slot(i), line + used + 1, sizeof(line) - used - 1);
+            }
+        }
         emit(user, line);
     }
 }

@@ -120,6 +120,22 @@ query is refused, or when the game crashes. It only reads; the game runs the sam
 report names the file as `nanRing`. `tyrelog=0` keeps the trap and drops the ring. The newest
 12 files are kept.
 
+The NaN workshop, for hunting where the physics NaN starts. Every key is off by default and
+read at game start:
+
+| key | what it does |
+|---|---|
+| `nantrapov=1` | the trap also stops at the first overflow (a finite value becoming infinite) |
+| `nantrapskip=0x1A0A8D,...` | game addresses whose traps are let through without a report |
+| `nanwatch=1` | after every physics step, checks your bike's bodies, wheels, tyres and rear shock; the first value that is not finite, and the first past a sanity limit, go in the log with the step and a ring file |
+| `nanring=N` | how many steps the ring keeps (default 1000 = 2 s, up to 15000 = 30 s) |
+| `nanflat=1` | logs every time a tyre is squashed near flat (`nanflatpct=N`, default 90 %) to `frostmod-nan-flat-*.csv` |
+| `nanburyrear=0.25` | with `nanwatch=1`, offline: **Ctrl+Shift+B** pushes the rear wheel and swingarm this far under the terrain on the next step, **Ctrl+Shift+L** does that and slams them down (`nanburyv=6` m/s); the next 2 s are logged every step. Rear-underground episodes always go to `frostmod-nan-rear-*.csv` |
+| `nanstress=1` | offline only: throws the bike up every few seconds so it lands hard, flat or sideways (`nanstressms`, `nanstressv`, `nanstressspin`, `nanstressdrop`, `nanstresswheel`) |
+
+The spawn's own harmless 0*inf (in the game's wheel setup) is let through without using up a
+report.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

@@ -226,6 +226,16 @@ endif()
 add_executable(tyrelog_test tests/tyrelog_test.cpp)
 add_test(NAME tyrelog COMMAND tyrelog_test)
 
+# --- NaN workshop test (src/nanwatch.h, nantrap overflow/skip, the longer ring) ---
+add_executable(nanwatch_test tests/nanwatch_test.cpp)
+add_test(NAME nanwatch COMMAND nanwatch_test)
+# And live: the spawn 0*inf rebuilt byte for byte is resumed unreported; nantrapov=1 traps the
+# first overflow once and resumes with the stock inf.
+if(WIN32)
+    add_executable(nanwatch_harness tests/nanwatch_harness.cpp src/nantrap.cpp src/crashreport.cpp)
+    add_test(NAME nanwatch_harness COMMAND nanwatch_harness)
+endif()
+
 add_executable(crashreport_test tests/crashreport_test.cpp)
 add_test(NAME crashreport COMMAND crashreport_test)
 

@@ -64,6 +64,7 @@
 #include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
+#include "nanwatch.h"    // nanwatch=1 / nanflat=1 / nanstress=1: the NaN workshop (diagnostic, off by default)
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
@@ -3820,6 +3821,11 @@ static nantrap::Config g_ntCfg;
 // tyrelog=0 turns nantrap's tyre ring off (TYRELOG section, src/tyrelog.h). It is on with
 // nantrap=1 otherwise; without nantrap=1 the key does nothing.
 static tyrelog::Config g_tlCfg;
+// nanwatch=1 / nanring= / nanflat=1 / nanstress=1 and their knobs (NANWATCH section,
+// src/nanwatch.h). Read early by NtReadCfg(); kept here so a save does not drop them.
+static nanwatch::Config g_nwCfg;
+static std::atomic<bool> g_nwOn{false};    // NANWATCH section: its checks passed and it runs
+static std::atomic<int> g_nwBuryReq{0};    // 1 bury the rear, 2 bury and slam (Ctrl+Shift+B / L)
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3837,6 +3843,18 @@ static void SaveOverlaySettings() {
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
     if (g_ntCfg.max != 1) fprintf(f, "nantrapmax=%d\n", g_ntCfg.max);
     if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
+    if (g_ntCfg.overflow) fprintf(f, "nantrapov=1\n");
+    if (g_ntCfg.skips > 0) {
+        fprintf(f, "nantrapskip=");
+        for (int i = 0; i < g_ntCfg.skips && i < nantrap::kMaxSkips; ++i)
+            fprintf(f, "%s0x%X", i ? "," : "", g_ntCfg.skip[i]);
+        fprintf(f, "\n");
+    }
+    {
+        char lines[16][40];
+        const int n = nanwatch::CfgLines(g_nwCfg, lines, 16);
+        for (int i = 0; i < n; ++i) fprintf(f, "%s\n", lines[i]);
+    }
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3855,6 +3873,7 @@ static void LoadOverlaySettings() {
         // Only kept for the next save: whether the trap went in was decided at load.
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
+        else if (nanwatch::ParseCfgLine(line, g_nwCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
@@ -5683,6 +5702,21 @@ void Tick() {
         prevHide = down;
     }
 
+    // NaN workshop (nanwatch=1 only): Ctrl+Shift+B buries the rear, Ctrl+Shift+L buries it and
+    // slams it down. Offline, on your own bike; the physics thread does it on the next step.
+    if (g_nwOn.load(std::memory_order_relaxed)) {
+        static bool prevB = false, prevL = false;
+        const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
+        const bool focused = fgPid == GetCurrentProcessId();
+        const bool b = focused && mods && (GetAsyncKeyState('B') & 0x8000);
+        const bool l = focused && mods && (GetAsyncKeyState('L') & 0x8000);
+        if (b && !prevB) { g_nwBuryReq.store(1); Log("[nanbury] Ctrl+Shift+B: burying the rear on the next step."); }
+        if (l && !prevL) { g_nwBuryReq.store(2); Log("[nanbury] Ctrl+Shift+L: burying the rear and slamming it down on the next step."); }
+        prevB = b; prevL = l;
+    }
+
     // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
     static bool prevF8 = false, prevEsc = false, prevKey[128] = {false};
@@ -6752,6 +6786,10 @@ static int hkGhsClose(unsigned handle) {
 using TerrainSampleFn = int32_t (*)(void*, void*, float*, float, float);
 static TerrainSampleFn g_origTerrain = nullptr;
 static std::atomic<unsigned> g_terrainGuarded{0};
+// NANWATCH: the terrain object the sim step's own height queries use (set while a step runs
+// on this thread), so the rear-underground check can ask the same terrain after the step.
+static thread_local bool t_nwInStep = false;
+static std::atomic<void*> g_nwTerrainObj{nullptr};
 
 static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y) {
     // isfinite, not isnan: an infinity survives the same comparisons and lands on the
@@ -6781,6 +6819,7 @@ static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y
         frostmod::crash::Note("refused a NaN height query (%u so far)", n);
         return 0;   // what the function itself returns for a query it cannot serve
     }
+    if (t_nwInStep) g_nwTerrainObj.store(obj, std::memory_order_relaxed);
     return g_origTerrain(obj, a2, out, x, y);
 }
 
@@ -7100,12 +7139,16 @@ static int32_t hkSimStep(int32_t slot, float dt) {
     // A bike's first steps run stock: the game's own throwaway 0 * inf there is not the NaN we
     // want, and it would use up the report (tyrelog::kSpawnSettle).
     if (!nantrap::Armed() || NtSpawnStep(slot)) {
+        t_nwInStep = true;
         const int32_t rc = g_origSimStep(slot, dt);
+        t_nwInStep = false;
         if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
         return rc;
     }
     const uint32_t saved = nantrap::Enter();
+    t_nwInStep = true;
     const int32_t rc = g_origSimStep(slot, dt);
+    t_nwInStep = false;
     nantrap::Restore(saved);   // the game's MXCSR, exactly as it was
     // The ring takes this step before a trap report goes out, so the report's CSV ends on the
     // step that made the NaN.
@@ -7126,12 +7169,23 @@ static int32_t hkSimStep(int32_t slot, float dt) {
 // reports name it as "nanRing". Read-only: plain loads, nothing written to the game, no hook
 // of its own. Every offset is checked against the exe's bytes before it turns on.
 // ===========================================================================
-static tyrelog::Ring<tyrelog::kRows> g_tlRing;   // 2 s, up to 4 bikes a step
+// 2 s, up to 4 bikes a step. nanring= (NANWATCH) swaps in a longer, zeroed outside array.
+static tyrelog::Ring<tyrelog::kRows> g_tlRing;
 static const uint8_t* g_tlWorlds = nullptr;    // the world slot array the sim step indexes
 static uint64_t g_tlSteps = 0;
 static bool g_tlRefusalDumped = false;
 static std::atomic<int> g_tlDumps{0};
-static constexpr int kTlMaxDumps = 6;          // a session's worth: refusal, trap(s), crash
+static int g_tlMaxDumps = 6;                   // a session's worth: refusal, trap(s), crash
+
+// NANWATCH state that TlSampleRaw fills (the section itself is further down). Each ring row
+// has its extra fields in the same slot of g_nwExtra (zeroed, allocated only when it is on).
+static nanwatch::Extra* g_nwExtra = nullptr;
+struct NwRow { size_t slot; const uint8_t* bike; const uint8_t* body; int local; };
+static NwRow g_nwRows[tyrelog::kMaxTagged];
+static int g_nwRowN = 0;
+static const uint8_t* g_nwBodies[nanwatch::kMaxBodies];   // row 0's ODE bodies, this step
+static int g_nwBodyN = 0;
+static void NwAfterStep();
 static constexpr int kTlKeepFiles = 12;        // ring CSVs kept in the folder, newest first
 static constexpr unsigned kTlTimedSteps = 5000;
 
@@ -7167,10 +7221,22 @@ static void TlSampleRaw(int32_t slot, float dt) {
     const int k = tyrelog::PickBikes(handles, active, n, own, pick, &local);
     if (k == 0) return;
     const uint64_t step = ++g_tlSteps;
+    g_nwRowN = 0;
     for (int j = 0; j < k; ++j) {
         const int i = pick[j];
         const uint8_t* body = nullptr;
         memcpy(&body, bikes[i] + tyrelog::kBikeChassis, sizeof(body));
+        const size_t slot = g_tlRing.NextSlot();
+        if (g_nwOn.load(std::memory_order_relaxed)) {
+            const uint8_t* bl[nanwatch::kMaxBodies];
+            const int nb = nanwatch::WorldBodies(body, bl, nanwatch::kMaxBodies);
+            nanwatch::ReadExtra(bikes[i], bl, nb, g_nwExtra[slot]);
+            if (j == 0) {
+                for (int b = 0; b < nb; ++b) g_nwBodies[b] = bl[b];
+                g_nwBodyN = nb;
+            }
+            g_nwRows[g_nwRowN++] = NwRow{slot, bikes[i], body, local ? 1 : 0};
+        }
         tyrelog::Step& s = g_tlRing.Next();
         s.step = step;
         s.dt = dt;
@@ -7262,7 +7328,7 @@ static bool TlWrite(const char* reason, char* name, size_t n) {
     if (!g_tlOn.load(std::memory_order_relaxed) || !name || !n) return false;
     name[0] = 0;
     if (g_tlRing.Count() == 0) return false;
-    if (g_tlDumps.fetch_add(1) >= kTlMaxDumps) return false;
+    if (g_tlDumps.fetch_add(1) >= g_tlMaxDumps) return false;
     const char* dir = frostmod::crash::ReportDir();
     if (!dir || !dir[0]) return false;
     SYSTEMTIME local, utc;
@@ -7282,6 +7348,13 @@ static bool TlWrite(const char* reason, char* name, size_t n) {
     m.version = frostmod::crash::Version();
     m.whenUtc = whenUtc;
     m.track = frostmod::crash::TheContext().track;   // the folder name; no rider, no server
+    if (g_nwOn.load(std::memory_order_relaxed)) {
+        m.extraHeader = nanwatch::kExtraHeader;
+        m.extraRow = [](size_t slot, char* out, size_t n) {
+            nanwatch::ExtraCsv(g_tlRing.Row(slot), g_nwExtra[slot], out, n);
+        };
+        m.maxSteps = (uint64_t)g_nwCfg.ring;
+    }
     tyrelog::WriteCsv(g_tlRing, m,
                       [](void* user, const char* line) {
                           std::fputs(line, (FILE*)user);
@@ -7327,12 +7400,14 @@ static void TlAfterStep(int32_t slot, float dt) {
             Log("[tyrelog] first refused NaN height query: the last %zu steps are in %s",
                 g_tlRing.Count(), name);
     }
+    if (g_nwOn.load(std::memory_order_relaxed)) NwAfterStep();
 }
 
 // After the sim-step hook is in. `fn` is the sim step as found; a relocated step means another
 // build, and the byte checks below then decide.
+static void NwInstall(intptr_t delta);
 static void TlInstall(const uint8_t* fn) {
-    if (!tyrelog::Enabled(g_ntCfg.on, g_tlCfg)) {
+    if (!tyrelog::Enabled(g_ntCfg.on, g_tlCfg) && !g_nwCfg.Any()) {
         Log("[tyrelog] off (tyrelog=0): the trap runs without the tyre ring.");
         return;
     }
@@ -7360,11 +7435,581 @@ static void TlInstall(const uint8_t* fn) {
         return;
     }
     g_tlWorlds = worlds;
+    // nanring=N: the ring holds N steps (4 rows a step when your bike is not known). Past the
+    // static 2 s it lives in a zeroed outside array; calloc's pages are only committed as the
+    // ring first fills them.
+    if (g_nwCfg.Any()) {
+        const size_t rows = (size_t)g_nwCfg.ring * tyrelog::kMaxTagged;
+        if (rows <= tyrelog::kRows) {
+            g_tlRing.SetCap(rows);
+        } else if (auto* big = (tyrelog::Step*)calloc(rows, sizeof(tyrelog::Step))) {
+            g_tlRing.SetCap(rows, big);
+        } else {
+            Log("[tyrelog] nanring=%d: could not get the memory; keeping 2 s.", g_nwCfg.ring);
+            g_nwCfg.ring = (int)tyrelog::kSteps;
+        }
+    }
+    NwInstall(delta);
     frostmod::crash::SetRingWriter(&TlWrite);
     g_tlOn.store(true, std::memory_order_release);
-    Log("[tyrelog] ON (with nantrap=1): the last %zu physics steps of your bike's tyre spin, "
+    Log("[tyrelog] ON: the last %d physics steps of your bike's tyre spin, "
         "sample radius, sample point and chassis speed are kept and written to frostmod-nan-ring-*.csv on the "
-        "trap, the first refused NaN height query, or a crash. Read-only.", tyrelog::kSteps);
+        "trap, the first refused NaN height query, or a crash. Read-only.",
+        g_nwCfg.Any() ? g_nwCfg.ring : (int)tyrelog::kSteps);
+}
+
+// ===========================================================================
+// NANWATCH  -  the NaN workshop (opt-in: nanwatch=1 / nanflat=1 / nanstress=1)
+//
+// Rides on the TYRELOG sampling: after each sim step the ring row also gets the tyre
+// deflection, the rear shock and bump stop, and a summary of every ODE body in the bike's
+// world (src/nanwatch.h). Then, per step:
+//   nanwatch=1   the first value that is not finite, and the first past a sanity limit, are
+//                logged once per kind with the step, the values and every body, and the ring
+//                (the steps before it) is written out.
+//   nanflat=1    each episode of a tyre near full deflection is one row of
+//                frostmod-nan-flat-*.csv, the first ones also in the log.
+//   nanstress=1  offline only: the bike is thrown up and turned every few seconds, so it
+//                lands hard, flat or sideways, with no rider on the controls.
+// Every offset is checked against the exe's bytes before any of it turns on.
+// ===========================================================================
+static nanwatch::Limits g_nwLimits;
+struct NwKind { char key[40]; unsigned long long count; uint64_t firstStep; };
+static NwKind g_nwKinds[64];
+static int g_nwKindN = 0;
+static bool g_nwNonfiniteSeen = false;
+static uint64_t g_nwLastSummary = 0;
+static unsigned long long g_nwTripSteps = 0;
+static nanwatch::FlatTracker g_nwFlat[tyrelog::kWheels];
+static char g_nwFlatPath[MAX_PATH] = "";
+static char g_nwRearPath[MAX_PATH] = "";
+static unsigned g_nwFlatLogged = 0;
+using NwSetPosFn = void (*)(void*, float, float, float);
+static NwSetPosFn g_nwSetPos = nullptr;
+// nanstress: bike time of the last throw, how many, and whether this throw's wheel spin went in.
+static float g_nsLastT = -1.0f;
+static unsigned g_nsThrows = 0;
+static bool g_nsSpun = true;
+static bool g_nsRefusedOnline = false;
+static unsigned g_nsLastSpawnSkips = 0;
+
+static const char* NwWheelName(int w) { return w == 0 ? "front" : "rear"; }
+
+// One log line of a row's state: chassis, wheels, shock, bodies.
+static void NwLogState(const char* tag, const tyrelog::Step& s, const nanwatch::Extra& x) {
+    Log("%s chassis pos=(%g, %g, %g) lvel=(%g, %g, %g) avel=(%g, %g, %g) bike_t=%.3f", tag,
+        s.pos[0], s.pos[1], s.pos[2], s.lvel[0], s.lvel[1], s.lvel[2], s.avel[0], s.avel[1], s.avel[2],
+        (double)s.bikeTime);
+    for (int w = 0; w < tyrelog::kWheels; ++w) {
+        const tyrelog::Wheel& o = s.wheel[w];
+        const nanwatch::WheelX& e = x.wheel[w];
+        Log("%s %s wheel: spin=%g rad/s R=%g (tyre %g) gap=%g hit=%d defl=%g rate=%g flat=%g of %g m "
+            "contact=%g deg (contact flag %d) sample0=(%g, %g, %g)",
+            tag, NwWheelName(w), o.spin, o.radius, e.radius0, o.gap, o.hit, e.defl, e.deflRate,
+            nanwatch::FlatRatio(e.defl, e.torus), e.torus, nanwatch::ContactAngle(o.radius, e.defl, e.torus),
+            e.contact, o.sample[0], o.sample[1], o.sample[2]);
+    }
+    Log("%s rear shock: ext=%g m (0 = bump stop fully in, below 0 = negative length) vel=%g m/s "
+        "stroke=%g bumpstop=%g m pen=%g mm; bodies=%d non-finite=%d max |pos|=%g |vel|=%g |avel|=%g",
+        tag, x.shockExt, x.shockVel, x.stroke, (double)x.bumpLen, (double)x.bumpPen, (int)x.bodies.n,
+        (int)x.bodies.nonfinite, (double)x.bodies.maxPos, (double)x.bodies.maxVel, (double)x.bodies.maxAvel);
+}
+
+// Every body of the bike's world, one line each. Plain loads.
+static void NwLogBodiesRaw(const char* tag) {
+    for (int i = 0; i < g_nwBodyN; ++i) {
+        float p[3], v[3], w[3], m = 0;
+        memcpy(p, g_nwBodies[i] + tyrelog::kBodyPos, 12);
+        memcpy(v, g_nwBodies[i] + tyrelog::kBodyLvel, 12);
+        memcpy(w, g_nwBodies[i] + tyrelog::kBodyAvel, 12);
+        memcpy(&m, g_nwBodies[i] + 0x48, 4);   // dMass.mass
+        Log("%s body %d%s: mass=%g pos=(%g, %g, %g) lvel=(%g, %g, %g) avel=(%g, %g, %g)", tag, i,
+            g_nwRowN > 0 && g_nwBodies[i] == g_nwRows[0].body ? " (chassis)" : "", (double)m, p[0], p[1],
+            p[2], v[0], v[1], v[2], w[0], w[1], w[2]);
+    }
+}
+static void NwLogBodies(const char* tag) {
+    __try {
+        NwLogBodiesRaw(tag);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("%s (a body read faulted)", tag);
+    }
+}
+
+static void NwSummary(bool force) {
+    if (!force && g_tlSteps - g_nwLastSummary < 15000) return;   // 30 s of steps
+    g_nwLastSummary = g_tlSteps;
+    if (!g_nwKindN) return;
+    char line[900];
+    size_t w = 0;
+    line[0] = 0;
+    for (int i = 0; i < g_nwKindN && w + 64 < sizeof(line); ++i)
+        w += (size_t)_snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, "%s%s x%llu", i ? ", " : "",
+                                 g_nwKinds[i].key, g_nwKinds[i].count);
+    Log("[nanwatch] steps with a trip so far: %llu of %llu. By kind: %s", g_nwTripSteps,
+        (unsigned long long)g_tlSteps, line);
+    if (nantrap::Armed() || nantrap::SpawnSkips())
+        Log("[nanwatch] nantrap so far: %u report(s), %u spawn 0*inf resumed, %u nantrapskip resumed",
+            nantrap::Reports(), nantrap::SpawnSkips(), nantrap::ListSkips());
+}
+
+static void NwCheck(const NwRow& row) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    const nanwatch::Extra& x = g_nwExtra[row.slot];
+    nanwatch::Trip t[16];
+    int n = nanwatch::Check(s, x, g_nwLimits, t, 16);
+    // A bike's first 0.1 s settles onto the ground from wherever it was put: only a
+    // non-finite value counts there (they come first in the list).
+    if (s.bikeTime >= 0.0f && s.bikeTime < 0.1f)
+        while (n > 0 && !t[n - 1].nonfinite) --n;
+    if (!n) return;
+    ++g_nwTripSteps;
+    int firstNew = -1;
+    bool newNonfinite = false;
+    for (int i = 0; i < n; ++i) {
+        char key[40];
+        nanwatch::TripKind(t[i], key, sizeof(key));
+        int k = 0;
+        while (k < g_nwKindN && strcmp(g_nwKinds[k].key, key) != 0) ++k;
+        if (k == g_nwKindN) {
+            if (g_nwKindN >= 64) continue;
+            strcpy_s(g_nwKinds[k].key, key);
+            g_nwKinds[k].count = 0;
+            g_nwKinds[k].firstStep = s.step;
+            ++g_nwKindN;
+            if (firstNew < 0) firstNew = i;
+            if (t[i].nonfinite && !g_nwNonfiniteSeen) newNonfinite = true;
+        }
+        ++g_nwKinds[k].count;
+    }
+    if (firstNew < 0) return;
+    char all[700];
+    size_t w = 0;
+    all[0] = 0;
+    for (int i = 0; i < n && w + 80 < sizeof(all); ++i) {
+        char one[96];
+        nanwatch::TripText(t[i], one, sizeof(one));
+        w += (size_t)_snprintf_s(all + w, sizeof(all) - w, _TRUNCATE, "%s%s", i ? "; " : "", one);
+    }
+    char what[64];
+    nanwatch::TripKind(t[firstNew], what, sizeof(what));
+    Log("[nanwatch] step %llu, bike_t %.3f s, bike %d%s: FIRST %s. This step: %s",
+        (unsigned long long)s.step, (double)s.bikeTime, (int)s.index, row.local ? " (yours)" : "", what, all);
+    if (newNonfinite) {
+        g_nwNonfiniteSeen = true;
+        frostmod::crash::Note("nanwatch: first non-finite at step %llu: %s", (unsigned long long)s.step, all);
+        NwLogState("[nanwatch]   now:", s, x);
+        // The step before, from the ring: the last values that were still finite.
+        const size_t cnt = g_tlRing.Count();
+        for (size_t i = cnt; i-- > 0;) {
+            const tyrelog::Step& p = g_tlRing.At(i);
+            if (p.step < s.step && p.index == s.index) {
+                NwLogState("[nanwatch]   step before:", p, g_nwExtra[g_tlRing.Slot(i)]);
+                break;
+            }
+        }
+        NwLogBodies("[nanwatch]  ");
+    } else {
+        NwLogState("[nanwatch]  ", s, x);
+    }
+    char reason[48], name[MAX_PATH];
+    _snprintf_s(reason, sizeof(reason), _TRUNCATE, "watch-%s", t[firstNew].nonfinite ? "nonfinite" : t[firstNew].field);
+    for (char* c = reason; *c; ++c)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-' || *c == '_')) *c = '_';
+    // Limit trips get at most 5 ring files a session, so the ones that matter (the first
+    // non-finite, the trap, the refusal, the crash) always have room.
+    static int limitDumps = 0;
+    const bool dump = newNonfinite || limitDumps < 5;
+    if (!newNonfinite && dump) ++limitDumps;
+    if (dump && TlWrite(reason, name, sizeof(name)))
+        Log("[nanwatch]   the steps before it are in %s", name);
+    NwSummary(true);
+}
+
+// One row onto a per-session CSV: opened, appended and closed each time, so the file on disk
+// is always complete (and its size right in Explorer) while the game still runs.
+static void NwAppendCsv(char* path, size_t pathN, const char* kind, const char* head, const char* header,
+                        const char* row, const char* tag) {
+    bool fresh = false;
+    if (!path[0]) {
+        const char* dir = frostmod::crash::ReportDir();
+        if (!dir || !dir[0]) return;
+        SYSTEMTIME lt;
+        GetLocalTime(&lt);
+        _snprintf_s(path, pathN, _TRUNCATE, "%s\\frostmod-nan-%s-%04d%02d%02d-%02d%02d%02d.csv", dir, kind, lt.wYear,
+                    lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond);
+        fresh = true;
+    }
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, fresh ? "wb" : "ab") != 0 || !f) return;
+    if (fresh) {
+        fprintf(f, "%s\n%s\n", head, header);
+        Log("%s episodes go to %s", tag, path);
+    }
+    fprintf(f, "%s\n", row);
+    fclose(f);
+}
+
+static void NwFlat(const NwRow& row) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    const nanwatch::Extra& x = g_nwExtra[row.slot];
+    const double on = g_nwCfg.flatPct / 100.0;
+    for (int w = 0; w < tyrelog::kWheels; ++w) {
+        nanwatch::Episode e;
+        if (!g_nwFlat[w].Update(w, s.step, s, x, on, e)) continue;
+        char head[256];
+        _snprintf_s(head, sizeof(head), _TRUNCATE, "# frostmod tyre-flat episodes: frostmod=%s track=%s flat at >= %d%% of TorusRadius",
+                    frostmod::crash::Version(), frostmod::crash::TheContext().track, g_nwCfg.flatPct);
+        char row2[512];
+        nanwatch::FlatCsv(e, row2, sizeof(row2));
+        NwAppendCsv(g_nwFlatPath, sizeof(g_nwFlatPath), "flat", head, nanwatch::kFlatHeader, row2, "[nanflat]");
+        if (g_nwFlatLogged < 40) {
+            ++g_nwFlatLogged;
+            Log("[nanflat] %s tyre near flat for %.0f ms at bike_t %.2f: peak %.0f%% of its %.0f mm section "
+                "(%.1f mm), contact half-angle %.1f deg, spin %.1f rad/s, R %.4f m, rear shock ext %.4f m, "
+                "bump stop %.1f mm%s",
+                NwWheelName(w), (double)(e.endT - e.startT) * 1000.0, (double)e.startT, e.peakRatio * 100.0,
+                x.wheel[w].torus * 1000.0, e.peakDefl * 1000.0, e.peakAngle, e.spinAtPeak, e.radiusAtPeak,
+                e.shockExtAtPeak, (double)e.bumpPenAtPeak, e.nonfinite ? " - NON-FINITE during it" : "");
+        }
+    }
+}
+
+// Writes the game's ODE bodies (velocities; positions through the game's own dBodySetPosition
+// when lifting). Only from NwAfterStep, on the physics thread, after the step returned.
+static void NwStressRaw(const NwRow& row) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    if (!row.body || !s.body) return;
+    // A new bike (respawn) starts its own clock.
+    if (s.bikeTime < g_nsLastT) g_nsLastT = -1.0f;
+    if (s.bikeTime < 3.0f) return;
+    float c[3], R[12];
+    memcpy(c, row.body + tyrelog::kBodyPos, 12);
+    memcpy(R, row.body + nanwatch::kBodyR, 48);
+    // Wheel spin just before it lands: falling, a tyre within 0.4 m of the ground, not touching.
+    if (!g_nsSpun && g_nwCfg.stressWheel > 0 && s.lvel[1] < -1.0f) {
+        for (int w = 0; w < tyrelog::kWheels; ++w) {
+            const tyrelog::Wheel& o = s.wheel[w];
+            if (o.hit || !(o.gap > 0.0 && o.gap < 0.4)) continue;
+            float pos[nanwatch::kMaxBodies][3];
+            for (int i = 0; i < g_nwBodyN; ++i) memcpy(pos[i], g_nwBodies[i] + tyrelog::kBodyPos, 12);
+            int idx[tyrelog::kWheels];
+            for (int k = 0; k < tyrelog::kWheels; ++k)
+                idx[k] = nanwatch::FindWheelBody(s.wheel[k].sample, s.wheel[k].radius, pos, g_nwBodyN, 0.03f);
+            for (int k = 0; k < tyrelog::kWheels; ++k) {
+                if (idx[k] < 0) continue;
+                uint8_t* b = (uint8_t*)g_nwBodies[idx[k]];
+                float Rw[12], av[3];
+                memcpy(Rw, b + nanwatch::kBodyR, 48);
+                memcpy(av, b + tyrelog::kBodyAvel, 12);
+                for (int r = 0; r < 3; ++r) av[r] += (float)g_nwCfg.stressWheel * Rw[r * 4 + 0];   // local x = axle
+                memcpy(b + tyrelog::kBodyAvel, av, 12);
+            }
+            g_nsSpun = true;
+            Log("[nanstress] throw #%u: +%d rad/s wheel spin just before landing (front body %d, rear body %d, "
+                "gap %.2f m)", g_nsThrows, g_nwCfg.stressWheel, idx[0], idx[1], o.gap);
+            break;
+        }
+    }
+    if (g_nsLastT >= 0.0f && s.bikeTime - g_nsLastT < g_nwCfg.stressMs / 1000.0f) return;
+    g_nsLastT = s.bikeTime;
+    const nanwatch::Throw kind = nanwatch::ThrowAt(g_nsThrows++);
+    float wv[3];
+    nanwatch::ThrowOmega(kind, R, (float)g_nwCfg.stressSpin, wv);
+    const float dv[3] = {0.0f, (float)g_nwCfg.stressV, 0.0f};
+    int moved = 0;
+    for (int i = 0; i < g_nwBodyN; ++i) {
+        uint8_t* b = (uint8_t*)g_nwBodies[i];
+        float p[3], v[3], av[3];
+        memcpy(p, b + tyrelog::kBodyPos, 12);
+        const float dx = p[0] - c[0], dy = p[1] - c[1], dz = p[2] - c[2];
+        if (dx * dx + dy * dy + dz * dz > 25.0f) continue;   // only what is on or near the bike
+        if (g_nwCfg.stressDrop > 0 && g_nwSetPos) {
+            g_nwSetPos(b, p[0], p[1] + (float)g_nwCfg.stressDrop, p[2]);
+            memcpy(p, b + tyrelog::kBodyPos, 12);
+            const float zero[3] = {0, 0, 0};
+            memcpy(b + tyrelog::kBodyLvel, zero, 12);
+            memcpy(b + tyrelog::kBodyAvel, zero, 12);
+        }
+        memcpy(v, b + tyrelog::kBodyLvel, 12);
+        memcpy(av, b + tyrelog::kBodyAvel, 12);
+        // The turn is about the chassis, wherever the lift put it.
+        const float cl[3] = {c[0], c[1] + (g_nwSetPos ? (float)g_nwCfg.stressDrop : 0.0f), c[2]};
+        nanwatch::ApplyKick(p, v, av, cl, dv, wv);
+        memcpy(b + tyrelog::kBodyLvel, v, 12);
+        memcpy(b + tyrelog::kBodyAvel, av, 12);
+        ++moved;
+    }
+    g_nsSpun = false;
+    Log("[nanstress] throw #%u (%s): %d bodies, +%d m/s up, %.1f rad/s, lifted %d m, at bike_t %.2f "
+        "(speed %.1f m/s)", g_nsThrows, nanwatch::ThrowName(kind), moved, g_nwCfg.stressV,
+        (double)g_nwCfg.stressSpin, g_nwCfg.stressDrop, (double)s.bikeTime, tyrelog::Len3(s.lvel));
+}
+
+static bool NwStress(const NwRow& row) {
+    __try {
+        NwStressRaw(row);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// ---- the rear underground (nanwatch=1) ---------------------------------------------------------
+// The rear wheel's ODE body is the one R from its first tyre sample; the swingarm is the body the
+// rear wheel is jointed to (not the chassis). The terrain under them comes from the game's own
+// height query (0x1F1720: obj, &height, &normal, x, z), on the terrain object the step itself
+// last asked, called after the step on the physics thread exactly as the wheel loop does.
+static nanwatch::RearTracker g_nwRearTr;
+static unsigned g_nwRearLogged = 0;
+static int g_nwRearIdx = -1, g_nwSwingIdx = -1;     // this step's body indexes
+static uint64_t g_nwTraceEnd = 0, g_nwTraceStart = 0;   // a bury's 2 s trace, in ring steps
+static unsigned g_nwBuries = 0;
+static bool g_nwBodiesLogged = false;
+static float g_nwTraceMinBottom = 0, g_nwTraceMinSwing = 0, g_nwTraceMinExt = 0, g_nwTraceMaxVel = 0;
+
+static bool NwGround(float x, float z, float& h) {
+    void* obj = g_nwTerrainObj.load(std::memory_order_relaxed);
+    if (!obj || !g_origTerrain) return false;
+    float n[16] = {};
+    __try {
+        return g_origTerrain(obj, &h, n, x, z) != 0 && std::isfinite(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// No C++ objects: wrapped in __try by NwRear.
+static bool NwRearRaw(const NwRow& row) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    nanwatch::Extra& x = g_nwExtra[row.slot];
+    x.rear = 0;
+    g_nwRearIdx = g_nwSwingIdx = -1;
+    if (!row.body || g_nwBodyN <= 0) return true;
+    float pos[nanwatch::kMaxBodies][3];
+    for (int i = 0; i < g_nwBodyN; ++i) memcpy(pos[i], g_nwBodies[i] + tyrelog::kBodyPos, 12);
+    const int rear = nanwatch::FindWheelBody(s.wheel[1].sample, s.wheel[1].radius, pos, g_nwBodyN, 0.03f);
+    const int front = nanwatch::FindWheelBody(s.wheel[0].sample, s.wheel[0].radius, pos, g_nwBodyN, 0.03f);
+    if (rear < 0) return true;
+    const uint8_t* jointed[8];
+    const int nj = nanwatch::JointedBodies(g_nwBodies[rear], jointed, 8);
+    int swing = -1;
+    for (int j = 0; j < nj && swing < 0; ++j)
+        for (int i = 0; i < g_nwBodyN; ++i)
+            if (g_nwBodies[i] == jointed[j] && g_nwBodies[i] != row.body && i != front) { swing = i; break; }
+    g_nwRearIdx = rear;
+    g_nwSwingIdx = swing;
+    float ground = 0;
+    if (!NwGround(pos[rear][0], pos[rear][2], ground)) return true;
+    x.rearAxleY = pos[rear][1];
+    x.rearGround = ground;
+    x.rearBottom = pos[rear][1] - (float)s.wheel[1].radius - ground;
+    x.swingClear = 1.0f;
+    if (swing >= 0) {
+        float pts[5][3];
+        const int np = nanwatch::SwingarmPoints(pos[rear], pos[swing], pts);
+        for (int i = 0; i < np; ++i) {
+            float g = 0;
+            if (NwGround(pts[i][0], pts[i][2], g) && pts[i][1] - g < x.swingClear) x.swingClear = pts[i][1] - g;
+        }
+    }
+    x.rear = 1;
+    return true;
+}
+
+static bool NwRear(const NwRow& row) {
+    __try {
+        return NwRearRaw(row);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void NwLogBodyRoles() {
+    float m[nanwatch::kMaxBodies] = {};
+    for (int i = 0; i < g_nwBodyN; ++i) memcpy(&m[i], g_nwBodies[i] + nanwatch::kBodyMass, 4);
+    char line[600];
+    size_t w = 0;
+    line[0] = 0;
+    for (int i = 0; i < g_nwBodyN && w + 48 < sizeof(line); ++i)
+        w += (size_t)_snprintf_s(line + w, sizeof(line) - w, _TRUNCATE, "%s#%d %.1f kg%s", i ? ", " : "", i, (double)m[i],
+                                 g_nwBodies[i] == g_nwRows[0].body ? " (chassis)"
+                                 : i == g_nwRearIdx                ? " (rear wheel)"
+                                 : i == g_nwSwingIdx               ? " (swingarm)"
+                                                                   : "");
+    Log("[nanrear] bodies: %s. Terrain object %s.", line, g_nwTerrainObj.load() ? "found" : "NOT found");
+}
+
+// The Ctrl+Shift+B / L move. Writes the game's bodies: only from NwAfterStep, after the step.
+static void NwBuryRaw(const NwRow& row, int kind) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    const nanwatch::Extra& x = g_nwExtra[row.slot];
+    if (!x.rear || g_nwRearIdx < 0 || !g_nwSetPos) {
+        Log("[nanbury] can't: rear wheel body %d, swingarm %d, ground %s.", g_nwRearIdx, g_nwSwingIdx,
+            x.rear ? "ok" : "not measured");
+        return;
+    }
+    const float depth = g_nwCfg.buryMm / 1000.0f;
+    const float dy = nanwatch::BuryShift(x.rearAxleY, s.wheel[1].radius, x.rearGround, depth);
+    const int idx[2] = {g_nwRearIdx, g_nwSwingIdx};
+    for (int k = 0; k < 2; ++k) {
+        if (idx[k] < 0) continue;
+        uint8_t* b = (uint8_t*)g_nwBodies[idx[k]];
+        float p[3];
+        memcpy(p, b + tyrelog::kBodyPos, 12);
+        g_nwSetPos(b, p[0], p[1] + dy, p[2]);   // velocity kept
+        if (kind == 2) {
+            float v[3];
+            memcpy(v, b + tyrelog::kBodyLvel, 12);
+            v[1] -= (float)g_nwCfg.buryV;
+            memcpy(b + tyrelog::kBodyLvel, v, 12);
+        }
+    }
+    ++g_nwBuries;
+    g_nwTraceStart = g_tlSteps;
+    g_nwTraceEnd = g_tlSteps + 1000;   // 2 s
+    g_nwTraceMinBottom = g_nwTraceMinSwing = 1e9f;
+    g_nwTraceMinExt = 1e9f;
+    g_nwTraceMaxVel = 0;
+    Log("[nanbury] #%u %s: rear wheel (body %d) and swingarm (body %d) moved %.3f m so the wheel's bottom is %.2f m "
+        "under the terrain (ground %.3f, axle %.3f, R %.3f)%s, speed %.1f m/s, bike_t %.2f. Logging 2 s.",
+        g_nwBuries, kind == 2 ? "bury + slam" : "bury", g_nwRearIdx, g_nwSwingIdx, (double)dy, (double)depth,
+        (double)x.rearGround, (double)x.rearAxleY, s.wheel[1].radius,
+        kind == 2 ? " and pushed down" : "", tyrelog::Len3(s.lvel), (double)s.bikeTime);
+    if (kind == 2) Log("[nanbury]   down velocity added: %d m/s (nanburyv)", g_nwCfg.buryV);
+}
+
+static bool NwBury(const NwRow& row, int kind) {
+    __try {
+        NwBuryRaw(row, kind);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void NwRearAfter(const NwRow& row) {
+    const tyrelog::Step& s = g_tlRing.Row(row.slot);
+    const nanwatch::Extra& x = g_nwExtra[row.slot];
+    if (!g_nwBodiesLogged && x.rear && s.bikeTime > 1.0f) {
+        g_nwBodiesLogged = true;
+        NwLogBodyRoles();
+    }
+    // A pending hotkey: offline, your own bike.
+    if (const int kind = g_nwBuryReq.exchange(0)) {
+        const auto& ctx = frostmod::crash::TheContext();
+        const bool offline = ctx.inSession.load(std::memory_order_relaxed) && !ctx.server[0];
+        if (!offline) Log("[nanbury] ignored: offline only (server '%s').", ctx.server);
+        else if (g_tlSteps < g_nwTraceEnd) Log("[nanbury] ignored: the last one's 2 s are still being logged.");
+        else if (!NwBury(row, kind)) Log("[nanbury] a body read or write faulted; nothing moved.");
+        else NwLogBodyRoles();
+    }
+    const bool tracing = g_tlSteps < g_nwTraceEnd;
+    if (tracing) {
+        if (x.rear) {
+            g_nwTraceMinBottom = (std::min)(g_nwTraceMinBottom, x.rearBottom);
+            g_nwTraceMinSwing = (std::min)(g_nwTraceMinSwing, x.swingClear);
+        }
+        g_nwTraceMinExt = (std::min)(g_nwTraceMinExt, (float)x.shockExt);
+        g_nwTraceMaxVel = (std::max)(g_nwTraceMaxVel, x.bodies.maxVel);
+        const uint64_t k = g_tlSteps - g_nwTraceStart;
+        if (k % 25 == 0)
+            Log("[nanbury] +%3llu ms: rear bottom %.3f swingarm %.3f gap %.3f | shock ext %.4f vel %.2f bump %.1f mm | "
+                "chassis vy %.2f | bodies max vel %.1f avel %.1f, non-finite %d",
+                (unsigned long long)(k * 2), x.rear ? (double)x.rearBottom : NAN, x.rear ? (double)x.swingClear : NAN,
+                s.wheel[1].gap, x.shockExt, x.shockVel, (double)x.bumpPen, (double)s.lvel[1], (double)x.bodies.maxVel,
+                (double)x.bodies.maxAvel, (int)x.bodies.nonfinite);
+        if (g_tlSteps + 1 == g_nwTraceEnd) {
+            Log("[nanbury] #%u done: lowest rear bottom %.3f, lowest swingarm %.3f, lowest shock ext %.4f, fastest body "
+                "%.1f m/s; non-finite: %s.",
+                g_nwBuries, (double)g_nwTraceMinBottom, (double)g_nwTraceMinSwing, (double)g_nwTraceMinExt,
+                (double)g_nwTraceMaxVel, g_nwNonfiniteSeen ? "YES (see the FIRST non-finite lines)" : "none");
+            char name[MAX_PATH], reason[32];
+            _snprintf_s(reason, sizeof(reason), _TRUNCATE, "bury%u", g_nwBuries);
+            if (g_nwBuries <= 20 && TlWrite(reason, name, sizeof(name)))
+                Log("[nanbury]   every step of it is in %s", name);
+        }
+    }
+    nanwatch::RearEpisode e;
+    if (!g_nwRearTr.Update(s.step, s, x, tracing, e)) return;
+    char head[200];
+    _snprintf_s(head, sizeof(head), _TRUNCATE, "# frostmod rear-underground episodes: frostmod=%s track=%s",
+                frostmod::crash::Version(), frostmod::crash::TheContext().track);
+    char row2[512];
+    nanwatch::RearCsv(e, row2, sizeof(row2));
+    NwAppendCsv(g_nwRearPath, sizeof(g_nwRearPath), "rear", head, nanwatch::kRearHeader, row2, "[nanrear]");
+    if (g_nwRearLogged < 40 || e.nonfinite) {
+        ++g_nwRearLogged;
+        Log("[nanrear] rear under the ground for %.0f ms at bike_t %.2f%s: lowest gap %.3f m, wheel bottom %.3f m, "
+            "swingarm %.3f m; shock ext down to %.4f m, bump stop %.1f mm; fastest body %.1f m/s, %.1f rad/s%s",
+            (double)(e.endT - e.startT) * 1000.0, (double)e.startT, e.buried ? " (buried by hotkey)" : "", e.minGap,
+            e.minBottom, e.minSwing, e.minShockExt, (double)e.maxBumpPen, (double)e.maxBodyVel, (double)e.maxBodyAvel,
+            e.nonfinite ? " - NON-FINITE during it" : "");
+    }
+}
+
+static void NwAfterStep() {
+    if (g_nwRowN <= 0) return;
+    // The rear underground: measured for your bike before the check, so it is in the ring row.
+    if (g_nwRows[0].local && !NwRear(g_nwRows[0])) g_nwExtra[g_nwRows[0].slot].rear = 0;
+    // The player's bike if it is known, every recorded bike otherwise.
+    for (int j = 0; j < g_nwRowN; ++j)
+        if (g_nwCfg.watch) NwCheck(g_nwRows[j]);
+    if (g_nwCfg.flat) NwFlat(g_nwRows[0]);
+    if (g_nwRows[0].local) NwRearAfter(g_nwRows[0]);
+    if (g_nwCfg.stress) {
+        const auto& ctx = frostmod::crash::TheContext();
+        const bool offline = ctx.inSession.load(std::memory_order_relaxed) && !ctx.server[0];
+        if (!offline || !g_nwRows[0].local) {
+            if (!g_nsRefusedOnline) {
+                g_nsRefusedOnline = true;
+                Log("[nanstress] waiting: throws only run offline, on your own bike (in session=%d, "
+                    "server='%s', your bike known=%d).", ctx.inSession.load() ? 1 : 0, ctx.server,
+                    g_nwRows[0].local);
+            }
+        } else {
+            if (g_nsRefusedOnline) { g_nsRefusedOnline = false; Log("[nanstress] offline on your own bike: throws start."); }
+            if (!NwStress(g_nwRows[0])) {
+                g_nwCfg.stress = false;
+                Log("[nanstress] a body read or write faulted - stress is off for the rest of this session.");
+            }
+        }
+    }
+    if (nantrap::SpawnSkips() != g_nsLastSpawnSkips && g_nsLastSpawnSkips == 0) {
+        g_nsLastSpawnSkips = nantrap::SpawnSkips();
+        Log("[nantrap] resumed the spawn 0*inf (bike_t %.3f s) without a report, as designed.",
+            (double)g_tlRing.Row(g_nwRows[0].slot).bikeTime);
+    }
+    if (g_nwCfg.watch) NwSummary(false);
+}
+
+// After TYRELOG's own checks passed: the extra fields' checks, then on.
+static void NwInstall(intptr_t delta) {
+    if (!g_nwCfg.Any()) return;
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) { Log("[nanwatch] off: no .text range."); return; }
+    for (const tyrelog::Check& c : nanwatch::kChecks) {
+        const uint8_t* p = (const uint8_t*)(g_base + c.rva + delta);
+        if (p < begin || p + c.len > end || memcmp(p, c.bytes, (size_t)c.len) != 0) {
+            Log("[nanwatch] off: %s does not match at RVA 0x%zx (game updated?). The ring and the "
+                "trap still run.", c.what, (size_t)(c.rva + delta));
+            return;
+        }
+    }
+    g_nwExtra = (nanwatch::Extra*)calloc(g_tlRing.cap, sizeof(nanwatch::Extra));
+    if (!g_nwExtra) { Log("[nanwatch] off: could not get the memory for the extra fields."); return; }
+    g_nwSetPos = (NwSetPosFn)(g_base + nanwatch::kRvaSetPosition + delta);
+    g_tlMaxDumps = 40;   // limit trips get 5, each bury 1 (up to 20), the rest stay free
+    g_nwOn.store(true, std::memory_order_release);
+    Log("[nanwatch] ON: watch=%d ring=%d steps (%.0f s) flat=%d (at %d%%) stress=%d. Every step checks "
+        "your bike's bodies, wheels, tyres and rear shock for the first non-finite or runaway value.",
+        g_nwCfg.watch ? 1 : 0, g_nwCfg.ring, g_nwCfg.ring * 0.002, g_nwCfg.flat ? 1 : 0, g_nwCfg.flatPct,
+        g_nwCfg.stress ? 1 : 0);
+    if (g_nwCfg.stress)
+        Log("[nanstress] ON (offline only): every %d ms of bike time the bike is thrown up at %d m/s with "
+            "%d rad/s of turn (flat, nose down, nose up, roll left, roll right), lifted %d m first, "
+            "+%d rad/s wheel spin before landing.", g_nwCfg.stressMs, g_nwCfg.stressV, g_nwCfg.stressSpin,
+            g_nwCfg.stressDrop, g_nwCfg.stressWheel);
 }
 
 // nantrap= / nantrapmax= straight from the file: the hook goes in before LoadOverlaySettings.
@@ -7373,14 +8018,17 @@ static void NtReadCfg() {
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
-        if (!nantrap::ParseCfgLine(line, g_ntCfg)) tyrelog::ParseCfgLine(line, g_tlCfg);
+        if (!nantrap::ParseCfgLine(line, g_ntCfg) && !tyrelog::ParseCfgLine(line, g_tlCfg))
+            nanwatch::ParseCfgLine(line, g_nwCfg);
     }
     fclose(f);
 }
 
 static void InstallNanTrap(intptr_t delta) {
     NtReadCfg();
-    if (!g_ntCfg.on) return;   // the default: no hook, no handler, nothing
+    // The default: no hook, no handler, nothing. nanwatch/nanflat/nanstress need the hook (and
+    // the ring) without the trap.
+    if (!g_ntCfg.on && !g_nwCfg.Any()) return;
     if (!g_game->offsets_complete) {
         Log("[nantrap] off for %s - the sim step is MX Bikes' and has no twin here.", g_game->display);
         return;
@@ -7408,12 +8056,22 @@ static void InstallNanTrap(intptr_t delta) {
         return;
     }
     // Handler first, then the hook: a step must never run armed with nothing to catch it.
-    nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
-    if (!nantrap::Armed()) return;
+    if (g_ntCfg.on) {
+        nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
+        if (!nantrap::Armed() && !g_nwCfg.Any()) return;
+    }
     if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
-        Log("[nantrap] ON (nantrap=1): the first invalid FP op in the sim step is logged and "
-            "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
-            "same values it does without it.", g_ntCfg.max);
+        if (nantrap::Armed()) {
+            Log("[nantrap] ON (nantrap=1): the first %s FP op in the sim step is logged and "
+                "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
+                "same values it does without it.", g_ntCfg.overflow ? "invalid or overflow" : "invalid",
+                g_ntCfg.max);
+            Log("[nantrap] the spawn 0*inf (0x267CF6 called from the r/|p| scale at 0x19F695) is "
+                "resumed without a report, matched by its bytes.");
+            for (int i = 0; i < g_ntCfg.skips && i < nantrap::kMaxSkips; ++i)
+                Log("[nantrap] nantrapskip: traps at mxbikes.exe+0x%X are resumed without a report.",
+                    g_ntCfg.skip[i]);
+        }
         TlInstall(fn);
     }
 }

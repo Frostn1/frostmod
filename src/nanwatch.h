@@ -73,6 +73,13 @@ inline constexpr size_t kBodyR         = 0xD0;   // dMatrix3, 3 rows of 4 floats
 inline constexpr size_t kWorldFirst    = 0x20;
 inline constexpr size_t kWorldCount    = 0x30;
 inline constexpr uint32_t kRvaSetPosition = 0x2AC7A0;
+// ODE joints: body->firstjoint is a list of dxJointNode {joint, other body, next} (24 bytes);
+// dBodyDestroy walks it (0x2AC67D mov r8, [rsi+0x30]; 0x2AC690 mov rdx, [r8]; 0x2AC6B2
+// mov r11, [r8+0x10]) and clears node.body at joint+0x40 / +0x58 (0x2AC6AA).
+inline constexpr size_t kBodyFirstJoint = 0x30;
+inline constexpr size_t kNodeBody = 0x08;
+inline constexpr size_t kNodeNext = 0x10;
+inline constexpr size_t kBodyMass = 0x48;   // dMass.mass (0x2AC912 copies dMass to +0x48)
 inline constexpr int kMaxBodies = 64;   // a world with more is not a bike's
 
 /// The last byte a read touches past `bike` (wheel 1's deflection rate). Tests size the fake.
@@ -97,6 +104,11 @@ inline constexpr tyrelog::Check kChecks[] = {
      "dBodySetPosition"},
     {0x2AC870, "\xF3\x0F\x11\x89\x10\x01\x00\x00", 8, "dBodySetLinearVel"},
     {0x2AC890, "\xF3\x0F\x11\x89\x20\x01\x00\x00", 8, "dBodySetAngularVel"},
+    {0x2AC67D, "\x4C\x8B\x46\x30", 4, "ODE body first joint node +0x30"},
+    {0x2AC6B2, "\x4D\x8B\x58\x10", 4, "ODE joint node next +0x10"},
+    {0x2AC6AA, "\x48\x89\x7C\xC2\x40", 5, "ODE joint node body +0x08"},
+    {0x2AC912, "\x41\xB8\x44\x00\x00\x00\x48\x83\xC1\x48", 10, "ODE body mass +0x48"},
+    {0x1F84E3, "\xE8\x38\x92\xFF\xFF\x85\xC0", 7, "height query (obj, &height, &normal, x, z)"},
 };
 
 // ---- frostmod_radar.cfg ----------------------------------------------------------------------
@@ -115,6 +127,8 @@ struct Config {
     int stressSpin = 3;        // nanstressspin=N, rad/s
     int stressDrop = 0;        // nanstressdrop=N, metres lifted first
     int stressWheel = 0;       // nanstresswheel=N, rad/s of wheel spin before landing
+    int buryMm = 250;          // nanburyrear=<m> (0.25 m), how far Ctrl+Shift+B/L push the rear under
+    int buryV = 6;             // nanburyv=N, m/s down added by Ctrl+Shift+L
 
     /// Whether anything here needs the sim-step hook and the ring.
     bool Any() const { return watch || flat || stress; }
@@ -140,7 +154,30 @@ inline bool ParseCfgLine(const char* line, Config& c) {
         {"nanflat", &flat, nullptr, 0, 1},
         {"nanwatch", &watch, nullptr, 0, 1},
         {"nanring", &c.ring, nullptr, kRingMin, kRingMax},
+        {"nanburyv", &c.buryV, nullptr, 0, 40},
     };
+    // nanburyrear takes metres with a fraction: 0.25, .3, 1.
+    if (std::strncmp(line, "nanburyrear", 11) == 0) {
+        const char* p = line + 11;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p != '=') return false;
+        ++p;
+        while (*p == ' ' || *p == '\t') ++p;
+        long whole = 0, frac = 0, scale = 1;
+        bool any = false;
+        while (*p >= '0' && *p <= '9' && whole < 100) { whole = whole * 10 + (*p++ - '0'); any = true; }
+        if (*p == '.') {
+            ++p;
+            while (*p >= '0' && *p <= '9') {
+                if (scale < 1000) { frac = frac * 10 + (*p - '0'); scale *= 10; }
+                ++p;
+                any = true;
+            }
+        }
+        if (!any) return false;
+        c.buryMm = Clamp((int)(whole * 1000 + frac * 1000 / scale), 10, 2000);
+        return true;
+    }
     for (const Key& k : keys) {
         const size_t n = std::strlen(k.name);
         if (std::strncmp(line, k.name, n) != 0) continue;
@@ -182,6 +219,8 @@ inline int CfgLines(const Config& c, char (*out)[40], int max) {
     if (c.stressSpin != d.stressSpin) put("nanstressspin", c.stressSpin);
     if (c.stressDrop != d.stressDrop) put("nanstressdrop", c.stressDrop);
     if (c.stressWheel != d.stressWheel) put("nanstresswheel", c.stressWheel);
+    if (c.buryV != d.buryV) put("nanburyv", c.buryV);
+    if (c.buryMm != d.buryMm && k < max) std::snprintf(out[k++], 40, "nanburyrear=%d.%03d", c.buryMm / 1000, c.buryMm % 1000);
     return k;
 }
 
@@ -273,6 +312,13 @@ struct Extra {
     double shockExt = 0, shockVel = 0, stroke = 0;
     float bumpLen = 0, bumpPen = 0;   // m, mm
     Bodies bodies;
+    // The rear underground (filled after the step, from the game's own height query):
+    int16_t rear = 0;            // 1 when the fields below were measured
+    int16_t rearBody = -1, swingBody = -1;   // indexes into the world's body list
+    float rearAxleY = 0;         // rear wheel body centre, m
+    float rearGround = 0;        // terrain height under it, m
+    float rearBottom = 0;        // axle - R - ground: < 0 is the wheel's bottom under the terrain
+    float swingClear = 0;        // lowest of the swingarm's points minus the terrain under it
 };
 
 /// The extra fields of one bike. Plain loads; nothing computed on what is read except the
@@ -312,6 +358,8 @@ struct Limits {
     double flatOver = 1.05;    // deflection / TorusRadius (1.0 = the game's clip)
     double shockVel = 50;      // m/s
     double shockOver = 0.05;   // m past full extension
+    double swingClear = -0.02; // m, the swingarm under the terrain
+    double rearBottom = -0.15; // m, the rear wheel's bottom under the terrain
 };
 
 struct Trip {
@@ -368,6 +416,10 @@ inline int Check(const tyrelog::Step& s, const Extra& x, const Limits& L, Trip* 
         test("shock_ext_max", 0, x.shockExt, x.stroke + L.shockOver, true);
         test("shock_vel", 0, std::fabs(x.shockVel), L.shockVel, true);
         test("bump_pen_mm", 0, (double)x.bumpPen, -1e9, false);
+        if (x.rear) {
+            test("swingarm_clear", 0, x.swingClear, L.swingClear, false);
+            test("rear_bottom", 0, x.rearBottom, L.rearBottom, false);
+        }
         const Bodies& b = x.bodies;
         if (b.nonfinite > 0 && nn < 16) {
             Trip& t = nf[nn++];
@@ -412,10 +464,11 @@ inline const char* kExtraHeader =
     "w0_defl,w0_defl_rate,w0_flat,w0_contact_deg,w0_contact,w0_torus,"
     "w1_defl,w1_defl_rate,w1_flat,w1_contact_deg,w1_contact,w1_torus,"
     "shock_ext,shock_vel,stroke,bump_len,bump_pen_mm,"
-    "bodies,bodies_bad,body_max_pos,body_max_vel,body_max_avel";
+    "bodies,bodies_bad,body_max_pos,body_max_vel,body_max_avel,"
+    "rear_measured,rear_axle_y,rear_ground,rear_bottom,swingarm_clear";
 
 inline void ExtraCsv(const tyrelog::Step& s, const Extra& x, char* out, size_t n) {
-    char f[24][32];
+    char f[32][32];
     int k = 0;
     for (int w = 0; w < tyrelog::kWheels; ++w) {
         const WheelX& e = x.wheel[w];
@@ -436,6 +489,11 @@ inline void ExtraCsv(const tyrelog::Step& s, const Extra& x, char* out, size_t n
     tyrelog::Num(x.bodies.maxPos, f[k++], 32);
     tyrelog::Num(x.bodies.maxVel, f[k++], 32);
     tyrelog::Num(x.bodies.maxAvel, f[k++], 32);
+    std::snprintf(f[k++], 32, "%d", (int)x.rear);
+    tyrelog::Num(x.rear ? x.rearAxleY : std::nan(""), f[k++], 32);
+    tyrelog::Num(x.rear ? x.rearGround : std::nan(""), f[k++], 32);
+    tyrelog::Num(x.rear ? x.rearBottom : std::nan(""), f[k++], 32);
+    tyrelog::Num(x.rear ? x.swingClear : std::nan(""), f[k++], 32);
     size_t w = 0;
     out[0] = 0;
     for (int i = 0; i < k && w < n; ++i)
@@ -526,6 +584,117 @@ inline void FlatCsv(const Episode& e, char* out, size_t n) {
     std::snprintf(out, n, "%d,%llu,%llu,%.4f,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d", e.wheel,
                   (unsigned long long)e.startStep, steps, (double)e.startT, (double)(e.endT - e.startT) * 1000.0,
                   f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], e.nonfinite ? 1 : 0);
+}
+
+// ---- the rear underground ------------------------------------------------------------------------
+/// The other bodies `body` is jointed to (null links skipped, each once). Returns how many.
+inline int JointedBodies(const uint8_t* body, const uint8_t** out, int max) {
+    int k = 0;
+    int guard = 0;
+    for (const uint8_t* node = ReadP(body + kBodyFirstJoint); node && guard < 32; node = ReadP(node + kNodeNext), ++guard) {
+        const uint8_t* other = ReadP(node + kNodeBody);
+        if (!other) continue;
+        bool seen = false;
+        for (int i = 0; i < k; ++i) seen |= out[i] == other;
+        if (!seen && k < max) out[k++] = other;
+    }
+    return k;
+}
+
+/// Points along the swingarm, from the rear axle through the swingarm's centre of mass and on
+/// to about where the pivot is (the centre sits near the middle of the arm), so the lowest
+/// of them finds the part of the arm that goes under first.
+inline int SwingarmPoints(const float* axle, const float* com, float (*pts)[3]) {
+    const float t[5] = {0.25f, 0.5f, 1.0f, 1.5f, 1.9f};
+    for (int i = 0; i < 5; ++i)
+        for (int c = 0; c < 3; ++c) pts[i][c] = axle[c] + (com[c] - axle[c]) * t[i];
+    return 5;
+}
+
+struct RearEpisode {
+    uint64_t startStep = 0, endStep = 0;
+    float startT = 0, endT = 0;
+    double minGap = 0;        // tyrelog's rear ground gap
+    double minBottom = 0;     // rear wheel bottom vs terrain
+    double minSwing = 0;      // swingarm clearance
+    double minShockExt = 0;
+    float maxBumpPen = 0;
+    float maxBodyVel = 0, maxBodyAvel = 0;
+    float speedAtStart = 0, vyAtStart = 0;
+    bool buried = false;      // started by Ctrl+Shift+B / L
+    bool nonfinite = false;
+};
+
+/// Rear-underground episodes: enter when the rear gap goes under -0.05 m, the wheel's bottom
+/// under -0.05 m, or the swingarm under the terrain; leave when all three are back.
+struct RearTracker {
+    bool in = false;
+    RearEpisode cur;
+    unsigned episodes = 0;
+
+    bool Update(uint64_t step, const tyrelog::Step& s, const Extra& x, bool buried, RearEpisode& done) {
+        const double gap = s.wheel[1].gap;
+        const double bottom = x.rear ? x.rearBottom : 1.0;
+        const double swing = x.rear ? x.swingClear : 1.0;
+        const bool bad = !std::isfinite(gap) || !std::isfinite(bottom) || !std::isfinite(swing) ||
+                         !std::isfinite(x.shockExt) || x.bodies.nonfinite > 0;
+        const bool under = gap < -0.05 || bottom < -0.05 || swing < 0.0;
+        if (!in) {
+            if (!under && !bad && !buried) return false;
+            in = true;
+            cur = RearEpisode{};
+            cur.startStep = step;
+            cur.startT = s.bikeTime;
+            cur.speedAtStart = (float)tyrelog::Len3(s.lvel);
+            cur.vyAtStart = s.lvel[1];
+            cur.minGap = gap; cur.minBottom = bottom; cur.minSwing = swing; cur.minShockExt = x.shockExt;
+        }
+        cur.buried |= buried;
+        cur.endStep = step;
+        cur.endT = s.bikeTime;
+        if (bad) cur.nonfinite = true;
+        if (gap < cur.minGap) cur.minGap = gap;
+        if (bottom < cur.minBottom) cur.minBottom = bottom;
+        if (swing < cur.minSwing) cur.minSwing = swing;
+        if (x.shockExt < cur.minShockExt) cur.minShockExt = x.shockExt;
+        if (x.bumpPen > cur.maxBumpPen) cur.maxBumpPen = x.bumpPen;
+        if (x.bodies.maxVel > cur.maxBodyVel) cur.maxBodyVel = x.bodies.maxVel;
+        if (x.bodies.maxAvel > cur.maxBodyAvel) cur.maxBodyAvel = x.bodies.maxAvel;
+        if (!bad && gap > -0.03 && bottom > -0.03 && swing > 0.01 && !buried) {
+            in = false;
+            ++episodes;
+            done = cur;
+            return true;
+        }
+        return false;
+    }
+};
+
+inline const char* kRearHeader =
+    "start_step,steps,start_bike_t,ms,min_rear_gap,min_rear_bottom,min_swingarm_clear,min_shock_ext,"
+    "max_bump_pen_mm,max_body_vel,max_body_avel,speed_at_start,vy_at_start,buried,nonfinite";
+
+inline void RearCsv(const RearEpisode& e, char* out, size_t n) {
+    char f[10][32];
+    int k = 0;
+    tyrelog::Num(e.minGap, f[k++], 32);
+    tyrelog::Num(e.minBottom, f[k++], 32);
+    tyrelog::Num(e.minSwing, f[k++], 32);
+    tyrelog::Num(e.minShockExt, f[k++], 32);
+    tyrelog::Num(e.maxBumpPen, f[k++], 32);
+    tyrelog::Num(e.maxBodyVel, f[k++], 32);
+    tyrelog::Num(e.maxBodyAvel, f[k++], 32);
+    tyrelog::Num(e.speedAtStart, f[k++], 32);
+    tyrelog::Num(e.vyAtStart, f[k++], 32);
+    const unsigned long long steps = e.endStep >= e.startStep ? e.endStep - e.startStep + 1 : 0;
+    std::snprintf(out, n, "%llu,%llu,%.4f,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d", (unsigned long long)e.startStep,
+                  steps, (double)e.startT, (double)(e.endT - e.startT) * 1000.0, f[0], f[1], f[2], f[3], f[4], f[5],
+                  f[6], f[7], f[8], e.buried ? 1 : 0, e.nonfinite ? 1 : 0);
+}
+
+/// How far to move the rear down so the wheel's bottom ends `depth` under the terrain.
+inline float BuryShift(float axleY, double R, float ground, float depth) {
+    return (ground - depth) - (axleY - (float)R);
 }
 
 // ---- stress (nanstress=1) ---------------------------------------------------------------------

@@ -392,6 +392,76 @@ static void ring_csv() {
     CHECK(plain.find(kExtraHeader) == std::string::npos, "plain CSV unchanged");
 }
 
+static void rear() {
+    Config c;
+    CHECK(c.buryMm == 250 && c.buryV == 6, "bury defaults");
+    CHECK(ParseCfgLine("nanburyrear=0.4", c) && c.buryMm == 400, "nanburyrear 0.4 (%d)", c.buryMm);
+    CHECK(ParseCfgLine("nanburyrear = .05", c) && c.buryMm == 50, "nanburyrear .05 (%d)", c.buryMm);
+    CHECK(ParseCfgLine("nanburyrear=1", c) && c.buryMm == 1000, "nanburyrear 1");
+    CHECK(ParseCfgLine("nanburyv=9", c) && c.buryV == 9, "nanburyv");
+    CHECK(!ParseCfgLine("nanburyrear=x", c), "bad value");
+    char lines[16][40];
+    const int n = CfgLines(c, lines, 16);
+    Config d;
+    for (int i = 0; i < n; ++i) ParseCfgLine(lines[i], d);
+    CHECK(d.buryMm == 1000 && d.buryV == 9, "bury keys round trip");
+
+    // Joint nodes: {joint, other body, next}.
+    std::vector<uint8_t> wheel(0x200, 0), arm(0x200, 0), n1(0x18, 0), n2(0x18, 0), n3(0x18, 0);
+    put(wheel, kBodyFirstJoint, (const uint8_t*)n1.data());
+    put(n1, kNodeBody, (const uint8_t*)arm.data());
+    put(n1, kNodeNext, (const uint8_t*)n2.data());
+    put(n2, kNodeBody, (const uint8_t*)nullptr);      // a joint to the world
+    put(n2, kNodeNext, (const uint8_t*)n3.data());
+    put(n3, kNodeBody, (const uint8_t*)arm.data());   // a second joint to the same body
+    const uint8_t* out[4];
+    CHECK(JointedBodies(wheel.data(), out, 4) == 1 && out[0] == arm.data(), "jointed: the swingarm once");
+
+    const float axle[3] = {0, 0.33f, -0.55f}, com[3] = {0, 0.4f, -0.3f};
+    float pts[5][3];
+    CHECK(SwingarmPoints(axle, com, pts) == 5 && std::fabs(pts[2][2] + 0.3f) < 1e-6f && pts[4][2] > -0.1f,
+          "points from the axle past the centre toward the pivot");
+    CHECK(std::fabs(BuryShift(0.33f, 0.33, 0.0f, 0.25f) + 0.25f) < 1e-6f, "bury shift");
+
+    Extra x;
+    x.have = 1;
+    x.rear = 1;
+    x.rearBottom = 0.01f;
+    x.swingClear = 0.2f;
+    x.shockExt = 0.05;
+    tyrelog::Step s = sane();
+    RearTracker tr;
+    RearEpisode e;
+    CHECK(!tr.Update(1, s, x, false, e) && !tr.in, "above ground: nothing");
+    x.swingClear = -0.04f;
+    x.shockExt = -0.0003;
+    CHECK(!tr.Update(2, s, x, false, e) && tr.in, "swingarm under: in");
+    s.wheel[1].gap = -0.12;
+    x.swingClear = -0.07f;
+    CHECK(!tr.Update(3, s, x, false, e), "still in");
+    s.wheel[1].gap = 0.01;
+    x.swingClear = 0.05f;
+    x.shockExt = 0.04;
+    CHECK(tr.Update(4, s, x, false, e) && !tr.in, "out");
+    CHECK(e.startStep == 2 && e.endStep == 4 && std::fabs(e.minSwing + 0.07) < 1e-6 && std::fabs(e.minGap + 0.12) < 1e-9 &&
+              std::fabs(e.minShockExt + 0.0003) < 1e-9 && !e.buried,
+          "episode minima");
+    char row[512];
+    RearCsv(e, row, sizeof(row));
+    CHECK(commas(row) == commas(kRearHeader), "rear csv columns (%d vs %d)", commas(row), commas(kRearHeader));
+    // A hotkey bury holds the episode open for its whole trace.
+    RearTracker hb;
+    CHECK(!hb.Update(1, s, x, true, e) && hb.in && hb.cur.buried, "bury opens one");
+    CHECK(hb.Update(2, s, x, false, e) && e.buried, "and it ends after");
+    // The check: a swingarm under the terrain is a limit trip.
+    Trip t[16];
+    x.swingClear = -0.05f;
+    int k = Check(sane(), x, Limits{}, t, 16);
+    bool saw = false;
+    for (int i = 0; i < k; ++i) saw |= std::strcmp(t[i].field, "swingarm_clear") == 0;
+    CHECK(saw, "swingarm_clear trips");
+}
+
 // What a clean step pays for the check (every step but a few). Printed; the bound only
 // catches something gone badly wrong.
 static void cost() {
@@ -426,6 +496,7 @@ int main() {
     flat();
     stress();
     ring_csv();
+    rear();
     cost();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);

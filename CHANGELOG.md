@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 2026-10-15 - v0.49.15
+
+The Coach overlay stays off unless Coach is open.
 
 ### Fixed
 - **Coach overlay with no Coach running.** The racing line, banner, minimap and gap showed from the files Coach left behind when there was no `coach.ini` to say Coach had closed. Nothing is drawn now unless Coach is open. `standalone=1` in `hud.ini` draws it anyway.

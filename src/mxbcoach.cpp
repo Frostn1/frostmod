@@ -46,6 +46,7 @@
 #include "coachcutmarks.h"
 #include "coachperf.h"
 #include "coachline.h"
+#include "coachpet.h"
 #include "coachhud.h"
 #include "coachlink.h"
 #include "coachgear.h"
@@ -913,6 +914,10 @@ void GearSample(int gear, float speed, float time, bool crashed) {
 /// The cut markers on the track: asked for, in practice, with a track to place them on.
 bool CutTrackOn() { return g_hud_set.enabled && g_hud_set.cuts_track && g_practice && !g_markers.empty(); }
 
+/// Pip on the line (coachpet.h): asked for, in practice. It stands on the ribbon, so the ribbon is
+/// built for it even with the line itself off.
+bool PetOn() { return g_hud_set.enabled && g_hud_set.pet && g_practice; }
+
 bool PaceOn() { return g_hud_set.enabled && g_hud_set.ground && g_hud_set.pace && g_pace_prof.ok(); }
 
 /// One telemetry sample for the pace hints. Under g_mu.
@@ -1725,7 +1730,7 @@ void LogHudSettings() {
                        " gap=" + on(s.gap) + " stance=" + on(s.stance) + " map=" + on(s.map) +
                        " setup=" + on(s.setup) + " trail=" + on(s.trail) + " ground=" + on(s.ground) +
                        " pace=" + on(s.pace) + " gear=" + on(s.gear) + " cuts=" + on(s.cuts) +
-                       " cuts_track=" + on(s.cuts_track));
+                       " cuts_track=" + on(s.cuts_track) + " pet=" + on(s.pet));
 }
 
 // At most once a second, from the telemetry callback rather than Draw.
@@ -2489,6 +2494,7 @@ int                   g_diag_left = 30;  // once a second, for the first 30 s ri
 std::vector<coachline::Vert> g_draw_verts;
 std::vector<coachline::Vert> g_draw_marks;  // the pace hints' chevrons and gate, as triangles
 std::vector<coachmark::Quad>  g_marks;  // the jump calls' quads, built under the lock, drawn outside it
+std::vector<coachmark::Quad>  g_pet_marks;  // Pip (coachpet.h), the same way
 
 using glMatrixMode_t    = void(WINAPI*)(GLenum);
 using glLoadMatrixf_t   = void(WINAPI*)(const GLfloat*);
@@ -3361,7 +3367,7 @@ void SnapProbe(const coachline::Mat4& proj, const coachline::Mat4& view, const c
 void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, const coachline::Mat4& model,
                     const coachline::Axes& ax, bool depth_ok) {
     const std::vector<coachline::Vert>& v = g_draw_verts;
-    if (v.size() < 4 && g_cut_marks.empty()) return;
+    if (v.size() < 4 && g_cut_marks.empty() && g_pet_marks.empty()) return;
     if (!g_gl_ext_looked) {
         g_gl_ext_looked  = true;
         if (!g_use_program) g_use_program = reinterpret_cast<glUseProgram_t>(wglGetProcAddress("glUseProgram"));
@@ -3525,6 +3531,24 @@ void DrawGroundLine(const coachline::Mat4& proj, const coachline::Mat4& view, co
         }
         glEnd();
     }
+    // Pip (coachpet.h): on the ribbon like the jump calls, and corrected the same way.
+    if (!g_pet_marks.empty()) {
+        const bool on_ground = g_line_on_ground;
+        glBegin(GL_QUADS);
+        for (const coachmark::Quad& q : g_pet_marks) {
+            const float dy = on_ground || (std::isfinite(q.m) && !g_snap_on) ? 0.0f
+                             : std::isfinite(q.m)                           ? g_lsnap.at(q.m)
+                                                                            : g_dsnap.at(q.s);
+            if (!std::isfinite(dy)) continue;
+            glColor4f(q.rgba[0], q.rgba[1], q.rgba[2], q.rgba[3]);
+            for (int c = 0; c < 4; ++c) {
+                float gx, gy, gz;
+                ax.apply(q.p[c][0], q.p[c][1] + dy, q.p[c][2], gx, gy, gz);
+                glVertex3f(gx, gy, gz);
+            }
+        }
+        glEnd();
+    }
     // The cut gates (coachcutmarks.h): already on the ground they were placed on, no snap.
     if (!g_cut_marks.empty()) {
         glBegin(GL_QUADS);
@@ -3604,6 +3628,35 @@ void BuildCutMarks() {
         poses.push_back(p);
     }
     coachcutmarks::Build(g_cut_marks, poses, g_rider.x, g_rider.y, g_marker_now, &g_cut_tally);
+}
+
+// Pip (coachpet.h): built under the lock after the ribbon and the jump calls. g_pet_marks is
+// declared with the ribbon's vertices (drawn in the same state block).
+coachpet::Follow             g_pet_follow;
+float                        g_pet_t    = NAN;  // the game time at the last build, for the easing
+coachpet::Face               g_pet_face = coachpet::IDLE;
+
+/// Pip for this frame: as far ahead as Coach's lap is now, on the ribbon. Under g_mu, after
+/// BuildMarks (it flies the same jump calls).
+void BuildPet() {
+    g_pet_marks.clear();
+    if (!PetOn() || g_draw_verts.size() < 4 || !std::isfinite(g_rider_m)) {
+        g_pet_follow.reset();
+        return;
+    }
+    const float ghost_m = g_clock.valid() ? coachpet::MetreAtTime(g_hud_sheet.ref, g_arc, g_clock.elapsed(g_time)) : NAN;
+    const float dt      = std::isfinite(g_pet_t) ? g_time - g_pet_t : 0.0f;
+    g_pet_t             = g_time;
+    const float lead    = g_pet_follow.step(coachpet::LeadTarget(ghost_m, g_rider_m, g_arc.total), dt);
+    coachpet::Face face = coachpet::IDLE;
+    coachpet::Build(g_pet_marks, g_draw_verts, g_jump_calls, lead, g_rider_m, g_arc.total, g_time, &face);
+    if (face != g_pet_face && (face == coachpet::WOW || face == coachpet::SCARED)) {
+        char b[80];
+        std::snprintf(b, sizeof(b), "%s at %.0f m, %.1f m ahead", face == coachpet::WOW ? "wow" : "scared",
+                      double(g_rider_m + lead), double(lead));
+        Log("pet", b);
+    }
+    g_pet_face = face;
 }
 
 /// This frame's marks for the calls ahead of the rider. Under g_mu, after the ribbon is built.
@@ -3771,7 +3824,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                 // Only while riding: in a menu, the pause screen or a loading screen nothing is
                 // built, read or drawn (coachline::Riding).
                 const bool wants = lock.owns_lock() && g_gl_ok && g_hud_set.enabled &&
-                                   (g_hud_set.ground || CutTrackOn()) && g_practice && g_have_sample && RidingNow(now);
+                                   (g_hud_set.ground || CutTrackOn() || PetOn()) && g_practice && g_have_sample && RidingNow(now);
                 // Without the lock this frame knows nothing: the next one does nothing either,
                 // and the search's clock is left as it was.
                 if (!lock.owns_lock()) g_gate.frame(false, false);
@@ -4144,7 +4197,8 @@ BOOL WINAPI hkSwap(HDC hdc) {
                         draw         = g_draw_verts.size() >= 4;
                         if (!draw) ++g_why[WHY_NO_VERTS];
                         BuildMarks();
-                        // Only the cut gates were asked for: the line and its marks stay off.
+                        BuildPet();
+                        // Only the cut gates or Pip were asked for: the line and its marks stay off.
                         if (!g_hud_set.ground) {
                             g_draw_verts.clear();
                             g_draw_marks.clear();
@@ -4152,7 +4206,7 @@ BOOL WINAPI hkSwap(HDC hdc) {
                             draw = false;
                         }
                         BuildCutMarks();
-                        if (!g_cut_marks.empty()) draw = true;
+                        if (!g_cut_marks.empty() || !g_pet_marks.empty()) draw = true;
                     }
                 } else if (lock.owns_lock()) {
                     // Not riding with the line on: the next frame's hooks do nothing at all.
@@ -4662,7 +4716,7 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
     LookForHud(false);
     if (!g_grid.ready() && GetTickCount64() - g_grid_look_ms >= 1000) LoadGround(true);
     LiveIn live;
-    live.on        = g_hud_set.enabled && g_hud_set.ground && g_practice && g_have_sample;
+    live.on        = g_hud_set.enabled && (g_hud_set.ground || g_hud_set.pet) && g_practice && g_have_sample;
     live.riding_ms = g_ride_since ? GetTickCount64() - g_ride_since : 0;
     LiveFillPos(live, _pData, _iDataSize);
     return live;
@@ -4952,7 +5006,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
             // track rather than at the HUD. MXBMRP3 polls the mouse from its own render path
             // for the same reason, and their drag works.
             PollDrag();
-            if (g_hud_set.ground || CutTrackOn()) InstallGroundHooks();
+            if (g_hud_set.ground || CutTrackOn() || PetOn()) InstallGroundHooks();
             BuildHud();
             for (const coachhud::Quad& in : g_frame.quads) {
                 if (quads >= int(coachhud::kMaxQuads)) break;

@@ -464,6 +464,10 @@ struct Settings {
     // map's trail unless hud.ini says otherwise: a rider who asked for "the line to take" meant
     // the one on the track, and found nothing there when only the map drew it.
     bool  ground = false;
+    // Pip, the Coach pet (coachpet.h): runs Coach's line ahead of the rider and flies its jumps.
+    // On its own it stands in for the line (the ribbon is built for it but not drawn). Off until
+    // asked for, like every addition.
+    bool  pet = false;
     // On that line: where to take off, where Coach's lap landed and what the jump is (coachjump.h).
     // On by default, since it only ever shows on the line the rider already asked for.
     bool  jumps = true;
@@ -534,6 +538,7 @@ inline Settings ParseSettings(const std::string& ini, bool mxbmrp3) {
     s.cuts    = flag("cuts", false);
     s.cuts_track = flag("cuts_track", false);
     s.ground  = flag("ground", s.trail);
+    s.pet     = flag("pet", false);
     s.jumps   = flag("jumps", true);
     s.pace    = flag("pace", true);
     s.gear    = flag("gear", true);

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Pip, the Coach pet.** A small chick in goggles runs Coach's line ahead of you, as far ahead as Coach's lap is at the same lap time (never closer than 7 m or further than 45 m). It flies each jump the way Coach's lap flew it: amazed over a single or a double, scared over a triple or a quad, happy after the landing. `pet=1` in `hud.ini` turns it on. With `ground=0` Pip replaces the blue line.
+
 ## 2026-10-15 - v0.49.15
 
 The Coach overlay stays off unless Coach is open.

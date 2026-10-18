@@ -369,6 +369,9 @@ add_executable(coachjump_preview tests/coachjump_preview.cpp)
 # model, jump lips, and the hysteresis that keeps them from flickering on noisy speed.
 add_executable(coachpace_test tests/coachpace_test.cpp)
 add_test(NAME coachpace COMMAND coachpace_test)
+# Pip, the Coach pet: its lead over the rider, its flights and faces over the jump calls, its sprite.
+add_executable(coachpet_test tests/coachpet_test.cpp)
+add_test(NAME coachpet COMMAND coachpet_test)
 # Gear hints over the ground line: the sheet's GEAR chunk, Coach's shifts, up/down detection and the
 # target gear, the hysteresis, the glyph on the line and the badge beside the cue box.
 add_executable(coachgear_test tests/coachgear_test.cpp)

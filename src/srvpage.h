@@ -174,7 +174,8 @@ struct Server {
     int         players = 0, max_players = 0;
     bool        passworded = false, joinable = true;
     double      last_seen = 0;
-    std::vector<std::string> missing;  // what MXB App would have to install first ("track", "bike")
+    std::vector<std::string> missing;  // what MXB App would have to install first ("track")
+    std::string              region;   // the app's region for the server ("europe", "na-east", ...)
 };
 
 /// A server's address as the game's -directconnect takes it: host:port, the host only letters,
@@ -347,6 +348,7 @@ inline Server ServerOf(const J& j) {
     s.passworded  = j["passworded"].flag();
     s.joinable    = j["joinable"].flag(true);
     s.last_seen   = j["lastSeen"].num();
+    s.region      = j["region"].str();
     const J& miss = j["missing"];
     for (const J& m : miss.a)
         if (m.t == J::STR) s.missing.push_back(Ascii(m.s));
@@ -543,6 +545,43 @@ inline int RowAt(float x, float y, int top, int count) {
 /// The tab `i`'s rectangle along the bottom of the panel.
 inline void TabRect(int i, float r[4]) {
     r[0] = kPanel[0] + float(i) * kTabW, r[1] = kTabY[0], r[2] = r[0] + kTabW, r[3] = kTabY[1];
+}
+
+// The Servers tab's filters, in the game's own row of them above the list.
+constexpr float kRegionBtn[4] = {0.0125f, 0.144444f, 0.1375f, 0.177778f};
+constexpr float kSearchBox[4] = {0.2750f, 0.155556f, 0.4500f, 0.177778f};  // the game's Filter Name box
+constexpr float kCheck[3][4]  = {{0.4750f, 0.155556f, 0.6250f, 0.177778f},
+                                 {0.6375f, 0.155556f, 0.7750f, 0.177778f},
+                                 {0.7875f, 0.155556f, 0.9875f, 0.177778f}};
+
+/// The regions the Region button steps through, with their labels: the app's own list.
+constexpr const char* kRegions[][2] = {{"", "All"},          {"europe", "Europe"}, {"na-east", "NA East"}, {"na-west", "NA West"},
+                                       {"na", "N. America"}, {"oceania", "Oceania"}, {"south-america", "S. America"},
+                                       {"asia", "Asia"},     {"other", "Other"}};
+constexpr int kRegionCount = int(sizeof(kRegions) / sizeof(kRegions[0]));
+
+struct Filters {
+    std::string search;      // matched against name and track, any case
+    int         region = 0;  // index into kRegions; 0 = all
+    bool        hide_empty = false, hide_full = false, ready_only = false;
+};
+
+inline std::string Lower(std::string s) {
+    for (char& c : s) c = char(tolower((unsigned char)c));
+    return s;
+}
+
+/// Whether server `s` shows under `f`.
+inline bool Passes(const Server& s, const Filters& f) {
+    if (f.hide_empty && s.players <= 0) return false;
+    if (f.hide_full && s.max_players > 0 && s.players >= s.max_players) return false;
+    if (f.ready_only && !s.missing.empty()) return false;
+    if (f.region > 0 && f.region < kRegionCount && s.region != kRegions[f.region][0]) return false;
+    if (!f.search.empty()) {
+        const std::string q = Lower(f.search);
+        if (Lower(s.name).find(q) == std::string::npos && Lower(s.track).find(q) == std::string::npos) return false;
+    }
+    return true;
 }
 
 inline bool Inside(const float r[4], float x, float y) { return x >= r[0] && x < r[2] && y >= r[1] && y < r[3]; }

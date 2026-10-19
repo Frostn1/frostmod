@@ -31,6 +31,7 @@
 #define DIRECTINPUT_VERSION 0x0800
 #endif
 #include <dinput.h>    // the game reads its mouse and keys through it
+#include <tlhelp32.h>  // the join probe walks the game's threads
 
 namespace srvgl {
 
@@ -432,6 +433,9 @@ struct Row {
     const srvpage::Server* server = nullptr;  // what Join joins; null when nothing to join
 };
 
+srvpage::Filters g_filters;  // the Servers tab's search and filters
+bool             g_search_focus = false;
+
 std::vector<Row> Rows() {
     std::vector<Row> rows;
     const srvpage::Theme& t = g_theme;
@@ -460,6 +464,7 @@ std::vector<Row> Rows() {
         }
     } else {
         for (const srvpage::Server& s : g_list) {
+            if (!srvpage::Passes(s, g_filters)) continue;
             Row r;
             const srvpage::Rgba c = s.joinable ? t.row_text : t.muted;
             r.c[0] = s.name + (s.passworded ? "  [pw]" : ""), r.col[0] = c;
@@ -813,6 +818,322 @@ void Classic(HWND w) {
 }
 
 // ---------------------------------------------------------------------------------------
+// The join probe: what the game hands its command bus when its own browser joins a server.
+//
+// frostmod_joinprobe.flag beside the log arms it for 40 seconds: a hardware breakpoint (DR0, set
+// on every thread from a worker) on the command bus itself - the function [mxb::RVA_CMD_BUS_PTR]
+// points at - so every bus call is seen whoever makes it. The first 4 seconds are the baseline:
+// every (command, caller) pair seen then is the menu's own traffic. After that, a pair seen for
+// the first time is new - pressing Join in the game's browser is what makes new ones - and its
+// arguments are kept: the registers and the first bytes behind rdx, r8 and r9. It reads, never
+// writes, and lets every call carry on. Then the breakpoint comes off and the new pairs go to the
+// log in the order they first appeared.
+
+struct BusSeen {
+    uint64_t  key = 0;  // cmd << 48 ^ caller; 0 = empty slot
+    uint32_t  cmd = 0, n = 0;
+    uintptr_t from = 0;
+    uint64_t  first_ms = 0;
+    bool      baseline = false;
+    uint64_t  rdx = 0, r8 = 0, r9 = 0;
+    uint8_t   at_rdx[64] = {}, at_r8[128] = {}, at_r9[32] = {};
+};
+constexpr int         kSeenSlots = 8192;
+BusSeen*              g_seen      = nullptr;  // kSeenSlots, open addressing
+std::atomic<int>      g_seen_n{0};
+std::atomic<int>      g_probe_state{0};  // 0 off, 1 armed
+uintptr_t             g_probe_at = 0;
+uint64_t              g_probe_from = 0, g_probe_until = 0;
+PVOID                 g_probe_veh = nullptr;
+SRWLOCK               g_bus_lock = SRWLOCK_INIT;
+
+bool SafeCopy(void* dst, uintptr_t src, size_t n) {
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        memset(dst, 0, n);
+        return false;
+    }
+}
+
+LONG CALLBACK ProbeVeh(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    if (!g_probe_at || c->Rip != g_probe_at) return EXCEPTION_CONTINUE_SEARCH;
+    c->EFlags |= 0x10000;  // RF: carry on past the breakpoint
+    if (!g_seen || g_probe_state != 1) return EXCEPTION_CONTINUE_EXECUTION;
+    uintptr_t from = 0;
+    SafeCopy(&from, c->Rsp, sizeof(from));
+    const uint32_t cmd = uint32_t(c->Rcx) & 0xFFFF;
+    const uint64_t key = (uint64_t(cmd) << 48) ^ from ^ 1;
+    const uint64_t now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_bus_lock);
+    size_t h = (key * 0x9E3779B97F4A7C15ull) >> 51;  // 13 bits
+    for (int probe = 0; probe < kSeenSlots; ++probe, h = (h + 1) & (kSeenSlots - 1)) {
+        BusSeen& s = g_seen[h];
+        if (s.key == key) {
+            ++s.n;
+            break;
+        }
+        if (s.key == 0) {
+            if (g_seen_n.load() >= kSeenSlots * 3 / 4) break;
+            s.key = key, s.cmd = cmd, s.n = 1, s.from = from, s.first_ms = now;
+            s.baseline = now < g_probe_from + 4000;
+            if (!s.baseline) {
+                s.rdx = c->Rdx, s.r8 = c->R8, s.r9 = c->R9;
+                SafeCopy(s.at_rdx, c->Rdx, sizeof(s.at_rdx));
+                SafeCopy(s.at_r8, c->R8, sizeof(s.at_r8));
+                SafeCopy(s.at_r9, c->R9, sizeof(s.at_r9));
+            }
+            ++g_seen_n;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_bus_lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// Set (or clear) DR0 on every other thread of the game. From its own worker thread.
+DWORD WINAPI ProbeArm(LPVOID on) {
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    HANDLE      snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{sizeof(te)};
+    int           n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != DWORD(-1)) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c)) {
+                if (on) c.Dr0 = g_probe_at, c.Dr7 = (c.Dr7 & ~0x30003ull) | 0x1;  // L0, execute, length 1
+                else c.Dr0 = 0, c.Dr7 &= ~0x30003ull;
+                if (SetThreadContext(t, &c)) ++n;
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    Log("[mxb] join probe %s on %d threads", on ? "armed" : "cleared", n);
+    return 0;
+}
+
+std::string Hex(const uint8_t* p, size_t n) {
+    std::string out;
+    char        b[4];
+    for (size_t i = 0; i < n; ++i) sprintf_s(b, "%02X ", p[i]), out += b;
+    return out;
+}
+std::string Printable(const uint8_t* p, size_t n) {
+    std::string out;
+    for (size_t i = 0; i < n; ++i) out += (p[i] >= 32 && p[i] < 127) ? char(p[i]) : '.';
+    return out;
+}
+
+// The watch: frostmod_watch.flag holds up to three break RVAs then the ranges to dump, e.g.
+//   "@AE330 @AE216 @AE57D E53DE0:20 S80:256"
+// "@rva" breaks there (DR1..DR3, every thread); "rva:len" dumps the game's memory at that RVA;
+// "Soff:len" dumps the stack at rsp+off. Each breakpoint reports its first hit - registers and
+// the ranges - and after two minutes, or once all have hit, the breakpoints come off. Read-only.
+struct WatchRange {
+    bool      stack = false;
+    uintptr_t at    = 0;  // address, or rsp offset
+    size_t    len   = 0;
+};
+struct WatchHit {
+    bool                 hit = false;
+    CONTEXT              ctx{};
+    std::vector<uint8_t> bytes;
+};
+uintptr_t               g_watch_at[3] = {};
+int                     g_watch_n     = 0;
+std::vector<WatchRange> g_watch_ranges;
+size_t                  g_watch_total = 0;
+WatchHit                g_watch_hit[3];
+std::atomic<int>        g_watch_state{0};  // 0 off, 1 armed
+std::atomic<int>        g_watch_hits{0};
+uint64_t                g_watch_until = 0;
+SRWLOCK                 g_watch_lock = SRWLOCK_INIT;
+
+LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    int      i = 0;
+    while (i < g_watch_n && c->Rip != g_watch_at[i]) ++i;
+    if (i == g_watch_n) return EXCEPTION_CONTINUE_SEARCH;
+    c->EFlags |= 0x10000;
+    if (g_watch_state != 1) return EXCEPTION_CONTINUE_EXECUTION;
+    AcquireSRWLockExclusive(&g_watch_lock);
+    WatchHit& h = g_watch_hit[i];
+    if (!h.hit) {
+        h.ctx = *c;
+        h.bytes.assign(g_watch_total, 0);
+        size_t off = 0;
+        for (const WatchRange& r : g_watch_ranges) {
+            SafeCopy(h.bytes.data() + off, r.stack ? uintptr_t(c->Rsp) + r.at : r.at, r.len);
+            off += r.len;
+        }
+        h.hit = true;
+        ++g_watch_hits;
+    }
+    ReleaseSRWLockExclusive(&g_watch_lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+DWORD WINAPI WatchArm(LPVOID on) {
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    HANDLE      snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{sizeof(te)};
+    int           n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != DWORD(-1)) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c)) {
+                c.Dr7 &= ~0xFFF000FCull;  // DR1..DR3: enable bits and their execute/length fields
+                c.Dr1 = c.Dr2 = c.Dr3 = 0;
+                if (on) {
+                    DWORD64* dr[3] = {&c.Dr1, &c.Dr2, &c.Dr3};
+                    for (int i = 0; i < g_watch_n; ++i) *dr[i] = g_watch_at[i], c.Dr7 |= 1ull << (2 * (i + 1));
+                }
+                if (SetThreadContext(t, &c)) ++n;
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    Log("[mxb] watch %s on %d threads", on ? "armed" : "cleared", n);
+    return 0;
+}
+
+void WatchTick(const std::string& dir) {
+    const uint64_t now = GetTickCount64();
+    if (g_watch_state == 1 && (now > g_watch_until || g_watch_hits.load() >= g_watch_n)) {
+        g_watch_state = 0;
+        if (HANDLE t = CreateThread(nullptr, 0, WatchArm, nullptr, 0, nullptr)) CloseHandle(t);
+        AcquireSRWLockShared(&g_watch_lock);
+        for (int i = 0; i < g_watch_n; ++i) {
+            const WatchHit& h = g_watch_hit[i];
+            if (!h.hit) {
+                Log("[mxb] watch @%llX: not hit", (unsigned long long)(g_watch_at[i] - g_base));
+                continue;
+            }
+            const CONTEXT& c = h.ctx;
+            Log("[mxb] watch @%llX HIT: rax=%p rbx=%p rcx=%p rdx=%p r8=%p r9=%p rsp=%p rbp=%p", (unsigned long long)(g_watch_at[i] - g_base),
+                (void*)c.Rax, (void*)c.Rbx, (void*)c.Rcx, (void*)c.Rdx, (void*)c.R8, (void*)c.R9, (void*)c.Rsp, (void*)c.Rbp);
+            size_t off = 0;
+            for (const WatchRange& r : g_watch_ranges) {
+                for (size_t o = 0; o < r.len; o += 32) {
+                    const size_t n = (std::min)(size_t(32), r.len - o);
+                    Log("[mxb]   %s%06llX+%03zX  %s |%s|", r.stack ? "rsp+" : "", (unsigned long long)(r.stack ? r.at : r.at - g_base), o,
+                        Hex(h.bytes.data() + off + o, n).c_str(), Printable(h.bytes.data() + off + o, n).c_str());
+                }
+                off += r.len;
+            }
+        }
+        ReleaseSRWLockShared(&g_watch_lock);
+        return;
+    }
+    const std::string flag = dir + "frostmod_watch.flag";
+    if (g_watch_state != 0 || GetFileAttributesA(flag.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    std::string spec;
+    if (FILE* f = _fsopen(flag.c_str(), "rb", _SH_DENYNO)) {
+        char   buf[1024];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        spec.assign(buf, n);
+    }
+    if (!DeleteFileA(flag.c_str())) return;
+    g_watch_n = 0, g_watch_total = 0;
+    g_watch_ranges.clear();
+    for (WatchHit& h : g_watch_hit) h.hit = false;
+    g_watch_hits = 0;
+    std::vector<char> tmp(spec.begin(), spec.end());
+    tmp.push_back(0);
+    char* ctx = nullptr;
+    for (char* tok = strtok_s(tmp.data(), " \r\n\t", &ctx); tok; tok = strtok_s(nullptr, " \r\n\t", &ctx)) {
+        if (tok[0] == '@') {
+            if (g_watch_n < 3) g_watch_at[g_watch_n++] = g_base + uintptr_t(strtoull(tok + 1, nullptr, 16));
+            continue;
+        }
+        char* colon = strchr(tok, ':');
+        if (!colon) continue;
+        WatchRange r;
+        r.stack = tok[0] == 'S' || tok[0] == 's';
+        r.at    = uintptr_t(strtoull(tok + (r.stack ? 1 : 0), nullptr, 16)) + (r.stack ? 0 : g_base);
+        r.len   = (std::min)(size_t(strtoul(colon + 1, nullptr, 0)), size_t(4096));
+        g_watch_ranges.push_back(r), g_watch_total += r.len;
+    }
+    if (!g_watch_n) return Log("[mxb] watch: no @address in the flag");
+    g_watch_until = now + 120000;
+    static PVOID veh = nullptr;
+    if (!veh) veh = AddVectoredExceptionHandler(1, WatchVeh);
+    g_watch_state = 1;
+    Log("[mxb] watch: %d breakpoints, %d ranges", g_watch_n, int(g_watch_ranges.size()));
+    if (HANDLE t = CreateThread(nullptr, 0, WatchArm, reinterpret_cast<LPVOID>(1), 0, nullptr)) CloseHandle(t);
+}
+
+/// From the frame: arm on the flag; when the time is up, clear and report the new calls.
+void ProbeTick() {
+    static uint64_t next = 0;
+    const uint64_t  now  = GetTickCount64();
+    if (g_probe_state == 1 && now > g_probe_until) {
+        g_probe_state = 0;
+        if (HANDLE t = CreateThread(nullptr, 0, ProbeArm, nullptr, 0, nullptr)) CloseHandle(t);
+        std::vector<const BusSeen*> fresh;
+        int                         base = 0;
+        AcquireSRWLockShared(&g_bus_lock);
+        for (int i = 0; i < kSeenSlots; ++i) {
+            if (!g_seen[i].key) continue;
+            if (g_seen[i].baseline) ++base;
+            else fresh.push_back(&g_seen[i]);
+        }
+        std::sort(fresh.begin(), fresh.end(), [](const BusSeen* a, const BusSeen* b) { return a->first_ms < b->first_ms; });
+        Log("[mxb] join probe: %d baseline pairs, %d new after it", base, int(fresh.size()));
+        for (const BusSeen* s : fresh) {
+            Log("[mxb]   +%llums bus 0x%03X from RVA 0x%llX x%u rdx=%p r8=%p r9=%p", (unsigned long long)(s->first_ms - g_probe_from),
+                s->cmd, (unsigned long long)(s->from >= g_base ? s->from - g_base : s->from), s->n, (void*)s->rdx, (void*)s->r8,
+                (void*)s->r9);
+            Log("[mxb]       r8 : %s |%s|", Hex(s->at_r8, 64).c_str(), Printable(s->at_r8, 128).c_str());
+            Log("[mxb]       rdx: %s |%s|", Hex(s->at_rdx, 32).c_str(), Printable(s->at_rdx, 64).c_str());
+            Log("[mxb]       r9 : %s", Hex(s->at_r9, 32).c_str());
+        }
+        ReleaseSRWLockShared(&g_bus_lock);
+    }
+    if (now < next) return;
+    next = now + 500;
+    std::string dir = g_logPath;
+    const size_t s = dir.find_last_of('\\');
+    if (s == std::string::npos) return;
+    WatchTick(dir.substr(0, s + 1));
+    const std::string flag = dir.substr(0, s + 1) + "frostmod_joinprobe.flag";
+    if (GetFileAttributesA(flag.c_str()) == INVALID_FILE_ATTRIBUTES || g_probe_state != 0) return;
+    if (!DeleteFileA(flag.c_str())) return;  // armed once per flag, never again off a stuck one
+    uintptr_t bus = 0;
+    SafeCopy(&bus, g_base + mxb::RVA_CMD_BUS_PTR, sizeof(bus));
+    if (!bus) return Log("[mxb] join probe: no bus pointer - offsets.h is stale, not arming");
+    if (!g_seen) g_seen = new BusSeen[kSeenSlots];
+    for (int i = 0; i < kSeenSlots; ++i) g_seen[i].key = 0;
+    g_seen_n      = 0;
+    g_probe_at    = bus;
+    g_probe_from  = now;
+    g_probe_until = now + 40000;
+    Log("[mxb] join probe: the bus is at RVA 0x%llX; baseline 4 s, then press Join in the game's browser", (unsigned long long)(bus - g_base));
+    if (!g_probe_veh) g_probe_veh = AddVectoredExceptionHandler(1, ProbeVeh);
+    g_probe_state = 1;
+    if (HANDLE t = CreateThread(nullptr, 0, ProbeArm, reinterpret_cast<LPVOID>(1), 0, nullptr)) CloseHandle(t);
+}
+
+// ---------------------------------------------------------------------------------------
 // A test shot: frostmod_shot.flag beside the log asks for the next frame as frostmod_shot.tga.
 // A fullscreen game can't be captured from outside, and the page needs proving on the real
 // frame. Looked for twice a second; the read-back only happens when asked.
@@ -853,6 +1174,7 @@ const char* const kTabName[3] = {"Friends", "Servers", "Classic"};
 /// Every presented frame in the menus, from the swap hook.
 void Frame(HDC hdc) {
     if (!g_on.load(std::memory_order_relaxed)) return;
+    ProbeTick();
     struct Shot {  // after this frame's page is drawn, whichever way Frame returns
         HDC dc;
         ~Shot() {
@@ -946,7 +1268,18 @@ void Frame(HDC hdc) {
         std::lock_guard<std::mutex> lk(g_typed_mu);
         typed.swap(g_typed);
     }
-    if (g_adding) {
+    if (g_search_focus) {
+        std::string& q = g_filters.search;
+        for (char c : typed) {
+            if (c == '\b') {
+                if (!q.empty()) q.pop_back();
+            } else if (q.size() < 32 && c >= 32 && c < 127) {
+                q += c;
+            }
+        }
+        if (!typed.empty()) g_top = 0, g_sel = -1;
+        if (g_enter.exchange(false) || g_esc.exchange(false)) g_search_focus = false;
+    } else if (g_adding) {
         for (char c : typed) {
             if (c == '\b') {
                 if (!g_code.empty()) g_code.pop_back();
@@ -991,6 +1324,16 @@ void Frame(HDC hdc) {
             Status(pipe::g_connected ? "Asked MXB App again" : "Open MXB App to use this", 2500);
         } else if (g_tab == FRIENDS && srvpage::Inside(srvpage::kTopBtn, mx, my) && pipe::g_connected) {
             g_adding = !g_adding, g_code.clear();
+        } else if (g_tab == SERVERS && srvpage::Inside(srvpage::kRegionBtn, mx, my)) {
+            g_filters.region = (g_filters.region + 1) % srvpage::kRegionCount, g_top = 0, g_sel = -1;
+        } else if (g_tab == SERVERS && srvpage::Inside(srvpage::kSearchBox, mx, my)) {
+            g_search_focus = true;
+        } else if (g_tab == SERVERS && srvpage::Inside(srvpage::kCheck[0], mx, my)) {
+            g_filters.hide_empty = !g_filters.hide_empty, g_top = 0, g_sel = -1;
+        } else if (g_tab == SERVERS && srvpage::Inside(srvpage::kCheck[1], mx, my)) {
+            g_filters.hide_full = !g_filters.hide_full, g_top = 0, g_sel = -1;
+        } else if (g_tab == SERVERS && srvpage::Inside(srvpage::kCheck[2], mx, my)) {
+            g_filters.ready_only = !g_filters.ready_only, g_top = 0, g_sel = -1;
         } else if (mx > srvpage::kList[2] - 0.012f && my >= srvpage::kListY0 && my < srvpage::kList[3] && count > srvpage::kRows) {
             const float k = (my - srvpage::kListY0) / (srvpage::kList[3] - srvpage::kListY0);
             g_top = int(k * float(count)) - srvpage::kRows / 2;
@@ -1045,8 +1388,32 @@ void Frame(HDC hdc) {
             note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) + " online";
         }
     } else if (!g_have_servers) note = "Asking MXB App for the servers...";
-    Say(g_main, srvpage::Fit(g_main.f, note, srvpage::kTextSize * g_H, 0.8f * g_W), g_adding ? 0.15f : 0.9875f, 0.15f,
-        srvpage::kTextSize, g_adding ? LEFT : RIGHT, note_c);
+    if (g_tab == FRIENDS || !pipe::g_connected)
+        Say(g_main, srvpage::Fit(g_main.f, note, srvpage::kTextSize * g_H, 0.8f * g_W), g_adding ? 0.15f : 0.9875f, 0.15f,
+            srvpage::kTextSize, g_adding ? LEFT : RIGHT, note_c);
+    if (g_tab == SERVERS && pipe::g_connected) {
+        // The game's own filter row: Region where Host World is, then search and the checkboxes.
+        DrawButton((std::string("Region: ") + srvpage::kRegions[g_filters.region][1]).c_str(), srvpage::kRegionBtn, mx, my, true);
+        Say(g_main, "Search:", srvpage::kSearchBox[0] - 0.00625f, srvpage::kSearchBox[1], srvpage::kTextSize, RIGHT, t.header_text);
+        Fill(srvpage::kSearchBox, g_search_focus ? t.list_bg : t.header_bg);
+        const std::string q = g_filters.search + (g_search_focus && (now_ms / 500) % 2 ? "_" : "");
+        Say(g_main, srvpage::Fit(g_main.f, q, srvpage::kRowText * g_H, (srvpage::kSearchBox[2] - srvpage::kSearchBox[0] - 0.008f) * g_W),
+            srvpage::kSearchBox[0] + 0.004f, srvpage::kSearchBox[1] + 0.001f, srvpage::kRowText, LEFT, t.row_text);
+        const char* names[3] = {"Hide Empty", "Hide Full", "Ready to Join"};
+        const bool  on[3]    = {g_filters.hide_empty, g_filters.hide_full, g_filters.ready_only};
+        for (int i = 0; i < 3; ++i) {
+            const float* r      = srvpage::kCheck[i];
+            const float  bh     = r[3] - r[1], bw = bh * float(g_H) / float(g_W);
+            const float  box[4] = {r[0], r[1], r[0] + bw, r[3]};
+            Fill(box, t.button);
+            if (on[i]) {
+                const float in[4] = {box[0] + bw * 0.25f, box[1] + bh * 0.25f, box[2] - bw * 0.25f, box[3] - bh * 0.25f};
+                Fill(in, t.button_text);
+            }
+            Say(g_main, names[i], box[2] + 0.005f, r[1], srvpage::kTextSize, LEFT, t.header_text);
+        }
+        if (!g_have_servers) Say(g_main, note, 0.0175f, srvpage::kListY0 + 0.004f, srvpage::kRowText, LEFT, t.muted);
+    }
 
     // The list: headers, rows, the scroll bar.
     Fill(srvpage::kList, t.list_bg);

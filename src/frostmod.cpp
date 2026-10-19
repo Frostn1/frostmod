@@ -61,6 +61,7 @@
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
+#include "srvpage.h"     // the in-game Servers page: the game's font, sprites and MXB App's list
 #include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
@@ -5279,6 +5280,7 @@ static void TcUndo(GLenum target, GLuint id, const texcompress::Entry& e) {
         id, e.w0, e.h0, n, e.origIfmt);
 }
 
+static void SrvOnTexImage(GLenum target, GLint level, GLsizei w, GLsizei h, GLenum format, GLenum type, const void* px);  // srvpage_gl.h
 static void APIENTRY hkMdTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                                     GLint border, GLenum format, GLenum type, const void* px) {
     GLint use = ifmt;
@@ -5317,6 +5319,7 @@ static void APIENTRY hkMdTexImage2D(GLenum target, GLint level, GLint ifmt, GLsi
     }
     if (g_mdLive.load(std::memory_order_relaxed))
         MdRecordLevel(target, level, (uint32_t)use, w, h, memdiag::LevelBytes((uint32_t)use, w, h), false);
+    SrvOnTexImage(target, level, w, h, format, type, px);
 }
 
 // The texcompress line: what was swapped, what it saved, and why the rest was left.
@@ -5921,6 +5924,9 @@ void Tick() {
     AdvanceReload();   // run at most one reload step, so a frame presents between steps
 }
 
+// The in-game Servers page (Servers button on the game's main menu): hooks, input and draw.
+#include "srvpage_gl.h"
+
 BOOL WINAPI hkSwapBuffers(HDC hdc)      { Tick(); return g_origSwapBuffers(hdc); }
 BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     Tick();
@@ -5930,7 +5936,10 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     // fires (count is stable) -> GL draws the overlay as before.
     static uint64_t lastDraw = 0;
     uint64_t now = g_drawCalls.load(std::memory_order_relaxed);
-    if (now == lastDraw) DrawOverlay(hdc);
+    if (now == lastDraw) {
+        DrawOverlay(hdc);
+        srvgl::Frame(hdc);  // the Servers page: the main menu only, and only when its button is in main.mnu
+    }
     lastDraw = now;
     return g_origWglSwapBuffers(hdc);
 }
@@ -7645,6 +7654,7 @@ DWORD WINAPI Init(LPVOID) {
         Log("[init] note: opengl32 not loaded; relying on gdi32!SwapBuffers for the tick.");
     }
     MdInstallCore();   // memdiag=1 only (frostmod_radar.cfg): GL upload accounting
+    SrvInstall(gl);    // the in-game Servers page, when its button is in the game's ui\main.mnu
 
     // OPT-IN (frostmod.exe --dump-serverlist): hook the master opcode handler
     // (signature-validated, clean prologue) and dump the server-list blob once per

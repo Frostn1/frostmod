@@ -91,9 +91,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# --- miniz (zip + inflate): the in-game Servers page reads the game's font and sprites
+# straight out of the player's ui.pkz (srvpage.h). Nothing of the game's is shipped.
+FetchContent_Declare(
+    miniz
+    GIT_REPOSITORY https://github.com/richgel999/miniz.git
+    GIT_TAG        3.0.2
+)
+# miniz 3.0.2 asks for an older CMake than 4.x accepts without this.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(miniz)
+
 # --- the mod DLL ---------------------------------------------------------------
 add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp src/nantrap.cpp ${FROSTMOD_DLL_RC})
-target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32 winhttp)
+target_link_libraries(frostmod PRIVATE minhook miniz gdi32 user32 opengl32 winhttp)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")
@@ -182,6 +196,11 @@ add_test(NAME session COMMAND session_test)
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)
 add_test(NAME masterlist COMMAND masterlist_test)
+# The in-game Servers page: the game's .fnt and .tga readers, MXB App's servers.json, the
+# address check, the layout. Reads the real ui.pkz and servers.json too when they are there.
+add_executable(srvpage_test tests/srvpage_test.cpp)
+target_link_libraries(srvpage_test PRIVATE miniz)
+add_test(NAME srvpage COMMAND srvpage_test)
 
 # --- race mode mod list --------------------------------------------------------
 # Which tracks and bikes the game is shown in MXB App's Auto race mode

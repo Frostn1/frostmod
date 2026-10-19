@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- **MXB page in the game's main menu.** An MXB button under Race opens a page in the game's own font and button art, with what the game's browser can't do. **Friends:** who's online and on which server, join them in one click, and add a friend by code. **Install & Join:** any server, even on a track you don't have; MXB App installs it, then restarts the game into the server, and the download's progress shows on the page. Everything comes from MXB App over a local pipe (`\.\pipe\mxbapp-ingame`); spam servers stay hidden by the browser filter. MXB App writes the button's `ui\main.mnu` beside the game from the player's own `ui.pkz`; without it nothing changes.
+- **MXB page in the game's main menu.** An MXB button under Race opens a page in the game's own font and button art, with what the game's browser can't do. **Friends:** who's online and on which server, join them in one click, and add a friend by code. **Install & Join:** any server, even on a track you don't have; MXB App installs it, then restarts the game into the server, and the download's progress shows on the page. Everything comes from MXB App over a local pipe (`\\.\pipe\mxbapp-ingame`); spam servers stay hidden by the browser filter. MXB App writes the button's `ui\main.mnu` beside the game from the player's own `ui.pkz`; without it nothing changes.
 
 ## 2026-10-15 - v0.49.15
 

@@ -52,6 +52,29 @@ static void Servers() {
     CHECK(ReadServers("").empty() && ReadServers("[]").empty() && ReadServers("{").empty(), "nothing to read");
 }
 
+static void Messages() {
+    bool    ok = false;
+    const J m  = ParseJson(R"({"re":"friends","note":"","friends":[
+        {"name":"Ann","online":true,"server":{"name":"MX Social","address":"9.9.9.9:9","track":"farm14","players":5,
+         "maxPlayers":20,"missing":["track"]}},
+        {"name":"Bob","online":false}]})",
+                          &ok);
+    CHECK(ok && m["re"].str() == "friends", "a friends message parses");
+    const std::vector<Friend> f = ReadFriends(m["friends"]);
+    CHECK(f.size() == 2, "two friends: %zu", f.size());
+    if (f.size() == 2) {
+        CHECK(f[0].online && f[0].has_server && f[0].on.address == "9.9.9.9:9", "Ann is on MX Social");
+        CHECK(f[0].on.missing.size() == 1 && f[0].on.missing[0] == "track", "and lacks its track");
+        CHECK(!f[1].online && !f[1].has_server, "Bob is offline");
+    }
+    const J j = ParseJson(R"({"re":"join","state":"installing","text":"Downloading Farm 14","pct":40})");
+    CHECK(j["state"].str() == "installing" && j["pct"].num() == 40.0, "join progress");
+    CHECK(ParseJson("{\"a\":", &ok).t == J::NUL && !ok, "a cut-off line is refused");
+    CHECK(Quote("say \"hi\"\\") == "\"say \\\"hi\\\"\\\\\"", "quoting: %s", Quote("say \"hi\"\\").c_str());
+    const J back = ParseJson("{\"code\":" + Quote("AB\"C") + "}");
+    CHECK(back["code"].str() == "AB\"C", "what Quote writes reads back");
+}
+
 static void Layout() {
     CHECK(RowAt(0.5f, kListY0 + 0.5f * kRowH, 10, 100) == 10, "the first row is `top`");
     CHECK(RowAt(0.5f, kListY0 + 2.5f * kRowH, 0, 2) == -1, "past the end");
@@ -98,6 +121,7 @@ static void RealFiles() {
 int main() {
     Addresses();
     Servers();
+    Messages();
     Layout();
     RealFiles();
     if (g_failures) {

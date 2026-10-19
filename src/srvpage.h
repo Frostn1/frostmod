@@ -174,6 +174,7 @@ struct Server {
     int         players = 0, max_players = 0;
     bool        passworded = false, joinable = true;
     double      last_seen = 0;
+    std::vector<std::string> missing;  // what MXB App would have to install first ("track", "bike")
 };
 
 /// A server's address as the game's -directconnect takes it: host:port, the host only letters,
@@ -206,14 +207,34 @@ inline std::string Ascii(const std::string& s) {
     return out;
 }
 
+// ---------------------------------------------------------------------------------------
+// JSON, just enough for what MXB App sends down the pipe: one message a line.
+
+struct J {
+    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } t = NUL;
+    bool                                   b = false;
+    double                                 n = 0;
+    std::string                            s;
+    std::vector<J>                         a;
+    std::vector<std::pair<std::string, J>> o;
+
+    const J& operator[](const char* key) const {
+        static const J none;
+        for (const auto& kv : o)
+            if (kv.first == key) return kv.second;
+        return none;
+    }
+    std::string str() const { return t == STR ? s : std::string(); }
+    double      num(double d = 0) const { return t == NUM ? n : d; }
+    bool        flag(bool d = false) const { return t == BOOL ? b : d; }
+};
+
 namespace json {
-// Just enough JSON for servers.json: an array of flat objects whose values are strings,
-// numbers, booleans, null, arrays of those, or objects (skipped).
 struct Reader {
     const char* p;
     const char* e;
     bool        bad = false;
-    void ws() {
+    void        ws() {
         while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) ++p;
     }
     bool eat(char c) {
@@ -246,7 +267,7 @@ struct Reader {
                         const char h = *p;
                         v = v * 16 + unsigned(h >= 'a' ? h - 'a' + 10 : h >= 'A' ? h - 'A' + 10 : h - '0');
                     }
-                    // Only whether it was ASCII matters to the page: anything else is drawn '?'.
+                    // Only whether it was ASCII matters here: anything else is drawn '?'.
                     if (v < 0x80) out += char(v);
                     else out += "\xC2\xBF";
                     break;
@@ -258,88 +279,116 @@ struct Reader {
         else bad = true;
         return out;
     }
-    double num() {
+    J value(int depth = 0) {
+        J v;
         ws();
-        const char* s = p;
-        while (p < e && (std::strchr("+-.eE", *p) || (*p >= '0' && *p <= '9'))) ++p;
-        return s == p ? (bad = true, 0.0) : std::atof(std::string(s, p).c_str());
-    }
-    // One value; strings are handed to `on_str` (the first of an array's), the rest skipped.
-    void value(std::string* s_out, double* n_out, bool* b_out, int depth = 0) {
-        ws();
-        if (p >= e || depth > 32) return void(bad = true);
+        if (p >= e || depth > 32) return bad = true, v;
         const char c = *p;
         if (c == '"') {
-            std::string v = str();
-            if (s_out && s_out->empty()) *s_out = v;
+            v.t = J::STR, v.s = str();
         } else if (c == '{') {
-            ++p;
-            if (eat('}')) return;
+            ++p, v.t = J::OBJ;
+            if (eat('}')) return v;
             do {
-                str();
-                if (!eat(':')) return void(bad = true);
-                value(nullptr, nullptr, nullptr, depth + 1);
+                std::string k = str();
+                if (!eat(':')) return bad = true, v;
+                v.o.emplace_back(std::move(k), value(depth + 1));
             } while (!bad && eat(','));
             if (!eat('}')) bad = true;
         } else if (c == '[') {
-            ++p;
-            if (eat(']')) return;
-            do value(s_out, nullptr, nullptr, depth + 1);
+            ++p, v.t = J::ARR;
+            if (eat(']')) return v;
+            do v.a.push_back(value(depth + 1));
             while (!bad && eat(','));
             if (!eat(']')) bad = true;
         } else if (c == 't' || c == 'f' || c == 'n') {
-            const bool t = c == 't';
+            v.t = c == 'n' ? J::NUL : J::BOOL, v.b = c == 't';
             while (p < e && *p >= 'a' && *p <= 'z') ++p;
-            if (b_out) *b_out = t;
         } else {
-            const double v = num();
-            if (n_out) *n_out = v;
+            const char* s0 = p;
+            while (p < e && (std::strchr("+-.eE", *p) || (*p >= '0' && *p <= '9'))) ++p;
+            if (s0 == p) return bad = true, v;
+            v.t = J::NUM, v.n = std::atof(std::string(s0, p).c_str());
         }
+        return v;
     }
 };
 }  // namespace json
 
-/// servers.json as MXB App writes it. A server without a usable address is left out.
+/// One JSON value out of `text`; NUL type (and `ok` false) when it isn't well formed.
+inline J ParseJson(const std::string& text, bool* ok = nullptr) {
+    json::Reader r{text.data(), text.data() + text.size()};
+    J            v = r.value();
+    if (ok) *ok = !r.bad;
+    return r.bad ? J{} : v;
+}
+
+/// JSON's text for `s`, quotes included.
+inline std::string Quote(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') out += '\\', out += c;
+        else if ((unsigned char)c < 0x20) out += ' ';
+        else out += c;
+    }
+    return out + "\"";
+}
+
+inline Server ServerOf(const J& j) {
+    Server s;
+    s.name        = Ascii(j["name"].str());
+    s.address     = SafeAddress(j["address"].str());
+    s.track       = Ascii(j["track"].str());
+    s.session     = Ascii(j["session"].str());
+    const J& cats = j["categories"];
+    if (cats.t == J::ARR && !cats.a.empty()) s.category = Ascii(cats.a[0].str());
+    s.players     = int(j["players"].num());
+    s.max_players = int(j["maxPlayers"].num());
+    s.passworded  = j["passworded"].flag();
+    s.joinable    = j["joinable"].flag(true);
+    s.last_seen   = j["lastSeen"].num();
+    const J& miss = j["missing"];
+    for (const J& m : miss.a)
+        if (m.t == J::STR) s.missing.push_back(Ascii(m.s));
+    return s;
+}
+
+/// A JSON array of servers as MXB App writes them (servers.json, or the pipe's "servers"). A
+/// server without a usable address is left out.
 inline std::vector<Server> ReadServers(const std::string& text) {
     std::vector<Server> out;
-    json::Reader r{text.data(), text.data() + text.size()};
-    if (!r.eat('[')) return out;
-    if (r.eat(']')) return out;
-    do {
-        if (!r.eat('{')) break;
-        Server s;
-        if (!r.eat('}')) {
-            do {
-                const std::string key = r.str();
-                if (!r.eat(':')) {
-                    r.bad = true;
-                    break;
-                }
-                double n = 0;
-                bool   b = false;
-                if (key == "name") r.value(&s.name, nullptr, nullptr);
-                else if (key == "address") r.value(&s.address, nullptr, nullptr);
-                else if (key == "track") r.value(&s.track, nullptr, nullptr);
-                else if (key == "session") r.value(&s.session, nullptr, nullptr);
-                else if (key == "categories") r.value(&s.category, nullptr, nullptr);
-                else if (key == "players") r.value(nullptr, &n, nullptr), s.players = int(n);
-                else if (key == "maxPlayers") r.value(nullptr, &n, nullptr), s.max_players = int(n);
-                else if (key == "lastSeen") r.value(nullptr, &n, nullptr), s.last_seen = n;
-                else if (key == "passworded") r.value(nullptr, nullptr, &b), s.passworded = b;
-                else if (key == "joinable") {
-                    b = true;
-                    r.value(nullptr, nullptr, &b);
-                    s.joinable = b;
-                } else r.value(nullptr, nullptr, nullptr);
-            } while (!r.bad && r.eat(','));
-            if (!r.bad && !r.eat('}')) r.bad = true;
+    const J             j = ParseJson(text);
+    for (const J& e : j.a) {
+        if (e.t != J::OBJ) continue;
+        Server s = ServerOf(e);
+        if (!s.address.empty()) out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// Friends, as MXB App sends them
+
+struct Friend {
+    std::string name;
+    bool        online = false;
+    Server      on;      // the server they're on; empty address when none
+    bool        has_server = false;
+};
+
+inline std::vector<Friend> ReadFriends(const J& arr) {
+    std::vector<Friend> out;
+    for (const J& e : arr.a) {
+        if (e.t != J::OBJ) continue;
+        Friend f;
+        f.name   = Ascii(e["name"].str());
+        f.online = e["online"].flag();
+        if (e["server"].t == J::OBJ) {
+            f.on         = ServerOf(e["server"]);
+            f.has_server = !f.on.address.empty();
         }
-        if (r.bad) break;
-        s.address = SafeAddress(s.address);
-        if (s.address.empty()) continue;
-        s.name = Ascii(s.name), s.track = Ascii(s.track), s.category = Ascii(s.category), s.session = Ascii(s.session);
-        out.push_back(std::move(s));
-    } while (r.eat(','));
+        out.push_back(std::move(f));
+    }
     return out;
 }
 

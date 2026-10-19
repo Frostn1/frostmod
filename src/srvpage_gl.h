@@ -1,27 +1,30 @@
-// srvpage_gl.h - the in-game Servers page: the hooks, the input and the GL draw.
+// srvpage_gl.h - the in-game MXB page: the hooks, the input, the pipe to MXB App and the draw.
 // Included once, from frostmod.cpp, after the texture hooks (hkMdTexImage2D) and before the
-// swap hook that calls SrvFrame. The pure parts (font, sprites, servers.json, layout) are in
+// swap hook that calls srvgl::Frame. The pure parts (font, sprites, JSON, layout) are in
 // srvpage.h.
+//
+// An "MXB" button on the game's main menu opens a page in the game's own look with what the
+// game's browser can't do: Friends (who's online and on which server, join them, add one by
+// code) and Install & Join (any server, even on a track you don't have: MXB App installs it,
+// then joins). Everything comes from MXB App over its local pipe; without the app running the
+// page says so.
 //
 // How the page knows the main menu is up. The game has no hook for "which screen is this", so
 // the override main.mnu gives our button an idle sprite of its own, frostsrv1.tga: 16 x 16, every
 // pixel the colour kMarker with alpha 0, so it draws nothing. Its upload is spotted in
 // glTexImage2D (that size, every pixel that colour) and its texture name kept; a frame in which
-// the game binds that name is a frame with the main menu on screen. Nothing else in the game is
-// 16 x 16 in that colour.
+// the game binds that name is a frame with the main menu on screen.
 //
 // Input is polled (GetAsyncKeyState, GetCursorPos) like the rest of FrostMod's panels. Nothing is
 // swallowed: on the main menu the right of the screen has nothing of the game's to click, and
 // the game's own column stays live - pick Testing and the page closes with the menu.
 //
-// Join restarts the game into the server: the game reads -directconnect only at startup (the
-// flag MXB App joins with). FrostMod writes the address to frostmod_join.txt and closes the
-// game; MXB App sees the game close, checks the address and starts it again into the server.
-// FrostMod starts no process of its own. Joining in-process is later work (bus command 0x389,
-// offsets.h).
+// Joining: the game reads -directconnect only at startup, so MXB App does it - installing first
+// when something is missing, with the progress shown here - then says "restart", FrostMod closes
+// the game, and the app starts it again into the server. FrostMod starts no process itself.
 //
-// Cost: two pointer compares per glBindTexture, a few calls a frame on the main menu, and the
-// page's quads only while it is open. The font and sprites are read from ui.pkz on first open.
+// Cost: a pointer compare per glBindTexture, a few calls a frame on the main menu, the page's
+// quads only while it is open, and a pipe thread that sleeps 30 ms between polls once started.
 
 namespace srvgl {
 
@@ -81,7 +84,6 @@ bool                         g_loaded = false, g_load_failed = false;
 FontTex                      g_main, g_data;
 Tex                          g_hover, g_pick;  // main2.tga, main3.tga
 std::vector<srvpage::Server> g_list;
-std::string                  g_list_note;
 bool                         g_open = false;
 int                          g_top = 0, g_sel = -1, g_gone = 0;
 bool                         g_down = false;  // the left button, last frame
@@ -139,51 +141,6 @@ void LoadArt() {
     if (ok) g_loaded = true;
     else g_load_failed = true;
     Log("[servers] the game's font and sprites from %s: %s", pkz.c_str(), ok ? "read" : "FAILED");
-}
-
-/// MXB App's server book.
-void LoadList() {
-    g_list.clear();
-    g_top = 0, g_sel = -1;
-    char*  app = nullptr;
-    size_t n   = 0;
-    std::string path;
-    if (_dupenv_s(&app, &n, "APPDATA") == 0 && app) path = std::string(app) + "\\com.frost.mxbikes\\servers.json";
-    free(app);
-    std::string text;
-    if (FILE* f = path.empty() ? nullptr : _fsopen(path.c_str(), "rb", _SH_DENYNO)) {
-        char buf[65536];
-        size_t got;
-        while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
-        fclose(f);
-    }
-    g_list = srvpage::ReadServers(text);
-    // The spam and cheat-ad servers go, by the rules that hide them in the game's own browser
-    // (frostmod_serverfilter.yaml) - the same rules MXB App applies.
-    size_t hidden = 0;
-    g_list.erase(std::remove_if(g_list.begin(), g_list.end(),
-                                [&](const srvpage::Server& s) {
-                                    frostmod::serverfilter::ServerInfo si;
-                                    si.name       = s.name;
-                                    si.ip         = s.address.substr(0, s.address.rfind(':'));
-                                    si.port       = uint16_t(atoi(s.address.c_str() + s.address.rfind(':') + 1));
-                                    si.players    = s.players;
-                                    si.maxPlayers = s.max_players;
-                                    si.locked     = s.passworded;
-                                    const bool h  = !frostmod::serverfilter::ShouldHide(si).empty();
-                                    hidden += h;
-                                    return h;
-                                }),
-                 g_list.end());
-    std::stable_sort(g_list.begin(), g_list.end(), srvpage::Before);
-    Log("[servers] %d spam servers left out by the server filter", int(hidden));
-    int busy = 0;
-    for (const srvpage::Server& s : g_list) busy += s.players > 0;
-    char b[160];
-    if (g_list.empty()) sprintf_s(b, "No servers yet - open MXB App once so it can fetch the list");
-    else sprintf_s(b, "%d servers, %d with riders   -   the list MXB App keeps", int(g_list.size()), busy);
-    g_list_note = b;
-    Log("[servers] %d servers from %s", int(g_list.size()), path.c_str());
 }
 
 // ---------------------------------------------------------------------------------------
@@ -250,9 +207,6 @@ struct Button {
     const char* label;
     float       r[4];
 };
-const Button kJoin    = {"Join", {0.5875f, srvpage::kBarY0, 0.7375f, srvpage::kBarY0 + 0.044444f}};
-const Button kRefresh = {"Refresh", {0.7375f, srvpage::kBarY0, 0.8875f, srvpage::kBarY0 + 0.044444f}};
-const Button kBack    = {"Back", {0.8875f, srvpage::kBarY0, 1.0f, srvpage::kBarY0 + 0.044444f}};
 
 void DrawButton(const Button& b, float mx, float my, bool down, bool enabled) {
     const float x0 = b.r[0] * g_W, y0 = b.r[1] * g_H, x1 = b.r[2] * g_W, y1 = b.r[3] * g_H;
@@ -263,31 +217,261 @@ void DrawButton(const Button& b, float mx, float my, bool down, bool enabled) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Join: MXB App restarts the game into the server
+// MXB App, over its local pipe
+//
+// \\.\pipe\mxbapp-ingame, served by MXB App for the current user. One JSON message a line
+// each way. FrostMod asks ("hello", "servers", "friends", "join", "friend_add"); the app
+// answers with "re" set to what was asked, and pushes "join" progress as it installs and
+// restarts. Nothing here blocks the render thread: a worker owns the pipe and the page reads
+// and writes two queues.
 
-/// Where the join request goes: frostmod_join.txt beside FrostMod's log, where the master-list
-/// feed already goes. FrostMod runs nothing itself: MXB App reads the request once the game has
-/// closed, checks the address again, and starts the game with -directconnect, the way its own
-/// Join button does.
-std::string JoinFile() {
-    std::string p = g_logPath;
-    const size_t s = p.find_last_of('\\');
-    return s == std::string::npos ? std::string() : p.substr(0, s + 1) + "frostmod_join.txt";
+namespace pipe {
+
+std::mutex               g_mu;
+std::deque<std::string>  g_out;  // lines to send
+std::deque<std::string>  g_in;   // lines received
+std::atomic<bool>        g_connected{false};
+std::atomic<bool>        g_started{false};
+
+void Send(const std::string& line) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_out.size() < 64) g_out.push_back(line + "\n");
 }
 
-void Join(const srvpage::Server& s, HWND game) {
+DWORD WINAPI Worker(LPVOID) {
+    std::string partial;
+    for (;;) {
+        HANDLE h = CreateFileW(L"\\\\.\\pipe\\mxbapp-ingame", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                               nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            g_connected = false;
+            Sleep(2000);
+            continue;
+        }
+        g_connected = true;
+        Log("[mxb] connected to MXB App");
+        partial.clear();
+        bool alive = true;
+        while (alive) {
+            std::deque<std::string> out;
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                out.swap(g_out);
+            }
+            for (const std::string& l : out) {
+                DWORD n = 0;
+                if (!WriteFile(h, l.data(), DWORD(l.size()), &n, nullptr)) {
+                    alive = false;
+                    break;
+                }
+            }
+            DWORD avail = 0;
+            if (alive && !PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) alive = false;
+            while (alive && avail > 0) {
+                char  buf[4096];
+                DWORD got = 0;
+                if (!ReadFile(h, buf, (std::min)(avail, DWORD(sizeof(buf))), &got, nullptr) || got == 0) {
+                    alive = false;
+                    break;
+                }
+                avail -= (std::min)(avail, got);
+                partial.append(buf, got);
+                size_t nl;
+                while ((nl = partial.find('\n')) != std::string::npos) {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    if (g_in.size() < 64) g_in.push_back(partial.substr(0, nl));
+                    partial.erase(0, nl + 1);
+                }
+                if (partial.size() > (8u << 20)) partial.clear();  // a line that never ends
+            }
+            if (alive) Sleep(30);
+        }
+        CloseHandle(h);
+        g_connected = false;
+        Log("[mxb] MXB App went away");
+        Sleep(1000);
+    }
+}
+
+void Start() {
+    if (g_started.exchange(true)) return;
+    if (HANDLE t = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr)) CloseHandle(t);
+}
+
+std::vector<std::string> Drain() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::vector<std::string> v(g_in.begin(), g_in.end());
+    g_in.clear();
+    return v;
+}
+
+}  // namespace pipe
+
+// ---------------------------------------------------------------------------------------
+// The page's data, as MXB App last sent it (render thread only)
+
+enum Tab { FRIENDS, SERVERS };
+Tab                          g_tab = FRIENDS;
+std::vector<srvpage::Friend> g_friends;
+bool                         g_have_friends = false, g_have_servers = false;
+std::string                  g_app;           // what the app says it is, once it says hello
+std::string                  g_friends_note;  // e.g. "sign in to MXB App to see friends"
+bool                         g_adding = false;  // the add-friend code box is open
+std::string                  g_code;
+uint64_t                     g_next_friends = 0;
+
+bool Spam(const srvpage::Server& s) {
+    frostmod::serverfilter::ServerInfo si;
+    si.name       = s.name;
+    si.ip         = s.address.substr(0, s.address.rfind(':'));
+    si.port       = uint16_t(atoi(s.address.c_str() + s.address.rfind(':') + 1));
+    si.players    = s.players;
+    si.maxPlayers = s.max_players;
+    si.locked     = s.passworded;
+    return !frostmod::serverfilter::ShouldHide(si).empty();
+}
+
+void Ask() {
+    pipe::Send("{\"op\":\"hello\",\"v\":1,\"frostmod\":\"" FROSTMOD_VERSION "\"}");
+    pipe::Send("{\"op\":\"friends\"}");
+    pipe::Send("{\"op\":\"servers\"}");
+    g_next_friends = GetTickCount64() + 10000;
+}
+
+void Handle(const std::string& line, HWND game) {
+    bool             ok = false;
+    const srvpage::J m  = srvpage::ParseJson(line, &ok);
+    if (!ok || m.t != srvpage::J::OBJ) return;
+    const std::string re = m["re"].str();
+    if (re == "hello") {
+        g_app = srvpage::Ascii(m["app"].str());
+    } else if (re == "servers") {
+        std::vector<srvpage::Server> list;
+        size_t                       hidden = 0;
+        for (const srvpage::J& e : m["servers"].a) {
+            srvpage::Server s = srvpage::ServerOf(e);
+            if (s.address.empty()) continue;
+            if (Spam(s)) {
+                ++hidden;
+                continue;
+            }
+            list.push_back(std::move(s));
+        }
+        std::stable_sort(list.begin(), list.end(), srvpage::Before);
+        g_list = std::move(list), g_have_servers = true;
+        if (g_tab == SERVERS) g_top = 0, g_sel = -1;
+        Log("[mxb] %d servers from MXB App, %d spam left out", int(g_list.size()), int(hidden));
+    } else if (re == "friends") {
+        g_friends      = srvpage::ReadFriends(m["friends"]);
+        g_friends_note = srvpage::Ascii(m["note"].str());
+        g_have_friends = true;
+        std::stable_sort(g_friends.begin(), g_friends.end(), [](const srvpage::Friend& a, const srvpage::Friend& b) {
+            if (a.has_server != b.has_server) return a.has_server;
+            if (a.online != b.online) return a.online;
+            return a.name < b.name;
+        });
+    } else if (re == "join") {
+        const std::string state = m["state"].str(), text = srvpage::Ascii(m["text"].str());
+        const int         pct   = int(m["pct"].num(-1));
+        char              b[200];
+        if (pct >= 0) sprintf_s(b, "%s  %d%%", text.c_str(), pct);
+        else sprintf_s(b, "%s", text.c_str());
+        Status(b, state == "error" ? 8000 : 60000);
+        Log("[mxb] join: %s - %s", state.c_str(), b);
+        // The app has what it needs and will start the game again into the server.
+        if (state == "restart" && game) PostMessageW(game, WM_CLOSE, 0, 0);
+    } else if (re == "friend_add") {
+        Status(srvpage::Ascii(m["text"].str()), 6000);
+        pipe::Send("{\"op\":\"friends\"}");
+    }
+}
+
+void Join(const srvpage::Server& s) {
     const std::string addr = srvpage::SafeAddress(s.address);
-    const std::string path = JoinFile();
-    if (addr.empty() || path.empty()) return Status("That server can't be joined from here");
-    const std::string tmp = path + ".tmp";
-    FILE* f = nullptr;
-    if (fopen_s(&f, tmp.c_str(), "wb") || !f) return Status("Couldn't hand the join to MXB App");
-    fprintf(f, "frostmod-join 1 %llu\n%s\t%s\n", (unsigned long long)time(nullptr) * 1000ull, addr.c_str(), s.name.c_str());
-    fclose(f);
-    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) return Status("Couldn't hand the join to MXB App");
-    Log("[servers] join %s (%s): handed to MXB App, closing the game", addr.c_str(), s.name.c_str());
-    Status("Joining " + s.name + " - MXB App restarts the game into it", 30000);
-    if (game) PostMessageW(game, WM_CLOSE, 0, 0);
+    if (addr.empty()) return Status("That server can't be joined from here");
+    if (!pipe::g_connected) return Status("Open MXB App to join from here", 6000);
+    pipe::Send("{\"op\":\"join\",\"address\":" + srvpage::Quote(addr) + ",\"name\":" + srvpage::Quote(s.name) + "}");
+    Status(s.missing.empty() ? "Joining " + s.name + "..." : "Installing what " + s.name + " needs...", 60000);
+    Log("[mxb] join %s (%s) asked of MXB App", addr.c_str(), s.name.c_str());
+}
+
+// ---------------------------------------------------------------------------------------
+// The rows each tab shows
+
+struct Row {
+    std::string            c[4];
+    float                  rgb[4][3];
+    const srvpage::Server* server = nullptr;  // what Join joins; null when nothing to join
+};
+
+std::vector<Row> Rows() {
+    std::vector<Row> rows;
+    const float      hi = 240.0f / 255.0f, dim = 0.62f;
+    auto             set = [](Row& r, int i, const std::string& t, float cr, float cg, float cb) {
+        r.c[i] = t, r.rgb[i][0] = cr, r.rgb[i][1] = cg, r.rgb[i][2] = cb;
+    };
+    if (g_tab == FRIENDS) {
+        for (const srvpage::Friend& f : g_friends) {
+            Row r;
+            const float c = f.online ? hi : 0.45f;
+            set(r, 0, f.name, c, c, c);
+            if (f.has_server) {
+                set(r, 1, f.on.name, hi, hi, hi);
+                set(r, 2, f.on.track, dim, dim, dim);
+                set(r, 3, f.on.missing.empty() ? "Join" : "Install & Join", 1.0f, 0.78f, 0.25f);
+                r.server = &f.on;
+            } else {
+                set(r, 1, f.online ? "Online - in the menus" : "Offline", dim, dim, dim);
+            }
+            rows.push_back(r);
+        }
+    } else {
+        for (const srvpage::Server& s : g_list) {
+            Row r;
+            const float c = s.joinable ? hi : 0.45f;
+            set(r, 0, s.name + (s.passworded ? "  [pw]" : ""), c, c, c);
+            set(r, 1, s.track, c, c, c);
+            char riders[24];
+            sprintf_s(riders, "%d/%d", s.players, s.max_players);
+            set(r, 2, riders, s.players > 0 ? 1.0f : c, s.players > 0 ? 0.78f : c, s.players > 0 ? 0.25f : c);
+            std::string need;
+            for (const std::string& m : s.missing) need += (need.empty() ? "needs " : " + ") + m;
+            set(r, 3, need.empty() ? "ready" : need, need.empty() ? 0.45f : 1.0f, need.empty() ? 0.75f : 0.62f,
+                need.empty() ? 0.45f : 0.2f);
+            r.server = &s;
+            rows.push_back(r);
+        }
+    }
+    return rows;
+}
+
+// ---------------------------------------------------------------------------------------
+// Typing a friend code: letters, digits and '-', polled like everything else
+
+void TypeCode(bool focus) {
+    static bool held[256] = {};
+    if (!focus) return;
+    auto edge = [&](int vk) {
+        const bool k  = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool on = k && !held[vk];
+        held[vk]      = k;
+        return on;
+    };
+    for (int vk = 'A'; vk <= 'Z'; ++vk)
+        if (edge(vk) && g_code.size() < 32) g_code += char(vk);
+    for (int vk = '0'; vk <= '9'; ++vk)
+        if (edge(vk) && g_code.size() < 32) g_code += char(vk);
+    if (edge(VK_OEM_MINUS) && g_code.size() < 32) g_code += '-';
+    if (edge(VK_BACK) && !g_code.empty()) g_code.pop_back();
+    if (edge(VK_RETURN) && !g_code.empty()) {
+        if (!pipe::g_connected) Status("Open MXB App to add friends from here", 6000);
+        else {
+            pipe::Send("{\"op\":\"friend_add\",\"code\":" + srvpage::Quote(g_code) + "}");
+            Status("Sending the friend request...", 6000);
+        }
+        g_adding = false, g_code.clear();
+    }
+    if (edge(VK_ESCAPE)) g_adding = false, g_code.clear();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -326,6 +510,22 @@ void MaybeShot(int w, int h) {
 // ---------------------------------------------------------------------------------------
 // The frame
 
+// The tabs, as big titles across the top in the menu's font; the bar's buttons per tab.
+const float kTabFriends[4] = {0.2300f, 0.030f, 0.3900f, 0.095f};
+const float kTabServers[4] = {0.4100f, 0.030f, 0.6600f, 0.095f};
+const Button kJoin    = {"Join", {0.5875f, srvpage::kBarY0, 0.7375f, srvpage::kBarY0 + 0.044444f}};
+const Button kAdd     = {"Add friend", {0.5375f, srvpage::kBarY0, 0.7375f, srvpage::kBarY0 + 0.044444f}};
+const Button kRefresh = {"Refresh", {0.7375f, srvpage::kBarY0, 0.8875f, srvpage::kBarY0 + 0.044444f}};
+const Button kBack    = {"Back", {0.8875f, srvpage::kBarY0, 1.0f, srvpage::kBarY0 + 0.044444f}};
+
+void DrawTab(const char* label, const float r[4], bool on, float mx, float my) {
+    const float hi = 240.0f / 255.0f;
+    const bool  over = !on && srvpage::Inside(r, mx, my);
+    const float c = on ? hi : over ? 0.85f : 0.42f;
+    Text(g_main, label, r[0] * g_W, r[1] * g_H, (r[3] - r[1]) * g_H, LEFT, c, c, c);
+    if (on) Quad(r[0] * g_W, r[3] * g_H + 2, r[0] * g_W + srvpage::TextWidth(g_main.f, label, (r[3] - r[1]) * g_H), r[3] * g_H + 5, 1.0f, 0.48f, 0.1f, 1.0f);
+}
+
 /// Every presented frame in the menus, from the swap hook.
 void Frame(HDC hdc) {
     if (!g_on.load(std::memory_order_relaxed)) return;
@@ -361,13 +561,17 @@ void Frame(HDC hdc) {
     over_prev       = over;
     const bool menu = over ? entered_on_menu : seen;
 
+    // Whatever MXB App sent since the last frame, page open or not (join progress included).
+    for (const std::string& line : pipe::Drain()) Handle(line, hwnd);
+
     if (!g_open) {
-        if (menu && click && srvpage::Inside(srvpage::kButton, mx, my)) {
+        if (menu && click && over) {
             LoadArt();
             if (g_loaded) {
-                LoadList();
-                g_open = true, g_gone = 0;
-                Log("[servers] page opened");
+                pipe::Start();
+                if (pipe::g_connected) Ask();
+                g_open = true, g_gone = 0, g_top = 0, g_sel = -1;
+                Log("[mxb] page opened");
             }
         }
         if (!g_open) return;
@@ -375,35 +579,57 @@ void Frame(HDC hdc) {
     // The game moved on (Testing, Settings...): the page goes with the main menu.
     g_gone = menu ? 0 : g_gone + 1;
     if (g_gone > 3) {
-        g_open = false;
-        Log("[servers] page closed with the main menu");
+        g_open = false, g_adding = false;
+        Log("[mxb] page closed with the main menu");
         return;
     }
+    // Connected late (MXB App started after the page opened), and the friends list kept fresh.
+    static bool was_connected = false;
+    if (pipe::g_connected && !was_connected) Ask();
+    was_connected = pipe::g_connected;
+    if (pipe::g_connected && g_tab == FRIENDS && now_ms > g_next_friends) {
+        pipe::Send("{\"op\":\"friends\"}");
+        g_next_friends = now_ms + 10000;
+    }
 
-    const int count = int(g_list.size());
+    const std::vector<Row> rows  = Rows();
+    const int              count = int(rows.size());
+    if (g_sel >= count) g_sel = -1;
+    const srvpage::Server* target = g_sel >= 0 ? rows[size_t(g_sel)].server : nullptr;
+    Button                 join   = kJoin;  // "Install & Join" when the server needs something first
+    if (target && !target->missing.empty()) join.label = "Install & Join", join.r[0] = 0.4875f;
+
     // Input
+    if (g_adding) TypeCode(focus);
     if (click) {
         const int row = srvpage::RowAt(mx, my, g_top, count);
-        if (mx > 0.975f && my >= srvpage::kListY0 && my < srvpage::kListY0 + srvpage::kRows * srvpage::kRowH && count > 0) {
-            // the scroll strip on the right edge: jump to that share of the list
+        if (srvpage::Inside(kTabFriends, mx, my) && g_tab != FRIENDS) {
+            g_tab = FRIENDS, g_top = 0, g_sel = -1;
+            if (pipe::g_connected) pipe::Send("{\"op\":\"friends\"}");
+        } else if (srvpage::Inside(kTabServers, mx, my) && g_tab != SERVERS) {
+            g_tab = SERVERS, g_top = 0, g_sel = -1, g_adding = false;
+        } else if (mx > 0.975f && my >= srvpage::kListY0 && my < srvpage::kListY0 + srvpage::kRows * srvpage::kRowH &&
+                   count > 0) {
             const float k = (my - srvpage::kListY0) / (srvpage::kRows * srvpage::kRowH);
             g_top = (std::max)(0, (std::min)(count - srvpage::kRows, int(k * float(count)) - srvpage::kRows / 2));
         } else if (row >= 0) {
-            const uint64_t now = GetTickCount64();
-            if (row == g_last_click_row && now - g_last_click_ms < 450) Join(g_list[size_t(row)], hwnd);
-            g_sel = row, g_last_click_row = row, g_last_click_ms = now;
-        } else if (srvpage::Inside(kJoin.r, mx, my) && g_sel >= 0 && g_sel < count) {
-            Join(g_list[size_t(g_sel)], hwnd);
+            if (row == g_last_click_row && now_ms - g_last_click_ms < 450 && rows[size_t(row)].server)
+                Join(*rows[size_t(row)].server);
+            g_sel = row, g_last_click_row = row, g_last_click_ms = now_ms;
+        } else if (srvpage::Inside(join.r, mx, my) && target) {
+            Join(*target);
+        } else if (g_tab == FRIENDS && srvpage::Inside(kAdd.r, mx, my) && !g_adding) {
+            g_adding = true, g_code.clear();
         } else if (srvpage::Inside(kRefresh.r, mx, my)) {
-            LoadList();
-            Status("List read again", 2000);
+            if (pipe::g_connected) Ask();
+            Status(pipe::g_connected ? "Asked MXB App again" : "Open MXB App to use this", 2500);
         } else if (srvpage::Inside(kBack.r, mx, my)) {
-            g_open = false;
-            Log("[servers] page closed");
+            g_open = false, g_adding = false;
+            Log("[mxb] page closed");
             return;
         }
     }
-    if (focus) {
+    if (focus && !g_adding) {
         static bool held[4] = {};
         const int   keys[4] = {VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
         const int   step[4] = {-1, 1, -srvpage::kRows, srvpage::kRows};
@@ -412,9 +638,8 @@ void Frame(HDC hdc) {
             if (k && !held[i]) g_top += step[i];
             held[i] = k;
         }
-        g_top = (std::max)(0, (std::min)(g_top, count - srvpage::kRows));
-        if (g_top < 0) g_top = 0;
     }
+    g_top = (std::max)(0, (std::min)(g_top, count - srvpage::kRows));
 
     // Draw
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -435,36 +660,58 @@ void Frame(HDC hdc) {
     const float W = float(g_W), H = float(g_H), x0 = srvpage::kPanelX0 * W;
     const float hi = 240.0f / 255.0f, dim = 0.62f;
     Quad(x0, 0, W, H, 0, 0, 0, 0.78f);
-    Text(g_main, "Servers", 0.235f * W, 0.035f * H, 0.066667f * H, LEFT, hi, hi, hi);
-    Text(g_data, g_list_note, 0.237f * W, 0.105f * H, 0.024f * H, LEFT, dim, dim, dim);
+    DrawTab("Friends", kTabFriends, g_tab == FRIENDS, mx, my);
+    DrawTab("Install & Join", kTabServers, g_tab == SERVERS, mx, my);
 
-    const float cName = 0.235f, cTrack = 0.585f, cRiders = 0.81f, cClass = 0.83f, rowSize = 0.0255f;
-    const float hy = 0.142f * H;
-    Text(g_data, "Server", cName * W, hy, 0.021f * H, LEFT, dim, dim, dim);
-    Text(g_data, "Track", cTrack * W, hy, 0.021f * H, LEFT, dim, dim, dim);
-    Text(g_data, "Riders", cRiders * W, hy, 0.021f * H, RIGHT, dim, dim, dim);
-    Text(g_data, "Class", cClass * W, hy, 0.021f * H, LEFT, dim, dim, dim);
+    // The line under the tabs: whether MXB App is there, and what this tab is for.
+    std::string note;
+    float       nr = dim, ng = dim, nb = dim;
+    if (!pipe::g_connected) {
+        note = "Open MXB App on this PC to use this page", nr = 1.0f, ng = 0.62f, nb = 0.2f;
+    } else if (g_tab == FRIENDS) {
+        if (!g_have_friends) note = "Asking MXB App for your friends...";
+        else if (!g_friends_note.empty()) note = g_friends_note, nr = 1.0f, ng = 0.62f, nb = 0.2f;
+        else {
+            int on = 0;
+            for (const srvpage::Friend& f : g_friends) on += f.online;
+            note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) +
+                   " online   -   join one, even on a track you don't have yet";
+        }
+    } else {
+        note = g_have_servers ? "Any server, even on a track you don't have: MXB App installs it, then joins"
+                              : "Asking MXB App for the servers...";
+    }
+    Text(g_data, note, 0.237f * W, 0.112f * H, 0.024f * H, LEFT, nr, ng, nb);
+
+    float cx[4] = {0.235f, 0.585f, 0.81f, 0.83f};
+    if (g_tab == FRIENDS) cx[1] = 0.42f, cx[2] = 0.66f;
+    const char*  head[2][4] = {{"Friend", "Where", "Track", ""}, {"Server", "Track", "Riders", "Needs"}};
+    const Align  al[4]   = {LEFT, LEFT, g_tab == FRIENDS ? LEFT : RIGHT, LEFT};
+    const float  hy      = 0.148f * H, rowSize = 0.0255f;
+    for (int i = 0; i < 4; ++i)
+        Text(g_data, head[g_tab == FRIENDS ? 0 : 1][i], cx[i] * W, hy, 0.021f * H, al[i], dim, dim, dim);
     Quad(x0 + 0.0225f * W, srvpage::kListY0 * H - 3, 0.97f * W, srvpage::kListY0 * H - 2, 1, 1, 1, 0.18f);
 
     const int hover = srvpage::RowAt(mx, my, g_top, count);
     for (int i = 0; i < srvpage::kRows && g_top + i < count; ++i) {
-        const int              idx = g_top + i;
-        const srvpage::Server& s   = g_list[size_t(idx)];
-        const float            ry0 = (srvpage::kListY0 + i * srvpage::kRowH) * H, ry1 = ry0 + srvpage::kRowH * H;
+        const int   idx = g_top + i;
+        const Row&  r   = rows[size_t(idx)];
+        const float ry0 = (srvpage::kListY0 + i * srvpage::kRowH) * H, ry1 = ry0 + srvpage::kRowH * H;
         if (idx == g_sel) Sprite(g_pick, x0 + 0.0125f * W, ry0, 0.97f * W, ry1);
         else if (idx == hover) Sprite(g_hover, x0 + 0.0125f * W, ry0, 0.97f * W, ry1, 0.8f);
         const float ty = ry0 + (srvpage::kRowH - rowSize) * 0.5f * H, sz = rowSize * H;
-        const float c  = s.joinable ? hi : 0.45f;
-        Text(g_data, srvpage::Fit(g_data.f, s.name + (s.passworded ? "  [pw]" : ""), sz, (cTrack - cName - 0.015f) * W), cName * W, ty,
-             sz, LEFT, c, c, c);
-        Text(g_data, srvpage::Fit(g_data.f, s.track, sz, (cRiders - cTrack - 0.06f) * W), cTrack * W, ty, sz, LEFT, c, c, c);
-        char riders[24];
-        sprintf_s(riders, "%d/%d", s.players, s.max_players);
-        const bool busy = s.players > 0;
-        Text(g_data, riders, cRiders * W, ty, sz, RIGHT, busy ? 1.0f : c, busy ? 0.78f : c, busy ? 0.25f : c);
-        Text(g_data, srvpage::Fit(g_data.f, s.category, sz, (0.965f - cClass) * W), cClass * W, ty, sz, LEFT, dim, dim, dim);
+        const float right[4] = {cx[1] - 0.015f, cx[2] - 0.015f, 0.82f, 0.965f};
+        for (int c = 0; c < 4; ++c) {
+            if (r.c[c].empty()) continue;
+            const Align a   = (g_tab == SERVERS && c == 2) ? RIGHT : LEFT;
+            const float w   = a == RIGHT ? 0.08f * W : (right[c] - cx[c]) * W;
+            Text(g_data, srvpage::Fit(g_data.f, r.c[c], sz, w), cx[c] * W, ty, sz, a, r.rgb[c][0], r.rgb[c][1], r.rgb[c][2]);
+        }
     }
-    // the scroll strip
+    if (count == 0 && pipe::g_connected && (g_tab == SERVERS ? g_have_servers : g_have_friends))
+        Text(g_data, g_tab == FRIENDS ? "No friends yet - Add friend with their code (in MXB App > Servers > Friends)"
+                                      : "No servers right now",
+             0.237f * W, (srvpage::kListY0 + 0.01f) * H, 0.024f * H, LEFT, dim, dim, dim);
     if (count > srvpage::kRows) {
         const float sy0 = srvpage::kListY0 * H, sy1 = (srvpage::kListY0 + srvpage::kRows * srvpage::kRowH) * H;
         Quad(0.978f * W, sy0, 0.982f * W, sy1, 1, 1, 1, 0.12f);
@@ -472,14 +719,21 @@ void Frame(HDC hdc) {
         Quad(0.976f * W, sy0 + a * (sy1 - sy0), 0.984f * W, sy0 + b * (sy1 - sy0), 1, 1, 1, 0.55f);
     }
 
-    // the bar
+    // The bar
     Quad(x0, srvpage::kBarY0 * H, W, (srvpage::kBarY0 + 0.044444f) * H, 0, 0, 0, 0.35f);
-    char range[64];
-    sprintf_s(range, count ? "%d-%d of %d" : "", g_top + 1, (std::min)(count, g_top + srvpage::kRows), count);
-    Text(g_data, range, 0.237f * W, (srvpage::kBarY0 + 0.011f) * H, 0.022f * H, LEFT, dim, dim, dim);
-    if (GetTickCount64() < g_status_until)
-        Text(g_data, g_status, 0.36f * W, (srvpage::kBarY0 + 0.011f) * H, 0.022f * H, LEFT, 1.0f, 0.78f, 0.25f);
-    DrawButton(kJoin, mx, my, down, g_sel >= 0);
+    if (g_adding) {
+        const std::string box = "Friend code: " + g_code + ((now_ms / 500) % 2 ? "_" : " ") + "   Enter to send";
+        Text(g_data, box, 0.237f * W, (srvpage::kBarY0 + 0.011f) * H, 0.024f * H, LEFT, hi, hi, hi);
+    } else if (GetTickCount64() < g_status_until) {
+        Text(g_data, srvpage::Fit(g_data.f, g_status, 0.022f * H, 0.29f * W), 0.237f * W, (srvpage::kBarY0 + 0.011f) * H,
+             0.022f * H, LEFT, 1.0f, 0.78f, 0.25f);
+    } else if (count) {
+        char range[64];
+        sprintf_s(range, "%d-%d of %d", g_top + 1, (std::min)(count, g_top + srvpage::kRows), count);
+        Text(g_data, range, 0.237f * W, (srvpage::kBarY0 + 0.011f) * H, 0.022f * H, LEFT, dim, dim, dim);
+    }
+    if (g_tab == FRIENDS && !target) DrawButton(kAdd, mx, my, down, pipe::g_connected && !g_adding);
+    else DrawButton(join, mx, my, down, target != nullptr && pipe::g_connected);
     DrawButton(kRefresh, mx, my, down, true);
     DrawButton(kBack, mx, my, down, true);
 

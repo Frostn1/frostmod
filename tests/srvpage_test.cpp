@@ -78,8 +78,17 @@ static void Messages() {
 static void Layout() {
     CHECK(RowAt(0.5f, kListY0 + 0.5f * kRowH, 10, 100) == 10, "the first row is `top`");
     CHECK(RowAt(0.5f, kListY0 + 2.5f * kRowH, 0, 2) == -1, "past the end");
-    CHECK(RowAt(0.1f, kListY0 + 0.5f * kRowH, 0, 100) == -1, "over the game's menu column");
-    CHECK(Inside(kButton, 0.1f, 0.43f) && !Inside(kButton, 0.1f, 0.47f), "the Servers button");
+    CHECK(RowAt(0.005f, kListY0 + 0.5f * kRowH, 0, 100) == -1, "left of the list");
+    CHECK(RowAt(0.5f, kList[1] + 0.01f, 0, 100) == -1, "on the column headers");
+    CHECK(kRows >= 25 && kListY0 + kRows * kRowH <= kList[3] + 1e-4f, "%d rows fit the list", kRows);
+    CHECK(Inside(kButton, 0.1f, 0.36f) && !Inside(kButton, 0.1f, 0.40f), "the game's Race button");
+    float r[4];
+    TabRect(1, r);
+    CHECK(Inside(r, 0.2f, 0.92f) && !Inside(r, 0.1f, 0.92f), "the second tab");
+    const Theme d = ReadTheme("theme=dark\npanel=#102030\nnope=#FFFFFF\nlist_bg=zz\n");
+    CHECK(d.panel.r > 0.06f && d.panel.r < 0.07f && d.panel.a == 1.0f, "a colour set by hand, opaque without alpha");
+    CHECK(d.list_bg.r == DarkTheme().list_bg.r, "a bad value leaves the theme's colour");
+    CHECK(ReadTheme("").panel.r == GameTheme().panel.r, "no file: the game's look");
 }
 
 static std::string Env(const char* k) {

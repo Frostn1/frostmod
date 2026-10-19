@@ -400,23 +400,149 @@ inline bool Before(const Server& a, const Server& b) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Colours. Nothing on the page is a fixed colour: everything comes from a theme. "game" is the
+// game's own look, the colours its pages are drawn in (sampled from ui.pkz: dialog1580x700t,
+// button1..3, tabh1..2, back1..2, done1..2, and the server list's colours in multijoin.mnu);
+// "dark" is a dark one for MXB App's dark mode. frostmod_page.ini picks one and can change any
+// colour: theme=dark, then e.g. panel=#202228F0.
+
+struct Rgba {
+    float r = 0, g = 0, b = 0, a = 1;
+};
+
+inline Rgba Hex(uint32_t rgba) {
+    return {float((rgba >> 24) & 0xff) / 255.0f, float((rgba >> 16) & 0xff) / 255.0f, float((rgba >> 8) & 0xff) / 255.0f,
+            float(rgba & 0xff) / 255.0f};
+}
+
+struct Theme {
+    Rgba title_bg, title_text;           // the bar across the top, and the page's name in it
+    Rgba panel, list_bg, header_bg;      // the big panel, the list inside it, its column headers
+    Rgba header_text, row_text, row_hover, row_pick, row_pick_bg, muted, needs, ready, busy;
+    Rgba button, button_hover, button_text, button_off;
+    Rgba tab, tab_on, tab_text, tab_text_on;
+    Rgba bar_bg, bar_text, back, back_hover, go, go_hover, note_warn;
+};
+
+inline Theme GameTheme() {
+    Theme t;
+    t.title_bg = Hex(0x0000007F), t.title_text = Hex(0xF0F0F0FF);
+    t.panel = Hex(0xBEB4AAF0), t.list_bg = Hex(0xDCDCDCFF), t.header_bg = Hex(0xB4B4B4FF);
+    t.header_text = Hex(0x000000FF), t.row_text = Hex(0x505050FF), t.row_hover = Hex(0x283CF0FF);
+    t.row_pick = Hex(0x000000FF), t.row_pick_bg = Hex(0x00000014), t.muted = Hex(0x8C8C8CFF);
+    t.needs = Hex(0xB4501EFF), t.ready = Hex(0x237823FF), t.busy = Hex(0x000000FF);
+    t.button = Hex(0x3C3C3CFF), t.button_hover = Hex(0x646464FF), t.button_text = Hex(0xF0F0F0FF), t.button_off = Hex(0x8C8C8CFF);
+    t.tab = Hex(0x948C84F0), t.tab_on = Hex(0xBEB4AAF0), t.tab_text = Hex(0xF0F0F0FF), t.tab_text_on = Hex(0x000000FF);
+    t.bar_bg = Hex(0x0000007F), t.bar_text = Hex(0xF0F0F0FF);
+    t.back = Hex(0x8C2323FF), t.back_hover = Hex(0xB42D2DFF), t.go = Hex(0x238C23FF), t.go_hover = Hex(0x2DB42DFF);
+    t.note_warn = Hex(0xB4501EFF);
+    return t;
+}
+
+inline Theme DarkTheme() {
+    Theme t   = GameTheme();
+    t.panel   = Hex(0x1A1C22F2), t.list_bg = Hex(0x22252DFF), t.header_bg = Hex(0x2C303AFF);
+    t.header_text = Hex(0xB8BCC8FF), t.row_text = Hex(0xDCDEE4FF), t.row_hover = Hex(0xFF9A3CFF);
+    t.row_pick = Hex(0xFFFFFFFF), t.row_pick_bg = Hex(0xFF7A1A40), t.muted = Hex(0x80869AFF);
+    t.needs = Hex(0xFFB347FF), t.ready = Hex(0x6FD38AFF), t.busy = Hex(0xFFFFFFFF);
+    t.button = Hex(0x343844FF), t.button_hover = Hex(0x484D5CFF), t.button_off = Hex(0x6A6F7EFF);
+    t.tab = Hex(0x262930F0), t.tab_on = Hex(0x1A1C22F2), t.tab_text = Hex(0x9AA0B0FF), t.tab_text_on = Hex(0xFFFFFFFF);
+    t.back = Hex(0x4A2A2AFF), t.back_hover = Hex(0x6E3434FF), t.go = Hex(0xE8661AFF), t.go_hover = Hex(0xFF7A1AFF);
+    t.note_warn = Hex(0xFFB347FF);
+    return t;
+}
+
+/// The theme frostmod_page.ini describes: "theme=game|dark" picks the base, and any "name=#RRGGBB"
+/// or "#RRGGBBAA" line changes one colour. Unknown lines are ignored.
+inline Theme ReadTheme(const std::string& ini) {
+    Theme t = GameTheme();
+    struct Slot {
+        const char* name;
+        Rgba Theme::*c;
+    };
+    static const Slot slots[] = {
+        {"title_bg", &Theme::title_bg},       {"title_text", &Theme::title_text},   {"panel", &Theme::panel},
+        {"list_bg", &Theme::list_bg},         {"header_bg", &Theme::header_bg},     {"header_text", &Theme::header_text},
+        {"row_text", &Theme::row_text},       {"row_hover", &Theme::row_hover},     {"row_pick", &Theme::row_pick},
+        {"row_pick_bg", &Theme::row_pick_bg}, {"muted", &Theme::muted},             {"needs", &Theme::needs},
+        {"ready", &Theme::ready},             {"busy", &Theme::busy},               {"button", &Theme::button},
+        {"button_hover", &Theme::button_hover}, {"button_text", &Theme::button_text}, {"button_off", &Theme::button_off},
+        {"tab", &Theme::tab},                 {"tab_on", &Theme::tab_on},           {"tab_text", &Theme::tab_text},
+        {"tab_text_on", &Theme::tab_text_on}, {"bar_bg", &Theme::bar_bg},           {"bar_text", &Theme::bar_text},
+        {"back", &Theme::back},               {"back_hover", &Theme::back_hover},   {"go", &Theme::go},
+        {"go_hover", &Theme::go_hover},       {"note_warn", &Theme::note_warn},
+    };
+    std::vector<std::pair<std::string, std::string>> kv;
+    size_t                                           i = 0;
+    while (i < ini.size()) {
+        size_t e = ini.find('\n', i);
+        if (e == std::string::npos) e = ini.size();
+        std::string line = ini.substr(i, e - i);
+        i                = e + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos || line[0] == '#' || line[0] == ';') continue;
+        kv.emplace_back(line.substr(0, eq), line.substr(eq + 1));
+    }
+    for (const auto& p : kv)
+        if (p.first == "theme" && p.second == "dark") t = DarkTheme();
+    for (const auto& p : kv) {
+        const std::string& v = p.second;
+        if (v.size() != 7 && v.size() != 9) continue;
+        if (v[0] != '#') continue;
+        uint32_t x = 0;
+        bool     ok = true;
+        for (size_t k = 1; k < v.size(); ++k) {
+            const char c = v[k];
+            const int  d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) ok = false;
+            x = x * 16 + uint32_t(d < 0 ? 0 : d);
+        }
+        if (!ok) continue;
+        if (v.size() == 7) x = (x << 8) | 0xFF;
+        for (const Slot& s : slots)
+            if (p.first == s.name) t.*(s.c) = Hex(x);
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------------------------------
 // Layout, in fractions of the window (0,0 top left), as the game's .mnu files place things.
 
-/// The button the override main.mnu adds under Race: id_frost_servers.
-constexpr float kButton[4] = {0.0f, 0.411111f, 0.2125f, 0.455556f};
+/// The game's own Race button (ID_MULTIPLAYER in main.mnu): it opens this page instead of the
+/// game's server browser, which stays one tab away (Classic).
+constexpr float kButton[4] = {0.0f, 0.344444f, 0.2125f, 0.388889f};
 
-constexpr float kPanelX0 = 0.2125f;   // the page fills the screen right of the game's menu column
-constexpr float kListY0  = 0.175f;    // the first row's top
-constexpr float kRowH    = 0.038f;
-constexpr int   kRows    = 18;
-constexpr float kBarY0   = 0.888889f; // the button bar (Join, Refresh, Back) at the bottom
+// The page is laid out as the game's Server Browser (multijoin.mnu) is: a title bar, one big
+// panel with a list in it, tabs under the panel, and Back / Join along the bottom.
+constexpr float kTitle[4]   = {0.0f, 0.0f, 1.0f, 0.088889f};
+constexpr float kPanel[4]   = {0.00625f, 0.133333f, 0.99375f, 0.911111f};
+constexpr float kList[4]    = {0.0125f, 0.188889f, 0.9875f, 0.855556f};
+constexpr float kHeaderH    = 0.026f;  // the column headers' band at the top of the list
+constexpr float kRowH       = 0.022222f;
+constexpr int   kRows       = int((0.855556f - 0.188889f - 0.026f) / 0.022222f);  // 28
+constexpr float kListY0     = 0.188889f + 0.026f;  // the first row's top
+constexpr float kTopBtn[4]  = {0.0125f, 0.144444f, 0.1375f, 0.177778f};  // like Host World
+constexpr float kLowBtn[4]  = {0.0125f, 0.866667f, 0.1375f, 0.9f};       // like Refresh
+constexpr float kTabY[2]    = {0.911111f, 0.944444f};
+constexpr float kTabW       = 0.125f;
+constexpr float kBar[4]     = {0.0f, 0.966667f, 1.0f, 1.0f};
+constexpr float kBack[4]    = {0.0f, 0.966667f, 0.1f, 1.0f};
+constexpr float kGo[4]      = {0.84375f, 0.966667f, 1.0f, 1.0f};         // Join / Install & Join
+constexpr float kTextSize   = 0.022222f;  // the game's 0.022222 for buttons, 0.02 for list rows
+constexpr float kRowText    = 0.020f;
 
 /// The row under the pointer at (x, y), counting from `top`, or -1.
 inline int RowAt(float x, float y, int top, int count) {
-    if (x < kPanelX0 + 0.01f || x > 0.99f || y < kListY0) return -1;
+    if (x < kList[0] || x > kList[2] - 0.012f || y < kListY0) return -1;
     const int r = int((y - kListY0) / kRowH);
     if (r < 0 || r >= kRows || top + r >= count) return -1;
     return top + r;
+}
+
+/// The tab `i`'s rectangle along the bottom of the panel.
+inline void TabRect(int i, float r[4]) {
+    r[0] = kPanel[0] + float(i) * kTabW, r[1] = kTabY[0], r[2] = r[0] + kTabW, r[3] = kTabY[1];
 }
 
 inline bool Inside(const float r[4], float x, float y) { return x >= r[0] && x < r[2] && y >= r[1] && y < r[3]; }

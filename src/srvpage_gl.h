@@ -26,6 +26,8 @@
 // Cost: a pointer compare per glBindTexture, a few calls a frame on the main menu, the page's
 // quads only while it is open, and a pipe thread that sleeps 30 ms between polls once started.
 
+#include <windowsx.h>  // GET_X_LPARAM
+
 namespace srvgl {
 
 constexpr uint8_t kMarker[3] = {0xF1, 0x05, 0x7E};  // the marker sprite's colour, R G B
@@ -82,7 +84,6 @@ struct FontTex {
 
 bool                         g_loaded = false, g_load_failed = false;
 FontTex                      g_main, g_data;
-Tex                          g_hover, g_pick;  // main2.tga, main3.tga
 std::vector<srvpage::Server> g_list;
 bool                         g_open = false;
 int                          g_top = 0, g_sel = -1, g_gone = 0;
@@ -125,19 +126,11 @@ bool LoadFont(const std::string& pkz, const char* name, FontTex& out) {
     return true;
 }
 
-bool LoadSprite(const std::string& pkz, const char* name, Tex& out) {
-    srvpage::Image im;
-    if (!srvpage::ReadTga(srvpage::ReadPkz(pkz, name), im)) return false;
-    out = Upload(im.w, im.h, GL_RGBA8, 0x80E1 /*GL_BGRA*/, im.bgra.data());
-    return true;
-}
-
 /// The game's font and sprites, out of its own ui.pkz. Once.
 void LoadArt() {
     if (g_loaded || g_load_failed) return;
     const std::string pkz = GameDir() + "\\ui.pkz";
-    const bool ok = LoadFont(pkz, "ui/main.fnt", g_main) && LoadFont(pkz, "ui/data.fnt", g_data) &&
-                    LoadSprite(pkz, "ui/main2.tga", g_hover) && LoadSprite(pkz, "ui/main3.tga", g_pick);
+    const bool ok = LoadFont(pkz, "ui/main.fnt", g_main) && LoadFont(pkz, "ui/data.fnt", g_data);
     if (ok) g_loaded = true;
     else g_load_failed = true;
     Log("[servers] the game's font and sprites from %s: %s", pkz.c_str(), ok ? "read" : "FAILED");
@@ -201,19 +194,49 @@ void Text(const FontTex& ft, const std::string& s, float x, float y, float size,
     glEnd();
 }
 
-// The bar's buttons, as the main menu draws its own: the game's sprite under the pointer, the
-// label right-aligned in main.fnt at the menu's size.
-struct Button {
-    const char* label;
-    float       r[4];
-};
+// The page's colours (srvpage::Theme): the game's look unless frostmod_page.ini says otherwise.
+srvpage::Theme g_theme = srvpage::GameTheme();
 
-void DrawButton(const Button& b, float mx, float my, bool down, bool enabled) {
-    const float x0 = b.r[0] * g_W, y0 = b.r[1] * g_H, x1 = b.r[2] * g_W, y1 = b.r[3] * g_H;
-    const bool  over = enabled && srvpage::Inside(b.r, mx, my);
-    if (over) Sprite(down ? g_pick : g_hover, x0, y0, x1, y1);
-    const float c = enabled ? 240.0f / 255.0f : 0.45f;
-    Text(g_main, b.label, x1 - 0.00625f * g_W, y0, 0.044444f * g_H, RIGHT, c, c, c);
+void LoadTheme() {
+    std::string dir = g_logPath;
+    const size_t s = dir.find_last_of('\\');
+    std::string  ini;
+    if (s != std::string::npos) {
+        if (FILE* f = _fsopen((dir.substr(0, s + 1) + "frostmod_page.ini").c_str(), "rb", _SH_DENYNO)) {
+            char   buf[8192];
+            size_t n = fread(buf, 1, sizeof(buf), f);
+            fclose(f);
+            ini.assign(buf, n);
+        }
+    }
+    g_theme = srvpage::ReadTheme(ini);
+}
+
+void Fill(const float r[4], const srvpage::Rgba& c) { Quad(r[0] * g_W, r[1] * g_H, r[2] * g_W, r[3] * g_H, c.r, c.g, c.b, c.a); }
+
+void Say(const FontTex& f, const std::string& s, float x, float y, float size, Align al, const srvpage::Rgba& c) {
+    Text(f, s, x * g_W, y * g_H, size * g_H, al, c.r, c.g, c.b, c.a);
+}
+
+/// A button as the game draws them: a flat block, its label right-aligned in main.fnt, lighter
+/// under the pointer. `fill`/`hover` default to the theme's grey buttons.
+void DrawButton(const char* label, const float r[4], float mx, float my, bool enabled, const srvpage::Rgba* fill = nullptr,
+                const srvpage::Rgba* hover = nullptr) {
+    const bool over = enabled && srvpage::Inside(r, mx, my);
+    Fill(r, over ? (hover ? *hover : g_theme.button_hover) : (fill ? *fill : g_theme.button));
+    const float h = (r[3] - r[1]);
+    Say(g_main, label, r[2] - 0.00625f, r[1] + (h - srvpage::kTextSize) * 0.5f, srvpage::kTextSize, RIGHT,
+        enabled ? g_theme.button_text : g_theme.button_off);
+}
+
+/// A label in the bottom bar, as Back / Join sit in the game's: on a coloured block.
+void DrawBarButton(const char* label, const float r[4], float mx, float my, bool enabled, bool left, const srvpage::Rgba& fill,
+                   const srvpage::Rgba& hover) {
+    const bool over = enabled && srvpage::Inside(r, mx, my);
+    if (enabled) Fill(r, over ? hover : fill);
+    const float h = (r[3] - r[1]);
+    Say(g_main, label, left ? r[0] + 0.00625f : r[2] - 0.00625f, r[1] + (h - srvpage::kTextSize) * 0.5f, srvpage::kTextSize,
+        left ? LEFT : RIGHT, enabled ? g_theme.bar_text : g_theme.button_off);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -399,45 +422,49 @@ void Join(const srvpage::Server& s) {
 // The rows each tab shows
 
 struct Row {
-    std::string            c[4];
-    float                  rgb[4][3];
+    std::string            c[5];
+    srvpage::Rgba          col[5];
     const srvpage::Server* server = nullptr;  // what Join joins; null when nothing to join
 };
 
 std::vector<Row> Rows() {
     std::vector<Row> rows;
-    const float      hi = 240.0f / 255.0f, dim = 0.62f;
-    auto             set = [](Row& r, int i, const std::string& t, float cr, float cg, float cb) {
-        r.c[i] = t, r.rgb[i][0] = cr, r.rgb[i][1] = cg, r.rgb[i][2] = cb;
+    const srvpage::Theme& t = g_theme;
+    auto need_text = [](const srvpage::Server& s) {
+        std::string need;
+        for (const std::string& m : s.missing) need += (need.empty() ? "needs " : " + ") + m;
+        return need;
     };
     if (g_tab == FRIENDS) {
         for (const srvpage::Friend& f : g_friends) {
             Row r;
-            const float c = f.online ? hi : 0.45f;
-            set(r, 0, f.name, c, c, c);
+            r.c[0] = f.name, r.col[0] = f.online ? t.row_text : t.muted;
             if (f.has_server) {
-                set(r, 1, f.on.name, hi, hi, hi);
-                set(r, 2, f.on.track, dim, dim, dim);
-                set(r, 3, f.on.missing.empty() ? "Join" : "Install & Join", 1.0f, 0.78f, 0.25f);
+                r.c[1] = f.on.name, r.col[1] = t.row_text;
+                r.c[2] = f.on.track, r.col[2] = t.row_text;
+                char riders[24];
+                sprintf_s(riders, "%d/%d", f.on.players, f.on.max_players);
+                r.c[3] = riders, r.col[3] = t.row_text;
+                const std::string need = need_text(f.on);
+                r.c[4] = need.empty() ? "ready" : need, r.col[4] = need.empty() ? t.ready : t.needs;
                 r.server = &f.on;
             } else {
-                set(r, 1, f.online ? "Online - in the menus" : "Offline", dim, dim, dim);
+                r.c[1] = f.online ? "In the menus" : "Offline", r.col[1] = t.muted;
             }
             rows.push_back(r);
         }
     } else {
         for (const srvpage::Server& s : g_list) {
             Row r;
-            const float c = s.joinable ? hi : 0.45f;
-            set(r, 0, s.name + (s.passworded ? "  [pw]" : ""), c, c, c);
-            set(r, 1, s.track, c, c, c);
+            const srvpage::Rgba c = s.joinable ? t.row_text : t.muted;
+            r.c[0] = s.name + (s.passworded ? "  [pw]" : ""), r.col[0] = c;
+            r.c[1] = s.track, r.col[1] = c;
+            r.c[2] = s.category, r.col[2] = c;
             char riders[24];
             sprintf_s(riders, "%d/%d", s.players, s.max_players);
-            set(r, 2, riders, s.players > 0 ? 1.0f : c, s.players > 0 ? 0.78f : c, s.players > 0 ? 0.25f : c);
-            std::string need;
-            for (const std::string& m : s.missing) need += (need.empty() ? "needs " : " + ") + m;
-            set(r, 3, need.empty() ? "ready" : need, need.empty() ? 0.45f : 1.0f, need.empty() ? 0.75f : 0.62f,
-                need.empty() ? 0.45f : 0.2f);
+            r.c[3] = riders, r.col[3] = s.players > 0 ? t.busy : c;
+            const std::string need = need_text(s);
+            r.c[4] = need.empty() ? "ready" : need, r.col[4] = need.empty() ? t.ready : t.needs;
             r.server = &s;
             rows.push_back(r);
         }
@@ -446,32 +473,82 @@ std::vector<Row> Rows() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Typing a friend code: letters, digits and '-', polled like everything else
+// Input the game must not see
+//
+// The page covers the game's whole main menu, buttons included, so while it is open the game
+// may not have the mouse or the keyboard: the game's window procedure is wrapped and, while the
+// page is up, mouse buttons, the wheel and keys stop here. On the main menu a click on Race
+// stops here too and opens the page instead of the game's server browser. Classic hands one
+// click on Race back to the game. The wheel scrolls the list; typed characters fill the
+// friend-code box.
 
-void TypeCode(bool focus) {
-    static bool held[256] = {};
-    if (!focus) return;
-    auto edge = [&](int vk) {
-        const bool k  = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        const bool on = k && !held[vk];
-        held[vk]      = k;
-        return on;
-    };
-    for (int vk = 'A'; vk <= 'Z'; ++vk)
-        if (edge(vk) && g_code.size() < 32) g_code += char(vk);
-    for (int vk = '0'; vk <= '9'; ++vk)
-        if (edge(vk) && g_code.size() < 32) g_code += char(vk);
-    if (edge(VK_OEM_MINUS) && g_code.size() < 32) g_code += '-';
-    if (edge(VK_BACK) && !g_code.empty()) g_code.pop_back();
-    if (edge(VK_RETURN) && !g_code.empty()) {
-        if (!pipe::g_connected) Status("Open MXB App to add friends from here", 6000);
-        else {
-            pipe::Send("{\"op\":\"friend_add\",\"code\":" + srvpage::Quote(g_code) + "}");
-            Status("Sending the friend request...", 6000);
-        }
-        g_adding = false, g_code.clear();
+WNDPROC               g_game_proc = nullptr;
+HWND                  g_game_wnd  = nullptr;
+std::atomic<bool>     g_swallow{false};        // the page is open
+std::atomic<bool>     g_race_armed{false};     // the main menu is up: Race is ours
+std::atomic<bool>     g_open_asked{false};     // Race was clicked
+std::atomic<uint64_t> g_pass_until{0};         // Classic: let the game have Race until then
+std::atomic<int>      g_wheel{0};              // wheel notches since the last frame
+std::mutex            g_typed_mu;
+std::string           g_typed;                 // characters typed since the last frame
+std::atomic<bool>     g_esc{false}, g_enter{false};
+
+bool OverRace(HWND w, LPARAM lp) {
+    RECT rc{};
+    if (!GetClientRect(w, &rc) || rc.right <= 0 || rc.bottom <= 0) return false;
+    const float x = float(GET_X_LPARAM(lp)) / float(rc.right), y = float(GET_Y_LPARAM(lp)) / float(rc.bottom);
+    return srvpage::Inside(srvpage::kButton, x, y);
+}
+
+LRESULT CALLBACK PageProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    const bool pass = GetTickCount64() < g_pass_until.load();
+    if (!pass && g_race_armed && !g_swallow && (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP || m == WM_LBUTTONDBLCLK) &&
+        OverRace(w, lp)) {
+        if (m == WM_LBUTTONUP) g_open_asked = true;
+        return 0;
     }
-    if (edge(VK_ESCAPE)) g_adding = false, g_code.clear();
+    if (g_swallow) {
+        switch (m) {
+            case WM_MOUSEWHEEL: g_wheel += GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA; return 0;
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+            case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_XBUTTONDOWN: case WM_XBUTTONUP: return 0;
+            case WM_CHAR: {
+                std::lock_guard<std::mutex> lk(g_typed_mu);
+                if (wp >= 32 && wp < 127 && g_typed.size() < 64) g_typed += char(wp);
+                else if (wp == 8) g_typed += '\b';
+                return 0;
+            }
+            case WM_KEYDOWN:
+                if (wp == VK_ESCAPE) g_esc = true;
+                if (wp == VK_RETURN) g_enter = true;
+                return 0;
+            case WM_KEYUP: case WM_SYSKEYDOWN: if (m == WM_KEYUP) return 0; break;
+        }
+    }
+    return CallWindowProcW(g_game_proc, w, m, wp, lp);
+}
+
+void Hook(HWND w) {
+    if (g_game_proc || !w) return;
+    g_game_wnd  = w;
+    g_game_proc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(w, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&PageProc)));
+    Log("[mxb] input hook %s", g_game_proc ? "in" : "FAILED");
+}
+
+/// Classic: the game's own server browser, by handing it one click on Race.
+void Classic(HWND w) {
+    RECT rc{};
+    if (!GetClientRect(w, &rc)) return;
+    const int x = int(rc.right * (srvpage::kButton[0] + srvpage::kButton[2]) * 0.5f);
+    const int y = int(rc.bottom * (srvpage::kButton[1] + srvpage::kButton[3]) * 0.5f);
+    POINT     pt{x, y};
+    ClientToScreen(w, &pt);
+    SetCursorPos(pt.x, pt.y);
+    g_pass_until = GetTickCount64() + 600;
+    PostMessageW(w, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+    PostMessageW(w, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+    PostMessageW(w, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -510,21 +587,7 @@ void MaybeShot(int w, int h) {
 // ---------------------------------------------------------------------------------------
 // The frame
 
-// The tabs, as big titles across the top in the menu's font; the bar's buttons per tab.
-const float kTabFriends[4] = {0.2300f, 0.030f, 0.3900f, 0.095f};
-const float kTabServers[4] = {0.4100f, 0.030f, 0.6600f, 0.095f};
-const Button kJoin    = {"Join", {0.5875f, srvpage::kBarY0, 0.7375f, srvpage::kBarY0 + 0.044444f}};
-const Button kAdd     = {"Add friend", {0.5375f, srvpage::kBarY0, 0.7375f, srvpage::kBarY0 + 0.044444f}};
-const Button kRefresh = {"Refresh", {0.7375f, srvpage::kBarY0, 0.8875f, srvpage::kBarY0 + 0.044444f}};
-const Button kBack    = {"Back", {0.8875f, srvpage::kBarY0, 1.0f, srvpage::kBarY0 + 0.044444f}};
-
-void DrawTab(const char* label, const float r[4], bool on, float mx, float my) {
-    const float hi = 240.0f / 255.0f;
-    const bool  over = !on && srvpage::Inside(r, mx, my);
-    const float c = on ? hi : over ? 0.85f : 0.42f;
-    Text(g_main, label, r[0] * g_W, r[1] * g_H, (r[3] - r[1]) * g_H, LEFT, c, c, c);
-    if (on) Quad(r[0] * g_W, r[3] * g_H + 2, r[0] * g_W + srvpage::TextWidth(g_main.f, label, (r[3] - r[1]) * g_H), r[3] * g_H + 5, 1.0f, 0.48f, 0.1f, 1.0f);
-}
+const char* const kTabName[3] = {"Friends", "Servers", "Classic"};
 
 /// Every presented frame in the menus, from the swap hook.
 void Frame(HDC hdc) {
@@ -544,6 +607,7 @@ void Frame(HDC hdc) {
     RECT rc{};
     POINT pt{};
     if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
+    if (seen) Hook(hwnd);
     g_W = rc.right, g_H = rc.bottom;
     GetCursorPos(&pt);
     ScreenToClient(hwnd, &pt);
@@ -552,37 +616,42 @@ void Frame(HDC hdc) {
     const bool  down  = focus && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool  click = g_down && !down;  // released this frame
     g_down            = down;
-    // Under the pointer the game draws our button's hover sprite instead of the marker, so the
-    // marker goes missing exactly when the button is clicked. Whether the pointer came onto the
-    // button from the main menu is what counts while it stays there.
+    // Under the pointer the game draws Race's hover sprite instead of the marker, so the marker
+    // goes missing exactly when Race is clicked. Whether the pointer came onto Race from the main
+    // menu is what counts while it stays there.
     static bool over_prev = false, entered_on_menu = false;
     const bool  over = srvpage::Inside(srvpage::kButton, mx, my);
     if (over && !over_prev) entered_on_menu = seen;
     over_prev       = over;
     const bool menu = over ? entered_on_menu : seen;
+    g_race_armed    = menu && g_game_proc != nullptr;
 
     // Whatever MXB App sent since the last frame, page open or not (join progress included).
     for (const std::string& line : pipe::Drain()) Handle(line, hwnd);
 
     if (!g_open) {
-        if (menu && click && over) {
+        // Race, caught in the window procedure (or, without it, seen here).
+        const bool asked = g_open_asked.exchange(false) || (!g_game_proc && menu && click && over);
+        if (asked && menu) {
             LoadArt();
             if (g_loaded) {
+                LoadTheme();
                 pipe::Start();
                 if (pipe::g_connected) Ask();
-                g_open = true, g_gone = 0, g_top = 0, g_sel = -1;
+                g_open = true, g_gone = 0, g_top = 0, g_sel = -1, g_tab = FRIENDS;
+                g_swallow = true, g_wheel = 0, g_esc = false, g_enter = false;
                 Log("[mxb] page opened");
             }
         }
         if (!g_open) return;
     }
-    // The game moved on (Testing, Settings...): the page goes with the main menu.
+    auto close = [&](const char* why) {
+        g_open = false, g_adding = false, g_swallow = false;
+        Log("[mxb] page closed (%s)", why);
+    };
+    // The game moved on (a join restarting it, a dialog): the page goes with the main menu.
     g_gone = menu ? 0 : g_gone + 1;
-    if (g_gone > 3) {
-        g_open = false, g_adding = false;
-        Log("[mxb] page closed with the main menu");
-        return;
-    }
+    if (g_gone > 30) return close("the main menu went away");
     // Connected late (MXB App started after the page opened), and the friends list kept fresh.
     static bool was_connected = false;
     if (pipe::g_connected && !was_connected) Ask();
@@ -596,47 +665,68 @@ void Frame(HDC hdc) {
     const int              count = int(rows.size());
     if (g_sel >= count) g_sel = -1;
     const srvpage::Server* target = g_sel >= 0 ? rows[size_t(g_sel)].server : nullptr;
-    Button                 join   = kJoin;  // "Install & Join" when the server needs something first
-    if (target && !target->missing.empty()) join.label = "Install & Join", join.r[0] = 0.4875f;
+    const bool             needs  = target && !target->missing.empty();
+    const bool             can_go = target && pipe::g_connected &&
+                        std::find(target->missing.begin(), target->missing.end(), "bike") == target->missing.end();
 
-    // Input
-    if (g_adding) TypeCode(focus);
+    // Keys: Esc closes (or cancels the friend code), typing fills the code box.
+    std::string typed;
+    {
+        std::lock_guard<std::mutex> lk(g_typed_mu);
+        typed.swap(g_typed);
+    }
+    if (g_adding) {
+        for (char c : typed) {
+            if (c == '\b') {
+                if (!g_code.empty()) g_code.pop_back();
+            } else if (g_code.size() < 16 && (isalnum((unsigned char)c) || c == '-')) {
+                g_code += char(toupper((unsigned char)c));
+            }
+        }
+        if (g_enter.exchange(false) && !g_code.empty()) {
+            pipe::Send("{\"op\":\"friend_add\",\"code\":" + srvpage::Quote(g_code) + "}");
+            Status("Sending the friend request...", 6000);
+            g_adding = false, g_code.clear();
+        }
+        if (g_esc.exchange(false)) g_adding = false, g_code.clear();
+    } else {
+        g_enter = false;
+        if (g_esc.exchange(false)) return close("Esc");
+    }
+    g_top -= g_wheel.exchange(0) * 3;
+
+    // Clicks
     if (click) {
         const int row = srvpage::RowAt(mx, my, g_top, count);
-        if (srvpage::Inside(kTabFriends, mx, my) && g_tab != FRIENDS) {
-            g_tab = FRIENDS, g_top = 0, g_sel = -1;
-            if (pipe::g_connected) pipe::Send("{\"op\":\"friends\"}");
-        } else if (srvpage::Inside(kTabServers, mx, my) && g_tab != SERVERS) {
-            g_tab = SERVERS, g_top = 0, g_sel = -1, g_adding = false;
-        } else if (mx > 0.975f && my >= srvpage::kListY0 && my < srvpage::kListY0 + srvpage::kRows * srvpage::kRowH &&
-                   count > 0) {
-            const float k = (my - srvpage::kListY0) / (srvpage::kRows * srvpage::kRowH);
-            g_top = (std::max)(0, (std::min)(count - srvpage::kRows, int(k * float(count)) - srvpage::kRows / 2));
-        } else if (row >= 0) {
-            if (row == g_last_click_row && now_ms - g_last_click_ms < 450 && rows[size_t(row)].server)
-                Join(*rows[size_t(row)].server);
-            g_sel = row, g_last_click_row = row, g_last_click_ms = now_ms;
-        } else if (srvpage::Inside(join.r, mx, my) && target) {
+        float     tab[4];
+        int       hit_tab = -1;
+        for (int i = 0; i < 3; ++i) {
+            srvpage::TabRect(i, tab);
+            if (srvpage::Inside(tab, mx, my)) hit_tab = i;
+        }
+        if (hit_tab == 2) {
+            close("Classic");
+            Classic(hwnd);
+            return;
+        } else if (hit_tab >= 0 && hit_tab != int(g_tab)) {
+            g_tab = Tab(hit_tab), g_top = 0, g_sel = -1, g_adding = false;
+            if (pipe::g_connected) pipe::Send(g_tab == FRIENDS ? "{\"op\":\"friends\"}" : "{\"op\":\"servers\"}");
+        } else if (srvpage::Inside(srvpage::kBack, mx, my)) {
+            return close("Back");
+        } else if (srvpage::Inside(srvpage::kGo, mx, my) && can_go) {
             Join(*target);
-        } else if (g_tab == FRIENDS && srvpage::Inside(kAdd.r, mx, my) && !g_adding) {
-            g_adding = true, g_code.clear();
-        } else if (srvpage::Inside(kRefresh.r, mx, my)) {
+        } else if (srvpage::Inside(srvpage::kLowBtn, mx, my)) {
             if (pipe::g_connected) Ask();
             Status(pipe::g_connected ? "Asked MXB App again" : "Open MXB App to use this", 2500);
-        } else if (srvpage::Inside(kBack.r, mx, my)) {
-            g_open = false, g_adding = false;
-            Log("[mxb] page closed");
-            return;
-        }
-    }
-    if (focus && !g_adding) {
-        static bool held[4] = {};
-        const int   keys[4] = {VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
-        const int   step[4] = {-1, 1, -srvpage::kRows, srvpage::kRows};
-        for (int i = 0; i < 4; ++i) {
-            const bool k = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-            if (k && !held[i]) g_top += step[i];
-            held[i] = k;
+        } else if (g_tab == FRIENDS && srvpage::Inside(srvpage::kTopBtn, mx, my) && pipe::g_connected) {
+            g_adding = !g_adding, g_code.clear();
+        } else if (mx > srvpage::kList[2] - 0.012f && my >= srvpage::kListY0 && my < srvpage::kList[3] && count > srvpage::kRows) {
+            const float k = (my - srvpage::kListY0) / (srvpage::kList[3] - srvpage::kListY0);
+            g_top = int(k * float(count)) - srvpage::kRows / 2;
+        } else if (row >= 0) {
+            if (row == g_last_click_row && now_ms - g_last_click_ms < 450 && rows[size_t(row)].server && pipe::g_connected)
+                Join(*rows[size_t(row)].server);
+            g_sel = row, g_last_click_row = row, g_last_click_ms = now_ms;
         }
     }
     g_top = (std::max)(0, (std::min)(g_top, count - srvpage::kRows));
@@ -657,85 +747,99 @@ void Frame(HDC hdc) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
 
-    const float W = float(g_W), H = float(g_H), x0 = srvpage::kPanelX0 * W;
-    const float hi = 240.0f / 255.0f, dim = 0.62f;
-    Quad(x0, 0, W, H, 0, 0, 0, 0.78f);
-    DrawTab("Friends", kTabFriends, g_tab == FRIENDS, mx, my);
-    DrawTab("Install & Join", kTabServers, g_tab == SERVERS, mx, my);
+    const srvpage::Theme& t = g_theme;
+    // The main menu's column is under the page: the rest of the screen is dimmed to match it,
+    // and the panel is solid where the column's buttons would show through.
+    const float right[4] = {0.2125f, 0.0f, 1.0f, 1.0f};
+    Fill(right, srvpage::Rgba{0, 0, 0, 0.5f});
+    Fill(srvpage::kTitle, t.title_bg);
+    Say(g_main, g_tab == FRIENDS ? "Friends" : "Install & Join", 0.9875f, 0.0111f, 0.066667f, RIGHT, t.title_text);
+    srvpage::Rgba solid = t.panel;
+    solid.a             = 1.0f;
+    const float column[4] = {srvpage::kPanel[0], srvpage::kPanel[1], 0.2125f, srvpage::kPanel[3]};
+    Fill(column, solid);
+    Fill(srvpage::kPanel, t.panel);
 
-    // The line under the tabs: whether MXB App is there, and what this tab is for.
-    std::string note;
-    float       nr = dim, ng = dim, nb = dim;
-    if (!pipe::g_connected) {
-        note = "Open MXB App on this PC to use this page", nr = 1.0f, ng = 0.62f, nb = 0.2f;
-    } else if (g_tab == FRIENDS) {
+    // Above the list: the tab's button on the left, what's going on on the right.
+    if (g_tab == FRIENDS) DrawButton(g_adding ? "Cancel" : "Add Friend", srvpage::kTopBtn, mx, my, pipe::g_connected);
+    std::string   note;
+    srvpage::Rgba note_c = t.header_text;
+    if (!pipe::g_connected) note = "Open MXB App on this PC to use this page", note_c = t.note_warn;
+    else if (g_adding) note = "Friend code:  " + g_code + ((now_ms / 500) % 2 ? "_" : " ") + "     Enter to send", note_c = t.header_text;
+    else if (g_tab == FRIENDS) {
         if (!g_have_friends) note = "Asking MXB App for your friends...";
-        else if (!g_friends_note.empty()) note = g_friends_note, nr = 1.0f, ng = 0.62f, nb = 0.2f;
+        else if (!g_friends_note.empty()) note = g_friends_note, note_c = t.note_warn;
         else {
             int on = 0;
             for (const srvpage::Friend& f : g_friends) on += f.online;
-            note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) +
-                   " online   -   join one, even on a track you don't have yet";
+            note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) + " online - join one, even on a track you don't have";
         }
-    } else {
-        note = g_have_servers ? "Any server, even on a track you don't have: MXB App installs it, then joins"
-                              : "Asking MXB App for the servers...";
-    }
-    Text(g_data, note, 0.237f * W, 0.112f * H, 0.024f * H, LEFT, nr, ng, nb);
+    } else note = g_have_servers ? "A track you don't have? MXB App installs it, then joins" : "Asking MXB App for the servers...";
+    Say(g_main, srvpage::Fit(g_main.f, note, srvpage::kTextSize * g_H, 0.8f * g_W), g_adding ? 0.15f : 0.9875f, 0.15f,
+        srvpage::kTextSize, g_adding ? LEFT : RIGHT, note_c);
 
-    float cx[4] = {0.235f, 0.585f, 0.81f, 0.83f};
-    if (g_tab == FRIENDS) cx[1] = 0.42f, cx[2] = 0.66f;
-    const char*  head[2][4] = {{"Friend", "Where", "Track", ""}, {"Server", "Track", "Riders", "Needs"}};
-    const Align  al[4]   = {LEFT, LEFT, g_tab == FRIENDS ? LEFT : RIGHT, LEFT};
-    const float  hy      = 0.148f * H, rowSize = 0.0255f;
-    for (int i = 0; i < 4; ++i)
-        Text(g_data, head[g_tab == FRIENDS ? 0 : 1][i], cx[i] * W, hy, 0.021f * H, al[i], dim, dim, dim);
-    Quad(x0 + 0.0225f * W, srvpage::kListY0 * H - 3, 0.97f * W, srvpage::kListY0 * H - 2, 1, 1, 1, 0.18f);
-
+    // The list: headers, rows, the scroll bar.
+    Fill(srvpage::kList, t.list_bg);
+    const float hb[4] = {srvpage::kList[0], srvpage::kList[1], srvpage::kList[2], srvpage::kList[1] + srvpage::kHeaderH};
+    Fill(hb, t.header_bg);
+    const bool  fr        = g_tab == FRIENDS;
+    const float cx[5]     = {0.0175f, fr ? 0.22f : 0.40f, fr ? 0.52f : 0.60f, 0.78f, 0.80f};
+    const float cw[5]     = {fr ? 0.19f : 0.37f, fr ? 0.28f : 0.19f, fr ? 0.22f : 0.13f, 0.06f, 0.17f};
+    const char* head[2][5] = {{"Friend", "Server", "Track", "Riders", "Needs"}, {"Name", "Track", "Class", "Riders", "Needs"}};
+    for (int c = 0; c < 5; ++c)
+        Say(g_main, head[fr ? 0 : 1][c], c == 3 ? cx[3] : cx[c], srvpage::kList[1] + 0.003f, srvpage::kRowText, c == 3 ? RIGHT : LEFT,
+            t.header_text);
     const int hover = srvpage::RowAt(mx, my, g_top, count);
     for (int i = 0; i < srvpage::kRows && g_top + i < count; ++i) {
         const int   idx = g_top + i;
         const Row&  r   = rows[size_t(idx)];
-        const float ry0 = (srvpage::kListY0 + i * srvpage::kRowH) * H, ry1 = ry0 + srvpage::kRowH * H;
-        if (idx == g_sel) Sprite(g_pick, x0 + 0.0125f * W, ry0, 0.97f * W, ry1);
-        else if (idx == hover) Sprite(g_hover, x0 + 0.0125f * W, ry0, 0.97f * W, ry1, 0.8f);
-        const float ty = ry0 + (srvpage::kRowH - rowSize) * 0.5f * H, sz = rowSize * H;
-        const float right[4] = {cx[1] - 0.015f, cx[2] - 0.015f, 0.82f, 0.965f};
-        for (int c = 0; c < 4; ++c) {
+        const float y0  = srvpage::kListY0 + float(i) * srvpage::kRowH;
+        if (idx == g_sel) {
+            const float sel[4] = {srvpage::kList[0], y0, srvpage::kList[2] - 0.012f, y0 + srvpage::kRowH};
+            Fill(sel, t.row_pick_bg);
+        }
+        for (int c = 0; c < 5; ++c) {
             if (r.c[c].empty()) continue;
-            const Align a   = (g_tab == SERVERS && c == 2) ? RIGHT : LEFT;
-            const float w   = a == RIGHT ? 0.08f * W : (right[c] - cx[c]) * W;
-            Text(g_data, srvpage::Fit(g_data.f, r.c[c], sz, w), cx[c] * W, ty, sz, a, r.rgb[c][0], r.rgb[c][1], r.rgb[c][2]);
+            const srvpage::Rgba col = idx == g_sel ? t.row_pick : idx == hover ? t.row_hover : r.col[c];
+            Say(g_main, srvpage::Fit(g_main.f, r.c[c], srvpage::kRowText * g_H, cw[c] * g_W), cx[c], y0 + 0.001f, srvpage::kRowText,
+                c == 3 ? RIGHT : LEFT, col);
         }
     }
-    if (count == 0 && pipe::g_connected && (g_tab == SERVERS ? g_have_servers : g_have_friends))
-        Text(g_data, g_tab == FRIENDS ? "No friends yet - Add friend with their code (in MXB App > Servers > Friends)"
-                                      : "No servers right now",
-             0.237f * W, (srvpage::kListY0 + 0.01f) * H, 0.024f * H, LEFT, dim, dim, dim);
+    if (count == 0 && pipe::g_connected && (fr ? g_have_friends : g_have_servers))
+        Say(g_main, fr ? "No friends yet - Add Friend with their code (MXB App > Servers > Friends shows yours)" : "No servers right now",
+            0.0175f, srvpage::kListY0 + 0.004f, srvpage::kRowText, LEFT, t.muted);
     if (count > srvpage::kRows) {
-        const float sy0 = srvpage::kListY0 * H, sy1 = (srvpage::kListY0 + srvpage::kRows * srvpage::kRowH) * H;
-        Quad(0.978f * W, sy0, 0.982f * W, sy1, 1, 1, 1, 0.12f);
+        const float y0 = srvpage::kListY0, y1 = srvpage::kList[3];
         const float a = float(g_top) / float(count), b = float(g_top + srvpage::kRows) / float(count);
-        Quad(0.976f * W, sy0 + a * (sy1 - sy0), 0.984f * W, sy0 + b * (sy1 - sy0), 1, 1, 1, 0.55f);
+        const float track[4] = {srvpage::kList[2] - 0.008f, y0, srvpage::kList[2] - 0.003f, y1};
+        const float thumb[4] = {srvpage::kList[2] - 0.009f, y0 + a * (y1 - y0), srvpage::kList[2] - 0.002f, y0 + b * (y1 - y0)};
+        Fill(track, t.header_bg);
+        Fill(thumb, t.button);
     }
 
-    // The bar
-    Quad(x0, srvpage::kBarY0 * H, W, (srvpage::kBarY0 + 0.044444f) * H, 0, 0, 0, 0.35f);
-    if (g_adding) {
-        const std::string box = "Friend code: " + g_code + ((now_ms / 500) % 2 ? "_" : " ") + "   Enter to send";
-        Text(g_data, box, 0.237f * W, (srvpage::kBarY0 + 0.011f) * H, 0.024f * H, LEFT, hi, hi, hi);
-    } else if (GetTickCount64() < g_status_until) {
-        Text(g_data, srvpage::Fit(g_data.f, g_status, 0.022f * H, 0.29f * W), 0.237f * W, (srvpage::kBarY0 + 0.011f) * H,
-             0.022f * H, LEFT, 1.0f, 0.78f, 0.25f);
-    } else if (count) {
-        char range[64];
-        sprintf_s(range, "%d-%d of %d", g_top + 1, (std::min)(count, g_top + srvpage::kRows), count);
-        Text(g_data, range, 0.237f * W, (srvpage::kBarY0 + 0.011f) * H, 0.022f * H, LEFT, dim, dim, dim);
+    // Under the list: Refresh, and what MXB App is doing (join progress).
+    DrawButton("Refresh", srvpage::kLowBtn, mx, my, true);
+    if (GetTickCount64() < g_status_until)
+        Say(g_main, srvpage::Fit(g_main.f, g_status, srvpage::kTextSize * g_H, 0.6f * g_W), 0.5f, 0.872f, srvpage::kTextSize, CENTRE,
+            t.header_text);
+    else if (count)
+        Say(g_main, std::to_string(g_top + 1) + "-" + std::to_string((std::min)(count, g_top + srvpage::kRows)) + " of " + std::to_string(count),
+            0.9875f, 0.872f, srvpage::kTextSize, RIGHT, t.header_text);
+
+    // The tabs, under the panel as the game's Local / World are.
+    for (int i = 0; i < 3; ++i) {
+        float r[4];
+        srvpage::TabRect(i, r);
+        const bool on = i == int(g_tab);
+        Fill(r, on ? t.tab_on : srvpage::Inside(r, mx, my) ? t.tab_on : t.tab);
+        Say(g_main, kTabName[i], r[0] + 0.00625f, r[1] + (r[3] - r[1] - srvpage::kTextSize) * 0.5f, srvpage::kTextSize, LEFT,
+            on ? t.tab_text_on : t.tab_text);
     }
-    if (g_tab == FRIENDS && !target) DrawButton(kAdd, mx, my, down, pipe::g_connected && !g_adding);
-    else DrawButton(join, mx, my, down, target != nullptr && pipe::g_connected);
-    DrawButton(kRefresh, mx, my, down, true);
-    DrawButton(kBack, mx, my, down, true);
+
+    // The bottom bar: Back, and Join / Install & Join.
+    Fill(srvpage::kBar, t.bar_bg);
+    DrawBarButton("Back", srvpage::kBack, mx, my, true, true, t.back, t.back_hover);
+    DrawBarButton(needs && can_go ? "Install & Join" : "Join", srvpage::kGo, mx, my, can_go, false, t.go, t.go_hover);
 
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
@@ -746,7 +850,7 @@ void Frame(HDC hdc) {
 
 }  // namespace srvgl
 
-/// At init: on only when the override main.mnu with our button sits beside mxbikes.exe.
+/// At init: on only when the override main.mnu with our marker on Race sits beside mxbikes.exe.
 static void SrvInstall(HMODULE gl) {
     const std::string mnu = srvgl::GameDir() + "\\ui\\main.mnu";
     bool              ours = false;
@@ -755,7 +859,7 @@ static void SrvInstall(HMODULE gl) {
         size_t n = fread(buf, 1, sizeof(buf) - 1, f);
         fclose(f);
         buf[n] = 0;
-        ours   = strstr(buf, "id_frost_servers") != nullptr;
+        ours   = strstr(buf, "frostsrv1.tga") != nullptr;
     }
     if (!ours) return;
     if (!gl) return Log("[servers] the Servers button is in main.mnu, but opengl32 isn't loaded - page off");

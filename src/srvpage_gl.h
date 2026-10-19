@@ -27,6 +27,10 @@
 // quads only while it is open, and a pipe thread that sleeps 30 ms between polls once started.
 
 #include <windowsx.h>  // GET_X_LPARAM
+#ifndef DIRECTINPUT_VERSION
+#define DIRECTINPUT_VERSION 0x0800
+#endif
+#include <dinput.h>    // the game reads its mouse and keys through it
 
 namespace srvgl {
 
@@ -233,7 +237,8 @@ void DrawButton(const char* label, const float r[4], float mx, float my, bool en
 void DrawBarButton(const char* label, const float r[4], float mx, float my, bool enabled, bool left, const srvpage::Rgba& fill,
                    const srvpage::Rgba& hover) {
     const bool over = enabled && srvpage::Inside(r, mx, my);
-    if (enabled) Fill(r, over ? hover : fill);
+    (void)fill;
+    if (over) Fill(r, hover);  // the game's bar shows its colour only under the pointer
     const float h = (r[3] - r[1]);
     Say(g_main, label, left ? r[0] + 0.00625f : r[2] - 0.00625f, r[1] + (h - srvpage::kTextSize) * 0.5f, srvpage::kTextSize,
         left ? LEFT : RIGHT, enabled ? g_theme.bar_text : g_theme.button_off);
@@ -537,6 +542,260 @@ void Hook(HWND w) {
 }
 
 /// Classic: the game's own server browser, by handing it one click on Race.
+// The game reads the mouse and keyboard through DirectInput, not window messages, so holding
+// them back happens there too: the devices' GetDeviceState and GetDeviceData are hooked (one
+// vtable per interface flavour, shared by every device of that flavour). While the page is open
+// the mouse's buttons and wheel and every key read as idle - the pointer still moves. On the main
+// menu, a press over Race is eaten the same way, so the game never opens its own browser. Classic
+// hands Race back by reporting the left button pressed for a few reads, then released.
+
+std::atomic<bool> g_eat_mouse{false};  // the page is open, or the pointer is over Race on the main menu
+std::atomic<bool> g_eat_keys{false};   // the page is open
+std::atomic<int>  g_fake_click{0};     // Classic: reads left of a pressed-then-released left button
+std::atomic<unsigned> g_di_reads[3] = {};  // diagnostics: mouse state reads, mouse buffered reads, eaten
+
+typedef HRESULT(STDMETHODCALLTYPE* DiState_t)(void*, DWORD, LPVOID);
+typedef HRESULT(STDMETHODCALLTYPE* DiData_t)(void*, DWORD, void*, LPDWORD, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* DiInfo_t)(void*, void*);
+DiState_t g_di_state[2] = {};
+DiData_t  g_di_data[2]  = {};
+
+/// What `dev` is: 1 a mouse, 2 a keyboard, 0 anything else. Asked of the device once.
+int DevType(void* dev, bool wide) {
+    static std::mutex             mu;
+    static std::vector<std::pair<void*, int>> seen;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto& p : seen)
+            if (p.first == dev) return p.second;
+    }
+    int type = 0;
+    // IDirectInputDevice8::GetDeviceInfo is the 16th method; the A and W structs differ only
+    // after dwDevType, which is all that is read.
+    alignas(8) unsigned char info[1024] = {};
+    *reinterpret_cast<DWORD*>(info) = wide ? DWORD(sizeof(DIDEVICEINSTANCEW)) : DWORD(sizeof(DIDEVICEINSTANCEA));
+    auto get = reinterpret_cast<DiInfo_t>((*reinterpret_cast<void***>(dev))[15]);
+    if (SUCCEEDED(get(dev, info))) {
+        const DWORD t = reinterpret_cast<DIDEVICEINSTANCEA*>(info)->dwDevType & 0xFF;
+        type = t == DI8DEVTYPE_MOUSE ? 1 : t == DI8DEVTYPE_KEYBOARD ? 2 : 0;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    if (seen.size() < 64) seen.emplace_back(dev, type);
+    return type;
+}
+
+template <int W>
+HRESULT STDMETHODCALLTYPE hkDiState(void* dev, DWORD cb, LPVOID data) {
+    const HRESULT hr = g_di_state[W](dev, cb, data);
+    if (FAILED(hr) || !data) return hr;
+    if ((cb == sizeof(DIMOUSESTATE) || cb == sizeof(DIMOUSESTATE2)) && DevType(dev, W == 1) == 1) {
+        ++g_di_reads[0];
+        auto* m = static_cast<DIMOUSESTATE*>(data);
+        if (int n = g_fake_click.load(); n > 0) {
+            m->rgbButtons[0] = n > 3 ? 0x80 : 0;  // pressed for a few reads, then released
+            g_fake_click     = n - 1;
+        } else if (g_eat_mouse) {
+            m->lZ = 0;
+            memset(static_cast<BYTE*>(data) + offsetof(DIMOUSESTATE, rgbButtons), 0, cb - offsetof(DIMOUSESTATE, rgbButtons));
+        }
+    } else if (cb == 256 && g_eat_keys && DevType(dev, W == 1) == 2) {
+        memset(data, 0, 256);
+    }
+    return hr;
+}
+
+template <int W>
+HRESULT STDMETHODCALLTYPE hkDiData(void* dev, DWORD cb, void* rgdod, LPDWORD inout, DWORD flags) {
+    const HRESULT hr = g_di_data[W](dev, cb, rgdod, inout, flags);
+    if (FAILED(hr) || !rgdod || !inout || *inout == 0 || cb < sizeof(DIDEVICEOBJECTDATA)) return hr;
+    if (DevType(dev, W == 1) == 1) ++g_di_reads[1];
+    const int type = (g_eat_mouse || g_eat_keys) ? DevType(dev, W == 1) : 0;
+    if (!type || (type == 1 && !g_eat_mouse) || (type == 2 && !g_eat_keys)) return hr;
+    // Drop the events the game may not see, keeping the rest in order.
+    auto* base = static_cast<BYTE*>(rgdod);
+    DWORD kept = 0;
+    for (DWORD i = 0; i < *inout; ++i) {
+        auto* e    = reinterpret_cast<DIDEVICEOBJECTDATA*>(base + size_t(i) * cb);
+        bool  drop = type == 2 || e->dwOfs == DIMOFS_Z || (e->dwOfs >= DIMOFS_BUTTON0 && e->dwOfs <= DIMOFS_BUTTON7);
+        if (drop) {
+            ++g_di_reads[2];
+            continue;
+        }
+        if (kept != i) memmove(base + size_t(kept) * cb, e, cb);
+        ++kept;
+    }
+    *inout = kept;
+    return hr;
+}
+
+// The other ways a game reads the mouse buttons: key-state polling and raw input. Counted, and
+// held back the same way as DirectInput while the page has the mouse.
+typedef SHORT(WINAPI* KeyState_t)(int);
+typedef UINT(WINAPI* RawData_t)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+KeyState_t g_orig_async = nullptr, g_orig_keystate = nullptr;
+RawData_t  g_orig_raw   = nullptr;
+std::atomic<unsigned> g_poll[3] = {};  // GetAsyncKeyState(mouse), GetKeyState(mouse), GetRawInputData
+thread_local bool     t_ours    = false;  // our own reads see the truth
+
+bool MouseKey(int vk) { return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2; }
+
+SHORT WINAPI hkAsyncKey(int vk) {
+    const SHORT r = g_orig_async(vk);
+    if (t_ours) return r;
+    if (MouseKey(vk)) {
+        ++g_poll[0];
+        if (g_eat_mouse) return 0;
+    } else if (g_eat_keys) {
+        return 0;
+    }
+    return r;
+}
+
+SHORT WINAPI hkKeyState(int vk) {
+    const SHORT r = g_orig_keystate(vk);
+    if (t_ours) return r;
+    if (MouseKey(vk)) {
+        ++g_poll[1];
+        if (g_eat_mouse) return 0;
+    } else if (g_eat_keys) {
+        return 0;
+    }
+    return r;
+}
+
+UINT WINAPI hkRawData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT hdr) {
+    const UINT r = g_orig_raw(h, cmd, data, size, hdr);
+    if (cmd == RID_INPUT && data && r != UINT(-1) && r >= sizeof(RAWINPUTHEADER)) {
+        ++g_poll[2];
+        auto* ri = static_cast<RAWINPUT*>(data);
+        if (ri->header.dwType == RIM_TYPEMOUSE && g_eat_mouse) ri->data.mouse.usButtonFlags = 0;
+        else if (ri->header.dwType == RIM_TYPEKEYBOARD && g_eat_keys) ri->data.keyboard.VKey = 0xFF, ri->data.keyboard.MakeCode = 0;
+    }
+    return r;
+}
+
+// The game takes its menu clicks and keys straight out of its message loop (PeekMessage), before
+// any window procedure sees them, so that is where they are held back: a button or key message
+// the game may not have comes back as WM_NULL. Our own handling of them (the Race click, the
+// wheel, typed characters) happens here too.
+typedef BOOL(WINAPI* PeekMsg_t)(LPMSG, HWND, UINT, UINT, UINT);
+typedef BOOL(WINAPI* GetMsg_t)(LPMSG, HWND, UINT, UINT);
+PeekMsg_t g_orig_peek[2] = {};
+GetMsg_t  g_orig_get[2]  = {};
+std::atomic<unsigned> g_msgs{0};  // diagnostics: mouse button messages the loop pulled
+
+void FilterMsg(MSG* m) {
+    if (!m || (g_game_wnd && m->hwnd != g_game_wnd && !IsChild(g_game_wnd, m->hwnd))) return;
+    const UINT     id   = m->message;
+    const bool     btn  = id == WM_LBUTTONDOWN || id == WM_LBUTTONUP || id == WM_LBUTTONDBLCLK || id == WM_RBUTTONDOWN ||
+                     id == WM_RBUTTONUP || id == WM_RBUTTONDBLCLK || id == WM_MBUTTONDOWN || id == WM_MBUTTONUP ||
+                     id == WM_XBUTTONDOWN || id == WM_XBUTTONUP;
+    const bool     key  = id == WM_KEYDOWN || id == WM_KEYUP || id == WM_CHAR || id == WM_SYSCHAR;
+    if (btn) ++g_msgs;
+    if (GetTickCount64() < g_pass_until.load()) return;
+    // On the main menu, Race is ours.
+    if (!g_swallow && g_race_armed && (id == WM_LBUTTONDOWN || id == WM_LBUTTONUP || id == WM_LBUTTONDBLCLK) && g_game_wnd &&
+        OverRace(g_game_wnd, m->lParam)) {
+        if (id == WM_LBUTTONUP) g_open_asked = true;
+        m->message = WM_NULL;
+        return;
+    }
+    if (!g_swallow) return;
+    if (id == WM_MOUSEWHEEL) {
+        g_wheel += GET_WHEEL_DELTA_WPARAM(m->wParam) / WHEEL_DELTA;
+        m->message = WM_NULL;
+    } else if (id == WM_CHAR) {
+        {
+            std::lock_guard<std::mutex> lk(g_typed_mu);
+            if (m->wParam >= 32 && m->wParam < 127 && g_typed.size() < 64) g_typed += char(m->wParam);
+            else if (m->wParam == 8) g_typed += '\b';
+        }
+        m->message = WM_NULL;
+    } else if (id == WM_KEYDOWN) {
+        if (m->wParam == VK_ESCAPE) g_esc = true;
+        if (m->wParam == VK_RETURN) g_enter = true;
+        // Keep the character translation for typing: TranslateMessage needs the WM_KEYDOWN.
+        if (!(m->wParam >= 'A' && m->wParam <= 'Z') && !(m->wParam >= '0' && m->wParam <= '9') && m->wParam != VK_BACK &&
+            m->wParam != VK_OEM_MINUS && m->wParam != VK_SPACE)
+            m->message = WM_NULL;
+    } else if (btn || key) {
+        m->message = WM_NULL;
+    }
+}
+
+template <int W>
+BOOL WINAPI hkPeek(LPMSG m, HWND h, UINT a, UINT b, UINT r) {
+    const BOOL got = g_orig_peek[W](m, h, a, b, r);
+    if (got) FilterMsg(m);  // a peek that leaves the message queued is read as well
+    return got;
+}
+
+template <int W>
+BOOL WINAPI hkGet(LPMSG m, HWND h, UINT a, UINT b) {
+    const BOOL got = g_orig_get[W](m, h, a, b);
+    if (got > 0) FilterMsg(m);
+    return got;
+}
+
+typedef BOOL(WINAPI* KbState_t)(PBYTE);
+KbState_t             g_orig_kb = nullptr;
+std::atomic<unsigned> g_kb_reads{0};
+
+BOOL WINAPI hkKbState(PBYTE keys) {
+    const BOOL ok = g_orig_kb(keys);
+    if (!ok || !keys || t_ours) return ok;
+    ++g_kb_reads;
+    if (g_eat_mouse) keys[VK_LBUTTON] = keys[VK_RBUTTON] = keys[VK_MBUTTON] = keys[VK_XBUTTON1] = keys[VK_XBUTTON2] = 0;
+    if (g_eat_keys)
+        for (int k = 8; k < 256; ++k) keys[k] = 0;
+    return ok;
+}
+
+/// Our own read of a key, past the hooks above.
+SHORT OurAsyncKey(int vk) {
+    t_ours        = true;
+    const SHORT r = GetAsyncKeyState(vk);
+    t_ours        = false;
+    return r;
+}
+
+/// Hook the DirectInput devices' reads, once: a throwaway mouse of each flavour gives the vtables.
+void HookDirectInput() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (HMODULE u = GetModuleHandleA("user32.dll")) {
+        if (auto p = GetProcAddress(u, "GetAsyncKeyState")) InstallHook((void*)p, (void*)&hkAsyncKey, (void**)&g_orig_async, "servers user32!GetAsyncKeyState");
+        if (auto p = GetProcAddress(u, "GetKeyState")) InstallHook((void*)p, (void*)&hkKeyState, (void**)&g_orig_keystate, "servers user32!GetKeyState");
+        if (auto p = GetProcAddress(u, "GetRawInputData")) InstallHook((void*)p, (void*)&hkRawData, (void**)&g_orig_raw, "servers user32!GetRawInputData");
+        if (auto p = GetProcAddress(u, "GetKeyboardState")) InstallHook((void*)p, (void*)&hkKbState, (void**)&g_orig_kb, "servers user32!GetKeyboardState");
+        if (auto p = GetProcAddress(u, "PeekMessageA")) InstallHook((void*)p, (void*)&hkPeek<0>, (void**)&g_orig_peek[0], "servers user32!PeekMessageA");
+        if (auto p = GetProcAddress(u, "PeekMessageW")) InstallHook((void*)p, (void*)&hkPeek<1>, (void**)&g_orig_peek[1], "servers user32!PeekMessageW");
+        if (auto p = GetProcAddress(u, "GetMessageA")) InstallHook((void*)p, (void*)&hkGet<0>, (void**)&g_orig_get[0], "servers user32!GetMessageA");
+        if (auto p = GetProcAddress(u, "GetMessageW")) InstallHook((void*)p, (void*)&hkGet<1>, (void**)&g_orig_get[1], "servers user32!GetMessageW");
+    }
+    for (int w = 0; w < 2; ++w) {
+        void* di = nullptr;
+        if (FAILED(DirectInput8Create(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION, w ? IID_IDirectInput8W : IID_IDirectInput8A, &di,
+                                      nullptr)) || !di)
+            continue;
+        void* dev = nullptr;
+        HRESULT hr = w ? static_cast<IDirectInput8W*>(di)->CreateDevice(GUID_SysMouse, reinterpret_cast<IDirectInputDevice8W**>(&dev), nullptr)
+                       : static_cast<IDirectInput8A*>(di)->CreateDevice(GUID_SysMouse, reinterpret_cast<IDirectInputDevice8A**>(&dev), nullptr);
+        if (SUCCEEDED(hr) && dev) {
+            void** vt = *reinterpret_cast<void***>(dev);
+            const bool a = InstallHook(vt[9], w ? (void*)&hkDiState<1> : (void*)&hkDiState<0>, (void**)&g_di_state[w],
+                                       w ? "servers dinput8 GetDeviceState W" : "servers dinput8 GetDeviceState A");
+            const bool b = InstallHook(vt[10], w ? (void*)&hkDiData<1> : (void*)&hkDiData<0>, (void**)&g_di_data[w],
+                                       w ? "servers dinput8 GetDeviceData W" : "servers dinput8 GetDeviceData A");
+            Log("[mxb] DirectInput %s: state %s, data %s", w ? "W" : "A", a ? "hooked" : "not hooked", b ? "hooked" : "not hooked");
+            static_cast<IUnknown*>(dev)->Release();
+        }
+        static_cast<IUnknown*>(di)->Release();
+    }
+}
+
+/// Classic: the game's own server browser, by handing it one click on Race.
 void Classic(HWND w) {
     RECT rc{};
     if (!GetClientRect(w, &rc)) return;
@@ -545,7 +804,9 @@ void Classic(HWND w) {
     POINT     pt{x, y};
     ClientToScreen(w, &pt);
     SetCursorPos(pt.x, pt.y);
-    g_pass_until = GetTickCount64() + 600;
+    g_pass_until = GetTickCount64() + 800;
+    g_eat_mouse  = false;
+    g_fake_click = 8;  // the next reads: pressed, then released
     PostMessageW(w, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
     PostMessageW(w, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
     PostMessageW(w, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
@@ -607,13 +868,13 @@ void Frame(HDC hdc) {
     RECT rc{};
     POINT pt{};
     if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
-    if (seen) Hook(hwnd);
+    if (seen) Hook(hwnd), HookDirectInput();
     g_W = rc.right, g_H = rc.bottom;
     GetCursorPos(&pt);
     ScreenToClient(hwnd, &pt);
     const float mx = float(pt.x) / float(g_W), my = float(pt.y) / float(g_H);
     const bool  focus = GetForegroundWindow() == hwnd;
-    const bool  down  = focus && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool  down  = focus && (OurAsyncKey(VK_LBUTTON) & 0x8000) != 0;
     const bool  click = g_down && !down;  // released this frame
     g_down            = down;
     // Under the pointer the game draws Race's hover sprite instead of the marker, so the marker
@@ -621,17 +882,27 @@ void Frame(HDC hdc) {
     // menu is what counts while it stays there.
     static bool over_prev = false, entered_on_menu = false;
     const bool  over = srvpage::Inside(srvpage::kButton, mx, my);
-    if (over && !over_prev) entered_on_menu = seen;
+    // (A pointer already resting on Race when the menu first shows counts once the marker is seen.)
+    entered_on_menu = over ? (over_prev && entered_on_menu) || seen : false;
     over_prev       = over;
     const bool menu = over ? entered_on_menu : seen;
     g_race_armed    = menu && g_game_proc != nullptr;
+    // The game's own read of the mouse and keys (DirectInput): held back while the page is up,
+    // and over Race on the main menu so that click is ours. Not while Classic hands Race back.
+    const bool passing = now_ms < g_pass_until.load();
+    g_eat_mouse        = !passing && (g_open || (menu && over));
+    g_eat_keys         = g_open;
 
     // Whatever MXB App sent since the last frame, page open or not (join progress included).
     for (const std::string& line : pipe::Drain()) Handle(line, hwnd);
 
+    if (click && !g_open)
+        Log("[mxb] click at %.3f,%.3f over_race=%d menu=%d seen=%d focus=%d armed=%d asked=%d eat=%d di=%u/%u/%u poll=%u/%u/%u msgs=%u kb=%u", mx, my, int(over),
+            int(menu), int(seen), int(focus), int(g_race_armed.load()), int(g_open_asked.load()), int(g_eat_mouse.load()),
+            g_di_reads[0].load(), g_di_reads[1].load(), g_di_reads[2].load(), g_poll[0].load(), g_poll[1].load(), g_poll[2].load(), g_msgs.load(), g_kb_reads.load());
     if (!g_open) {
         // Race, caught in the window procedure (or, without it, seen here).
-        const bool asked = g_open_asked.exchange(false) || (!g_game_proc && menu && click && over);
+        const bool asked = g_open_asked.exchange(false) || (menu && click && over && !passing);
         if (asked && menu) {
             LoadArt();
             if (g_loaded) {
@@ -639,7 +910,7 @@ void Frame(HDC hdc) {
                 pipe::Start();
                 if (pipe::g_connected) Ask();
                 g_open = true, g_gone = 0, g_top = 0, g_sel = -1, g_tab = FRIENDS;
-                g_swallow = true, g_wheel = 0, g_esc = false, g_enter = false;
+                g_swallow = true, g_wheel = 0, g_esc = false, g_enter = false, g_open_asked = false;
                 Log("[mxb] page opened");
             }
         }
@@ -754,11 +1025,10 @@ void Frame(HDC hdc) {
     Fill(right, srvpage::Rgba{0, 0, 0, 0.5f});
     Fill(srvpage::kTitle, t.title_bg);
     Say(g_main, g_tab == FRIENDS ? "Friends" : "Install & Join", 0.9875f, 0.0111f, 0.066667f, RIGHT, t.title_text);
+    // Solid, so nothing of the main menu under it shows through anywhere on it.
     srvpage::Rgba solid = t.panel;
     solid.a             = 1.0f;
-    const float column[4] = {srvpage::kPanel[0], srvpage::kPanel[1], 0.2125f, srvpage::kPanel[3]};
-    Fill(column, solid);
-    Fill(srvpage::kPanel, t.panel);
+    Fill(srvpage::kPanel, solid);
 
     // Above the list: the tab's button on the left, what's going on on the right.
     if (g_tab == FRIENDS) DrawButton(g_adding ? "Cancel" : "Add Friend", srvpage::kTopBtn, mx, my, pipe::g_connected);
@@ -772,9 +1042,9 @@ void Frame(HDC hdc) {
         else {
             int on = 0;
             for (const srvpage::Friend& f : g_friends) on += f.online;
-            note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) + " online - join one, even on a track you don't have";
+            note = std::to_string(g_friends.size()) + " friends, " + std::to_string(on) + " online";
         }
-    } else note = g_have_servers ? "A track you don't have? MXB App installs it, then joins" : "Asking MXB App for the servers...";
+    } else if (!g_have_servers) note = "Asking MXB App for the servers...";
     Say(g_main, srvpage::Fit(g_main.f, note, srvpage::kTextSize * g_H, 0.8f * g_W), g_adding ? 0.15f : 0.9875f, 0.15f,
         srvpage::kTextSize, g_adding ? LEFT : RIGHT, note_c);
 
@@ -838,6 +1108,8 @@ void Frame(HDC hdc) {
 
     // The bottom bar: Back, and Join / Install & Join.
     Fill(srvpage::kBar, t.bar_bg);
+    const float home[4] = {0.0f, srvpage::kBar[1], 0.2125f, 1.0f};  // the main menu's own corner of the bar
+    Fill(home, srvpage::Rgba{0, 0, 0, 0.75f});
     DrawBarButton("Back", srvpage::kBack, mx, my, true, true, t.back, t.back_hover);
     DrawBarButton(needs && can_go ? "Install & Join" : "Join", srvpage::kGo, mx, my, can_go, false, t.go, t.go_hover);
 

@@ -176,6 +176,9 @@ struct Server {
     double      last_seen = 0;
     std::vector<std::string> missing;  // what MXB App would have to install first ("track")
     std::string              region;   // the app's region for the server ("europe", "na-east", ...)
+    // What the game's own join needs (offsets.h, "the browser's own JOIN"):
+    std::string              layout, classes, bikes;  // classes and bikes "/"-joined; bikes "" = any
+    std::string              lan;                     // the LAN address, host:port, or ""
 };
 
 /// A server's address as the game's -directconnect takes it: host:port, the host only letters,
@@ -195,6 +198,35 @@ inline std::string SafeAddress(const std::string& a) {
     }
     if (p < 1 || p > 65535) return "";
     return host + ":" + port;
+}
+
+/// An IPv4 host:port as the game's join record holds an address: 01, the address as IPv6
+/// (::ffff:a.b.c.d), the port big-endian - 19 bytes. False (and all zero) for anything else.
+inline bool PackAddress(const std::string& a, uint8_t out[19]) {
+    std::memset(out, 0, 19);
+    const std::string s = SafeAddress(a);
+    if (s.empty()) return false;
+    const size_t      colon = s.rfind(':');
+    const std::string host  = s.substr(0, colon);
+    unsigned          o[4]  = {};
+    int               n     = 0;
+    size_t            i     = 0;
+    while (n < 4) {
+        const size_t      dot  = host.find('.', i);
+        const std::string part = host.substr(i, dot == std::string::npos ? std::string::npos : dot - i);
+        if (part.empty() || part.size() > 3 || part.find_first_not_of("0123456789") != std::string::npos) return false;
+        o[n++] = unsigned(std::atoi(part.c_str()));
+        if (o[n - 1] > 255) return false;
+        if (dot == std::string::npos) break;
+        i = dot + 1;
+    }
+    if (n != 4 || host.find('.', i) != std::string::npos) return false;
+    const unsigned port = unsigned(std::atoi(s.c_str() + colon + 1));
+    out[0]  = 1;
+    out[11] = 0xFF, out[12] = 0xFF;
+    for (int k = 0; k < 4; ++k) out[13 + k] = uint8_t(o[k]);
+    out[17] = uint8_t(port >> 8), out[18] = uint8_t(port & 0xFF);
+    return true;
 }
 
 /// Text the game's fonts can draw: ASCII, anything else one '?' per character.
@@ -343,6 +375,16 @@ inline Server ServerOf(const J& j) {
     s.session     = Ascii(j["session"].str());
     const J& cats = j["categories"];
     if (cats.t == J::ARR && !cats.a.empty()) s.category = Ascii(cats.a[0].str());
+    auto joined = [](const J& arr) {
+        std::string out;
+        for (const J& v : arr.a)
+            if (v.t == J::STR) out += (out.empty() ? "" : "/") + v.s;
+        return out;
+    };
+    s.classes = Ascii(joined(cats));
+    s.bikes   = Ascii(joined(j["bikes"]));
+    s.layout  = Ascii(j["trackLayout"].str());
+    s.lan     = SafeAddress(j["lanAddress"].str());
     s.players     = int(j["players"].num());
     s.max_players = int(j["maxPlayers"].num());
     s.passworded  = j["passworded"].flag();

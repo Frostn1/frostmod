@@ -241,6 +241,36 @@ constexpr int       CMD_JOIN          = 0x389;    // bus cmd id that initiates t
 constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0FE7;  // the `call [bus]` inside the JOIN handler
 constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is omitted
 
+// ---- the browser's own JOIN, as it actually runs (watched live 2026-10-19) ------------------
+// The 0x389 model above never fires on a real join: hardware breakpoints on the bus during a join
+// from the game's World browser show the Join button's handler (around 0x0AE260) doing this:
+//   bus 0x11E   -> the selected row
+//   bus 0x385   -> that server's record, copied to the stack (0x37E for the Local tab):
+//                  +0x00 19 bytes  public address: 01, IPv6 (an IPv4 as ::ffff:a.b.c.d), port BE
+//                  +0x13 19 bytes  LAN address, same form
+//                  +0x26 name; +0x68 max riders, +0x6C riders; +0x78 nonzero = needs a password
+//   then four strings out of the record's session info: track, layout, classes ("A/B/C"), bikes
+//   ("" = any), a check that some installed bike fits, and finally:
+//     no password: the two addresses -> JOIN_ADDR / JOIN_LAN, the strings -> JOIN_TRACK..BIKES,
+//                  OPEN_DIALOG("home/bike_choose", 2): the bike picker, whose Start connects.
+//     password:    the same addresses, name + strings -> PJOIN_NAME..BIKES,
+//                  OPEN_DIALOG("home/password", 0): asks, then the bike picker.
+// So a join is those globals filled and that one call, on the UI thread, from a menu.
+constexpr uintptr_t RVA_OPEN_DIALOG     = 0x0EC330;  // int(const char* path, int mode): push rbx; sub rsp,30h
+constexpr uint8_t   SIG_OPEN_DIALOG[6]  = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30};
+constexpr uintptr_t RVA_JOIN_ADDR       = 0xE53DE0;  // 19 bytes (RVA_SB_CONNECT_TARGET)
+constexpr uintptr_t RVA_JOIN_LAN        = 0xE54020;  // 19 bytes
+constexpr uintptr_t RVA_JOIN_PASSWORD   = 0xE549C0;  // up to 100
+constexpr uintptr_t RVA_JOIN_TRACK      = 0xE58420;  // 40
+constexpr uintptr_t RVA_JOIN_LAYOUT     = 0xE58448;  // 40
+constexpr uintptr_t RVA_JOIN_CLASSES    = 0xE58470;  // 100
+constexpr uintptr_t RVA_JOIN_BIKES      = 0xE584D4;  // 100
+constexpr uintptr_t RVA_PJOIN_NAME      = 0xE58200;  // 100
+constexpr uintptr_t RVA_PJOIN_TRACK     = 0xE58264;  // 40
+constexpr uintptr_t RVA_PJOIN_LAYOUT    = 0xE5828C;  // 40
+constexpr uintptr_t RVA_PJOIN_CLASSES   = 0xE582B4;  // 100
+constexpr uintptr_t RVA_PJOIN_BIKES     = 0xE58318;  // 100
+
 // ---- the GHS handle pool: a crash we can actually stop (beta21e, 2026-09-16) ----
 // WHAT THE POOL HOLDS (traced 2026-09-16): trainers. Every caller of the pool's open/read/
 // close builds a trainer path - `%sprofiles\%s\trainers\%s_%s.trn`, `%strainers\%s.trn` -

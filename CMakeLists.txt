@@ -107,7 +107,8 @@ FetchContent_MakeAvailable(miniz)
 
 # --- the mod DLL ---------------------------------------------------------------
 add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp src/nantrap.cpp ${FROSTMOD_DLL_RC})
-target_link_libraries(frostmod PRIVATE minhook miniz gdi32 user32 opengl32 winhttp)
+# dinput8/dxguid: the in-game MXB page holds the game's mouse and keys back while it is open.
+target_link_libraries(frostmod PRIVATE minhook miniz gdi32 user32 opengl32 winhttp dinput8 dxguid)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")

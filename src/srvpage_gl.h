@@ -367,6 +367,10 @@ void Ask() {
     g_next_friends = GetTickCount64() + 10000;
 }
 
+void StartInGameJoin(bool installed);  // below, with Join
+bool SafeCopy(void* dst, uintptr_t src, size_t n);  // with the join probe
+std::string Hex(const uint8_t* p, size_t n);
+
 void Handle(const std::string& line, HWND game) {
     bool             ok = false;
     const srvpage::J m  = srvpage::ParseJson(line, &ok);
@@ -408,14 +412,122 @@ void Handle(const std::string& line, HWND game) {
         Status(b, state == "error" ? 8000 : 60000);
         Log("[mxb] join: %s - %s", state.c_str(), b);
         // The app has what it needs and will start the game again into the server.
-        if (state == "restart" && game) PostMessageW(game, WM_CLOSE, 0, 0);
+        (void)game;
+        // The track is in (installed just now, or there already): the game's own join from here.
+        if (state == "ready") StartInGameJoin(m["installed"].flag());
     } else if (re == "friend_add") {
         Status(srvpage::Ascii(m["text"].str()), 6000);
         pipe::Send("{\"op\":\"friends\"}");
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Joining in the running game - the game's own join (offsets.h, "the browser's own JOIN")
+//
+// What the game's Join button does once it has a server, done here with the server MXB App
+// listed: its address, LAN address, track, layout, classes and bikes go into the globals the
+// connect reads, and the game's own dialog opener puts up the bike picker (or the password box
+// first), whose Start connects. No restart, no -directconnect. Everything written is checked
+// first - an IPv4 address and port, ASCII text cut to each field's size - and the opener's first
+// bytes must be the ones it had when this was worked out, or nothing is written at all.
+
+srvpage::Server g_join_server;    // the server Join was pressed on
+int             g_join_step = 0;  // 0 idle, 1 waiting for the game to re-read its mods, 2 join now
+uint64_t        g_join_at   = 0;
+
+void StartInGameJoin(bool installed) {
+    if (g_join_server.address.empty()) return;
+    g_join_step = installed ? 1 : 2;
+    g_join_at   = GetTickCount64();
+    if (installed) RequestReload();  // the track just installed: the game has to see it first
+}
+
+bool PutText(uintptr_t rva, size_t size, const std::string& v) {
+    __try {
+        char* dst = reinterpret_cast<char*>(g_base + rva);
+        memset(dst, 0, size);
+        memcpy(dst, v.data(), (std::min)(v.size(), size - 1));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool PutBytes(uintptr_t rva, const uint8_t* v, size_t n) {
+    __try {
+        memcpy(reinterpret_cast<void*>(g_base + rva), v, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+typedef int(__fastcall* OpenDialog_t)(const char* path, int mode);
+
+int CallOpen(OpenDialog_t f, const char* path, int mode) {
+    __try {
+        return f(path, mode);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+extern std::atomic<bool> g_swallow, g_eat_mouse, g_eat_keys;  // the input hooks, below
+
+/// The join, on the UI thread from a menu frame.
+void JoinNow() {
+    const srvpage::Server& s       = g_join_server;
+    uint8_t                code[6] = {};
+    SafeCopy(code, g_base + mxb::RVA_OPEN_DIALOG, sizeof(code));
+    if (memcmp(code, mxb::SIG_OPEN_DIALOG, sizeof(code)) != 0) {
+        Log("[mxb] join: the game's dialog opener isn't where offsets.h says (%s) - not joining", Hex(code, 6).c_str());
+        return Status("This game version isn't supported for joining from here yet", 8000);
+    }
+    uint8_t addr[19], lan[19];
+    if (!srvpage::PackAddress(s.address, addr)) return Status("That server's address can't be joined from here", 6000);
+    if (!srvpage::PackAddress(s.lan, lan)) memcpy(lan, addr, sizeof(lan));
+    bool ok = PutBytes(mxb::RVA_JOIN_ADDR, addr, sizeof(addr)) && PutBytes(mxb::RVA_JOIN_LAN, lan, sizeof(lan)) &&
+              PutText(mxb::RVA_JOIN_PASSWORD, 100, "");
+    const char* path = "home/bike_choose";
+    int         mode = 2;
+    if (s.passworded) {
+        ok = ok && PutText(mxb::RVA_PJOIN_NAME, 100, s.name) && PutText(mxb::RVA_PJOIN_TRACK, 40, s.track) &&
+             PutText(mxb::RVA_PJOIN_LAYOUT, 40, s.layout) && PutText(mxb::RVA_PJOIN_CLASSES, 100, s.classes) &&
+             PutText(mxb::RVA_PJOIN_BIKES, 100, s.bikes);
+        path = "home/password", mode = 0;
+    } else {
+        ok = ok && PutText(mxb::RVA_JOIN_TRACK, 40, s.track) && PutText(mxb::RVA_JOIN_LAYOUT, 40, s.layout) &&
+             PutText(mxb::RVA_JOIN_CLASSES, 100, s.classes) && PutText(mxb::RVA_JOIN_BIKES, 100, s.bikes);
+    }
+    if (!ok) {
+        Log("[mxb] join: couldn't write the join globals");
+        return Status("Couldn't join from here", 6000);
+    }
+    // The page goes; the game's own screen takes over.
+    g_open = false, g_adding = false, g_swallow = false, g_eat_mouse = false, g_eat_keys = false;
+    const int r = CallOpen(reinterpret_cast<OpenDialog_t>(g_base + mxb::RVA_OPEN_DIALOG), path, mode);
+    Log("[mxb] join %s (%s) in the game: track %s, classes %s, bikes %s -> %s = %d", s.address.c_str(), s.name.c_str(),
+        s.track.c_str(), s.classes.c_str(), s.bikes.empty() ? "any" : s.bikes.c_str(), path, r);
+}
+
+/// From the frame: the join, once the game has its mods (re-read when a track was just installed).
+void JoinTick(bool menu) {
+    if (!g_join_step) return;
+    const uint64_t now = GetTickCount64();
+    if (now - g_join_at > 60000) {
+        g_join_step = 0;
+        Log("[mxb] join of %s gave up waiting", g_join_server.name.c_str());
+        return;
+    }
+    if (g_join_step == 1 && !g_reloadActive.load() && now - g_join_at > 1500) g_join_step = 2;
+    if (g_join_step == 2 && menu) {
+        g_join_step = 0;
+        JoinNow();
+    }
+}
+
 void Join(const srvpage::Server& s) {
+    g_join_server = s;
     const std::string addr = srvpage::SafeAddress(s.address);
     if (addr.empty()) return Status("That server can't be joined from here");
     if (!pipe::g_connected) return Status("Open MXB App to join from here", 6000);
@@ -488,16 +600,14 @@ std::vector<Row> Rows() {
 // The page covers the game's whole main menu, buttons included, so while it is open the game
 // may not have the mouse or the keyboard: the game's window procedure is wrapped and, while the
 // page is up, mouse buttons, the wheel and keys stop here. On the main menu a click on Race
-// stops here too and opens the page instead of the game's server browser. Classic hands one
-// click on Race back to the game. The wheel scrolls the list; typed characters fill the
-// friend-code box.
+// stops here too and opens the page instead of the game's server browser. The wheel scrolls
+// the list; typed characters fill the friend-code box.
 
 WNDPROC               g_game_proc = nullptr;
 HWND                  g_game_wnd  = nullptr;
 std::atomic<bool>     g_swallow{false};        // the page is open
 std::atomic<bool>     g_race_armed{false};     // the main menu is up: Race is ours
 std::atomic<bool>     g_open_asked{false};     // Race was clicked
-std::atomic<uint64_t> g_pass_until{0};         // Classic: let the game have Race until then
 std::atomic<int>      g_wheel{0};              // wheel notches since the last frame
 std::mutex            g_typed_mu;
 std::string           g_typed;                 // characters typed since the last frame
@@ -511,8 +621,7 @@ bool OverRace(HWND w, LPARAM lp) {
 }
 
 LRESULT CALLBACK PageProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
-    const bool pass = GetTickCount64() < g_pass_until.load();
-    if (!pass && g_race_armed && !g_swallow && (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP || m == WM_LBUTTONDBLCLK) &&
+    if (g_race_armed && !g_swallow && (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP || m == WM_LBUTTONDBLCLK) &&
         OverRace(w, lp)) {
         if (m == WM_LBUTTONUP) g_open_asked = true;
         return 0;
@@ -546,17 +655,14 @@ void Hook(HWND w) {
     Log("[mxb] input hook %s", g_game_proc ? "in" : "FAILED");
 }
 
-/// Classic: the game's own server browser, by handing it one click on Race.
 // The game reads the mouse and keyboard through DirectInput, not window messages, so holding
 // them back happens there too: the devices' GetDeviceState and GetDeviceData are hooked (one
 // vtable per interface flavour, shared by every device of that flavour). While the page is open
 // the mouse's buttons and wheel and every key read as idle - the pointer still moves. On the main
-// menu, a press over Race is eaten the same way, so the game never opens its own browser. Classic
-// hands Race back by reporting the left button pressed for a few reads, then released.
+// menu, a press over Race is eaten the same way, so the game never opens its own browser.
 
 std::atomic<bool> g_eat_mouse{false};  // the page is open, or the pointer is over Race on the main menu
 std::atomic<bool> g_eat_keys{false};   // the page is open
-std::atomic<int>  g_fake_click{0};     // Classic: reads left of a pressed-then-released left button
 std::atomic<unsigned> g_di_reads[3] = {};  // diagnostics: mouse state reads, mouse buffered reads, eaten
 
 typedef HRESULT(STDMETHODCALLTYPE* DiState_t)(void*, DWORD, LPVOID);
@@ -596,10 +702,7 @@ HRESULT STDMETHODCALLTYPE hkDiState(void* dev, DWORD cb, LPVOID data) {
     if ((cb == sizeof(DIMOUSESTATE) || cb == sizeof(DIMOUSESTATE2)) && DevType(dev, W == 1) == 1) {
         ++g_di_reads[0];
         auto* m = static_cast<DIMOUSESTATE*>(data);
-        if (int n = g_fake_click.load(); n > 0) {
-            m->rgbButtons[0] = n > 3 ? 0x80 : 0;  // pressed for a few reads, then released
-            g_fake_click     = n - 1;
-        } else if (g_eat_mouse) {
+        if (g_eat_mouse) {
             m->lZ = 0;
             memset(static_cast<BYTE*>(data) + offsetof(DIMOUSESTATE, rgbButtons), 0, cb - offsetof(DIMOUSESTATE, rgbButtons));
         }
@@ -697,7 +800,6 @@ void FilterMsg(MSG* m) {
                      id == WM_XBUTTONDOWN || id == WM_XBUTTONUP;
     const bool     key  = id == WM_KEYDOWN || id == WM_KEYUP || id == WM_CHAR || id == WM_SYSCHAR;
     if (btn) ++g_msgs;
-    if (GetTickCount64() < g_pass_until.load()) return;
     // On the main menu, Race is ours.
     if (!g_swallow && g_race_armed && (id == WM_LBUTTONDOWN || id == WM_LBUTTONUP || id == WM_LBUTTONDBLCLK) && g_game_wnd &&
         OverRace(g_game_wnd, m->lParam)) {
@@ -800,21 +902,18 @@ void HookDirectInput() {
     }
 }
 
-/// Classic: the game's own server browser, by handing it one click on Race.
-void Classic(HWND w) {
-    RECT rc{};
-    if (!GetClientRect(w, &rc)) return;
-    const int x = int(rc.right * (srvpage::kButton[0] + srvpage::kButton[2]) * 0.5f);
-    const int y = int(rc.bottom * (srvpage::kButton[1] + srvpage::kButton[3]) * 0.5f);
-    POINT     pt{x, y};
-    ClientToScreen(w, &pt);
-    SetCursorPos(pt.x, pt.y);
-    g_pass_until = GetTickCount64() + 800;
-    g_eat_mouse  = false;
-    g_fake_click = 8;  // the next reads: pressed, then released
-    PostMessageW(w, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
-    PostMessageW(w, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
-    PostMessageW(w, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+/// Classic: the game's own server browser, opened the way its Race button opens it
+/// (ID_MULTIPLAYER -> the dialog opener with "home/multisetup", 0).
+void Classic() {
+    uint8_t code[6] = {};
+    SafeCopy(code, g_base + mxb::RVA_OPEN_DIALOG, sizeof(code));
+    if (memcmp(code, mxb::SIG_OPEN_DIALOG, sizeof(code)) != 0) {
+        Log("[mxb] classic: the game's dialog opener isn't where offsets.h says (%s)", Hex(code, 6).c_str());
+        return;
+    }
+    g_eat_mouse = false, g_eat_keys = false;
+    const int r = CallOpen(reinterpret_cast<OpenDialog_t>(g_base + mxb::RVA_OPEN_DIALOG), "home/multisetup", 0);
+    Log("[mxb] classic: the game's server browser = %d", r);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1210,13 +1309,13 @@ void Frame(HDC hdc) {
     const bool menu = over ? entered_on_menu : seen;
     g_race_armed    = menu && g_game_proc != nullptr;
     // The game's own read of the mouse and keys (DirectInput): held back while the page is up,
-    // and over Race on the main menu so that click is ours. Not while Classic hands Race back.
-    const bool passing = now_ms < g_pass_until.load();
-    g_eat_mouse        = !passing && (g_open || (menu && over));
+    // and over Race on the main menu so that click is ours.
+    g_eat_mouse        = g_open || (menu && over);
     g_eat_keys         = g_open;
 
     // Whatever MXB App sent since the last frame, page open or not (join progress included).
     for (const std::string& line : pipe::Drain()) Handle(line, hwnd);
+    JoinTick(seen || (over && entered_on_menu) || g_open);
 
     if (click && !g_open)
         Log("[mxb] click at %.3f,%.3f over_race=%d menu=%d seen=%d focus=%d armed=%d asked=%d eat=%d di=%u/%u/%u poll=%u/%u/%u msgs=%u kb=%u", mx, my, int(over),
@@ -1224,7 +1323,7 @@ void Frame(HDC hdc) {
             g_di_reads[0].load(), g_di_reads[1].load(), g_di_reads[2].load(), g_poll[0].load(), g_poll[1].load(), g_poll[2].load(), g_msgs.load(), g_kb_reads.load());
     if (!g_open) {
         // Race, caught in the window procedure (or, without it, seen here).
-        const bool asked = g_open_asked.exchange(false) || (menu && click && over && !passing);
+        const bool asked = g_open_asked.exchange(false) || (menu && click && over);
         if (asked && menu) {
             LoadArt();
             if (g_loaded) {
@@ -1310,7 +1409,7 @@ void Frame(HDC hdc) {
         }
         if (hit_tab == 2) {
             close("Classic");
-            Classic(hwnd);
+            Classic();
             return;
         } else if (hit_tab >= 0 && hit_tab != int(g_tab)) {
             g_tab = Tab(hit_tab), g_top = 0, g_sel = -1, g_adding = false;

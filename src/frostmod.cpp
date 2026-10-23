@@ -66,6 +66,7 @@
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
+#include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -3788,6 +3789,12 @@ static std::atomic<int>  g_msgPort{54210};     // FrostServer's API port; its ow
 // gfxwatch=1: re-apply the ridden bike's gfx.cfg when it is saved (LIVE BIKE GFX.CFG). Off by
 // default; F8 -> G toggles it and the choice is kept here.
 static std::atomic<bool> g_gfxWatch{false};
+// menukey=: the key that opens the FrostMod menu, packed (hotkey::Pack) so the renderers can
+// read it without a lock. F8 unless the player picks another - in the menu ("Change menu
+// key") or by hand in the file (menukey=Ctrl+F9). Only written when it is not F8.
+static std::atomic<int>  g_menuKey{frostmod::hotkey::Pack(frostmod::hotkey::Default())};
+static frostmod::hotkey::Hotkey MenuKey() { return frostmod::hotkey::Unpack(g_menuKey.load()); }
+static void MenuKeyName(char* out, size_t n) { frostmod::hotkey::Format(MenuKey(), out, n); }
 
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
 // Radar/outline toggles and the overlay size. The filename stays as it was so an
@@ -3830,6 +3837,10 @@ static void SaveOverlaySettings() {
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
+    if (MenuKey() != frostmod::hotkey::Default()) {
+        char mk[48]; MenuKeyName(mk, sizeof(mk));
+        fprintf(f, "menukey=%s\n", mk);
+    }
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
@@ -3847,6 +3858,20 @@ static void LoadOverlaySettings() {
         if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
         else if (sscanf_s(line, "gfxwatch=%d", &v) == 1) g_gfxWatch.store(v == 1);
+        // A key that cannot be parsed, or one that may not open the menu, keeps F8: a
+        // hand-edited typo must never leave the player with no way into the menu.
+        else if (strncmp(line, "menukey=", 8) == 0) {
+            char* val = line + 8;
+            val[strcspn(val, "\r\n")] = 0;
+            frostmod::hotkey::Hotkey k;
+            const char* why = nullptr;
+            if (!frostmod::hotkey::Parse(val, &k))
+                Log("[menu] menukey=%s is not a key FrostMod knows - keeping F8", val);
+            else if (!frostmod::hotkey::Bindable(k, &why))
+                Log("[menu] menukey=%s: %s - keeping F8", val, why);
+            else
+                g_menuKey.store(frostmod::hotkey::Pack(k));
+        }
         // Only kept for the next save: whether the hooks went in was decided at load.
         else if (sscanf_s(line, "memdiag=%d",  &v) == 1) g_memDiag.store(v != 0);
         else if (sscanf_s(line, "texcompress=%d", &v) == 1) g_texCompress.store(v != 0);
@@ -3867,9 +3892,10 @@ static void LoadOverlaySettings() {
     fclose(f);
     // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
     // fix) match nothing above and are skipped; the next save drops them.
-    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d%s",
+    char mk[48]; MenuKeyName(mk, sizeof(mk));
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d menukey=%s%s",
         g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(),
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
 }
 
@@ -3957,14 +3983,17 @@ std::atomic<bool>      g_overlayOn{true};
 // bring the overlay back, and it is why this can never leave someone stranded with a UI
 // they cannot see. Not persisted: it is a per-session thing you turn on to record.
 std::atomic<bool>      g_cleanView{false};
-std::atomic<bool>      g_menuOpen{false};       // F8 opens the FrostMod action menu
+std::atomic<bool>      g_menuOpen{false};       // the menu key (F8) opens the action menu
+// "Change menu key": the next key pressed becomes the menu key, Esc cancels. Set by
+// MenuAction() and run by Tick(), both on the render thread; atomic for the renderers.
+std::atomic<bool>      g_menuKeyCapture{false};
 std::atomic<ULONGLONG> g_statusUntil{0};        // show g_statusText until this tick
 std::mutex             g_statusMutex;
 char                   g_statusText[128] = {0};
 
-// The FrostMod menu (F8). One entry per action - press its key. New features add a
-// row here instead of another global F-key. Keep labels short (they set the width).
-// The F8 menu. `action` is what MenuAction() runs; the key is only what is shown and
+// The FrostMod menu (the menu key, F8 by default). One entry per action - press its key.
+// New features add a row here instead of another global F-key. Keep labels short (they set
+// the width). `action` is what MenuAction() runs; the key is only what is shown and
 // pressed. `dev` rows show only with devmenu=1 in frostmod_radar.cfg, and sit last.
 struct MenuItem { char key; const char* label; bool showsSize; int action; bool dev; };
 static const MenuItem kMenu[] = {
@@ -3982,6 +4011,7 @@ static const MenuItem kMenu[] = {
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
     { '0', "Rebuild riders (load new gear models)", false, 9 },
+    { 'K', "Change menu key",               false, 16 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -3997,8 +4027,23 @@ static int MenuCount() {                 // the rows shown: the dev rows only on
 static void MenuRowText(int i, char* out, size_t n) {
     if (kMenu[i].showsSize)
         sprintf_s(out, n, "  %c   %s  (%d%%)", kMenu[i].key, kMenu[i].label, g_uiPct.load());
-    else
+    else if (kMenu[i].action == 16) {                // the menu key row shows the key
+        char mk[48]; MenuKeyName(mk, sizeof(mk));
+        sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label, mk);
+    } else
         sprintf_s(out, n, "  %c   %s", kMenu[i].key, kMenu[i].label);
+}
+
+// The menu's last line: how to close it, or, while "Change menu key" waits, what to press.
+static void MenuFooterText(char* out, size_t n) {
+    if (g_menuKeyCapture.load()) { strcpy_s(out, n, "  press the new key   Esc cancel"); return; }
+    char mk[48]; MenuKeyName(mk, sizeof(mk));
+    sprintf_s(out, n, "  %s / Esc   close", mk);
+}
+// The corner hint: the version and the key that opens the menu.
+static void HintText(char* out, size_t n) {
+    char mk[48]; MenuKeyName(mk, sizeof(mk));
+    sprintf_s(out, n, "Game Integration v" FROSTMOD_VERSION " - %s", mk);
 }
 
 // Clean view is cleared by anything that puts a panel on screen, so opening something can
@@ -4573,7 +4618,7 @@ void DrawOverlay(HDC hdc) {
         std::lock_guard<std::mutex> lk(g_statusMutex);
         strncpy_s(line, g_statusText, _TRUNCATE);
     } else {
-        strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
+        HintText(line, sizeof(line));
     }
 
     glPushAttrib(GL_ALL_ATTRIB_BITS);
@@ -4611,7 +4656,8 @@ void DrawOverlay(HDC hdc) {
             GlText(x0 + 8, y, row); y -= lh;
         }
         glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
-        GlText(x0 + 8, y, "  F8 / Esc   close");
+        char foot[64]; MenuFooterText(foot, sizeof(foot));
+        GlText(x0 + 8, y, foot);
     } else if (g_overlayOn.load() || reloading || GetTickCount64() < g_statusUntil.load()) {
         // compact pill: hint / status, or the reload progress bar
         const int bw = 250, bh = reloading ? 38 : 24;
@@ -4894,7 +4940,8 @@ static void BuildOverlayDrawLists() {
             char row[96]; MenuRowText(i, row, sizeof(row));
             DText(MX + PADX, y, row, cWhite, FS); y += LH;
         }
-        DText(MX + PADX, y, "  F8 / Esc   close", cGray, FS);
+        char foot[64]; MenuFooterText(foot, sizeof(foot));
+        DText(MX + PADX, y, foot, cGray, FS);
     } else if (g_overlayOn.load() || reloading || GetTickCount64() < g_statusUntil.load()) {
         char line[128];
         if (reloading) {
@@ -4905,7 +4952,7 @@ static void BuildOverlayDrawLists() {
             std::lock_guard<std::mutex> lk(g_statusMutex);
             strncpy_s(line, g_statusText, _TRUNCATE);
         } else {
-            strcpy_s(line, "Game Integration v" FROSTMOD_VERSION " - F8");
+            HintText(line, sizeof(line));
         }
         const float w = 0.20f, h = reloading ? 0.060f : 0.034f;
         DQuad(MX, MY, MX + w, MY + h, ToABGR(0.0f, 0.0f, 0.0f, 0.45f));   // faded black
@@ -5077,6 +5124,10 @@ void MenuAction(int d) {   // d = the row's action, not its key
     case 15: g_menuOpen.store(false); GfxWatchToggle(); break;   // live bike gfx.cfg
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
     case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // change bike / gear
+    // Menu stays open: the next key pressed is the new menu key (Tick), Esc cancels.
+    case 16: g_menuKeyCapture.store(true);
+             Log("[menu] change menu key: press the new key (Esc cancels)");
+             break;
     default: break;
     }
     // Hidden actions kept for reference / easy re-enable (their functions still exist):
@@ -5683,41 +5734,105 @@ void Tick() {
         prevHide = down;
     }
 
-    // F8 opens the FrostMod menu; while open, a digit runs an item, Esc/F8 closes.
+    // The menu key (F8 unless menukey= says otherwise) opens the FrostMod menu; while open,
+    // a row's key runs it, Esc or the menu key closes it.
     // New features are rows in kMenu[] / MenuAction(), not new global F-keys.
-    static bool prevF8 = false, prevEsc = false, prevKey[128] = {false};
-    bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (f8 && !prevF8) {
+    static bool prevMenuKey = false, prevEsc = false, prevKey[128] = {false};
+    const bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool altDown   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const bool escDown   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+
+    // "Change menu key" (menu > K): the first key that goes down after the row was picked
+    // becomes the menu key, with whatever Ctrl/Shift/Alt is held. Keys already down when it
+    // started (the K itself) count only once released and pressed again. Esc cancels; a key
+    // that may not open the menu is refused on the status line and the wait goes on. The
+    // menu rows do nothing meanwhile, so the new key cannot also run one.
+    if (g_menuKeyCapture.load()) {
+        static bool capDown[256];
+        static bool capArmed = false;
+        if (!capArmed) {
+            for (int vk = 1; vk < 256; ++vk) capDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            capArmed = true;
+        }
+        if (!g_menuOpen.load()) {                     // closed some other way: drop the wait
+            g_menuKeyCapture.store(false); capArmed = false;
+            Log("[menu] change menu key cancelled (menu closed)");
+        } else if (escDown && !capDown[VK_ESCAPE]) {
+            g_menuKeyCapture.store(false); capArmed = false;
+            SetStatus("menu key unchanged", 1500);
+            Log("[menu] change menu key cancelled");
+        } else {
+            for (int vk = 1; vk < 256; ++vk) {
+                const bool d = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                const bool edge = d && !capDown[vk];
+                capDown[vk] = d;
+                if (!edge || vk == VK_ESCAPE || frostmod::hotkey::IsModifier(vk) ||
+                    frostmod::hotkey::IsMouse(vk))
+                    continue;
+                frostmod::hotkey::Hotkey k;
+                k.vk = vk; k.ctrl = ctrlDown; k.shift = shiftDown; k.alt = altDown;
+                char name[48]; frostmod::hotkey::Format(k, name, sizeof(name));
+                const char* why = nullptr;
+                char msg[128];
+                if (!frostmod::hotkey::Bindable(k, &why)) {
+                    sprintf_s(msg, "%s can't open the menu: %s", name, why);
+                    SetStatus(msg, 2500);
+                    Log("[menu] change menu key: %s refused (%s)", name, why);
+                    continue;
+                }
+                g_menuKey.store(frostmod::hotkey::Pack(k));
+                g_menuKeyCapture.store(false); capArmed = false;
+                SaveOverlaySettings();
+                sprintf_s(msg, "menu key: %s", name);
+                SetStatus(msg, 2500);
+                Log("[menu] menu key set to %s (saved as menukey=%s)", name, name);
+                prevMenuKey = true;                   // this press must not close the menu
+                break;
+            }
+        }
+        prevEsc = escDown;                            // the cancelling Esc must not close it
+    }
+
+    const frostmod::hotkey::Hotkey menuKey = MenuKey();
+    const bool menuKeyDown = (GetAsyncKeyState(menuKey.vk) & 0x8000) != 0 &&
+                             frostmod::hotkey::Matches(menuKey, ctrlDown, shiftDown, altDown);
+    if (menuKeyDown && !prevMenuKey && !g_menuKeyCapture.load()) {
         ClearClean();                                    // never open something invisible
         if (g_chOpen.load()) {
-            CloseChange(); Log("[change] panel closed (F8)");
-        } else if (g_msOpen.load()) {                        // F8 also closes an open list
-            CloseModelSwap(); Log("[model] model swap closed (F8).");
+            CloseChange(); Log("[change] panel closed (menu key)");
+        } else if (g_msOpen.load()) {                    // the menu key also closes an open list
+            CloseModelSwap(); Log("[model] model swap closed (menu key).");
         } else if (g_trkOpen.load()) {
-            CloseTrackManager(); Log("[trklib] track manager closed (F8).");
+            CloseTrackManager(); Log("[trklib] track manager closed (menu key).");
         } else if (g_swOpen.load()) {
-            CloseSwitcher(); Log("[switch] switcher closed (F8).");
+            CloseSwitcher(); Log("[switch] switcher closed (menu key).");
         } else if (g_dcOpen.load()) {
-            CloseDirectConnect(); Log("[connect] direct connect closed (F8).");
+            CloseDirectConnect(); Log("[connect] direct connect closed (menu key).");
 
         } else {
             bool open = !g_menuOpen.load();
             g_menuOpen.store(open);
-            Log("[menu] %s", open ? "opened (press a number; Esc/F8 to close)" : "closed");
+            char mk[48]; MenuKeyName(mk, sizeof(mk));
+            if (open) Log("[menu] opened (press a number; Esc/%s to close)", mk);
+            else      Log("[menu] closed");
         }
     }
-    prevF8 = f8;
+    prevMenuKey = menuKeyDown || (prevMenuKey && (GetAsyncKeyState(menuKey.vk) & 0x8000) != 0);
     if (g_menuOpen.load()) {
+        // With a combination menu key (Ctrl+K) held, its key is the menu key, not the row.
+        const bool chordHeld = (menuKey.ctrl || menuKey.shift || menuKey.alt) &&
+                               (ctrlDown || shiftDown || altDown);
+        const bool rowsLive = !g_menuKeyCapture.load() && !chordHeld;
         for (int i = 0; i < MenuCount(); ++i) {              // a row's key -> its action
             const int d = kMenu[i].key;                      // a digit or an upper-case letter
             if (!((d >= '0' && d <= '9') || (d >= 'A' && d <= 'Z'))) continue;
             bool k = (GetAsyncKeyState(d) & 0x8000) != 0;   // VK code == the character
-            if (k && !prevKey[d]) MenuAction(kMenu[i].action);
+            if (rowsLive && k && !prevKey[d]) MenuAction(kMenu[i].action);
             prevKey[d] = k;
         }
-        bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        if (esc && !prevEsc) g_menuOpen.store(false);
-        prevEsc = esc;
+        if (!g_menuKeyCapture.load() && escDown && !prevEsc) g_menuOpen.store(false);
+        prevEsc = escDown;
     }
 
     // Track manager (F8 > 2): modal keyboard list with two sub-modes.
@@ -7535,7 +7650,7 @@ DWORD WINAPI Init(LPVOID) {
         Log("[init] ignoring a reload signal sent before this game started (the game's own "
             "startup scan already reads the mods folder)");
     if (g_game->content_derived())
-        Log("[init] reload = re-run content load (fcn.1400ef210); press R / F8 to trigger.");
+        Log("[init] reload = re-run content load (fcn.1400ef210); press R / the menu key to trigger.");
 
     // CONTENT hooks first and ASAP - they're timing-critical: we must be hooked
     // before the game's one-time startup mods scan. Wait for the code to be
@@ -7565,7 +7680,7 @@ DWORD WINAPI Init(LPVOID) {
             uint8_t *cb, *ce;
             if (GetExecRange(g_base, &cb, &ce) && (uint8_t*)ci >= cb && (uint8_t*)ci < ce) {
                 g_contentInit = (ContentInit_t)ci;
-                Log("[init] content-load routine @ RVA 0x%zx - reload ready (R / F8).",
+                Log("[init] content-load routine @ RVA 0x%zx - reload ready (R / the menu key).",
                     (size_t)(ci - g_base));
             } else {
                 Log("[init] WARNING: content-load RVA 0x%zx outside .text; reload disabled.",
@@ -7804,7 +7919,7 @@ DWORD WINAPI Init(LPVOID) {
             if (char* s = strrchr(g_inactivePath, '\\')) *s = 0;   // strip trailing "\mods"
             strcat_s(g_inactivePath, "\\FrostMod Inactive Tracks");
             Log("[trklib] mods=%s", g_modsPath);
-            Log("[trklib] inactive store=%s (F8 menu > 2 opens the track manager)", g_inactivePath);
+            Log("[trklib] inactive store=%s (menu > 2 opens the track manager)", g_inactivePath);
         } else {
             Log("[trklib] mods path unknown yet (run frostmod.exe so it writes frostmod_mods.txt).");
         }
@@ -7905,7 +8020,7 @@ DWORD WINAPI Init(LPVOID) {
                 g_unsafeReloadFrom = g_game->reload_count;
         }
         if (g_game->reload_verified)
-            Log("[reload] %s's step table is confirmed - reload is ON (R / F8).", g_game->display);
+            Log("[reload] %s's step table is confirmed - reload is ON (R / the menu key).", g_game->display);
         else if (g_unsafeReload && g_unsafeReloadFrom > 1)
             Log("[reload] ARMED UNSAFELY from step %d of %d (--unsafe-reload-from): steps "
                 "1..%d are SKIPPED on %s. If the rest complete, the skipped step is the "

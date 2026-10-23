@@ -762,7 +762,7 @@ int main(int argc, char** argv) {
                reloadFrom, reloadFrom - 1);
     else
         printf("[*] reload: %s\n",
-               game->reload_verified   ? "on (press R here, or R / F8 in game)"
+               game->reload_verified   ? "on (press R here, or R / the menu key in game)"
                : unsafeReload          ? "ARMED UNSAFELY for this title - it has crashed the game; "
                                          "you are collecting a log"
                                        : "OFF for this title - offsets derived but not confirmed "
@@ -967,10 +967,10 @@ int main(int argc, char** argv) {
                 printf("  (none%s)\n", modsExist ? " - drop .pkz files into the mods folder" : "");
             else
                 for (const auto& m : known) printf("  - %s\n", Rel(modsPath, m).c_str());
-            printf("\nRELOAD: press R here, or F8 in-game (opens the FrostMod menu) -> 1.\n"
+            printf("\nRELOAD: press R here, or the menu key in-game (F8 unless changed) -> 3.\n"
                    "  FrostMod re-runs the game's content-load so new tracks/skins register,\n"
                    "  with an on-screen progress bar (no freeze).\n");
-            printf("\nIN-GAME: F8 = FrostMod menu (top-left). Press a number for an action.\n");
+            printf("\nIN-GAME: F8 = FrostMod menu (top-left; menu > K changes the key). Press a number for an action.\n");
             printf("\n--- live log ---   [R] reload   [Q]/Ctrl+C quit\n");
             printf("    (with --dump-serverlist, opening the online browser auto-dumps the list)\n");
         }

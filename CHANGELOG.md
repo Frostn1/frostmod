@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-23 - v0.49.16
+
+The menu key can be changed, for anyone whose F8 is already taken.
+
+### Added
+- **Change menu key (menu → `K`).** Press the new key, with Ctrl, Shift or Alt if you want a
+  combination; `Esc` cancels. It works straight away and is saved as `menukey=` in
+  `frostmod_radar.cfg` (for example `menukey=Ctrl+F9`). `F8` stays the default, so nothing
+  changes unless you pick another key. The menu, its footer and the corner hint show the key
+  in use. Keys that would make the menu hard to reach again (`Esc`, `F7`, a bare letter or
+  digit, the keys the lists use) are refused, and a bad `menukey=` line keeps `F8`.
+
 ## 2026-10-15 - v0.49.15
 
 The Coach overlay stays off unless Coach is open.

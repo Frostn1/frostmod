@@ -65,22 +65,52 @@ treated as an explicit path to the DLL.
 ### In-game (works in fullscreen)
 
 Press **`F8`** to open the FrostMod **menu** (top-left). While it's open, press an
-item's number; `Esc` or `F8` closes it. Everything lives here instead of a separate
+item's key; `Esc` or `F8` closes it. Everything lives here instead of a separate
 F-key per feature.
 
 | In the menu | Action |
 |-------------|--------|
-| `1` | Reload mods (rescans content from disk, with a progress bar) |
-| `2` | Change bike / gear — in the pits, swap bike, paint and rider gear without leaving the server |
-| `3` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
-| `4` | Server announcements — show or hide a FrostServer's styled messages |
-| `5` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
-| `6` | Toggle the corner hint overlay |
-| `7` | Hide overlay — everything FrostMod draws, for recording (see below) |
+| `1` | Refresh paints |
+| `2` | Refresh gear and paints |
+| `T` | Refresh tracks |
+| `B` | Refresh bikes |
+| `3` | Reload all mods (rescans content from disk, with a progress bar) |
+| `4` | Change bike / gear — in the pits, swap bike, paint and rider gear without leaving the server |
+| `5` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
+| `6` | Server announcements — show or hide a FrostServer's styled messages |
 | `G` | Watch gfx.cfg — a saved bike `gfx.cfg` goes onto the bike without a restart (see below) |
+| `7` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
+| `8` | Toggle the corner hint overlay |
+| `9` | Hide overlay — everything FrostMod draws, for recording (see below) |
+| `0` | Rebuild riders (load new gear models) |
+| `K` | Change menu key (see below) |
 
-With `devmenu=1` in `frostmod_radar.cfg`, an `8` row appears: **Rebuild riders
-(experimental)**, for testing.
+#### Changing the menu key
+
+`F8` is the default. If it clashes with another tool (ReShade takes screenshots on `F8` for
+some people), pick another key:
+
+1. Press `F8`, then **`K`** (Change menu key). The bottom line reads *press the new key*.
+2. Press the new key. Hold Ctrl, Shift or Alt with it for a combination (`Ctrl+F9`).
+   `Esc` cancels and keeps the old key.
+
+The new key works straight away, shows in the menu and the corner hint, and is saved as
+`menukey=` in `frostmod_radar.cfg` next to `frostmod.log`. You can also write it there by hand
+while the game is closed: `menukey=F9`, `menukey=Ctrl+F8`, `menukey=Shift+Alt+Insert`.
+Names are `F1`–`F24`, `A`–`Z`, `0`–`9`, `Num0`–`Num9`, `Insert`, `Delete`, `Home`, `End`,
+`PageUp`, `PageDown`, `Pause`, `ScrollLock`, and `VK_xx` for any other virtual-key code.
+Delete the line to go back to `F8`.
+
+Some keys are refused, because the menu would be hard to get back into: `Esc`, a modifier on
+its own, mouse buttons, `F7` (clean view), `Ctrl+Shift+H` (Coach overlay), and on their own
+a letter, a digit, `Enter`, `Space`, `Tab`, `Backspace` or an arrow (they need Ctrl, Shift or
+Alt). A refused or unreadable `menukey=` line in the file keeps `F8` and says why in
+`frostmod.log`.
+
+Everywhere these docs say `F8`, read your menu key.
+
+With `devmenu=1` in `frostmod_radar.cfg`, any developer rows appear at the bottom of the
+menu.
 
 With `memdiag=1` in `frostmod_radar.cfg` (read at game start; off by default), FrostMod
 counts what the game uploads to OpenGL (textures by internal format and size, buffer

@@ -70,6 +70,11 @@ folder to list, and the plugin identity to answer with.
   helmets, boots and rider models too; **Refresh tracks** (`T`) and **Refresh bikes** (`B`)
   rescan just those. A refresh asked for while a bike, paint or event
   chooser is open waits until you leave that screen.
+- **Menu key** - `F8` opens the FrostMod menu unless you pick another key. If `F8` clashes
+  with something else (ReShade screenshots, say), open the menu, press **`K`** (Change menu
+  key) and press the new key, with Ctrl/Shift/Alt if you want them; `Esc` cancels. It is saved
+  as `menukey=` in `frostmod_radar.cfg`, next to `frostmod.log` (for example
+  `menukey=Ctrl+F9`). Everywhere these docs say `F8`, read your menu key.
 - **Filter servers** - on by default. Tune the rules in `frostmod_serverfilter.yaml`
   (created next to the binaries, with docs, on first run), or pass
   `--no-filter-servers` to turn it off.

@@ -129,6 +129,7 @@ There is **no footpeg key** in a bike's `gfx.cfg` or `.geom`. **[P]** (exe strin
 ## FrostMod: applying it live
 
 - **F8 → `G` (Watch gfx.cfg)**, off by default, saved as `gfxwatch=1` in `frostmod_radar.cfg`.
+  F8 is the default menu key; if you changed it (menu → `K`, `menukey=`), use yours.
   Every 0.5 s FrostMod checks the loose `gfx.cfg` of each loaded bike (`<mods>\bikes\<Bike>\gfx.cfg`,
   which is the active FrostMod Models variant). A new write time or size re-applies the live keys
   to every loaded vehicle on that bike, bike and cockpit. Changed values go to `frostmod.log` as

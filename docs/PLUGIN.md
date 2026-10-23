@@ -223,7 +223,7 @@ tail is the same fields, waiting to be derived.
 
 ## Feature 3 — in-game overlay (hybrid render path)
 
-The overlay (status pill, reload progress bar, F8 menu, track manager/switcher) has
+The overlay (status pill, reload progress bar, F8 menu - or the `menukey=` key - track manager/switcher) has
 **two renderers over one shared state**, chosen automatically:
 
 - **Sanctioned `Draw()`** — used on track/spectate/replay in plugin mode.

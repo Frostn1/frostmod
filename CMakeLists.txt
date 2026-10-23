@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.49.15")
+set(FROSTMOD_VERSION "0.49.16")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -198,6 +198,12 @@ add_test(NAME changefree COMMAND changefree_test)
 # Starting a reload under a bike chooser crashed a player's game three times.
 add_executable(refreshgate_test tests/refreshgate_test.cpp)
 add_test(NAME refreshgate COMMAND refreshgate_test)
+
+# --- the menu key (src/hotkey.h) ------------------------------------------------
+# menukey= in frostmod_radar.cfg: the names read and written, and which keys may open the
+# menu. A key that cannot be bound back again would strand the player without a menu.
+add_executable(hotkey_test tests/hotkey_test.cpp)
+add_test(NAME hotkey COMMAND hotkey_test)
 
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.

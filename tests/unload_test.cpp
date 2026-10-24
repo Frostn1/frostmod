@@ -171,15 +171,16 @@ static void TestInventory() {
     CHECK(!Has(fm, "MH_Uninitialize("),
           "no MH_Uninitialize: a thread inside a detour still calls through its trampoline");
 
-    // Hand-written code patches: the antifreeze displacement and the tyre-fallback span. Each
-    // VirtualProtect is one of these two (apply, verify-revert, revert) - a new one is a new
-    // patch that needs a revert in TdRevertPatches.
-    CHECK(Count(fm, "VirtualProtect(") == 10,
-          "VirtualProtect is called %d times (10 known: antifreeze 6, tyre fallback 4); a new code "
+    // Hand-written code patches: the antifreeze displacement, the tyre-fallback span and the
+    // map-guard calls. Each VirtualProtect is one of these three (apply, verify-revert, revert) -
+    // a new one is a new patch that needs a revert in TdRevertPatches.
+    CHECK(Count(fm, "VirtualProtect(") == 14,
+          "VirtualProtect is called %d times (14 known: antifreeze 6, tyre fallback 4, map guard 4); a new code "
           "patch must be reverted in TdRevertPatches - then update this count", Count(fm, "VirtualProtect("));
     const std::string patches = Body(fm, "static void TdRevertPatches(");
     CHECK(Has(patches, "TyreFallbackRevert()"), "teardown reverts the tyre fallback span");
     CHECK(Has(patches, "AfRevert()"), "teardown reverts the antifreeze displacement");
+    CHECK(Has(patches, "MgRevert()"), "teardown reverts the map-guard calls");
 
     // Threads: each kept in a handle and stopped (and joined when it may block) first.
     CHECK(Count(fm, "CreateThread(") == 3,

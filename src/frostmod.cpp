@@ -65,6 +65,7 @@
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
+#include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
@@ -3827,6 +3828,10 @@ static nantrap::Config g_ntCfg;
 // tyrelog=0 turns nantrap's tyre ring off (TYRELOG section, src/tyrelog.h). It is on with
 // nantrap=1 otherwise; without nantrap=1 the key does nothing.
 static tyrelog::Config g_tlCfg;
+// mapguard=0 turns the quad-batch map guard off (MAP GUARD section, src/mapguard.h); on by
+// default. mapguardtest=N fakes a bad map on every Nth flush so the fallback can be tested.
+static std::atomic<bool> g_mgOn{true};
+static std::atomic<int>  g_mgTestEvery{0};
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3848,6 +3853,8 @@ static void SaveOverlaySettings() {
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
     if (g_ntCfg.max != 1) fprintf(f, "nantrapmax=%d\n", g_ntCfg.max);
     if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
+    if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
+    if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3881,6 +3888,9 @@ static void LoadOverlaySettings() {
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
+        // Only read at load: the guard goes in right after this, or not at all.
+        else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
+        else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
@@ -7116,6 +7126,216 @@ static void InstallTyreFallback(intptr_t delta) {
         "tyre instead of crashing the bike list (+0x%llX).", (unsigned long long)(kRvaSpan + delta));
 }
 
+// ===========================================================================
+// MAP GUARD  -  the quad-batch flush no longer writes through a bad glMapBuffer pointer
+//
+// mapguard.h has the chain. The flush at 0x2409D0 maps its batch's vertex buffer and writes
+// through the result unchecked; on one RTX 5080 + ReShade setup that result is junk (never
+// NULL in the dumps) and the first store faults at mxbikes.exe+0x24085C. The flush's map and
+// unmap calls now go through MgMap / MgUnmap: a pointer that is committed and writable is
+// handed back untouched, anything else gets a scratch buffer of ours, uploaded at the unmap.
+// Only those two call instructions change; every other caller of the map function, and
+// glMapBuffer itself, are left alone. mapguard=0 turns it off; mapguardtest=N fakes a bad
+// pointer on every Nth map so the fallback can be watched in game.
+// ===========================================================================
+using MgMapFn         = void* (*)(void* vb);
+using MgUnmapFn       = int (*)(void* vb, int first, int count);
+using MgBindFn        = void (*)(void* vb);
+using MgSubDataFn     = void(APIENTRY*)(GLenum, ptrdiff_t, ptrdiff_t, const void*);
+using MgUnmapBufferFn = GLboolean(APIENTRY*)(GLenum);
+using MgGetBufParamFn = void(APIENTRY*)(GLenum, GLenum, GLint*);
+
+// Render thread only, except the counter (read at teardown for the summary line).
+struct MgSlot { const void* vb; uint8_t* buf; size_t cap; size_t live; };   // live: bytes lent, 0 = none
+static MgSlot                g_mgSlots[mapguard::kMaxSlots] = {};
+static uint64_t              g_mgMaps = 0;              // maps seen at this site (mapguardtest)
+static std::atomic<unsigned> g_mgFired{0};
+static MgGetBufParamFn       g_mgGetBufParam = nullptr;
+static bool                  g_mgGetBufParamLooked = false;
+static uintptr_t             g_mgSpan = 0;              // VA of the map call, 0 = not patched
+static uint8_t*              g_mgStubs = nullptr;       // kept after revert: a thread may be on its way through
+
+static mapguard::Verdict MgClassify(const void* p, size_t size, mapguard::Region* bad) {
+    return mapguard::Classify((uintptr_t)p, size, [](uintptr_t a, mapguard::Region* r) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)a, &mbi, sizeof(mbi))) return false;
+        r->base = (uintptr_t)mbi.BaseAddress; r->size = mbi.RegionSize;
+        r->state = mbi.State; r->protect = mbi.Protect;
+        return true;
+    }, bad);
+}
+
+// The scratch kept for this record, grown to `size`. nullptr when there is no room for one.
+static MgSlot* MgSlotFor(const void* vb, size_t size) {
+    MgSlot* s = nullptr;
+    for (MgSlot& x : g_mgSlots) if (x.vb == vb) { s = &x; break; }
+    if (!s) for (MgSlot& x : g_mgSlots) if (!x.vb) { s = &x; s->vb = vb; break; }
+    if (!s) return nullptr;
+    if (s->cap < size) {
+        uint8_t* nb = (uint8_t*)VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!nb) return nullptr;
+        if (s->buf) VirtualFree(s->buf, 0, MEM_RELEASE);
+        s->buf = nb; s->cap = size;
+    }
+    return s;
+}
+
+// Called by the flush instead of 0x22AC50, with the flush's own frame.
+static void* MgMap(void* vb) {
+    void* p = ((MgMapFn)(g_base + mapguard::kRvaMapFn))(vb);
+    const uint8_t* rec = (const uint8_t*)vb;
+    const int every = g_mgTestEvery.load(std::memory_order_relaxed);
+    const bool forced = every > 0 && mapguard::ForceThis(++g_mgMaps, every);
+    const size_t size = mapguard::BufferBytes(*(const int32_t*)(rec + mapguard::kVbCount),
+                                              *(const int32_t*)(rec + mapguard::kVbStride));
+    mapguard::Region bad{};
+    const mapguard::Verdict v = forced ? mapguard::Verdict::Forced : MgClassify(p, size, &bad);
+    if (v == mapguard::Verdict::Ok) return p;
+
+    // Only the glMapBuffer path is ours to stand in for. With buffers off, or no buffer name,
+    // the game returns what it always did and its own unmap does what it always did.
+    const bool glPath = *(const int32_t*)(g_base + mapguard::kRvaGlOk) != 0 &&
+                        *(const int32_t*)(g_base + mapguard::kRvaUseMap) != 0 &&
+                        *(const int32_t*)(rec + mapguard::kVbGlName) != 0;
+    MgSlot* s = (glPath && size) ? MgSlotFor(vb, size) : nullptr;
+    const unsigned n = g_mgFired.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (mapguard::ShouldLog(n)) {
+        if (!s)
+            Log("[mapguard] the quad batch's glMapBuffer gave %p (%s) for a %zu-byte buffer and "
+                "there is no scratch to stand in (%s) - the game's pointer is kept. Fired %u so far.",
+                p, mapguard::VerdictName(v), size,
+                !glPath ? "not the glMapBuffer path" : !size ? "record size out of range" : "out of memory",
+                n);
+        else if (v == mapguard::Verdict::Forced)
+            Log("[mapguard] mapguardtest=%d: map %llu treated as bad (real pointer %p) - this "
+                "batch is drawn from FrostMod's copy. Fired %u so far.",
+                every, (unsigned long long)g_mgMaps, p, n);
+        else
+            Log("[mapguard] the quad batch's glMapBuffer gave %p, %s (region %p +0x%llx state 0x%x "
+                "protect 0x%x), for a %zu-byte buffer - drawn from FrostMod's copy instead of "
+                "crashing at mxbikes.exe+0x24085C. Fired %u so far.",
+                p, mapguard::VerdictName(v), (void*)bad.base, (unsigned long long)bad.size,
+                bad.state, bad.protect, size, n);
+        frostmod::crash::Note("quad-batch map guard fired (%u so far, %s)", n, mapguard::VerdictName(v));
+    }
+    if (!s) return p;
+    s->live = size;
+    return s->buf;
+}
+
+// Called by the flush instead of 0x22ACC0. Anything we did not lend goes to the game's own.
+static int MgUnmap(void* vb, int first, int count) {
+    MgSlot* s = nullptr;
+    for (MgSlot& x : g_mgSlots) if (x.vb == vb) { s = &x; break; }
+    if (!s || !s->live)
+        return ((MgUnmapFn)(g_base + mapguard::kRvaUnmapFn))(vb, first, count);
+
+    const size_t n = s->live;
+    s->live = 0;
+    auto subData = *(MgSubDataFn*)(g_base + mapguard::kRvaGlBufferSubData);
+    auto unmapBuf = *(MgUnmapBufferFn*)(g_base + mapguard::kRvaGlUnmapBuffer);
+    if (!g_mgGetBufParamLooked) {
+        g_mgGetBufParamLooked = true;
+        g_mgGetBufParam = (MgGetBufParamFn)wglGetProcAddress("glGetBufferParameteriv");
+    }
+    // The buffer the map bound; re-bound through the game's cache so the cache stays right.
+    ((MgBindFn)(g_base + mapguard::kRvaBindFn))(vb);
+    // SubData on a buffer GL still has mapped is an error, so a mapping that "succeeded" with a
+    // junk pointer (or a forced one) is closed first. If GL says it is not mapped, leave it.
+    GLint mapped = 1;
+    if (g_mgGetBufParam) g_mgGetBufParam(mapguard::kGlArrayBuffer, mapguard::kGlBufferMapped, &mapped);
+    if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
+    if (subData) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)n, s->buf);
+    return 0;   // what 0x22ACC0's glMapBuffer path returns
+}
+
+// Put the two calls back exactly as they shipped. Called from Shutdown(): the stubs jump into
+// this dll, which the game unloads next.
+static void MgRevert() {
+    if (!g_mgSpan) return;
+    using namespace mapguard;
+    const uintptr_t mapSite = g_base + kRvaMapCall, unmapSite = g_base + kRvaUnmapCall;
+    const size_t span = (unmapSite + kCallLen) - mapSite;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)mapSite, span, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[mapguard] could not revert: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    memcpy((void*)mapSite, kMapWin + kMapCallInWin, kCallLen);
+    memcpy((void*)unmapSite, kUnmapWin + kUnmapCallInWin, kCallLen);
+    VirtualProtect((void*)mapSite, span, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)mapSite, span);
+    g_mgSpan = 0;
+    const unsigned n = g_mgFired.load();
+    Log("[mapguard] off: the quad batch's own map/unmap calls are back%s",
+        n ? "" : " (it never fired this run)");
+    if (n) Log("[mapguard] fired %u time(s) this run", n);
+}
+
+static void InstallMapGuard() {
+    using namespace mapguard;
+    if (g_game != &GAME_MXB) {
+        Log("[mapguard] off for %s - the offsets are MX Bikes' only.", g_game->display);
+        return;
+    }
+    if (!g_mgOn.load()) { Log("[mapguard] off by config (mapguard=0)"); return; }
+    if (g_mgSpan) return;
+    if (g_unloading.load()) return;
+    const uintptr_t mapSite = g_base + kRvaMapCall, unmapSite = g_base + kRvaUnmapCall;
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te) ||
+        (uint8_t*)(g_base + kRvaMapFn) < tb || (uint8_t*)(g_base + kRvaUnmapWin + kUnmapWinLen) > te ||
+        !Matches((const uint8_t*)(g_base + kRvaMapWin), kMapWin, kMapWinLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaUnmapWin), kUnmapWin, kUnmapWinLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaMapFn), kMapFnBytes, kMapFnLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaUnmapFn), kUnmapFnBytes, kUnmapFnLen)) {
+        Log("[mapguard] not applied: the bytes at +0x%llX / +0x%llX are not the quad-batch map "
+            "and unmap calls we expect (game updated?). Nothing patched.",
+            (unsigned long long)kRvaMapCall, (unsigned long long)kRvaUnmapCall);
+        return;
+    }
+    if (!g_mgStubs) g_mgStubs = (uint8_t*)AllocNear(mapSite, 0x40, PAGE_EXECUTE_READWRITE);
+    if (!g_mgStubs) { Log("[mapguard] not applied: no free page within reach"); return; }
+    BuildStub(g_mgStubs, (uint64_t)&MgMap);
+    BuildStub(g_mgStubs + 0x20, (uint64_t)&MgUnmap);
+    FlushInstructionCache(GetCurrentProcess(), g_mgStubs, 0x40);
+
+    uint8_t mapPatch[kCallLen], unmapPatch[kCallLen];
+    if (!BuildCall(mapSite, (uintptr_t)g_mgStubs, mapPatch) ||
+        !BuildCall(unmapSite, (uintptr_t)(g_mgStubs + 0x20), unmapPatch)) {
+        Log("[mapguard] not applied: stub out of rel32 reach");
+        return;
+    }
+    const size_t span = (unmapSite + kCallLen) - mapSite;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)mapSite, span, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[mapguard] not applied: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    // Unmap first: until the map side is ours nothing is lent, so a flush that runs between
+    // the two writes still pairs the game's own map with the game's own unmap.
+    memcpy((void*)unmapSite, unmapPatch, kCallLen);
+    memcpy((void*)mapSite, mapPatch, kCallLen);
+    VirtualProtect((void*)mapSite, span, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)mapSite, span);
+    g_mgSpan = mapSite;
+
+    // Prove both landed by decoding them back.
+    if (CallTarget(mapSite, (const uint8_t*)mapSite) != (uintptr_t)g_mgStubs ||
+        CallTarget(unmapSite, (const uint8_t*)unmapSite) != (uintptr_t)(g_mgStubs + 0x20)) {
+        MgRevert();
+        Log("[mapguard] not applied: the patch did not verify, reverted");
+        return;
+    }
+    const int every = g_mgTestEvery.load();
+    Log("[mapguard] on: the quad batch's glMapBuffer result is checked before the game writes "
+        "to it; a bad one is replaced by FrostMod's copy (calls at +0x%llX / +0x%llX).",
+        (unsigned long long)kRvaMapCall, (unsigned long long)kRvaUnmapCall);
+    if (every > 0)
+        Log("[mapguard] TEST MODE (mapguardtest=%d): every %dth map is treated as bad on purpose. "
+            "Remove the line from frostmod_radar.cfg when done.", every, every);
+}
+
 // The sibling sampler 0x1F1D10 (see offsets.h): same NaN escape, other grid. It answers
 // "no answer" with 1, so that is what a refused query returns here.
 using TerrainSample2Fn = int32_t (*)(void*, void*, void*, float, float);
@@ -7947,6 +8167,10 @@ DWORD WINAPI Init(LPVOID) {
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
+        // Same moment, same reason: the saved setting is known. The flush it guards may already
+        // be drawing the loading screen; the unmap call is written before the map call, so a
+        // flush in between still pairs the game's own map with the game's own unmap.
+        InstallMapGuard();
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
@@ -8096,6 +8320,7 @@ static void TdDisableHooks(bool) {
 static void TdRevertPatches(bool) {
     TyreFallbackRevert();   // jumps into a stub that calls this dll
     AfRevert();             // points at our cell, not our code, but the game gets its bytes back
+    MgRevert();             // two calls into stubs that jump into this dll
 }
 static void TdRemoveHandlers(bool) {
     nantrap::Uninstall();

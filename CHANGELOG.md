@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-25 - v0.49.17
+
+A game crash on supercross tracks is caught instead of closing the game.
+
+### Fixed
+- **Crash on supercross tracks.** The game's quad batch sometimes got a bad buffer pointer back
+  from the graphics driver and wrote through it, closing the game. FrostMod now checks the
+  pointer and, when it is bad, writes to its own scratch buffer and uploads that instead, so the
+  frame goes on and the game stays up. Valid pointers are left untouched. Turn it off with
+  `mapguard=0`.
+
 ## 2026-10-23 - v0.49.16
 
 The menu key can be changed, for anyone whose F8 is already taken.

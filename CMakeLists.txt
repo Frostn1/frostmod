@@ -269,6 +269,13 @@ add_test(NAME antifreeze COMMAND antifreeze_test)
 add_executable(tyrefallback_test tests/tyrefallback_test.cpp)
 add_test(NAME tyrefallback COMMAND tyrefallback_test)
 
+# --- quad-batch map guard test -------------------------------------------------
+# The two call sites rewritten, the map/unmap functions they reach, the GL pointers and flags
+# those read, and the "is this pointer writable" rule (src/mapguard.h). Pure, so it runs on
+# any host.
+add_executable(mapguard_test tests/mapguard_test.cpp)
+add_test(NAME mapguard COMMAND mapguard_test)
+
 # --- unload teardown test ------------------------------------------------------
 # The game FreeLibrary()s the plugin after Shutdown(); nothing may point into it after that.
 # Proves src/unload.h's order (threads, hooks, patches, handlers; once), and reads

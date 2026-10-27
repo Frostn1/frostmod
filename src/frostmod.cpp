@@ -7127,13 +7127,14 @@ static void InstallTyreFallback(intptr_t delta) {
 }
 
 // ===========================================================================
-// MAP GUARD  -  the quad-batch flush no longer writes through a bad glMapBuffer pointer
+// MAP GUARD  -  the quad-batch flush no longer writes through a bad vertex-buffer pointer
 //
-// mapguard.h has the chain. The flush at 0x2409D0 maps its batch's vertex buffer and writes
-// through the result unchecked; on one RTX 5080 + ReShade setup that result is junk (never
-// NULL in the dumps) and the first store faults at mxbikes.exe+0x24085C. The flush's map and
-// unmap calls now go through MgMap / MgUnmap: a pointer that is committed and writable is
-// handed back untouched, anything else gets a scratch buffer of ours, uploaded at the unmap.
+// mapguard.h has the chain. The flush at 0x2409D0 gets its batch's vertex pointer from
+// 0x22AC50 and writes through it unchecked; on one RTX 5080 + ReShade setup that pointer is
+// junk (the ram path's shadow pointer, in the 0.49.17 dumps) and the first store faults at
+// mxbikes.exe+0x24085C. The flush's map and unmap calls now go through MgMap / MgUnmap: a
+// pointer that is committed and writable is handed back untouched, anything else gets a
+// scratch buffer of ours on every path, uploaded at the unmap (or kept, with no GL buffer).
 // Only those two call instructions change; every other caller of the map function, and
 // glMapBuffer itself, are left alone. mapguard=0 turns it off; mapguardtest=N fakes a bad
 // pointer on every Nth map so the fallback can be watched in game.
@@ -7146,10 +7147,15 @@ using MgUnmapBufferFn = GLboolean(APIENTRY*)(GLenum);
 using MgGetBufParamFn = void(APIENTRY*)(GLenum, GLenum, GLint*);
 
 // Render thread only, except the counter (read at teardown for the summary line).
-struct MgSlot { const void* vb; uint8_t* buf; size_t cap; size_t live; };   // live: bytes lent, 0 = none
+struct MgSlot {
+    const void* vb; uint8_t* buf; size_t cap;
+    size_t live;              // bytes lent, 0 = none
+    mapguard::Path path;      // the path the game was on when we lent it
+};
 static MgSlot                g_mgSlots[mapguard::kMaxSlots] = {};
 static uint64_t              g_mgMaps = 0;              // maps seen at this site (mapguardtest)
 static std::atomic<unsigned> g_mgFired{0};
+static unsigned              g_mgKindFired[mapguard::kKinds] = {};   // per (path, verdict), for the log
 static MgGetBufParamFn       g_mgGetBufParam = nullptr;
 static bool                  g_mgGetBufParamLooked = false;
 static uintptr_t             g_mgSpan = 0;              // VA of the map call, 0 = not patched
@@ -7163,6 +7169,13 @@ static mapguard::Verdict MgClassify(const void* p, size_t size, mapguard::Region
         r->state = mbi.State; r->protect = mbi.Protect;
         return true;
     }, bad);
+}
+
+// Which of 0x22AC50's paths this record takes right now (same three ints the game tests).
+static mapguard::Path MgPath(const uint8_t* rec) {
+    return mapguard::PathOf(*(const int32_t*)(g_base + mapguard::kRvaGlOk),
+                            *(const int32_t*)(g_base + mapguard::kRvaUseMap),
+                            *(const int32_t*)(rec + mapguard::kVbGlName));
 }
 
 // The scratch kept for this record, grown to `size`. nullptr when there is no room for one.
@@ -7192,34 +7205,35 @@ static void* MgMap(void* vb) {
     const mapguard::Verdict v = forced ? mapguard::Verdict::Forced : MgClassify(p, size, &bad);
     if (v == mapguard::Verdict::Ok) return p;
 
-    // Only the glMapBuffer path is ours to stand in for. With buffers off, or no buffer name,
-    // the game returns what it always did and its own unmap does what it always did.
-    const bool glPath = *(const int32_t*)(g_base + mapguard::kRvaGlOk) != 0 &&
-                        *(const int32_t*)(g_base + mapguard::kRvaUseMap) != 0 &&
-                        *(const int32_t*)(rec + mapguard::kVbGlName) != 0;
-    MgSlot* s = (glPath && size) ? MgSlotFor(vb, size) : nullptr;
+    // Whatever path the game is on, a bad pointer is never handed to the flush: it writes
+    // into our scratch, and MgUnmap does the right thing with that for the path.
+    const mapguard::Path path = MgPath(rec);
+    MgSlot* s = size ? MgSlotFor(vb, size) : nullptr;
     const unsigned n = g_mgFired.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (mapguard::ShouldLog(n)) {
+    const unsigned k = ++g_mgKindFired[mapguard::KindIndex(path, v)];
+    if (mapguard::ShouldLog(k)) {
         if (!s)
-            Log("[mapguard] the quad batch's glMapBuffer gave %p (%s) for a %zu-byte buffer and "
-                "there is no scratch to stand in (%s) - the game's pointer is kept. Fired %u so far.",
-                p, mapguard::VerdictName(v), size,
-                !glPath ? "not the glMapBuffer path" : !size ? "record size out of range" : "out of memory",
-                n);
+            Log("[mapguard] %s: the quad batch's map gave %p (%s) for a %zu-byte buffer and "
+                "there is no scratch to stand in (%s) - the game's pointer is kept. This kind "
+                "%u, all kinds %u so far.",
+                mapguard::PathName(path), p, mapguard::VerdictName(v), size,
+                !size ? "record size out of range" : "out of memory", k, n);
         else if (v == mapguard::Verdict::Forced)
-            Log("[mapguard] mapguardtest=%d: map %llu treated as bad (real pointer %p) - this "
-                "batch is drawn from FrostMod's copy. Fired %u so far.",
-                every, (unsigned long long)g_mgMaps, p, n);
+            Log("[mapguard] %s: mapguardtest=%d: map %llu treated as bad (real pointer %p) - this "
+                "batch is written to FrostMod's copy. This kind %u, all kinds %u so far.",
+                mapguard::PathName(path), every, (unsigned long long)g_mgMaps, p, k, n);
         else
-            Log("[mapguard] the quad batch's glMapBuffer gave %p, %s (region %p +0x%llx state 0x%x "
-                "protect 0x%x), for a %zu-byte buffer - drawn from FrostMod's copy instead of "
-                "crashing at mxbikes.exe+0x24085C. Fired %u so far.",
-                p, mapguard::VerdictName(v), (void*)bad.base, (unsigned long long)bad.size,
-                bad.state, bad.protect, size, n);
-        frostmod::crash::Note("quad-batch map guard fired (%u so far, %s)", n, mapguard::VerdictName(v));
+            Log("[mapguard] %s: the quad batch's map gave %p, %s (region %p +0x%llx state 0x%x "
+                "protect 0x%x), for a %zu-byte buffer - written to FrostMod's copy instead of "
+                "crashing at mxbikes.exe+0x24085C. This kind %u, all kinds %u so far.",
+                mapguard::PathName(path), p, mapguard::VerdictName(v), (void*)bad.base,
+                (unsigned long long)bad.size, bad.state, bad.protect, size, k, n);
+        frostmod::crash::Note("quad-batch map guard fired (%s, %s, %u of this kind, %u in all)",
+                              mapguard::PathName(path), mapguard::VerdictName(v), k, n);
     }
     if (!s) return p;
     s->live = size;
+    s->path = path;
     return s->buf;
 }
 
@@ -7232,21 +7246,32 @@ static int MgUnmap(void* vb, int first, int count) {
 
     const size_t n = s->live;
     s->live = 0;
+    const mapguard::UnmapAction act = mapguard::UnmapFor(s->path, MgPath((const uint8_t*)vb));
+    if (act == mapguard::UnmapAction::Game) {
+        // No GL buffer: the game's unmap returns 1 without touching GL. The flush's writes
+        // went into our scratch, which stays allocated, so nothing is left pointing at junk.
+        return mapguard::UnmapResult(act, ((MgUnmapFn)(g_base + mapguard::kRvaUnmapFn))(vb, first, count));
+    }
     auto subData = *(MgSubDataFn*)(g_base + mapguard::kRvaGlBufferSubData);
     auto unmapBuf = *(MgUnmapBufferFn*)(g_base + mapguard::kRvaGlUnmapBuffer);
-    if (!g_mgGetBufParamLooked) {
-        g_mgGetBufParamLooked = true;
-        g_mgGetBufParam = (MgGetBufParamFn)wglGetProcAddress("glGetBufferParameteriv");
-    }
     // The buffer the map bound; re-bound through the game's cache so the cache stays right.
     ((MgBindFn)(g_base + mapguard::kRvaBindFn))(vb);
-    // SubData on a buffer GL still has mapped is an error, so a mapping that "succeeded" with a
-    // junk pointer (or a forced one) is closed first. If GL says it is not mapped, leave it.
-    GLint mapped = 1;
-    if (g_mgGetBufParam) g_mgGetBufParam(mapguard::kGlArrayBuffer, mapguard::kGlBufferMapped, &mapped);
-    if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
+    if (act == mapguard::UnmapAction::CloseThenUpload) {
+        // SubData on a buffer GL still has mapped is an error, so a mapping that "succeeded"
+        // with a junk pointer (or a forced one) is closed first. If GL says it is not mapped,
+        // leave it.
+        if (!g_mgGetBufParamLooked) {
+            g_mgGetBufParamLooked = true;
+            g_mgGetBufParam = (MgGetBufParamFn)wglGetProcAddress("glGetBufferParameteriv");
+        }
+        GLint mapped = 1;
+        if (g_mgGetBufParam) g_mgGetBufParam(mapguard::kGlArrayBuffer, mapguard::kGlBufferMapped, &mapped);
+        if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
+    }
+    // On the ram path this is the game's own upload, from our copy instead of its bad RAM
+    // pointer. The whole buffer goes up: the four arrays sit at fixed offsets across all of it.
     if (subData) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)n, s->buf);
-    return 0;   // what 0x22ACC0's glMapBuffer path returns
+    return mapguard::UnmapResult(act, 0);
 }
 
 // Put the two calls back exactly as they shipped. Called from Shutdown(): the stubs jump into
@@ -7328,8 +7353,8 @@ static void InstallMapGuard() {
         return;
     }
     const int every = g_mgTestEvery.load();
-    Log("[mapguard] on: the quad batch's glMapBuffer result is checked before the game writes "
-        "to it; a bad one is replaced by FrostMod's copy (calls at +0x%llX / +0x%llX).",
+    Log("[mapguard] on: the quad batch's vertex pointer is checked before the game writes "
+        "to it; a bad one is replaced by FrostMod's copy on any path (calls at +0x%llX / +0x%llX).",
         (unsigned long long)kRvaMapCall, (unsigned long long)kRvaUnmapCall);
     if (every > 0)
         Log("[mapguard] TEST MODE (mapguardtest=%d): every %dth map is treated as bad on purpose. "

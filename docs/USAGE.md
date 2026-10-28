@@ -206,8 +206,8 @@ Off by default. When on, FrostMod upgrades the lighting in MX Bikes' own materia
 the game loads them. There is no ReShade and no extra pass: the game's GLSL is rewritten in place.
 
 - **Specular**: energy-conserving Blinn-Phong instead of plain Phong. Matte materials get a
-  softer, dimmer highlight and shiny ones a tighter, brighter one, and no highlight shows on a
-  side facing away from the sun.
+  softer, dimmer highlight and shiny ones a tighter, brighter one that fades out at its edge
+  rather than clipping to flat white, and no highlight shows on a side facing away from the sun.
 - **Reflections**: Schlick Fresnel on the cubemap reflection, so surfaces reflect less head-on
   and more at the edges, within each material's own minimum and maximum.
 - **Normal maps**: renormalised, with an optional strength.

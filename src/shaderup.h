@@ -21,8 +21,10 @@
 //   kSpec     the Phong line -> fm_spec(): Blinn-Phong with the half vector, exponent 4x the
 //             material's Phong shininess (the usual match for the lobe width), the (n+8)/8
 //             energy normalisation taken relative to n = 64 so a mid-shiny material keeps its
-//             brightness, clamped at 4x, times N.L so no highlight shows on the side facing
-//             away from the sun. Strength shaderspec=.
+//             brightness, capped at 1.5x, times N.L so no highlight shows on the side facing
+//             away from the sun. Strength shaderspec=. Above 0.5 the term rolls off on a soft
+//             shoulder toward 0.95, so a tight, shiny highlight fades out instead of clipping
+//             to a flat white disc with a hard edge.
 //   kFresnel  the reflection weight -> fm_fresnel(): the same RefFactorMin/RefFactor range,
 //             with the curve moved from the artist's pow(1-c, FresExp) toward Schlick's
 //             (1-c)^5 by shaderfresnel= (default 80; 100 = pure Schlick). Head-on surfaces
@@ -208,8 +210,9 @@ inline const char* HelperText(Rule r) {
         return "float fm_spec(vec3 L,vec3 N,vec3 E,float sh){"
                "vec3 H=normalize(L-normalize(E));"
                "float n=clamp(sh*4.0,1.0,2048.0);"
-               "float k=min((n+8.0)/72.0,4.0);"
-               "return pow(max(dot(N,H),0.0),n)*k*max(dot(N,L),0.0)*FM_SPEC;}\n";
+               "float k=min((n+8.0)/72.0,1.5);"
+               "float s=pow(max(dot(N,H),0.0),n)*k*max(dot(N,L),0.0)*FM_SPEC;"
+               "return s<0.5?s:0.5+0.45*(1.0-exp((0.5-s)/0.45));}\n";
     case kFresnel:
         return "float fm_fresnel(float f0,float f90,float e,float edn){"
                "float c=1.0-clamp(abs(edn),0.0,1.0);"

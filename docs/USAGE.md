@@ -79,6 +79,7 @@ F-key per feature.
 | `5` | Bike model swap — swap a bike's model (whole file set) for another (see below) |
 | `6` | Server announcements — show or hide a FrostServer's styled messages |
 | `G` | Watch gfx.cfg — a saved bike `gfx.cfg` goes onto the bike without a restart (see below) |
+| `S` | Material shaders — upgraded lighting on the game's own materials, on or off (see below) |
 | `7` | Overlay size — steps 75 → 200 %; the menu stays open so you can see it change |
 | `8` | Toggle the corner hint overlay |
 | `9` | Hide overlay — everything FrostMod draws, for recording (see below) |
@@ -198,6 +199,41 @@ a second, in the pits or on track. Each changed value is logged as a `[gfx]` lin
 textures and the exhaust still need a rejoin; the status line says so when you change one. The
 setting is kept as `gfxwatch=1` in `frostmod_radar.cfg`. Keys, units and frames:
 [GFX_CFG.md](GFX_CFG.md).
+
+### Material shaders (menu `S`)
+
+Off by default. When on, FrostMod upgrades the lighting in MX Bikes' own material shaders as
+the game loads them. There is no ReShade and no extra pass: the game's GLSL is rewritten in place.
+
+- **Specular**: energy-conserving Blinn-Phong instead of plain Phong. Matte materials get a
+  softer, dimmer highlight and shiny ones a tighter, brighter one, and no highlight shows on a
+  side facing away from the sun.
+- **Reflections**: Schlick Fresnel on the cubemap reflection, so surfaces reflect less head-on
+  and more at the edges, within each material's own minimum and maximum.
+- **Normal maps**: renormalised, with an optional strength.
+- **Shadows**: four taps instead of one, which softens the edge a little.
+
+Only shaders FrostMod recognises are changed, by a hash of their exact source. Another game
+build, or a shader it doesn't know, is left as the game wrote it, and the log says so. If an
+upgraded shader fails to compile or link, the game's own is put back and the log says why.
+
+`S` in the menu turns it on or off and saves the choice. **`Ctrl+Shift+S`** switches between
+upgraded and original while you ride, for a side-by-side look; that switch isn't saved. Every
+`[shaders]` line in `frostmod.log` names a replaced shader or says what was left alone.
+
+Settings in `frostmod_radar.cfg` (edit with the game closed; integers, percent):
+
+| Key | Default | What |
+|-----|---------|------|
+| `shaders=` | `0` | `1` turns it on |
+| `shaderbump=` | `100` | normal-map strength, 0–300 |
+| `shaderspec=` | `100` | specular strength, 0–300 |
+| `shaderfresnel=` | `80` | how far the reflection curve moves to Schlick, 0–100. At `100` the live switch can't relink reflective materials and leaves them as they were. |
+| `shadersoft=` | `100` | shadow tap spread, in percent of one texel of a 2048 map, 0–400. `0` keeps the single tap. |
+| `shadertone=` | `0` | `1` adds a soft highlight shoulder above 80 % brightness |
+| `shaderkey=` | `Ctrl+Shift+S` | the live switch key |
+| `grade=` | `0` | `1` adds a minimal colour grade on the final image (with `shaders=1`) |
+| `gradebright=` / `gradecontrast=` / `gradesat=` | `100` | brightness 50–150, contrast 50–150, saturation 0–200 |
 
 ## Files
 

@@ -68,6 +68,8 @@
 #include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
+#include "shaderup.h"     // shaders=1: upgraded material shading in the game's own GLSL (off by default)
+#include "shaderswitch.h" // shaders=1: the live A/B relink that keeps the game's uniform locations
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -3832,6 +3834,14 @@ static tyrelog::Config g_tlCfg;
 // default. mapguardtest=N fakes a bad map on every Nth flush so the fallback can be tested.
 static std::atomic<bool> g_mgOn{true};
 static std::atomic<int>  g_mgTestEvery{0};
+// shaders=1 and its strengths (SHADERS section, src/shaderup.h); off by default. Read once at
+// load; F8 > S and the A/B key change it, and the live state, on the render thread only.
+static shaderup::Config  g_suCfg;
+// shaderkey=: the live A/B key (upgraded <-> the game's own shading). Ctrl+Shift+S unless set.
+static frostmod::hotkey::Hotkey SuDefaultKey() {
+    frostmod::hotkey::Hotkey k; k.vk = 'S'; k.ctrl = true; k.shift = true; return k;
+}
+static std::atomic<int>  g_suKey{frostmod::hotkey::Pack(SuDefaultKey())};
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3855,6 +3865,11 @@ static void SaveOverlaySettings() {
     if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
     if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
     if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
+    fputs(shaderup::CfgLines(g_suCfg).c_str(), f);
+    if (frostmod::hotkey::Unpack(g_suKey.load()) != SuDefaultKey()) {
+        char sk[48]; frostmod::hotkey::Format(frostmod::hotkey::Unpack(g_suKey.load()), sk, sizeof(sk));
+        fprintf(f, "shaderkey=%s\n", sk);
+    }
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3891,6 +3906,24 @@ static void LoadOverlaySettings() {
         // Only read at load: the guard goes in right after this, or not at all.
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
+        // shaders=, shaderbump=, ..., grade=. Read here once; whether the hooks go in is
+        // decided right after this, at load.
+        else if (shaderup::ParseCfgLine(line, g_suCfg)) {}
+        // The A/B key. One that cannot be parsed, or may not be bound, keeps Ctrl+Shift+S.
+        else if (strncmp(line, "shaderkey=", 10) == 0) {
+            char* val = line + 10;
+            val[strcspn(val, "\r\n")] = 0;
+            frostmod::hotkey::Hotkey k;
+            const char* why = nullptr;
+            if (!frostmod::hotkey::Parse(val, &k))
+                Log("[shaders] shaderkey=%s is not a key FrostMod knows - keeping Ctrl+Shift+S", val);
+            else if (!frostmod::hotkey::Bindable(k, &why))
+                Log("[shaders] shaderkey=%s: %s - keeping Ctrl+Shift+S", val, why);
+            else if (k == MenuKey())
+                Log("[shaders] shaderkey=%s is the menu key - keeping Ctrl+Shift+S", val);
+            else
+                g_suKey.store(frostmod::hotkey::Pack(k));
+        }
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
@@ -4017,6 +4050,7 @@ static const MenuItem kMenu[] = {
     { '5', "Bike model swap",               false, 3  },
     { '6', "Server announcements",          false, 8  },
     { 'G', "Watch gfx.cfg",                 false, 15 },
+    { 'S', "Material shaders",              false, 17 },
     { '7', "Overlay size",                  true,  6  },
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
@@ -4040,6 +4074,8 @@ static void MenuRowText(int i, char* out, size_t n) {
     else if (kMenu[i].action == 16) {                // the menu key row shows the key
         char mk[48]; MenuKeyName(mk, sizeof(mk));
         sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label, mk);
+    } else if (kMenu[i].action == 17) {              // the shaders row shows on / off
+        sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label, g_suCfg.on ? "on" : "off");
     } else
         sprintf_s(out, n, "  %c   %s", kMenu[i].key, kMenu[i].label);
 }
@@ -5111,6 +5147,7 @@ void GfxWatchTick();    // fwd (same place)
 void ArrivedGearTick(); // fwd (same place)
 void OpenChange(); void CloseChange(); void HandleChangeKeys(); void PollChange();   // fwd (CHANGE)
 extern std::atomic<bool> g_chOpen;
+void SuMenuToggle();    // fwd (SHADERS)
 void MenuAction(int d) {   // d = the row's action, not its key
     switch (d) {
     case 1: RequestReload();    g_menuOpen.store(false); break;   // reload mods (shows the bar)
@@ -5132,6 +5169,7 @@ void MenuAction(int d) {   // d = the row's action, not its key
               SetStatus(on ? "server announcements: on" : "server announcements: off", 1500);
               Log("[servermsg] %s", on ? "on" : "off"); g_menuOpen.store(false); } break;
     case 15: g_menuOpen.store(false); GfxWatchToggle(); break;   // live bike gfx.cfg
+    case 17: g_menuOpen.store(false); SuMenuToggle(); break;     // upgraded material shaders
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
     case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // change bike / gear
     // Menu stays open: the next key pressed is the new menu key (Tick), Esc cancels.
@@ -5616,6 +5654,486 @@ static void MdRenderTick() {
     MdReport("first frame", true);
 }
 
+// ===========================================================================
+// SHADERS  -  upgraded material shading in the game's own GLSL (opt-in: shaders=1)
+//
+// src/shaderup.h has the what and the why; this is the plumbing. Nothing here runs unless
+// frostmod_radar.cfg says shaders=1, or the rider turns it on from the menu (F8 > S).
+//
+// HOW A SOURCE IS SWAPPED. The game resolves glShaderSourceARB, glCompileShaderARB and
+// glLinkProgramARB through wglGetProcAddress once, when it makes its GL context, and builds
+// every program right after. With shaders=1 we hook opengl32!wglGetProcAddress at load; when
+// the game asks for one of those three, the driver function it is about to be handed gets an
+// inline hook (MinHook), the way memdiag hooks its ARB entry points. Then:
+//   glShaderSourceARB  hashes the source. A kKnown[] hash gets the upgraded text; anything
+//                      else goes through untouched. Every source is remembered by shader name.
+//   glCompileShaderARB an upgraded shader that does not compile is put back to the game's own
+//                      text and compiled again, and the driver's log goes to frostmod.log.
+//   glLinkProgramARB   a program that does not link with an upgraded shader in it is put back
+//                      the same way and linked again. After a good link the uniform locations
+//                      are kept: they are the ones the game is about to ask for, once, and keep.
+// The game never checks a status itself, so a fallback here is the only one there is.
+//
+// LATE START. Injected after the game made its programs, the hooks go in on the first frame
+// instead (same three names, same detours) and the existing programs are found by walking the
+// small handle space once (glGetObjectParameterivARB answers only for live objects). They are
+// then switched exactly like the live A/B below.
+//
+// THE LIVE A/B (shaderkey=, Ctrl+Shift+S; or F8 > S, which also saves). Switching a running
+// program means re-sourcing its fragment shader and relinking it, on the render thread,
+// between frames. A relink resets every uniform and may move them, and the game asked for the
+// locations once. So: every active uniform's value is read first and written back after; every
+// vertex attribute is bound to the location it had; and the new link must keep every uniform
+// where the game believes it is (shaderup::LocationsCompatible) or the program is put back as
+// it was. tools/shaderlab replays this offline for every known source: all keep their
+// locations with the default shaderfresnel=80 (shaderup.h says why not 100).
+//
+// THE COLOUR GRADE (grade=1, needs shaders=1; off by default). One extra pass in our
+// wglSwapBuffers hook, before FrostMod's own overlay: the back buffer is copied to a texture and
+// drawn back through brightness / contrast / saturation (gradebright= gradecontrast= gradesat=).
+// Kept to those three on purpose: a modder is writing a full grading plugin, and this is not it.
+// ===========================================================================
+namespace su {
+
+using SourceFn  = void(APIENTRY*)(GLuint, GLsizei, const char* const*, const GLint*);
+using CompileFn = void(APIENTRY*)(GLuint);
+using LinkFn    = void(APIENTRY*)(GLuint);
+
+constexpr GLuint kScanMax        = 4096;     // handles walked on a late start
+constexpr GLenum kSourceLength   = 0x8B88;   // GL_OBJECT_SHADER_SOURCE_LENGTH_ARB
+constexpr GLenum kFragmentShader = 0x8B30;
+
+// The three detoured entry points: the trampolines (what calling the real one means).
+static SourceFn  g_oSource  = nullptr;
+static CompileFn g_oCompile = nullptr;
+static LinkFn    g_oLink    = nullptr;
+static void*     g_hookedAt[3] = {};          // driver addresses, so none is hooked twice
+static std::atomic<int> g_hooked{0};          // how many of the three are in
+
+// Everything else, resolved with a context current (render thread, or inside the link hook).
+// gl.source / gl.compile / gl.link are pointed at the trampolines once the hooks are in, so our
+// own calls never come back through the detours.
+static shaderswitch::Api g_gl;
+static std::atomic<bool> g_resolved{false};
+using CreateShFn = GLuint(APIENTRY*)(GLenum);
+using CreatePrFn = GLuint(APIENTRY*)(void);
+using AttachFn   = void(APIENTRY*)(GLuint, GLuint);
+using U1iFn      = void(APIENTRY*)(GLint, GLint);
+using U3fFn      = void(APIENTRY*)(GLint, GLfloat, GLfloat, GLfloat);
+using ActTexFn   = void(APIENTRY*)(GLenum);
+using GetSrcFn   = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+static CreateShFn g_createSh = nullptr;  static CreatePrFn g_createPr = nullptr;
+static AttachFn   g_attach = nullptr;    static U1iFn      g_u1i = nullptr;
+static U3fFn      g_u3f = nullptr;       static ActTexFn   g_activeTex = nullptr;
+static GetSrcFn   g_getSource = nullptr;
+
+using GetProc_t = PROC(WINAPI*)(LPCSTR);
+static GetProc_t g_oGetProc = nullptr;        // opengl32!wglGetProcAddress, once hooked
+
+struct Shader {
+    std::string            orig;              // the game's own text
+    const shaderup::Known* known = nullptr;   // its table row, if any
+    bool                   upgraded = false;  // what the driver holds now
+};
+struct Program {
+    std::vector<shaderup::Loc> game;          // the locations the game asked for and kept
+};
+static std::mutex                 g_mx;       // the game may build on another thread
+static std::map<GLuint, Shader>   g_shaders;
+static std::map<GLuint, Program>  g_programs;
+static std::set<uint64_t>         g_unknownLogged;
+static std::atomic<bool> g_live{false};       // upgraded is what new and switched programs get
+static std::atomic<bool> g_want{false};       // hooks wanted (shaders=1 at load, or turned on)
+static std::atomic<int>  g_swapped{0};        // sources upgraded as the game compiled them
+static std::atomic<int>  g_fallbacks{0};      // upgrades put back after a failure
+static bool              g_scanned = false;   // existing programs adopted (late start)
+
+static void* Proc(const char* name) {
+    void* p = g_oGetProc ? (void*)g_oGetProc(name) : (void*)wglGetProcAddress(name);
+    const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return (v <= 3 || p == (void*)-1) ? nullptr : p;   // drivers report a miss as 0..3 or -1
+}
+
+// After the hooks: our own source/compile/link calls go to the driver, not the detours.
+static void UseTrampolines() {
+    if (g_oSource) g_gl.source = g_oSource;
+    if (g_oCompile) g_gl.compile = g_oCompile;
+    if (g_oLink) g_gl.link = g_oLink;
+}
+
+static bool Resolve() {
+    if (g_resolved.load()) return true;
+    bool ok = g_gl.Load(Proc);
+    g_createSh  = (CreateShFn)Proc("glCreateShaderObjectARB");
+    g_createPr  = (CreatePrFn)Proc("glCreateProgramObjectARB");
+    g_attach    = (AttachFn)Proc("glAttachObjectARB");
+    g_u1i       = (U1iFn)Proc("glUniform1iARB");
+    g_u3f       = (U3fFn)Proc("glUniform3fARB");
+    g_activeTex = (ActTexFn)Proc("glActiveTextureARB");
+    g_getSource = (GetSrcFn)Proc("glGetShaderSourceARB");
+    ok = ok && g_createSh && g_createPr && g_attach && g_u1i && g_u3f && g_activeTex && g_getSource;
+    if (!ok) {
+        static bool said = false;
+        if (!said) { said = true; Log("[shaders] the driver lacks an ARB shader-object entry point - staying off"); }
+        return false;
+    }
+    UseTrampolines();
+    g_resolved.store(true);
+    return true;
+}
+
+static void DrainErrors() { for (int i = 0; i < 32 && glGetError() != GL_NO_ERROR; ++i) {} }
+
+// ---- the three detours -------------------------------------------------------------------------
+static void APIENTRY hkSource(GLuint sh, GLsizei count, const char* const* str, const GLint* len) {
+    if (g_unloading.load() || !str || count <= 0) { g_oSource(sh, count, str, len); return; }
+    std::string src;
+    for (GLsizei i = 0; i < count; ++i) {
+        if (!str[i]) continue;
+        if (len && len[i] >= 0) src.append(str[i], (size_t)len[i]);
+        else src.append(str[i]);
+    }
+    const shaderup::Known* k = shaderup::Find(shaderup::Hash(src), src.size());
+    shaderup::Result r;
+    if (k && g_live.load()) r = shaderup::Upgrade(src, *k, g_suCfg);
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        Shader& s = g_shaders[sh];
+        s.orig = src; s.known = k; s.upgraded = r.ok;
+        // A material shader we do not know: say so once, so a new game build shows in the log.
+        if (!k && src.find("gl_FrontMaterial.shininess") != std::string::npos && src.find("fm_spec(") == std::string::npos &&
+            g_unknownLogged.insert(shaderup::Hash(src)).second)
+            Log("[shaders] a material shader we do not know (hash %016llx, %zu bytes) - left as the game wrote it",
+                (unsigned long long)shaderup::Hash(src), src.size());
+    }
+    if (k && g_live.load() && !r.ok)
+        Log("[shaders] %s (%016llx) not upgraded: %s - left as the game wrote it", k->label,
+            (unsigned long long)k->hash, r.why);
+    if (r.ok) {
+        g_swapped.fetch_add(1);
+        Log("[shaders] shader %u: %s (%016llx) upgraded", sh, k->label, (unsigned long long)k->hash);
+        const char* p = r.out.c_str();
+        g_oSource(sh, 1, &p, nullptr);
+        return;
+    }
+    g_oSource(sh, count, str, len);
+}
+
+static void APIENTRY hkCompile(GLuint sh) {
+    g_oCompile(sh);
+    if (g_unloading.load()) return;
+    std::string orig;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        auto it = g_shaders.find(sh);
+        if (it == g_shaders.end() || !it->second.upgraded) return;
+        orig = it->second.orig;
+    }
+    if (!Resolve() || shaderswitch::Status(g_gl, sh, shaderswitch::kCompileStatus)) return;
+    Log("[shaders] shader %u: the upgrade did not compile, the game's own is back. Driver: %s", sh,
+        shaderswitch::InfoLog(g_gl, sh).c_str());
+    shaderswitch::SetSource(g_gl, sh, orig);
+    g_oCompile(sh);
+    std::lock_guard<std::mutex> lk(g_mx);
+    g_shaders[sh].upgraded = false;
+    g_fallbacks.fetch_add(1);
+}
+
+static void APIENTRY hkLink(GLuint p) {
+    g_oLink(p);
+    if (g_unloading.load() || !Resolve()) return;
+    if (!shaderswitch::Status(g_gl, p, shaderswitch::kLinkStatus)) {
+        std::vector<std::pair<GLuint, std::string>> back;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            for (GLuint sh : shaderswitch::Attached(g_gl, p)) {
+                auto it = g_shaders.find(sh);
+                if (it != g_shaders.end() && it->second.upgraded) {
+                    back.push_back({sh, it->second.orig});
+                    it->second.upgraded = false;
+                }
+            }
+        }
+        if (back.empty()) return;   // the game's own program failed; not ours to explain
+        Log("[shaders] program %u did not link upgraded, the game's own shaders are back. Driver: %s", p,
+            shaderswitch::InfoLog(g_gl, p).c_str());
+        for (auto& b : back) { shaderswitch::SetSource(g_gl, b.first, b.second); g_oCompile(b.first); }
+        g_oLink(p);
+        g_fallbacks.fetch_add((int)back.size());
+        if (!shaderswitch::Status(g_gl, p, shaderswitch::kLinkStatus)) return;
+    }
+    auto locs = shaderswitch::Locations(g_gl, p);
+    std::lock_guard<std::mutex> lk(g_mx);
+    g_programs[p].game = std::move(locs);
+}
+
+// One of the three names, hooked once at the driver address it resolves to.
+static void HookOne(const char* name, void* target) {
+    struct H { const char* n; void* d; void** o; };
+    static const H hs[3] = {{"glShaderSourceARB", (void*)&hkSource, (void**)&g_oSource},
+                            {"glCompileShaderARB", (void*)&hkCompile, (void**)&g_oCompile},
+                            {"glLinkProgramARB", (void*)&hkLink, (void**)&g_oLink}};
+    static std::mutex hookMx;
+    if (!name || !target || !g_want.load()) return;
+    std::lock_guard<std::mutex> lk(hookMx);
+    for (int i = 0; i < 3; ++i) {
+        if (strcmp(name, hs[i].n) != 0) continue;
+        if (g_hookedAt[i]) return;                    // already in
+        char label[64]; sprintf_s(label, "shaders %s", hs[i].n);
+        if (InstallHook(target, hs[i].d, hs[i].o, label)) {
+            g_hookedAt[i] = target;
+            g_hooked.fetch_add(1);
+            if (g_resolved.load()) UseTrampolines();
+        }
+        return;
+    }
+}
+
+static PROC WINAPI hkGetProc(LPCSTR name) {
+    PROC p = g_oGetProc(name);
+    // Only the three names, and only while the feature is wanted.
+    if (p && name && !g_unloading.load() && g_want.load() && g_hooked.load() < 3 &&
+        name[0] == 'g' && name[1] == 'l' && strstr(name, "ARB"))
+        HookOne(name, (void*)p);
+    return p;
+}
+
+// The first frame (or the first switch-on): put in whichever of the three are missing.
+static bool EnsureHooks() {
+    if (g_hooked.load() == 3) return true;
+    for (const char* n : {"glShaderSourceARB", "glCompileShaderARB", "glLinkProgramARB"})
+        if (void* p = Proc(n)) HookOne(n, p);
+    if (g_hooked.load() != 3) {
+        Log("[shaders] only %d of 3 shader entry points could be hooked - staying off", g_hooked.load());
+        return false;
+    }
+    UseTrampolines();
+    return true;
+}
+
+// Late start: the programs the game made before our hooks, found by handle.
+static void Scan() {
+    if (g_scanned) return;
+    g_scanned = true;
+    int programs = 0, adopted = 0;
+    for (GLuint h = 1; h <= kScanMax; ++h) {
+        if (!shaderswitch::IsProgram(g_gl, h)) continue;   // a dead handle only sets an error
+        ++programs;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (g_programs.count(h)) continue;
+        }
+        Program pr; pr.game = shaderswitch::Locations(g_gl, h);
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_programs[h] = std::move(pr);
+        for (GLuint sh : shaderswitch::Attached(g_gl, h)) {
+            if (g_shaders.count(sh)) continue;
+            GLint n = 0; g_gl.param(sh, kSourceLength, &n);
+            if (n <= 1 || n > 65536) continue;
+            std::string src((size_t)n, '\0'); GLsizei got = 0;
+            g_getSource(sh, n, &got, &src[0]);
+            src.resize(got > 0 ? (size_t)got : 0);
+            Shader s; s.orig = src; s.known = shaderup::Find(shaderup::Hash(src), src.size());
+            g_shaders[sh] = std::move(s);
+            ++adopted;
+        }
+    }
+    DrainErrors();
+    Log("[shaders] %d program(s) live, %d shader source(s) the hooks had not seen adopted", programs, adopted);
+}
+
+// Switch one program's upgradable shaders to `on`. -1 refused (left as it was), 0 nothing to
+// do, 1 switched.
+static int Switch(GLuint p, bool on) {
+    if (!shaderswitch::IsProgram(g_gl, p)) return 0;   // the game deleted it
+    std::vector<shaderswitch::Change> ch;
+    std::vector<shaderup::Loc> game;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        auto pit = g_programs.find(p);
+        if (pit == g_programs.end()) return 0;
+        game = pit->second.game;
+        for (GLuint sh : shaderswitch::Attached(g_gl, p)) {
+            auto it = g_shaders.find(sh);
+            if (it == g_shaders.end() || !it->second.known || it->second.upgraded == on) continue;
+            const Shader& s = it->second;
+            auto r = shaderup::Upgrade(s.orig, *s.known, g_suCfg);
+            if (on && r.ok) ch.push_back({sh, r.out, s.orig});
+            else if (!on) ch.push_back({sh, s.orig, r.ok ? r.out : s.orig});
+        }
+    }
+    if (ch.empty()) return 0;
+    std::string why;
+    const auto out = shaderswitch::Relink(g_gl, p, ch, game, &why);
+    if (out != shaderswitch::Outcome::Switched) {
+        Log("[shaders] program %u could not be switched %s (%s); %s", p, on ? "on" : "off", why.c_str(),
+            out == shaderswitch::Outcome::Refused ? "left as it was"
+                                                  : "AND DID NOT GO BACK CLEANLY - restart the game");
+        g_fallbacks.fetch_add(1);
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (const auto& c : ch) g_shaders[c.shader].upgraded = on;
+    return 1;
+}
+
+// Switch every program we know of. Render thread, context current, between frames.
+static void SetLive(bool on, bool quiet = false) {
+    if (!Resolve()) return;
+    if (on && !EnsureHooks()) return;
+    g_live.store(on);
+    Scan();   // once: anything built before the hooks
+    std::vector<GLuint> ps;
+    { std::lock_guard<std::mutex> lk(g_mx); for (auto& kv : g_programs) ps.push_back(kv.first); }
+    int sw = 0, bad = 0;
+    for (GLuint p : ps) { const int r = Switch(p, on); sw += r > 0; bad += r < 0; }
+    DrainErrors();
+    if (!quiet || sw || bad)
+        Log("[shaders] %s: %d program(s) switched, %d left as they were",
+            on ? "upgraded shading ON" : "the game's own shading", sw, bad);
+}
+
+// ---- the colour grade -------------------------------------------------------------------------
+static GLuint g_gradeProg = 0, g_gradeTex = 0;
+static GLint  g_gradeLocFrame = -1, g_gradeLocGrade = -1;
+static int    g_gradeW = 0, g_gradeH = 0;
+static bool   g_gradeFailed = false;
+
+static bool GradeInit() {
+    if (g_gradeProg) return true;
+    if (g_gradeFailed || !Resolve()) return false;
+    const GLuint fs = g_createSh(kFragmentShader);
+    shaderswitch::SetSource(g_gl, fs, shaderup::GradeFragmentSource());   // never through hkSource
+    g_gl.compile(fs);
+    if (!shaderswitch::Status(g_gl, fs, shaderswitch::kCompileStatus)) {
+        Log("[shaders] grade pass did not compile (%s) - grade off", shaderswitch::InfoLog(g_gl, fs).c_str());
+        g_gradeFailed = true; DrainErrors(); return false;
+    }
+    const GLuint p = g_createPr();
+    g_attach(p, fs);
+    g_gl.link(p);
+    if (!shaderswitch::Status(g_gl, p, shaderswitch::kLinkStatus)) {
+        Log("[shaders] grade pass did not link (%s) - grade off", shaderswitch::InfoLog(g_gl, p).c_str());
+        g_gradeFailed = true; DrainErrors(); return false;
+    }
+    g_gradeProg = p;
+    g_gradeLocFrame = g_gl.uLoc(p, "fm_frame");
+    g_gradeLocGrade = g_gl.uLoc(p, "fm_grade");
+    Log("[shaders] grade pass ready (brightness %d%%, contrast %d%%, saturation %d%%)", g_suCfg.bright,
+        g_suCfg.contrast, g_suCfg.sat);
+    return true;
+}
+
+// The back buffer, graded in place. From the wglSwapBuffers hook, before our overlay.
+static void GradePass() {
+    if (!g_want.load() || !g_live.load() || !g_suCfg.grade || shaderup::GradeIsIdentity(g_suCfg) ||
+        g_unloading.load())
+        return;
+    // glGetIntegerv is a driver round trip; the viewport and the bound framebuffer are asked
+    // every 32nd frame, like the overlay does.
+    static GLint vp[4] = {0, 0, 0, 0}, fbo = 0;
+    static unsigned age = 0;
+    if (vp[2] <= 0 || (age++ & 31) == 0) {
+        glGetIntegerv(GL_VIEWPORT, vp);
+        glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING_EXT */, &fbo);
+    }
+    if (vp[2] <= 0 || vp[3] <= 0 || fbo != 0 || !GradeInit()) return;
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+    g_activeTex(0x84C0 /* GL_TEXTURE0 */);
+    if (!g_gradeTex) glGenTextures(1, &g_gradeTex);
+    glBindTexture(GL_TEXTURE_2D, g_gradeTex);
+    if (g_gradeW != vp[2] || g_gradeH != vp[3]) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, vp[2], vp[3], 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        g_gradeW = vp[2]; g_gradeH = vp[3];
+    }
+    glReadBuffer(GL_BACK);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vp[0], vp[1], vp[2], vp[3]);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_ALPHA_TEST); glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_FOG); glDisable(GL_LIGHTING);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glDepthMask(GL_FALSE);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+    glMatrixMode(GL_TEXTURE);    glPushMatrix(); glLoadIdentity();
+    const GLuint prev = g_gl.handle(shaderswitch::kProgramObject);
+    g_gl.use(g_gradeProg);
+    g_u1i(g_gradeLocFrame, 0);
+    g_u3f(g_gradeLocGrade, g_suCfg.bright / 100.0f, g_suCfg.contrast / 100.0f, g_suCfg.sat / 100.0f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(-1, -1);
+    glTexCoord2f(1, 0); glVertex2f(1, -1);
+    glTexCoord2f(1, 1); glVertex2f(1, 1);
+    glTexCoord2f(0, 1); glVertex2f(-1, 1);
+    glEnd();
+    g_gl.use(prev);
+    glMatrixMode(GL_TEXTURE);    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glPopAttrib();
+}
+
+}  // namespace su
+
+// At load, right after the settings are read: with shaders=1 the hook on wglGetProcAddress goes
+// in before the game makes its context. With shaders=0 nothing is hooked at all.
+static void SuInstall() {
+    if (!g_suCfg.on) { Log("[shaders] off (shaders=1 in frostmod_radar.cfg, or F8 > S, turns it on)"); return; }
+    su::g_want.store(true);
+    su::g_live.store(true);
+    HMODULE gl = GetModuleHandleA("opengl32.dll");
+    void* gp = gl ? (void*)GetProcAddress(gl, "wglGetProcAddress") : nullptr;
+    if (!gp || !InstallHook(gp, (void*)&su::hkGetProc, (void**)&su::g_oGetProc, "shaders opengl32!wglGetProcAddress"))
+        Log("[shaders] wglGetProcAddress not hooked - the shaders are switched on the first frame instead");
+    size_t known = 0; shaderup::KnownTable(&known);
+    char key[48]; frostmod::hotkey::Format(frostmod::hotkey::Unpack(g_suKey.load()), key, sizeof(key));
+    Log("[shaders] ON: %zu known material shaders; bump %d%% spec %d%% fresnel %d%% shadow %d%% shoulder %s, "
+        "grade %s. %s switches it live for A/B.",
+        known, g_suCfg.bump, g_suCfg.spec, g_suCfg.fresnel, g_suCfg.soft, g_suCfg.tone ? "on" : "off",
+        g_suCfg.grade ? "on" : "off", key);
+}
+
+// F8 > S: on / off, saved. Turning it on mid-session hooks and switches what the game built.
+void SuMenuToggle() {
+    g_suCfg.on = !g_suCfg.on;
+    SaveOverlaySettings();
+    if (g_suCfg.on) su::g_want.store(true);
+    if (su::g_want.load()) su::SetLive(g_suCfg.on);
+    if (g_suCfg.on && !su::g_live.load())
+        SetStatus("material shaders: could not switch on - see frostmod.log", 3000);
+    else
+        SetStatus(g_suCfg.on ? "material shaders: upgraded (saved)" : "material shaders: the game's own (saved)", 2000);
+}
+
+// Every frame, render thread: the first-frame catch-up and the A/B key.
+static void SuRenderTick() {
+    if (!su::g_want.load() || g_unloading.load()) return;
+    static bool first = true;
+    if (first) {
+        first = false;
+        // The hooks saw the game build its programs: nothing older to look for.
+        { std::lock_guard<std::mutex> lk(su::g_mx); if (!su::g_shaders.empty()) su::g_scanned = true; }
+        // Whatever the hooks missed (a late start) is switched now; after an early start this
+        // finds every program already upgraded and switches nothing.
+        su::SetLive(su::g_live.load(), true);
+        Log("[shaders] first frame: %d source(s) upgraded as the game compiled them, %d put back after a failure",
+            su::g_swapped.load(), su::g_fallbacks.load());
+    }
+    const frostmod::hotkey::Hotkey k = frostmod::hotkey::Unpack(g_suKey.load());
+    static bool prev = false;
+    const bool down = (GetAsyncKeyState(k.vk) & 0x8000) != 0 &&
+                      frostmod::hotkey::Matches(k, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0,
+                                                (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0,
+                                                (GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+    if (down && !prev && g_suCfg.on) {
+        const bool on = !su::g_live.load();
+        su::SetLive(on);
+        SetStatus(on ? "material shaders: UPGRADED" : "material shaders: the game's own", 1500);
+    }
+    prev = down;
+}
+
 // Crash context for the INJECTED copy, out of the plugin copy's block.
 //
 // The two copies are separate modules with separate statics, and the split runs straight
@@ -5682,6 +6200,7 @@ void Tick() {
     // ride past someone.
     SessionPublish();
     MdRenderTick();   // memdiag=1 only: one-time hook of the driver entry points
+    SuRenderTick();   // shaders=1 only: first-frame catch-up and the A/B key
 
     // One int read per frame, watching for the server browser's login to wedge. Cheap enough
     // to do here rather than on a timer, and the window it watches for is only five seconds
@@ -6055,6 +6574,7 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     // fires (count is stable) -> GL draws the overlay as before.
     static uint64_t lastDraw = 0;
     uint64_t now = g_drawCalls.load(std::memory_order_relaxed);
+    su::GradePass();   // grade=1 only (with shaders=1): before our overlay, so the overlay stays ungraded
     if (now == lastDraw) DrawOverlay(hdc);
     lastDraw = now;
     return g_origWglSwapBuffers(hdc);
@@ -8171,6 +8691,8 @@ DWORD WINAPI Init(LPVOID) {
         // be drawing the loading screen; the unmap call is written before the map call, so a
         // flush in between still pairs the game's own map with the game's own unmap.
         InstallMapGuard();
+        // shaders=1 only: the wglGetProcAddress hook, before the game makes its GL context.
+        SuInstall();
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row

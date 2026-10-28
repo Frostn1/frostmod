@@ -18,7 +18,10 @@
 //   kBump     `BumpNorm = normalize(BumpNorm);`  ->  fm_bump(): xy scaled by shaderbump=,
 //             renormalised, and a zero-length texel (a black mip) stays a flat normal
 //             instead of becoming NaN.
-//   kSpec     the Phong line -> fm_spec(): Blinn-Phong with the half vector, exponent 4x the
+//   kSpec     the Phong line -> fm_spec(). Below shininess 12 it is the game's own Phong term,
+//             unchanged: the broad sheen of a low-shininess material (bike plastics run 3-6)
+//             is what shows their form, and dimming it made them read flat. From 12 to 32 it
+//             blends into the upgraded term: Blinn-Phong with the half vector, exponent 4x the
 //             material's Phong shininess (the usual match for the lobe width), the (n+8)/8
 //             energy normalisation taken relative to n = 64 so a mid-shiny material keeps its
 //             brightness, capped at 1.5x, times N.L so no highlight shows on the side facing
@@ -208,11 +211,16 @@ inline const char* HelperText(Rule r) {
     case kSpec:
         // L: to the light. E: eye -> surface (the game's EyeDir), so the view vector is -E.
         return "float fm_spec(vec3 L,vec3 N,vec3 E,float sh){"
-               "vec3 H=normalize(L-normalize(E));"
+               "vec3 V=normalize(E);"
+               "float p=pow(max(dot(reflect(L,N),V),0.0),sh);"
+               "float t=smoothstep(12.0,32.0,sh);"
+               "if(t<=0.0)return p*FM_SPEC;"
+               "vec3 H=normalize(L-V);"
                "float n=clamp(sh*4.0,1.0,2048.0);"
                "float k=min((n+8.0)/72.0,1.5);"
                "float s=pow(max(dot(N,H),0.0),n)*k*max(dot(N,L),0.0)*FM_SPEC;"
-               "return s<0.5?s:0.5+0.45*(1.0-exp((0.5-s)/0.45));}\n";
+               "s=s<0.5?s:0.5+0.45*(1.0-exp((0.5-s)/0.45));"
+               "return mix(p*FM_SPEC,s,t);}\n";
     case kFresnel:
         return "float fm_fresnel(float f0,float f90,float e,float edn){"
                "float c=1.0-clamp(abs(edn),0.0,1.0);"

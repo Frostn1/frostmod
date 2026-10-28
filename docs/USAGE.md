@@ -205,9 +205,10 @@ setting is kept as `gfxwatch=1` in `frostmod_radar.cfg`. Keys, units and frames:
 Off by default. When on, FrostMod upgrades the lighting in MX Bikes' own material shaders as
 the game loads them. There is no ReShade and no extra pass: the game's GLSL is rewritten in place.
 
-- **Specular**: energy-conserving Blinn-Phong instead of plain Phong. Matte materials get a
-  softer, dimmer highlight and shiny ones a tighter, brighter one that fades out at its edge
-  rather than clipping to flat white, and no highlight shows on a side facing away from the sun.
+- **Specular**: shiny materials (helmets, visors, chrome) get energy-conserving Blinn-Phong: a
+  tighter highlight that fades out at its edge rather than clipping to flat white, and none on
+  a side facing away from the sun. Low-shininess materials, like most bike plastics, keep the
+  game's own broad sheen exactly; the two blend between shininess 12 and 32.
 - **Reflections**: Schlick Fresnel on the cubemap reflection, so surfaces reflect less head-on
   and more at the edges, within each material's own minimum and maximum.
 - **Normal maps**: renormalised, with an optional strength.

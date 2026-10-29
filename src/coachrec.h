@@ -27,6 +27,11 @@
 //   POSITIONS   every bike's race number, flags, track position and x/y/z, 10 Hz (others.h)
 //   RACE_LAP    f32 time, raw SPluginsRaceLap_t - any rider's lap (others.h)
 //   RACE_SPLIT  f32 time, raw SPluginsRaceSplit_t - any rider's split (others.h)
+//   LEAN_BIND / LEAN  the rider's lean controls and their readings (lean.h)
+//   RIDER_SKELETON the local rider's skeleton: node names and tree, or why it is unknown -
+//               once per stint, before the first RIDER_BONES (riderbones.h)
+//   RIDER_BONES the rider's pose as the game drew it: per node a quaternion and a position in
+//               the bike frame - with every SAMPLE while the skeleton is known (riderbones.h)
 //
 // A reader skips a tag it doesn't know by its length, so new tags keep the format version.
 #pragma once
@@ -71,6 +76,8 @@ enum Tag : uint8_t {
     RACE_SPLIT  = 15,
     LEAN_BIND   = 16,
     LEAN        = 17,
+    RIDER_SKELETON = 18,
+    RIDER_BONES    = 19,
 };
 
 /// Appends records to one file.

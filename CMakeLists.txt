@@ -256,6 +256,11 @@ add_test(NAME stance COMMAND stance_test)
 add_executable(lean_test tests/lean_test.cpp)
 add_test(NAME lean COMMAND lean_test)
 
+# The rider's skeleton (src/riderbones.h): the walk over the game's objects, the build check
+# that keeps it off on any other build, and the RIDER_SKELETON / RIDER_BONES bytes.
+add_executable(riderbones_test tests/riderbones_test.cpp)
+add_test(NAME riderbones COMMAND riderbones_test)
+
 # --- rider-visibility patch test -----------------------------------------------
 # The displacement arithmetic behind the antifreeze patch. A wrong number there is a wild
 # read on every frame inside remote-rider playback, so it is proved rather than trusted.

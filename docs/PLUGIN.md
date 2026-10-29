@@ -267,6 +267,11 @@ asks for telemetry at 50 Hz, and writes one `.mxbc` file per stint on track to
 payloads, byte for byte; the layout is documented at the top of `coachrec.h` and pinned by
 `tests/coachrec_test.cpp`. MX Bikes only: the other titles send different telemetry structs.
 
+Beside each sample it also records the rider's **pose as the game drew it**: every node of
+the local rider's animated skeleton, in the bike's frame (`RIDER_SKELETON` / `RIDER_BONES`).
+That one reads the game's memory, so it runs only on the build its layout was read from
+(beta21e) and says "unknown build" on any other. See [RIDER_BONES.md](RIDER_BONES.md).
+
 In practice it also shows **live cues**. On `EventInit` it loads
 `<save path>\mxbcoach\cues\<track>.<bike>.cue`, else `<track>.cue`, written by the app and
 ignored unless it was made for a track of the same length. On `RunInit` it turns cues on only

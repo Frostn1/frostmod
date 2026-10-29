@@ -66,6 +66,7 @@
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
+#include "shockguard.h"   // the rear shock's curve lookup: a NaN gets curve[0], not a read 8 GB off
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
@@ -3832,6 +3833,10 @@ static tyrelog::Config g_tlCfg;
 // default. mapguardtest=N fakes a bad map on every Nth flush so the fallback can be tested.
 static std::atomic<bool> g_mgOn{true};
 static std::atomic<int>  g_mgTestEvery{0};
+// shockguard=0 turns the rear-shock NaN guard off (SHOCK GUARD section, src/shockguard.h); on
+// by default.
+static std::atomic<bool> g_sgOn{true};
+static void ShockGuardTick();   // SHOCK GUARD section; called once a frame
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3855,6 +3860,7 @@ static void SaveOverlaySettings() {
     if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
     if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
     if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
+    if (!g_sgOn.load()) fprintf(f, "shockguard=0\n");
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3891,6 +3897,7 @@ static void LoadOverlaySettings() {
         // Only read at load: the guard goes in right after this, or not at all.
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
+        else if (sscanf_s(line, "shockguard=%d", &v) == 1) g_sgOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
@@ -5687,6 +5694,7 @@ void Tick() {
     // to do here rather than on a timer, and the window it watches for is only five seconds
     // wide.
     WorldWatch();
+    ShockGuardTick();    // the shock guard's counter: a log line and a crash-trail note
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     RaceFilterTick();
 
@@ -7437,6 +7445,126 @@ static void InstallTerrainGuard(intptr_t delta) {
 }
 
 // ===========================================================================
+// SHOCK GUARD  -  the rear shock's curve lookup no longer indexes with a NaN (+0x1A29AE)
+//
+// shockguard.h has the chain. The terrain guard above turns a NaN bike's height queries away,
+// but the bike is still NaN, and the next thing to read it is the rear shock: 0x1A2970 looks
+// up the shock curve with x = 1 - length / stroke, NaN passes both of its range checks, and
+// the read at +0x1A29AE lands 8 GB below the curve. That is the top crash in the reports, and
+// it is what OB's 2026-10-28 report is.
+//
+// The one call to 0x1A2970 now goes through a machine-code stub that makes a NaN x into 0 -
+// the function's own "x <= 0" branch, curve[0] - and counts it. A finite x goes straight on.
+// The stub keeps every register the game's leaf keeps (the caller relies on xmm5 surviving
+// the call), so it does no logging of its own: ShockGuardTick() reads its counter once a
+// frame, on the render thread, and writes the log line and the crash-trail note from there.
+// shockguard=0 turns it off.
+// ===========================================================================
+static uintptr_t         g_sgSite   = 0;         // VA of the call we repointed, 0 = not patched
+static uint8_t*          g_sgStub   = nullptr;   // kept after revert: a thread may be on its way through
+static uint32_t          g_sgLogged = 0;         // the count at the last log line
+
+static void ShockGuardTick() {
+    if (!g_sgStub) return;
+    const uint32_t n = *(volatile const uint32_t*)(g_sgStub + shockguard::kCountOff);
+    if (n == g_sgLogged) return;
+    const uint32_t prev = g_sgLogged;
+    g_sgLogged = n;
+    // Log when the count crosses a line the rate limit allows, and always the first.
+    bool due = prev == 0;
+    for (uint64_t k = (uint64_t)prev + 1; !due && k <= n && k <= (uint64_t)prev + 64; ++k)
+        due = shockguard::ShouldLog(k);
+    if (!due && n - prev > 64) due = true;
+    if (!due) return;
+    const uint8_t* bike = *(uint8_t* volatile const*)(g_sgStub + shockguard::kBikeOff);
+    double len = 0, stroke = 0;
+    if (bike) {
+        SafeReadBytes((const char*)(bike + shockguard::kBikeShockLen), (char*)&len, sizeof(len));
+        SafeReadBytes((const char*)(bike + shockguard::kBikeStroke), (char*)&stroke, sizeof(stroke));
+    }
+    Log("[shock] turned away a NaN shock-curve lookup (bike %p, shock length %g, stroke %g). "
+        "This is the crash at mxbikes.exe+0x%zx; the game got curve[0] instead. %u so far.",
+        (const void*)bike, len, stroke, (size_t)shockguard::kRvaFault, n);
+    frostmod::crash::Note("refused a NaN shock lookup (%u so far)", n);
+}
+
+// Put the call back exactly as it shipped. The stub only jumps into the game, never into this
+// dll, but the game gets its bytes back on unload like every other patch.
+static void SgRevert() {
+    if (!g_sgSite) return;
+    using namespace shockguard;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)g_sgSite, kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[shock] could not revert: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    memcpy((void*)g_sgSite, kWin + kCallInWin, kCallLen);
+    VirtualProtect((void*)g_sgSite, kCallLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)g_sgSite, kCallLen);
+    g_sgSite = 0;
+    const uint32_t n = g_sgStub ? *(volatile const uint32_t*)(g_sgStub + kCountOff) : 0;
+    if (n) Log("[shock] off: the rear shock's own call is back (turned away %u NaN lookup(s) this run)", n);
+    else   Log("[shock] off: the rear shock's own call is back (it never fired this run)");
+}
+
+static void InstallShockGuard() {
+    using namespace shockguard;
+    if (g_game != &GAME_MXB) {
+        Log("[shock] guard off for %s - the offsets are MX Bikes' only.", g_game->display);
+        return;
+    }
+    if (!g_sgOn.load()) { Log("[shock] guard off by config (shockguard=0)"); return; }
+    if (g_sgSite) return;
+    if (g_unloading.load()) return;
+    const uintptr_t site = g_base + kRvaCall;
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te) ||
+        (uint8_t*)(g_base + kRvaCurveFn) < tb || (uint8_t*)(g_base + kRvaWin + kWinLen) > te ||
+        !Matches((const uint8_t*)(g_base + kRvaWin), kWin, kWinLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaCurveFn), kFnBytes, kFnLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaLenLoad), kLenLoad, kLoadLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaStrokeLoad), kStrokeLoad, kLoadLen)) {
+        Log("[shock] guard not applied: the bytes at +0x%llX are not the rear shock's curve "
+            "lookup we expect (game updated?). Nothing patched.", (unsigned long long)kRvaCall);
+        return;
+    }
+    if (!g_sgStub) g_sgStub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_sgStub) { Log("[shock] guard not applied: no free page within reach"); return; }
+    memset(g_sgStub, 0xCC, kPageBytes);
+    memset(g_sgStub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_sgStub, (uintptr_t)g_sgStub, (uint64_t)(g_base + kRvaCurveFn));
+    FlushInstructionCache(GetCurrentProcess(), g_sgStub, kPageBytes);
+    g_sgLogged = 0;
+
+    int32_t rel = 0;
+    if (!CallRel(site, (uintptr_t)g_sgStub, &rel)) {
+        Log("[shock] guard not applied: stub out of rel32 reach");
+        return;
+    }
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)site, kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[shock] guard not applied: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    // Only the rel32 changes, and it is 4-byte aligned in this build (0x1A2E80), so the physics
+    // thread sees the old call or the new one, never half of each.
+    if (((site + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(site + 1), (LONG)rel);
+    else                       memcpy((void*)(site + 1), &rel, sizeof(rel));
+    VirtualProtect((void*)site, kCallLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)site, kCallLen);
+    g_sgSite = site;
+
+    if (CallTarget(site, (const uint8_t*)site) != (uintptr_t)g_sgStub) {
+        SgRevert();
+        Log("[shock] guard not applied: the patch did not verify, reverted");
+        return;
+    }
+    Log("[shock] guard on: a NaN rear-shock curve lookup gets curve[0] instead of reading 8 GB "
+        "off the table (call at +0x%llX, the crash at +0x%llX).",
+        (unsigned long long)kRvaCall, (unsigned long long)kRvaFault);
+}
+
+// ===========================================================================
 // NANTRAP  -  where the physics NaN is made (opt-in: nantrap=1 in frostmod_radar.cfg)
 //
 // The terrain guard above refuses a NaN position; it cannot say where the NaN came from,
@@ -8196,6 +8324,8 @@ DWORD WINAPI Init(LPVOID) {
         // be drawing the loading screen; the unmap call is written before the map call, so a
         // flush in between still pairs the game's own map with the game's own unmap.
         InstallMapGuard();
+        // Same moment: shockguard=0 is known now. One call instruction, in the physics step.
+        InstallShockGuard();
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row
@@ -8346,6 +8476,7 @@ static void TdRevertPatches(bool) {
     TyreFallbackRevert();   // jumps into a stub that calls this dll
     AfRevert();             // points at our cell, not our code, but the game gets its bytes back
     MgRevert();             // two calls into stubs that jump into this dll
+    SgRevert();             // one call into a stub that jumps back into the game
 }
 static void TdRemoveHandlers(bool) {
     nantrap::Uninstall();

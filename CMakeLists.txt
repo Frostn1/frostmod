@@ -276,6 +276,13 @@ add_test(NAME tyrefallback COMMAND tyrefallback_test)
 add_executable(mapguard_test tests/mapguard_test.cpp)
 add_test(NAME mapguard COMMAND mapguard_test)
 
+# --- rear-shock NaN guard test -------------------------------------------------
+# The call repointed, the curve lookup it reaches, and the stub in front of it
+# (src/shockguard.h). On Windows the stub also runs in front of a copy of the game's own
+# function bytes against a fake bike: a NaN gets curve[0], a finite x is untouched.
+add_executable(shockguard_test tests/shockguard_test.cpp)
+add_test(NAME shockguard COMMAND shockguard_test)
+
 # --- unload teardown test ------------------------------------------------------
 # The game FreeLibrary()s the plugin after Shutdown(); nothing may point into it after that.
 # Proves src/unload.h's order (threads, hooks, patches, handlers; once), and reads

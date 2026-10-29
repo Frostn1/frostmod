@@ -67,6 +67,7 @@
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
 #include "shockguard.h"   // the rear shock's curve lookup: a NaN gets curve[0], not a read 8 GB off
+#include "nanrecover.h"   // a bike whose physics state goes NaN is put back with the game's own reset
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
@@ -3837,6 +3838,10 @@ static std::atomic<int>  g_mgTestEvery{0};
 // by default.
 static std::atomic<bool> g_sgOn{true};
 static void ShockGuardTick();   // SHOCK GUARD section; called once a frame
+// nanrecover=0 turns off the reset of a bike whose physics state went NaN (NANRECOVER section,
+// src/nanrecover.h); on by default. Read early by NtReadCfg(), with nantrap=, before the sim
+// step hook goes in; kept here so a save does not drop it.
+static std::atomic<bool> g_nrOn{true};
 
 static void SaveOverlaySettings() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
@@ -3861,6 +3866,7 @@ static void SaveOverlaySettings() {
     if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
     if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
     if (!g_sgOn.load()) fprintf(f, "shockguard=0\n");
+    if (!g_nrOn.load()) fprintf(f, "nanrecover=0\n");
     fclose(f);
 }
 static void LoadOverlaySettings() {
@@ -3898,6 +3904,8 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
         else if (sscanf_s(line, "shockguard=%d", &v) == 1) g_sgOn.store(v != 0);
+        // Only kept for the next save: whether the reset went in was decided at load.
+        else if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
@@ -7583,22 +7591,30 @@ static SimStepFn g_origSimStep = nullptr;
 static void TlAfterStep(int32_t slot, float dt);
 static bool NtSpawnStep(int32_t slot);
 static std::atomic<bool> g_tlOn{false};
+static void NrCheck(int32_t slot, bool before);   // NANRECOVER section, below
+static std::atomic<bool> g_nrLive{false};
 
 static int32_t hkSimStep(int32_t slot, float dt) {
+    const bool nr = g_nrLive.load(std::memory_order_relaxed);
+    // A NaN put into a bike between steps (by anything but the step) is reset before the bike
+    // code reads it.
+    if (nr) NrCheck(slot, true);
     // A bike's first steps run stock: the game's own throwaway 0 * inf there is not the NaN we
     // want, and it would use up the report (tyrelog::kSpawnSettle).
     if (!nantrap::Armed() || NtSpawnStep(slot)) {
         const int32_t rc = g_origSimStep(slot, dt);
         if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
+        if (nr) NrCheck(slot, false);
         return rc;
     }
     const uint32_t saved = nantrap::Enter();
     const int32_t rc = g_origSimStep(slot, dt);
     nantrap::Restore(saved);   // the game's MXCSR, exactly as it was
     // The ring takes this step before a trap report goes out, so the report's CSV ends on the
-    // step that made the NaN.
+    // step that made the NaN. The reset comes after both, so they show the NaN, not the fix.
     if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
     nantrap::Flush();          // a pending report, if the step trapped; nothing otherwise
+    if (nr) NrCheck(slot, false);
     return rc;
 }
 
@@ -7855,21 +7871,305 @@ static void TlInstall(const uint8_t* fn) {
         "trap, the first refused NaN height query, or a crash. Read-only.", tyrelog::kSteps);
 }
 
+// ===========================================================================
+// NANRECOVER  -  a bike whose physics state went NaN gets the game's own reset (on by default)
+//
+// src/nanrecover.h has the evidence and the reasoning. Short version: the physics NaN is 46% of
+// the MX Bikes crashes FrostMod collects, the bike goes from calm to NaN inside one sim step,
+// and the bike code reads it in the next one and faults (+0x1A29AE and friends). The terrain
+// and shock guards each turn away one reader; this takes the NaN away from all of them.
+//
+// After each sim step (and once before it), every active bike in the slot is checked with
+// integer tests on its floats. A finite bike costs the check and nothing else: no write, no
+// call. A non-finite one is handed to place-bike 0x197060 - the function the game's own
+// respawn runs - with the main body's position and heading from a snapshot taken while it was
+// still finite and sane. Then it is checked again and the result is logged ("[nanrecover]")
+// and noted in the crash trail, so a crash that still follows says what was tried.
+//
+// Runs on the physics thread, between steps, where the game's own respawn job also runs. Every
+// read of the game's memory is under SEH; one fault turns this off for the session.
+// ===========================================================================
+static const uint8_t* g_nrWorlds = nullptr;   // the sim step's world slot array
+static nanrecover::ResetFn g_nrReset = nullptr;
+static nanrecover::Track g_nrTracks[8];        // per bike, most recently seen
+static std::atomic<uint32_t> g_nrResets{0};
+static std::atomic<uint32_t> g_nrFailed{0};
+static constexpr unsigned kNrTimedSteps = 5000;
+
+struct NrFound {
+    uint8_t* bike;
+    int32_t handle;
+    nanrecover::Bad bad;
+};
+
+static nanrecover::Track* NrTrackFor(const uint8_t* bike, int32_t handle, float t) {
+    nanrecover::Track* spare = nullptr;
+    for (auto& tr : g_nrTracks) {
+        if (tr.bike == bike) {
+            // Another bike at the same address, or the same one spawned again (its clock went
+            // back): start over. A clock that is not a number says nothing either way.
+            if (tr.handle != handle || (t == t && t < tr.lastTime)) tr.Clear(bike, handle, t);
+            if (t == t) tr.lastTime = t;
+            return &tr;
+        }
+        if (!spare && !tr.bike) spare = &tr;
+    }
+    if (!spare) {   // a full table: drop the one with the least history
+        spare = &g_nrTracks[0];
+        for (auto& tr : g_nrTracks)
+            if (tr.steps < spare->steps) spare = &tr;
+    }
+    spare->Clear(bike, handle, t == t ? t : 0.0f);
+    return spare;
+}
+
+// No C++ objects with destructors: the caller wraps it in __try. Fills up to `max` bikes that
+// failed the check; snapshots the ones that passed (after the step only).
+static int NrScanRaw(int32_t slot, bool before, NrFound* found, int max) {
+    if (slot < 1 || slot > 3 || !g_nrWorlds) return 0;
+    const uint8_t* world = g_nrWorlds + (size_t)(slot - 1) * tyrelog::kWorldStride;
+    const uint8_t* list = nullptr;
+    memcpy(&list, world + tyrelog::kWorldBikeList, sizeof(list));
+    const int n = tyrelog::ListCount(list);
+    if (n <= 0 || n > tyrelog::kMaxBikes) return 0;
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        uint8_t* bike = (uint8_t*)tyrelog::ListItem(list, i);
+        if (!bike) continue;
+        int32_t on = 0;
+        memcpy(&on, bike + nanrecover::kBikeActive, 4);
+        if (on == 0) continue;   // the bike sim skips it, and so does this
+        nanrecover::Bad bad;
+        if (!nanrecover::Scan(bike, &bad)) {
+            if (k < max) {
+                found[k].bike = bike;
+                memcpy(&found[k].handle, bike + nanrecover::kBikeHandle, 4);
+                found[k].bad = bad;
+                ++k;
+            }
+            continue;
+        }
+        if (before) continue;
+        int32_t handle = 0;
+        float t = 0;
+        memcpy(&handle, bike + nanrecover::kBikeHandle, 4);
+        memcpy(&t, bike + nanrecover::kBikeTime, 4);
+        const uint8_t* body = nullptr;
+        memcpy(&body, bike + nanrecover::kBodyMain, sizeof(body));
+        if (!body) continue;
+        float pos[3], lvel[3], avel[3], R[12];
+        memcpy(pos, body + nanrecover::kBodyPos, sizeof(pos));
+        memcpy(lvel, body + nanrecover::kBodyLvel, sizeof(lvel));
+        memcpy(avel, body + nanrecover::kBodyAvel, sizeof(avel));
+        memcpy(R, body + nanrecover::kBodyR, sizeof(R));
+        nanrecover::Track* tr = NrTrackFor(bike, handle, t);
+        tr->SawCounter(bike[nanrecover::kBikeResets]);
+        tr->Passed(pos, lvel, avel, R);
+    }
+    return k;
+}
+
+static int NrScan(int32_t slot, bool before, NrFound* found, int max, bool* faulted) {
+    *faulted = false;
+    __try {
+        return NrScanRaw(slot, before, found, max);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faulted = true;
+        return 0;
+    }
+}
+
+// The forces the step accumulated on the bike's bodies: zero between steps in a stock game
+// (ODE clears them at the end of each step), so clearing them before a reset only matters when
+// a NaN got into them from outside.
+static void NrClearForcesRaw(uint8_t* bike) {
+    const uint8_t* body[7];
+    uint32_t off[7];
+    nanrecover::Bodies(bike, body, off);
+    for (const uint8_t* b : body)
+        if (b) {
+            memset((void*)(b + nanrecover::kBodyFacc), 0, 12);
+            memset((void*)(b + nanrecover::kBodyTacc), 0, 12);
+        }
+}
+
+// place-bike under SEH. -1: it faulted; otherwise what it returned (0 placed, 1 no such bike).
+static int NrPlace(uint8_t* bike, int32_t handle, const nanrecover::Snap& s) {
+    __try {
+        NrClearForcesRaw(bike);
+        // (handle, x, z, heading, y): y is where its ground query starts, so a little above the
+        // body, never under the surface it was on.
+        return g_nrReset(handle, s.pos[0], s.pos[2], s.heading, s.pos[1] + 1.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+static bool NrRescan(uint8_t* bike, nanrecover::Bad* bad) {
+    __try {
+        return nanrecover::Scan(bike, bad);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void NrRecover(const NrFound& f, bool before) {
+    using namespace nanrecover;
+    float t = 0;
+    SafeReadBytes((const char*)(f.bike + kBikeTime), (char*)&t, sizeof(t));
+    Track* tr = NrTrackFor(f.bike, f.handle, t);
+    const uint32_t minAge = tr->MinAgeForNext();
+    const Snap* s = tr->Pick(minAge);
+    const uint32_t n = g_nrResets.load(std::memory_order_relaxed) + 1;
+    const char* what = FieldName(f.bad.field);
+    char where[48] = "";
+    if (f.bad.field >= Field::BodyPos && f.bad.field <= Field::BodyAvel)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, " of body [bike+0x%X]", f.bad.where);
+    else if (f.bad.field >= Field::WheelSpin && f.bad.field <= Field::WheelDeflVel)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, " of wheel %u", f.bad.where);
+    if (!s) {
+        const uint32_t m = g_nrFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLog(m))
+            Log("[nanrecover] bike %p (handle %d) has a non-finite %s%s (%08X) %s the step, "
+                "%.3f s after its spawn, and no finite position to put it back at yet. Left to "
+                "the terrain and shock guards. %u so far.",
+                (void*)f.bike, f.handle, what, where, f.bad.bits, before ? "before" : "after",
+                (double)t, m);
+        if (ShouldLog(m))
+            frostmod::crash::Note("nanrecover: NaN %s%s, no good position to reset to", what, where);
+        return;
+    }
+    const float age = (float)(tr->steps - s->step) * 0.002f;
+    const int rc = NrPlace(f.bike, f.handle, *s);
+    tr->DidReset();
+    uint8_t counter = 0;
+    if (SafeReadBytes((const char*)(f.bike + kBikeResets), (char*)&counter, 1) == 1)
+        tr->PlacedByUs(counter);
+    g_nrResets.store(n, std::memory_order_relaxed);
+    Bad after;
+    const bool clean = rc == 0 && NrRescan(f.bike, &after);
+    const bool say = ShouldLog(n);
+    if (say)
+        Log("[nanrecover] bike %p (handle %d): non-finite %s%s (%08X) %s the step, %.3f s after "
+            "its spawn. Reset with the game's place-bike to (%.2f, %.2f, %.2f) heading %.1f, "
+            "where it was %.2f s before: %s. %u reset(s) this run, %u for this bike.",
+            (void*)f.bike, f.handle, what, where, f.bad.bits, before ? "before" : "after",
+            (double)t, (double)s->pos[0], (double)s->pos[1], (double)s->pos[2],
+            (double)s->heading, (double)age,
+            rc < 0 ? "place-bike FAULTED" : rc != 0 ? "place-bike did not know the bike"
+            : clean ? "finite again" : "STILL non-finite",
+            n, tr->resets);
+    if (rc < 0) {
+        // Whatever place-bike tripped on, it will trip on again: stop calling it.
+        g_nrLive.store(false, std::memory_order_relaxed);
+        Log("[nanrecover] off for the rest of this session (place-bike faulted). The terrain and "
+            "shock guards still run.");
+    } else if (say && !clean && rc == 0) {
+        Log("[nanrecover] still non-finite after the reset: %s (%08X). It is tried again next "
+            "step, from further back.", FieldName(after.field), after.bits);
+    }
+    // The trail holds 32 notes; a bike that needs a reset every step must not push out what
+    // came before it.
+    if (say || rc < 0)
+        frostmod::crash::Note("nanrecover: NaN %s%s, bike reset to %.0f,%.0f,%.0f (%s, %u so far)",
+                              what, where, (double)s->pos[0], (double)s->pos[1],
+                              (double)s->pos[2], rc < 0 ? "faulted" : clean ? "ok" : "still NaN", n);
+}
+
+static void NrCheck(int32_t slot, bool before) {
+    // The cost, measured on the player's own machine: both checks of the first few thousand
+    // steps are timed and the mean goes in the log once.
+    static unsigned timed = 0;
+    static long long ticks = 0;
+    LARGE_INTEGER a{}, b{};
+    const bool timing = timed < kNrTimedSteps;
+    if (timing) QueryPerformanceCounter(&a);
+    NrFound found[4];
+    bool faulted = false;
+    const int k = NrScan(slot, before, found, 4, &faulted);
+    if (timing) {
+        QueryPerformanceCounter(&b);
+        ticks += b.QuadPart - a.QuadPart;
+        if (++timed == kNrTimedSteps) {
+            LARGE_INTEGER fq{};
+            QueryPerformanceFrequency(&fq);
+            const double ns =
+                fq.QuadPart ? (double)ticks * 1e9 / (double)fq.QuadPart / kNrTimedSteps : 0.0;
+            Log("[nanrecover] the check costs %.0f ns (mean of %u; it runs twice a 2 ms step).",
+                ns, kNrTimedSteps);
+        }
+    }
+    if (faulted) {
+        g_nrLive.store(false, std::memory_order_relaxed);
+        Log("[nanrecover] a read of the bike list faulted - off for the rest of this session.");
+        return;
+    }
+    for (int i = 0; i < k && g_nrLive.load(std::memory_order_relaxed); ++i) NrRecover(found[i], before);
+}
+
+// Before the sim step hook goes in. `fn` is the sim step as found. Every RVA here is beta21e's
+// and is checked byte for byte; one mismatch and nanrecover stays off (the guards still run).
+static bool NrInstall(const uint8_t* fn) {
+    if (g_unloading.load()) return false;
+    if (fn != (const uint8_t*)(g_base + mxb::RVA_SIM_STEP)) {
+        Log("[nanrecover] off: the sim step moved, so this is not the build its offsets are for.");
+        return false;
+    }
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) { Log("[nanrecover] off: no .text range."); return false; }
+    auto check = [&](uint32_t rva, const char* bytes, int len, const char* what) {
+        const uint8_t* p = (const uint8_t*)(g_base + rva);
+        if (p < begin || p + len > end || memcmp(p, bytes, (size_t)len) != 0) {
+            Log("[nanrecover] off: %s does not match at RVA 0x%x (game updated?). The terrain "
+                "and shock guards still run.", what, rva);
+            return false;
+        }
+        return true;
+    };
+    for (const nanrecover::Check& c : nanrecover::kChecks)
+        if (!check(c.rva, c.bytes, c.len, c.what)) return false;
+    // The bike list and world array, as tyrelog reads them.
+    for (const tyrelog::Check& c : tyrelog::kChecks)
+        if (!check(c.rva, c.bytes, c.len, c.what)) return false;
+    int32_t rel = 0;
+    memcpy(&rel, fn + tyrelog::kSimStepLeaAt + 3, 4);
+    const uint8_t* worlds = fn + tyrelog::kSimStepLeaAt + 7 + rel;
+    auto dos = (const IMAGE_DOS_HEADER*)g_base;
+    auto nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)g_base + dos->e_lfanew);
+    const uint8_t* lo = (const uint8_t*)g_base;
+    const uint8_t* hi = lo + nt->OptionalHeader.SizeOfImage;
+    if (worlds < lo || worlds + 3 * tyrelog::kWorldStride > hi) {
+        Log("[nanrecover] off: the world array the sim step points at is outside the exe.");
+        return false;
+    }
+    g_nrWorlds = worlds;
+    g_nrReset = (nanrecover::ResetFn)(g_base + nanrecover::kRvaReset);
+    return true;
+}
+
 // nantrap= / nantrapmax= straight from the file: the hook goes in before LoadOverlaySettings.
 static void NtReadCfg() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128];
+    int v = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (!nantrap::ParseCfgLine(line, g_ntCfg)) tyrelog::ParseCfgLine(line, g_tlCfg);
+        if (nantrap::ParseCfgLine(line, g_ntCfg)) continue;
+        if (tyrelog::ParseCfgLine(line, g_tlCfg)) continue;
+        if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
     }
     fclose(f);
 }
 
+// The sim step hook carries two things: nantrap=1 (off by default) and nanrecover (on by
+// default). Either one puts it in; with both off the step is not touched.
 static void InstallNanTrap(intptr_t delta) {
     NtReadCfg();
-    if (!g_ntCfg.on) return;   // the default: no hook, no handler, nothing
-    if (!g_game->offsets_complete) {
+    bool trap = g_ntCfg.on;
+    bool rec = g_nrOn.load();
+    if (!rec) Log("[nanrecover] off by config (nanrecover=0)");
+    if (!trap && !rec) return;   // no hook, no handler, nothing
+    if (!g_game->offsets_complete || g_game != &GAME_MXB) {
         Log("[nantrap] off for %s - the sim step is MX Bikes' and has no twin here.", g_game->display);
         return;
     }
@@ -7895,10 +8195,27 @@ static void InstallNanTrap(intptr_t delta) {
             fn[0], fn[1], fn[2], fn[3], fn[4]);
         return;
     }
+    // Before the hook: every byte the reset relies on, and the world array it walks.
+    if (rec) rec = NrInstall(fn);
     // Handler first, then the hook: a step must never run armed with nothing to catch it.
-    nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
-    if (!nantrap::Armed()) return;
-    if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
+    if (trap) {
+        nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
+        trap = nantrap::Armed();
+    }
+    if (!trap && !rec) return;
+    if (!InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
+        if (trap) nantrap::Uninstall();
+        return;
+    }
+    if (rec) {
+        g_nrLive.store(true, std::memory_order_release);
+        Log("[nanrecover] ON: after every physics step each bike's bodies, wheels and suspension "
+            "are checked for a value that is not a number. One that is gets the game's own "
+            "reset (place-bike 0x%zx) where it was a moment before, instead of the crash. A "
+            "finite bike is never touched. nanrecover=0 turns it off.",
+            (size_t)nanrecover::kRvaReset);
+    }
+    if (trap) {
         Log("[nantrap] ON (nantrap=1): the first invalid FP op in the sim step is logged and "
             "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
             "same values it does without it.", g_ntCfg.max);

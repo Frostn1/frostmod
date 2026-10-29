@@ -150,6 +150,13 @@ query is refused, or when the game crashes. It only reads; the game runs the sam
 report names the file as `nanRing`. `tyrelog=0` keeps the trap and drops the ring. The newest
 12 files are kept.
 
+When MX Bikes's physics turns your bike's state into numbers that are not numbers (NaN), the
+game used to crash on the next physics step. FrostMod now checks every bike after each step and
+puts one that went NaN back on the track with the game's own reset, where it was a moment
+before, and logs a `[nanrecover]` line. A bike whose numbers are fine is never touched.
+`nanrecover=0` in `frostmod_radar.cfg` turns it off; if the game has updated and the bytes it
+relies on no longer match, it stays off and says so in the log.
+
 The overlay sizes itself to your screen, so it takes up the same share of a 4K display
 as it does of a 1080p one. Row `5` is on top of that, for when you want it bigger (or
 smaller) than that. The size and the toggles persist across restarts, in

@@ -283,6 +283,15 @@ add_test(NAME mapguard COMMAND mapguard_test)
 add_executable(shockguard_test tests/shockguard_test.cpp)
 add_test(NAME shockguard COMMAND shockguard_test)
 
+# --- NaN bike reset test ---------------------------------------------------------
+# The offsets the per-step check reads and the place-bike call it makes, proved against the
+# install's byte checks (src/nanrecover.h). The check runs against a fake bike: every finite
+# state passes (random, extreme, and the last calm step of four real crashes), every non-finite
+# value in every covered field is caught and named. On Windows the game's own ODE body setters
+# run against the fake bike's bodies.
+add_executable(nanrecover_test tests/nanrecover_test.cpp)
+add_test(NAME nanrecover COMMAND nanrecover_test)
+
 # --- unload teardown test ------------------------------------------------------
 # The game FreeLibrary()s the plugin after Shutdown(); nothing may point into it after that.
 # Proves src/unload.h's order (threads, hooks, patches, handlers; once), and reads

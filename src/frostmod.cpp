@@ -4020,7 +4020,7 @@ static const MenuItem kMenu[] = {
     { '7', "Overlay size",                  true,  6  },
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
-    { '0', "Rebuild riders (load new gear models)", false, 9 },
+    { '0', "Rebuild riders (new gear)", false, 9 },
     { 'K', "Change menu key",               false, 16 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.

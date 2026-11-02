@@ -4044,58 +4044,12 @@ static void MenuRowText(int i, char* out, size_t n) {
         sprintf_s(out, n, "  %c   %s", kMenu[i].key, kMenu[i].label);
 }
 
-static const int kMenuWrapChars = 32;
-
-static void WrapMenuText(const char *text, std::vector<std::string> &lines)
-{
-    std::string remaining = text ? text : "";
-    const size_t labelStart = remaining.find("   ");
-    const std::string indent = labelStart == std::string::npos
-                                   ? ""
-                                   : std::string(labelStart + 4, ' ');
-    bool first = true;
-    while (!remaining.empty())
-    {
-        const int available = first ? kMenuWrapChars : kMenuWrapChars - (int)indent.size();
-        if ((int)remaining.size() <= available)
-        {
-            lines.push_back(first ? remaining : indent + remaining);
-            break;
-        }
-        size_t split = remaining.rfind(' ', available);
-        if (split == std::string::npos || split == 0)
-            split = available;
-        lines.push_back((first ? "" : indent) + remaining.substr(0, split));
-        remaining.erase(0, split);
-        while (!remaining.empty() && remaining.front() == ' ')
-            remaining.erase(0, 1);
-        first = false;
-    }
-    if (lines.empty())
-        lines.push_back("");
-}
-
-static int MenuContentLines()
-{
-    int lines = 0;
-    char text[128];
-    for (int i = 0; i < MenuCount(); ++i)
-    {
-        MenuRowText(i, text, sizeof(text));
-        std::vector<std::string> wrapped;
-        WrapMenuText(text, wrapped);
-        lines += (int)wrapped.size();
-    }
-    return lines;
-}
-
 // The menu's last line: how to close it, or, while "Change menu key" waits, what to press.
 static void MenuFooterText(char* out, size_t n) {
     if (g_menuKeyCapture.load()) { strcpy_s(out, n, "  press the new key   Esc cancel"); return; }
     char mk[48]; MenuKeyName(mk, sizeof(mk));
     sprintf_s(out, n, "  %s / Esc   close", mk);
 }
-
 // The corner hint: the version and the key that opens the menu.
 static void HintText(char* out, size_t n) {
     char mk[48]; MenuKeyName(mk, sizeof(mk));
@@ -4698,7 +4652,7 @@ void DrawOverlay(HDC hdc) {
         DrawDirectConnect(w, h, lh);
     } else if (menu) {
         // The action menu: title + one row per item + a footer. Press a row's key.
-        const int rows = MenuContentLines() + 2; // title + wrapped items + footer
+        const int rows = MenuCount() + 2;        // title + items + footer
         const int bw = 280, bh = rows * lh + 8;
         const int x0 = 10, x1 = x0 + bw, y1 = h - 10, y0 = y1 - bh;
         glColor4f(0.04f, 0.05f, 0.08f, 0.86f);
@@ -4709,13 +4663,7 @@ void DrawOverlay(HDC hdc) {
         glColor4f(0.90f, 0.94f, 1.0f, 1.0f);
         for (int i = 0; i < MenuCount(); ++i) {
             char row[96]; MenuRowText(i, row, sizeof(row));
-            std::vector<std::string> wrapped;
-            WrapMenuText(row, wrapped);
-            for (const std::string &line : wrapped)
-            {
-                GlText(x0 + 8, y, line.c_str());
-                y -= lh;
-            }
+            GlText(x0 + 8, y, row); y -= lh;
         }
         glColor4f(0.6f, 0.66f, 0.76f, 1.0f);
         char foot[64]; MenuFooterText(foot, sizeof(foot));
@@ -4993,21 +4941,14 @@ static void BuildOverlayDrawLists() {
         }
         DText(MX + PADX, y, "  digits . :   Enter connect   Esc cancel", cGray, FS);
     } else if (menu) {
-        const int rows = MenuContentLines() + 2;
-        const float w = 0.24f;
-        const float h = rows * LH + 0.010f;
+        const int rows = MenuCount() + 2;
+        const float w = 0.24f, h = rows * LH + 0.010f;   // wide enough for the size row
         DQuad(MX, MY, MX + w, MY + h, ToABGR(0.04f, 0.05f, 0.08f, 0.86f));
         float y = MY + 0.006f;
         DText(MX + PADX, y, "FrostMod v" FROSTMOD_VERSION "  -  menu", cBlue, FS); y += LH;
         for (int i = 0; i < MenuCount(); ++i) {
             char row[96]; MenuRowText(i, row, sizeof(row));
-            std::vector<std::string> wrapped;
-            WrapMenuText(row, wrapped);
-            for (const std::string &line : wrapped)
-            {
-                DText(MX + PADX, y, line.c_str(), cWhite, FS);
-                y += LH;
-            }
+            DText(MX + PADX, y, row, cWhite, FS); y += LH;
         }
         char foot[64]; MenuFooterText(foot, sizeof(foot));
         DText(MX + PADX, y, foot, cGray, FS);

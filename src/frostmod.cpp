@@ -7498,7 +7498,12 @@ static void SgRevert() {
         Log("[shock] could not revert: VirtualProtect failed (%lu)", GetLastError());
         return;
     }
-    memcpy((void*)g_sgSite, kWin + kCallInWin, kCallLen);
+    // Same as the install: only the rel32 differs, and the physics thread may be running this
+    // call, so it goes back with one aligned store where it can.
+    int32_t orig = 0;
+    memcpy(&orig, kWin + kCallInWin + 1, sizeof(orig));
+    if (((g_sgSite + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(g_sgSite + 1), (LONG)orig);
+    else                           memcpy((void*)(g_sgSite + 1), &orig, sizeof(orig));
     VirtualProtect((void*)g_sgSite, kCallLen, prot, &prot);
     FlushInstructionCache(GetCurrentProcess(), (void*)g_sgSite, kCallLen);
     g_sgSite = 0;

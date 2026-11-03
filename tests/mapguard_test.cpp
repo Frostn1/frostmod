@@ -236,6 +236,10 @@ static void TestPaths() {
     CHECK(UnmapResult(UnmapAction::Game, 1) == 1, "game's result passed through");
     CHECK(UnmapResult(UnmapAction::Upload, 1) == 0 && UnmapResult(UnmapAction::CloseThenUpload, 1) == 0,
           "an upload returns 0, as both of the game's upload paths do");
+    CHECK(UploadBytes(576000, 0) == 0 && UploadBytes(576000, -1) == 0,
+          "an empty batch uploads nothing, like the game's unmap (count * stride = 0)");
+    CHECK(UploadBytes(576000, 1) == 576000 && UploadBytes(576000, 16000) == 576000,
+          "a batch with vertices uploads the whole scratch: the arrays sit at fixed offsets");
 
     // The 0.49.17 dumps: the junk pointers came from the ram path and none of them is memory.
     FakeMem empty;

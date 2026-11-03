@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-03 - v0.50.0
+
+Three more crash fixes. Together with the trainer and terrain guards already in, FrostMod now handles
+the faults behind about 60% of the crash reports in thomas4f's MXBMRP3 usage survey.
+
+### Fixed
+- **Gate and render crash at +0x24085C.** The quad batch's vertex pointer is now checked on every
+  path the game fills it through, not only `glMapBuffer`. A bad one gets FrostMod's scratch buffer
+  and the frame is drawn. Turn it off with `mapguard=0`.
+- **Rear-shock crash at +0x1A29AE.** A shock curve lookup with a value that is not a number now
+  reads the curve's first entry instead of 8 GB off the table. Turn it off with `shockguard=0`.
+- **A bike whose physics goes NaN.** After every physics step each bike is checked, and one whose
+  values are not numbers is put back with the game's own respawn at where it was about 100 ms
+  earlier. A finite bike is never touched. Turn it off with `nanrecover=0`.
+
 ## 2026-10-25 - v0.49.17
 
 A game crash on supercross tracks is caught instead of closing the game.

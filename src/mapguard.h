@@ -273,6 +273,12 @@ inline UnmapAction UnmapFor(Path atMap, Path now) {
 /// The value 0x22ACC0 would have returned on the path we stood in for (0 = uploaded).
 inline int UnmapResult(UnmapAction a, int gameResult) { return a == UnmapAction::Game ? gameResult : 0; }
 
+/// Bytes MgUnmap uploads from a scratch of `lent` bytes when the flush says it wrote `count`
+/// vertices. An empty batch wrote nothing, and the game's own unmap uploads count * stride =
+/// 0 bytes for it, so neither do we; the NULL fires (up to 196k a run) are exactly those.
+/// Anything else goes up whole: the four arrays sit at fixed offsets across all of it.
+inline size_t UploadBytes(size_t lent, int count) { return count > 0 ? lent : 0; }
+
 /// One rate-limit counter per (path, verdict): a flood of one kind must not hide another.
 inline int KindIndex(Path p, Verdict v) {
     const int pi = (int)p, vi = (int)v;

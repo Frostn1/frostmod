@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-03 - v0.51.0
+
+The last four crashes on thomas4f's MXBMRP3 known-crash list are now handled, so FrostMod covers
+every crash on that list.
+
+### Fixed
+- **Crash at +0x45B0 after leaving a session.** A bike index outside the bike list now gets
+  "no names in common" instead of a read off the list. Turn it off with `bikelistguard=0`.
+- **Crash at +0x3B940 at the end of an online race.** A water-wake update after the track freed
+  its list is skipped. Turn it off with `wakeguard=0`.
+- **Crash at +0x1FED9E in menu lists.** A list line that names an item the box does not have is
+  not drawn that frame. Turn it off with `listboxguard=0`.
+- **Crash at +0x2A42F0 on some launches.** The game passed a stack pointer in 32 bits, which
+  breaks when Windows puts the stack above 4 GB. It now passes all 64. Turn it off with `ptr64fix=0`.
+
 ## 2026-11-03 - v0.50.0
 
 Three more crash fixes. Together with the trainer and terrain guards already in, FrostMod now handles

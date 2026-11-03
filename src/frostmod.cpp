@@ -4035,7 +4035,7 @@ static const MenuItem kMenu[] = {
     { '7', "Overlay size",                  true,  6  },
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
-    { '0', "Rebuild riders (load new gear models)", false, 9 },
+    { '0', "Rebuild riders (new gear)", false, 9 },
     { 'K', "Change menu key",               false, 16 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
@@ -7285,8 +7285,10 @@ static int MgUnmap(void* vb, int first, int count) {
         if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
     }
     // On the ram path this is the game's own upload, from our copy instead of its bad RAM
-    // pointer. The whole buffer goes up: the four arrays sit at fixed offsets across all of it.
-    if (subData) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)n, s->buf);
+    // pointer. An empty batch uploads nothing (as the game's unmap does); any other goes up
+    // whole, since the four arrays sit at fixed offsets across all of it.
+    const size_t up = mapguard::UploadBytes(n, count);
+    if (subData && up) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)up, s->buf);
     return mapguard::UnmapResult(act, 0);
 }
 
@@ -7506,7 +7508,12 @@ static void SgRevert() {
         Log("[shock] could not revert: VirtualProtect failed (%lu)", GetLastError());
         return;
     }
-    memcpy((void*)g_sgSite, kWin + kCallInWin, kCallLen);
+    // Same as the install: only the rel32 differs, and the physics thread may be running this
+    // call, so it goes back with one aligned store where it can.
+    int32_t orig = 0;
+    memcpy(&orig, kWin + kCallInWin + 1, sizeof(orig));
+    if (((g_sgSite + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(g_sgSite + 1), (LONG)orig);
+    else                           memcpy((void*)(g_sgSite + 1), &orig, sizeof(orig));
     VirtualProtect((void*)g_sgSite, kCallLen, prot, &prot);
     FlushInstructionCache(GetCurrentProcess(), (void*)g_sgSite, kCallLen);
     g_sgSite = 0;

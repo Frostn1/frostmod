@@ -283,6 +283,14 @@ add_test(NAME mapguard COMMAND mapguard_test)
 add_executable(shockguard_test tests/shockguard_test.cpp)
 add_test(NAME shockguard COMMAND shockguard_test)
 
+# --- session guards test ------------------------------------------------------
+# The four end-of-session / ASLR guards (src/sessionguards.h): the bytes each install checks,
+# the tables and counts they decode, and the two machine-code stubs. On Windows the stubs also
+# run for real: a good list-box line or pointer comes out as the game would make it, a bad one
+# takes the skip path and is counted.
+add_executable(sessionguards_test tests/sessionguards_test.cpp)
+add_test(NAME sessionguards COMMAND sessionguards_test)
+
 # --- NaN bike reset test ---------------------------------------------------------
 # The offsets the per-step check reads and the place-bike call it makes, proved against the
 # install's byte checks (src/nanrecover.h). The check runs against a fake bike: every finite

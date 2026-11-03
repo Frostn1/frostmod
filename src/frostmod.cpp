@@ -67,6 +67,7 @@
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
 #include "shockguard.h"   // the rear shock's curve lookup: a NaN gets curve[0], not a read 8 GB off
+#include "sessionguards.h" // four end-of-session / ASLR crashes, each sent down the game's own empty path
 #include "nanrecover.h"   // a bike whose physics state goes NaN is put back with the game's own reset
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
@@ -3838,6 +3839,13 @@ static std::atomic<int>  g_mgTestEvery{0};
 // by default.
 static std::atomic<bool> g_sgOn{true};
 static void ShockGuardTick();   // SHOCK GUARD section; called once a frame
+// bikelistguard=0, wakeguard=0, listboxguard=0, ptr64fix=0 turn the session guards off one by
+// one (SESSION GUARDS section, src/sessionguards.h); all on by default.
+static std::atomic<bool> g_blOn{true};
+static std::atomic<bool> g_wkOn{true};
+static std::atomic<bool> g_lbOn{true};
+static std::atomic<bool> g_p64On{true};
+static void SessionGuardsTick();   // SESSION GUARDS section; called once a frame
 // nanrecover=0 turns off the reset of a bike whose physics state went NaN (NANRECOVER section,
 // src/nanrecover.h); on by default. Read early by NtReadCfg(), with nantrap=, before the sim
 // step hook goes in; kept here so a save does not drop it.
@@ -3866,6 +3874,10 @@ static void SaveOverlaySettings() {
     if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
     if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
     if (!g_sgOn.load()) fprintf(f, "shockguard=0\n");
+    if (!g_blOn.load()) fprintf(f, "bikelistguard=0\n");
+    if (!g_wkOn.load()) fprintf(f, "wakeguard=0\n");
+    if (!g_lbOn.load()) fprintf(f, "listboxguard=0\n");
+    if (!g_p64On.load()) fprintf(f, "ptr64fix=0\n");
     if (!g_nrOn.load()) fprintf(f, "nanrecover=0\n");
     fclose(f);
 }
@@ -3904,6 +3916,10 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
         else if (sscanf_s(line, "shockguard=%d", &v) == 1) g_sgOn.store(v != 0);
+        else if (sscanf_s(line, "bikelistguard=%d", &v) == 1) g_blOn.store(v != 0);
+        else if (sscanf_s(line, "wakeguard=%d", &v) == 1) g_wkOn.store(v != 0);
+        else if (sscanf_s(line, "listboxguard=%d", &v) == 1) g_lbOn.store(v != 0);
+        else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) g_p64On.store(v != 0);
         // Only kept for the next save: whether the reset went in was decided at load.
         else if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
@@ -5703,6 +5719,7 @@ void Tick() {
     // wide.
     WorldWatch();
     ShockGuardTick();    // the shock guard's counter: a log line and a crash-trail note
+    SessionGuardsTick(); // the list-box and pointer stubs' counters, the same way
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     RaceFilterTick();
 
@@ -7580,6 +7597,274 @@ static void InstallShockGuard() {
 }
 
 // ===========================================================================
+// SESSION GUARDS  -  four crashes from thomas4f's beta21e list (src/sessionguards.h)
+//
+//   +0x45B0    bike list read with an index that is not a bike      bikelistguard=0
+//   +0x3B940   wake effect update after the track freed its list    wakeguard=0
+//   +0x1FED9E  list box line naming an item it does not have        listboxguard=0
+//   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
+//
+// sessionguards.h has the code for each. The first two are MinHook detours on the game's
+// function that answer the way the function already answers an empty list. The last two are
+// MinHook jumps in the middle of a function to a machine-code stub (as the server filter's
+// loop-top is): MinHook holds the game's threads while it writes, which a hand-written
+// multi-byte patch here could not promise. Every one checks its bytes first and stays off on
+// a mismatch; the stubs only jump back into the game, and MH_DisableHook at unload puts the
+// bytes back. The stubs count what they turn away and SessionGuardsTick() logs it from the
+// frame, as the shock guard does; the detours log from the call, at most ~20 lines a session.
+// ===========================================================================
+
+/// The bytes at `rva` are `want`, inside .text. beta21e only: every guard below refuses
+/// rather than looking elsewhere.
+static bool SsgCodeIs(uintptr_t rva, const uint8_t* want, size_t n) {
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te)) return false;
+    const uint8_t* p = (const uint8_t*)(g_base + rva);
+    return p >= tb && p + n <= te && sessionguards::Matches(p, want, n);
+}
+
+/// The data cell a rip-relative operand we have already matched names, if it is in the image.
+static void* SsgCell(const uint8_t* insn, uintptr_t rva, size_t dispAt, size_t len, size_t bytes) {
+    const uintptr_t cell = sessionguards::RipTarget(insn, rva, dispAt, len);
+    auto* dos = (IMAGE_DOS_HEADER*)g_base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
+    if (cell < 0x1000 || cell + bytes > nt->OptionalHeader.SizeOfImage) return nullptr;
+    return (void*)(g_base + cell);
+}
+
+static bool SsgMxbOnly(const char* tag) {
+    if (g_game == &GAME_MXB) return true;
+    Log("[%s] guard off for %s - the offsets are MX Bikes' only.", tag, g_game->display);
+    return false;
+}
+
+// ---- +0x45B0: the bike list ----------------------------------------------------------
+using BikeCatFn = int (*)(int bike, int* cat);
+static BikeCatFn                g_origBikeCat = nullptr;
+static void* volatile*          g_blList      = nullptr;   // &bike list pointer
+static volatile const int32_t*  g_blCount     = nullptr;
+static void* volatile*          g_blCats      = nullptr;   // &category list pointer
+static volatile const int32_t*  g_blCatCount  = nullptr;
+static std::atomic<uint32_t>    g_blRefused{0};
+
+static int hkBikeCat(int bike, int* cat) {
+    const int32_t count = *g_blCount;
+    if (sessionguards::bikelist::Admit(bike, count, *g_blList != nullptr, cat, *g_blCatCount,
+                                       *g_blCats != nullptr))
+        return g_origBikeCat(bike, cat);
+    const uint32_t n = g_blRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[bikelist] turned away a bike-list read for bike %d (the list has %d) - the crash at "
+            "mxbikes.exe+0x45B0. The game got 'no names in common', as for a bike with none. "
+            "%u so far.", bike, count, n);
+        frostmod::crash::Note("refused bike-list index %d of %d (%u so far)", bike, count, n);
+    }
+    return sessionguards::bikelist::kEmpty;
+}
+
+static void InstallBikeListGuard() {
+    using namespace sessionguards::bikelist;
+    if (!SsgMxbOnly("bikelist")) return;
+    if (!g_blOn.load()) { Log("[bikelist] guard off by config (bikelistguard=0)"); return; }
+    if (g_origBikeCat || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaFn, kFn, kFnLen) ||
+        !SsgCodeIs(kRvaBikeCount, kBikeCount, sizeof(kBikeCount)) ||
+        !SsgCodeIs(kRvaBikeTable, kBikeTable, sizeof(kBikeTable)) ||
+        !SsgCodeIs(kRvaCatCount, kCatCount, sizeof(kCatCount)) ||
+        !SsgCodeIs(kRvaCatTable, kCatTable, sizeof(kCatTable))) {
+        Log("[bikelist] guard not applied: the bytes at +0x%llX are not the bike-list lookup we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    // The cells, decoded from the function's own loads; the counts from the loops that read
+    // the same tables, which must decode to the same cells.
+    void* list  = SsgCell(kFn + kBikeTableAt, kRvaFn + kBikeTableAt, kLoadDisp, kLoadLen, 8);
+    void* cats  = SsgCell(kFn + kCatTableAt, kRvaFn + kCatTableAt, kLoadDisp, kLoadLen, 8);
+    void* list2 = SsgCell(kBikeTable, kRvaBikeTable, 3, 7, 8);
+    void* cats2 = SsgCell(kCatTable, kRvaCatTable, 3, 7, 8);
+    void* count = SsgCell(kBikeCount, kRvaBikeCount, 2, 6, 4);
+    void* catn  = SsgCell(kCatCount, kRvaCatCount, 2, 6, 4);
+    if (!list || !cats || !count || !catn || list != list2 || cats != cats2) {
+        Log("[bikelist] guard not applied: the list and count cells do not decode consistently.");
+        return;
+    }
+    g_blList = (void* volatile*)list;  g_blCount = (volatile const int32_t*)count;
+    g_blCats = (void* volatile*)cats;  g_blCatCount = (volatile const int32_t*)catn;
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkBikeCat, (void**)&g_origBikeCat,
+                     "bikeListLookup(0x4580)")) {
+        g_origBikeCat = nullptr;
+        return;
+    }
+    Log("[bikelist] guard on: a bike index outside the bike list gets 'no names in common' "
+        "instead of a read off the list (fn +0x%llX, the crash at +0x%llX; %d bikes loaded).",
+        (unsigned long long)kRvaFn, (unsigned long long)kRvaFault, (int)*g_blCount);
+}
+
+// ---- +0x3B940: the wake effects ------------------------------------------------------
+using WakeFn = int (*)(float dt);
+static WakeFn                  g_origWake  = nullptr;
+static void* volatile*         g_wkList    = nullptr;
+static void* volatile*         g_wkVerts   = nullptr;
+static volatile int32_t*       g_wkCount   = nullptr;
+static std::atomic<uint32_t>   g_wkSkipped{0};
+
+static int hkWake(float dt) {
+    if (sessionguards::wake::Admit(*g_wkList, *g_wkVerts)) return g_origWake(dt);
+    *g_wkCount = 0;   // what the update stores first; 0x5AA50 uploads this many vertices
+    const uint32_t n = g_wkSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[wake] skipped a wake-effect update: the track teardown already freed its list - the "
+            "crash at mxbikes.exe+0x3B940. %u so far.", n);
+        frostmod::crash::Note("skipped a wake update after teardown (%u so far)", n);
+    }
+    return 0;
+}
+
+static void InstallWakeGuard() {
+    using namespace sessionguards::wake;
+    if (!SsgMxbOnly("wake")) return;
+    if (!g_wkOn.load()) { Log("[wake] guard off by config (wakeguard=0)"); return; }
+    if (g_origWake || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaFn, kHead, kHeadLen) ||
+        !SsgCodeIs(kRvaCountStore, kCountStore, sizeof(kCountStore)) ||
+        !SsgCodeIs(kRvaLoop, kLoop, kLoopLen)) {
+        Log("[wake] guard not applied: the bytes at +0x%llX are not the wake-effect update we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    void* list  = SsgCell(kHead + kListAt, kRvaFn + kListAt, 3, 7, 8);
+    void* verts = SsgCell(kHead + kVertsAt, kRvaFn + kVertsAt, 3, 7, 8);
+    void* count = SsgCell(kCountStore, kRvaCountStore, 3, 7, 4);
+    if (!list || !verts || !count) {
+        Log("[wake] guard not applied: the decoded cells are outside the module.");
+        return;
+    }
+    g_wkList = (void* volatile*)list; g_wkVerts = (void* volatile*)verts;
+    g_wkCount = (volatile int32_t*)count;
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkWake, (void**)&g_origWake,
+                     "wakeUpdate(0x3b8e0)")) {
+        g_origWake = nullptr;
+        return;
+    }
+    Log("[wake] guard on: a wake-effect update after the track freed its list is skipped "
+        "(fn +0x%llX, the crash at +0x%llX).", (unsigned long long)kRvaFn, (unsigned long long)kRvaFault);
+}
+
+// ---- +0x1FED9E: the list box line ----------------------------------------------------
+static uint8_t* g_lbStub   = nullptr;   // kept after unload: a thread may be on its way through
+static void*    g_lbTramp  = nullptr;   // MinHook's; unused, the stub jumps back itself
+static uint32_t g_lbLogged = 0;
+
+static void InstallListBoxGuard() {
+    using namespace sessionguards::listbox;
+    if (!SsgMxbOnly("listbox")) return;
+    if (!g_lbOn.load()) { Log("[listbox] guard off by config (listboxguard=0)"); return; }
+    if (g_lbTramp || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaWin, kWin, kWinLen) || !SsgCodeIs(kRvaTail, kTail, sizeof(kTail)) ||
+        !SsgCodeIs(kRvaAdd, kAdd, kAddLen)) {
+        Log("[listbox] guard not applied: the bytes at +0x%llX are not the list-box draw we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaSite);
+        return;
+    }
+    const uintptr_t site = g_base + kRvaSite;
+    if (!g_lbStub) g_lbStub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_lbStub) { Log("[listbox] guard not applied: no page for the stub"); return; }
+    memset(g_lbStub, 0xCC, kPageBytes);
+    memset(g_lbStub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_lbStub, (uintptr_t)g_lbStub, (uint64_t)(g_base + kRvaBack), (uint64_t)(g_base + kRvaSkip));
+    FlushInstructionCache(GetCurrentProcess(), g_lbStub, kPageBytes);
+    g_lbLogged = 0;
+    if (!InstallHook((void*)site, g_lbStub, &g_lbTramp, "listBoxLine(0x1fed8c)")) {
+        g_lbTramp = nullptr;
+        return;
+    }
+    Log("[listbox] guard on: a list-box line naming an item the box does not have is skipped "
+        "instead of read (at +0x%llX, the crash at +0x%llX).",
+        (unsigned long long)kRvaSite, (unsigned long long)kRvaFault);
+}
+
+// ---- +0x2A42F0: the 32-bit pointer ---------------------------------------------------
+static uint8_t* g_p64Stub   = nullptr;
+static void*    g_p64Tramp  = nullptr;
+static uint32_t g_p64Logged = 0;
+
+static void InstallPtr64Fix() {
+    using namespace sessionguards::ptr64;
+    if (!SsgMxbOnly("ptr64")) return;
+    if (!g_p64On.load()) { Log("[ptr64] fix off by config (ptr64fix=0)"); return; }
+    if (g_p64Tramp || g_unloading.load()) return;
+    bool ok = SsgCodeIs(kRvaSite, kSite, kSiteLen) && SsgCodeIs(kRvaCallee, kCallee, sizeof(kCallee)) &&
+              SsgCodeIs(kRvaDispatch, kDispatch, kDispatchLen);
+    // And the dispatcher's table sends job 863 here.
+    uint8_t *tb, *te;
+    const uint8_t* entry = (const uint8_t*)(g_base + kRvaJumpTable + 4 * kJob);
+    ok = ok && GetExecRange(g_base, &tb, &te) && entry >= tb && entry + 4 <= te &&
+         (uint32_t)sessionguards::Disp32(entry) == (uint32_t)kRvaSite;
+    if (!ok) {
+        Log("[ptr64] fix not applied: the bytes at +0x%llX are not job 863 as we expect it "
+            "(game updated?). Nothing patched.", (unsigned long long)kRvaSite);
+        return;
+    }
+    const uintptr_t site = g_base + kRvaSite;
+    if (!g_p64Stub) g_p64Stub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_p64Stub) { Log("[ptr64] fix not applied: no page for the stub"); return; }
+    memset(g_p64Stub, 0xCC, kPageBytes);
+    memset(g_p64Stub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_p64Stub, (uintptr_t)g_p64Stub, (uint64_t)(g_base + kRvaBack));
+    FlushInstructionCache(GetCurrentProcess(), g_p64Stub, kPageBytes);
+    g_p64Logged = 0;
+    if (!InstallHook((void*)site, g_p64Stub, &g_p64Tramp, "job863Pointer(0x127109)")) {
+        g_p64Tramp = nullptr;
+        return;
+    }
+    Log("[ptr64] fix on: job 863 hands +0x%llX its pointer in 64 bits, not 32 (at +0x%llX). "
+        "Launches with the stack below 4 GB see no change; above, this is the crash.",
+        (unsigned long long)kRvaCallee, (unsigned long long)kRvaSite);
+}
+
+/// A stub's counter crossed a line the rate limit allows (or is the first).
+static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* now) {
+    if (!page) return false;
+    const uint32_t n = *(volatile const uint32_t*)(page + off);
+    if (n == *logged) return false;
+    const uint32_t prev = *logged;
+    *logged = n;
+    *now = n;
+    bool due = prev == 0;
+    for (uint64_t k = (uint64_t)prev + 1; !due && k <= n && k <= (uint64_t)prev + 64; ++k)
+        due = sessionguards::ShouldLog(k);
+    return due || n - prev > 64;
+}
+
+static void SessionGuardsTick() {
+    uint32_t n = 0;
+    if (SsgDue(g_lbStub, sessionguards::listbox::kCountOff, &g_lbLogged, &n)) {
+        using namespace sessionguards::listbox;
+        const uint32_t item = *(volatile const uint32_t*)(g_lbStub + kItemOff);
+        const uint32_t text = *(volatile const uint32_t*)(g_lbStub + kTextOff);
+        const void* obj = *(void* volatile const*)(g_lbStub + kObjOff);
+        Log("[listbox] skipped a list-box line naming item %d (text offset %u) in box %p - the "
+            "crash at mxbikes.exe+0x1FED9E. That line is not drawn this frame. %u so far.",
+            (int)item, text, obj, n);
+        frostmod::crash::Note("skipped a list-box line, item %d (%u so far)", (int)item, n);
+    }
+    if (SsgDue(g_p64Stub, sessionguards::ptr64::kCountOff, &g_p64Logged, &n)) {
+        const uint64_t p = *(volatile const uint64_t*)(g_p64Stub + sessionguards::ptr64::kLastOff);
+        Log("[ptr64] this launch's stack is above 4 GB: job 863 passed 0x%llX whole, where the "
+            "game alone would have passed 0x%llX and crashed at mxbikes.exe+0x2A42F0. %u call(s) "
+            "so far.", (unsigned long long)p, (unsigned long long)(uint32_t)p, n);
+        if (n == 1) frostmod::crash::Note("job 863 pointer above 4 GB, passed whole");
+    }
+}
+
+static void InstallSessionGuards() {
+    InstallBikeListGuard();
+    InstallWakeGuard();
+    InstallListBoxGuard();
+    InstallPtr64Fix();
+}
+
+// ===========================================================================
 // NANTRAP  -  where the physics NaN is made (opt-in: nantrap=1 in frostmod_radar.cfg)
 //
 // The terrain guard above refuses a NaN position; it cannot say where the NaN came from,
@@ -8650,6 +8935,9 @@ DWORD WINAPI Init(LPVOID) {
         InstallMapGuard();
         // Same moment: shockguard=0 is known now. One call instruction, in the physics step.
         InstallShockGuard();
+        // Same moment: their keys are known now. Two detours and two mid-function jumps,
+        // each byte-checked; MinHook holds the game's threads while it writes.
+        InstallSessionGuards();
 
         // OPT-IN (frostmod.exe --filter-servers): install the loop-top filter that logs
         // every server row and skips (hides) the ones matching the rules BEFORE the row

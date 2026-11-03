@@ -734,6 +734,166 @@ constexpr uintptr_t RVA_RACE_ENTRY_KEY   = 0x5122A4; // first entry's race numbe
 constexpr int       RACE_ENTRY_STRIDE    = 0x178;
 constexpr int VEH_LINK = 0x5B18;   // the index kind 15 links (other VEH_* in the teardown block)
 
+// ---- the rider's animated skeleton (MXB Coach RIDER_BONES) --------------------------------
+// How this was found: docs/RIDER_BONES.md. Read-only: nothing here is written or called.
+//
+// Every rider is a set of engine objects (rider-gfx block above). The rider BODY object
+// (gfx +0x1D4) is a skinned model: it owns a node hierarchy loaded from the rider model, and
+// the animations in rider\animations\<type>\*.anm are bound to those nodes by name. Each frame
+// the engine blends the animations into every node's local matrix, applies the head turn on
+// top, and multiplies down the tree into each node's world matrix [confirmed statically]. The
+// mesh is skinned from those [inferred: the draw path was not traced]. They are what
+// RIDER_BONES records. NOT YET CONFIRMED AGAINST A RUNNING GAME.
+//
+//   own vehicle   [RVA_OWN_VEHICLE] - 1, a record of RVA_VEHICLES (VEHICLE_STRIDE each)
+//   gfx block     record + VEH_GFX
+//     +0x000      i32 bike body handle; placed at chassis x T(+0x004) every frame
+//     +0x004      f32[3] the bike body's offset from the physics chassis
+//     +0x1D4      i32 rider body handle; placed from the rider body transform (sim +0x438)
+//   handle -> object:  [RVA_OBJ_TABLE]: i32 count, then {i32 handle, pad, object*} x count,
+//                      sorted by handle (binary search, 0x15C270)
+//   object
+//     +0x11C      f32[16] world matrix, row-major, column vectors (translation at [3],[7],[11])
+//     +0x1E8      i32 which hierarchy; the animated update forces 0
+//     +0x1F0      hierarchy*[]  (the animated one is [0])
+//   hierarchy
+//     +0x04 / +0x08   root count / i32 root node indices
+//     +0x10 / +0x18   node count / node array, NODE_STRIDE each, indexed from 0
+//   node
+//     +0x000      char name[0x64] ("riderRIG_Head", ...), NUL-terminated
+//     +0x064      u32 flags (bit 8: head-turn override on top of the animation)
+//     +0x068      f32[16] local from the animation blend
+//     +0x0C0      f32[16] local actually used (after the override)
+//     +0x100      f32[16] world = parent world x local (the root's parent: object +0x11C)
+//     +0x290      i32 child count     +0x298  i32* child node indices
+//
+// Version check: the exe's TimeDateStamp must be beta21e's, AND every site below must match
+// byte for byte in the running process (call targets wildcarded). Each one pins a field this
+// reads; any mismatch and RIDER_BONES reports "unknown build" and reads nothing.
+constexpr uint32_t  RB_BUILD_STAMP    = 0x6A21833D;   // beta21e
+constexpr uintptr_t RVA_OBJ_TABLE     = 0x584870;     // qword: the object handle table
+constexpr int       OBJ_TABLE_ENTRIES = 0x04;         // first entry
+constexpr int       OBJ_TABLE_STRIDE  = 0x10;
+constexpr int       OBJ_TABLE_PTR     = 0x08;         // object* within an entry
+constexpr int       OBJ_WORLD         = 0x11C;
+constexpr int       OBJ_HIERS         = 0x1F0;
+constexpr int       HIER_ROOT_COUNT   = 0x04;
+constexpr int       HIER_ROOTS        = 0x08;
+constexpr int       HIER_NODE_COUNT   = 0x10;
+constexpr int       HIER_NODES        = 0x18;
+constexpr int       NODE_STRIDE       = 0x3F8;
+constexpr int       NODE_NAME         = 0x000;
+constexpr int       NODE_NAME_LEN     = 0x64;
+constexpr int       NODE_WORLD        = 0x100;
+constexpr int       NODE_CHILD_COUNT  = 0x290;
+constexpr int       NODE_CHILDREN     = 0x298;
+constexpr int       GFX_BIKE_BODY     = 0x000;
+constexpr int       GFX_BIKE_OFFSET   = 0x004;
+constexpr int       GFX_RIDER_BODY    = 0x1D4;
+
+// node world = parent world x local: hier +0x18, stride 0x3F8, local +0xC0, world +0x100,
+//   children +0x290 / +0x298 (0x2430F0, recursive)
+constexpr uintptr_t RVA_RB_NODE_WORLD = 0x2430F0;
+constexpr char SIG_RB_NODE_WORLD[] =
+    "\x48\x89\x5C\x24\x10\x4C\x89\x44\x24\x18\x48\x89\x4C\x24\x08\x55\x56\x57\x48\x81\xEC\xA0"
+    "\x00\x00\x00\x48\x8B\x79\x18\x48\x63\xEA\x48\x8B\xF1\x48\x8B\xDD\x48\x69\xDB\xF8\x03\x00"
+    "\x00\x48\x8D\x54\x3B\x68\x48\x8D\x8C\x3B\xC0\x00\x00\x00\xE8\x00\x00\x00\x00\x0F\xBA\x64"
+    "\x3B\x64\x08\x73\x0A\x8B\xD5\x48\x8B\xCE\xE8\x00\x00\x00\x00\x48\x8B\x94\x24\xD0\x00\x00"
+    "\x00\x48\x8D\xB4\x3B\x00\x01\x00\x00\x4C\x8D\x84\x3B\xC0\x00\x00\x00\x48\x8B\xCE\xE8\x00"
+    "\x00\x00\x00\x0F\xBA\x64\x3B\x64\x0E\x73\x39\x48\x8D\x94\x3B\x44\x02\x00\x00\x48\x8D\x4C"
+    "\x24\x20\xE8\x00\x00\x00\x00\x48\x8D\x54\x24\x20\x48\x8D\x4C\x24\x60\x4C\x8B\xC6\xE8\x00"
+    "\x00\x00\x00\x48\x8D\x94\x3B\x04\x02\x00\x00\x4C\x8D\x44\x24\x60\x48\x8B\xCE\xE8\x00\x00"
+    "\x00\x00\x0F\xBA\x64\x3B\x64\x0B\x73\x18\x4C\x8D\x84\x3B\x80\x01\x00\x00\x48\x8D\x8C\x3B"
+    "\xC0\x01\x00\x00\x48\x8B\xD6\xE8\x00\x00\x00\x00\x33\xF6\x39\xB4\x3B\x90\x02\x00\x00\x7E"
+    "\x32\x48\x8B\xEE\x48\x8B\x84\x3B\x98\x02\x00\x00\x48\x8B\x8C\x24\xC0\x00\x00\x00\x4C\x8D"
+    "\x84\x3B\x00\x01\x00\x00\x8B\x14\x28\xE8\x00\x00\x00\x00\xFF\xC6\x48\x83\xC5\x04\x3B\xB4"
+    "\x3B\x90\x02\x00\x00\x7C\xD1";
+constexpr char SIG_RB_NODE_WORLD_MASK[] =
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx????xxxxxxx"
+    "xxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxx??"
+    "??xxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxx"
+    "xxxxxxx";
+// per-frame animated-object update: obj +0x1E8 = 0, blend (0x21FDD0), world (0x243220),
+//   then hier = obj +0x1F0[+0x1E8], node count hier +0x10
+constexpr uintptr_t RVA_RB_ANIM_UPDATE = 0x221BB4;
+constexpr char SIG_RB_ANIM_UPDATE[] =
+    "\x44\x89\xA1\xE8\x01\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xCF\xE8\x00\x00\x00\x00\x48\x8B"
+    "\xCF\xE8\x00\x00\x00\x00\x4C\x63\x9F\xE8\x01\x00\x00\x45\x8B\xC4\x4A\x8B\x94\xDF\xF0\x01"
+    "\x00\x00\x81\xA7\x10\x01\x00\x00\xFF\xEF\xFF\xFF\x44\x39\x62\x10";
+constexpr char SIG_RB_ANIM_UPDATE_MASK[] =
+    "xxxxxxxx????xxxx????xxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// bus 0x5A: 64 bytes into obj +0x11C (the object's world matrix)
+constexpr uintptr_t RVA_RB_OBJ_SETMATRIX = 0x2197B7;
+constexpr char SIG_RB_OBJ_SETMATRIX[] =
+    "\x48\x8D\x88\x1C\x01\x00\x00\x48\x8B\xD3\x41\xB8\x40\x00\x00\x00";
+constexpr char SIG_RB_OBJ_SETMATRIX_MASK[] =
+    "xxxxxxxxxxxxxxxx";
+// handle -> object: binary search, entries at table +4, 16 bytes: i32 handle, object* at +8
+constexpr uintptr_t RVA_RB_HANDLE_LOOKUP = 0x15C270;
+constexpr char SIG_RB_HANDLE_LOOKUP[] =
+    "\x89\x54\x24\x10\x48\x89\x4C\x24\x08\x48\x83\xEC\x38\x83\x7C\x24\x48\x00\x75\x07\x33\xC0"
+    "\xE9\xB1\x00\x00\x00\x48\x83\x7C\x24\x40\x00\x75\x07\x33\xC0\xE9\xA2\x00\x00\x00\x48\x8B"
+    "\x44\x24\x40\x48\x89\x44\x24\x10\x48\x8B\x44\x24\x40\x48\x89\x44\x24\x20\x48\x8B\x44\x24"
+    "\x20\x48\x83\xC0\x04\x48\x89\x44\x24\x20\xC7\x44\x24\x08\x00\x00\x00\x00\x48\x8B\x44\x24"
+    "\x10\x8B\x00\x89\x44\x24\x28\x8B\x4C\x24\x28\x8B\x44\x24\x08\x03\xC1\x99\x2B\xC2\xD1\xF8"
+    "\x89\x44\x24\x18\x48\x63\x4C\x24\x18\x48\x6B\xC9\x10\x48\x8B\x44\x24\x20\x48\x03\xC1\x48"
+    "\x89\x04\x24\x48\x8B\x0C\x24\x8B\x44\x24\x48\x39\x01\x75\x0C\x48\x8B\x04\x24\x48\x8B\x40"
+    "\x08";
+constexpr char SIG_RB_HANDLE_LOOKUP_MASK[] =
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// mov rcx, [rip -> 0x584870]: the object handle table
+constexpr uintptr_t RVA_RB_OBJ_TABLE = 0x21D21B;
+constexpr char SIG_RB_OBJ_TABLE[] =
+    "\x48\x8B\x0D\x4E\x76\x36\x00";
+constexpr char SIG_RB_OBJ_TABLE_MASK[] =
+    "xxxxxxx";
+// anim load matches each track to a node by the name at node +0x00
+constexpr uintptr_t RVA_RB_NODE_NAME = 0x21CFD3;
+constexpr char SIG_RB_NODE_NAME[] =
+    "\x48\x8B\x83\xF0\x01\x00\x00\x48\x8B\x48\x18\x48\x03\xCD\xE8\x00\x00\x00\x00";
+constexpr char SIG_RB_NODE_NAME_MASK[] =
+    "xxxxxxxxxxxxxxx????";
+// pose code: rider body (gfx +0x1D4) placed from sim +0x438 with bus 0x5A
+constexpr uintptr_t RVA_RB_BODY_PLACE = 0x54446;
+constexpr char SIG_RB_BODY_PLACE[] =
+    "\x48\x8D\x96\x38\x04\x00\x00\x48\x8D\x8C\x24\xD0\x00\x00\x00\xE8\x00\x00\x00\x00\x8B\x97"
+    "\xD4\x01\x00\x00\x4C\x8D\x84\x24\xD0\x00\x00\x00\xB9\x5A\x00\x00\x00\xFF\x15\xD5\x27\x51"
+    "\x00";
+constexpr char SIG_RB_BODY_PLACE_MASK[] =
+    "xxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxx";
+// pose code: bike body (gfx +0x00) placed from sim +0x04 x T(gfx +0x04) with bus 0x5A
+constexpr uintptr_t RVA_RB_BIKE_PLACE = 0x52458;
+constexpr char SIG_RB_BIKE_PLACE[] =
+    "\xF3\x0F\x10\x5F\x0C\xF3\x0F\x10\x57\x08\x48\x8D\x8C\x24\xD0\x00\x00\x00\xF3\x0F\x10\x4F"
+    "\x04\xE8\x00\x00\x00\x00\x48\x8D\x46\x04\x4C\x8D\x84\x24\xD0\x00\x00\x00\x48\x8D\x8C\x24"
+    "\xD0\x00\x00\x00\x48\x8B\xD0\x48\x89\x84\x24\x10\x01\x00\x00\xE8\x00\x00\x00\x00\x8B\x17"
+    "\x4C\x8D\x84\x24\xD0\x00\x00\x00\xB9\x5A\x00\x00\x00\xFF\x15\x9B\x47\x51\x00";
+constexpr char SIG_RB_BIKE_PLACE_MASK[] =
+    "xxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxx";
+// own vehicle [0xE62710]-1, x 0x5B24 + 0xF4EE20, gfx at +0x274
+constexpr uintptr_t RVA_RB_OWN_GFX = 0xA7282;
+constexpr char SIG_RB_OWN_GFX[] =
+    "\x44\x8B\x1D\x87\xB4\xDB\x00\x48\x8D\x05\x90\x7B\xEA\x00\x41\xFF\xCB\x33\xF6\x4D\x63\xE3"
+    "\x4D\x69\xE4\x24\x5B\x00\x00\x4C\x03\xE0\x39\xB4\x24\xE8\x06\x00\x00\x74\x2F\x48\x8D\x94"
+    "\x24\xE0\x00\x00\x00\x49\x8D\x8C\x24\x74\x02\x00\x00\x45\x33\xC9\x45\x33\xC0";
+constexpr char SIG_RB_OWN_GFX_MASK[] =
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+struct CodeSig { uintptr_t rva; const char* bytes; const char* mask; const char* what; };
+constexpr CodeSig kRiderBoneSigs[] = {
+    {RVA_RB_NODE_WORLD, SIG_RB_NODE_WORLD, SIG_RB_NODE_WORLD_MASK, "node world"},
+    {RVA_RB_ANIM_UPDATE, SIG_RB_ANIM_UPDATE, SIG_RB_ANIM_UPDATE_MASK, "anim update"},
+    {RVA_RB_OBJ_SETMATRIX, SIG_RB_OBJ_SETMATRIX, SIG_RB_OBJ_SETMATRIX_MASK, "obj setmatrix"},
+    {RVA_RB_HANDLE_LOOKUP, SIG_RB_HANDLE_LOOKUP, SIG_RB_HANDLE_LOOKUP_MASK, "handle lookup"},
+    {RVA_RB_OBJ_TABLE, SIG_RB_OBJ_TABLE, SIG_RB_OBJ_TABLE_MASK, "obj table"},
+    {RVA_RB_NODE_NAME, SIG_RB_NODE_NAME, SIG_RB_NODE_NAME_MASK, "node name"},
+    {RVA_RB_BODY_PLACE, SIG_RB_BODY_PLACE, SIG_RB_BODY_PLACE_MASK, "body place"},
+    {RVA_RB_BIKE_PLACE, SIG_RB_BIKE_PLACE, SIG_RB_BIKE_PLACE_MASK, "bike place"},
+    {RVA_RB_OWN_GFX, SIG_RB_OWN_GFX, SIG_RB_OWN_GFX_MASK, "own gfx"},
+};
+constexpr int kRiderBoneSigCount = (int)(sizeof(kRiderBoneSigs) / sizeof(kRiderBoneSigs[0]));
+
 } // namespace mxb
 
 // ============ GP Bikes ========================================================

@@ -2,15 +2,15 @@
 
 ## 2026-11-12 - v0.52.0
 
-Aussie mode, for riders on 150-250 ms ping. Off by default.
+Aussie mode: other riders feel as solid as they did in Beta 20. Off by default.
 
 ### Added
-- **Aussie mode** (`aussiemode=1`, or the switch in MXB App's Game Integration settings). At high
-  ping the game guesses other riders forward with a noisy acceleration term, so they overshoot
-  and snap back. Aussie mode guesses them forward at their last speed instead. At about 200 ms
-  that cut warps from 333 to 18 a minute and position error from 0.28 to 0.22 m. It changes only
-  how you see other riders. Nothing on the wire changes, and nothing in your own bike's physics.
-  Measurements are in `docs/aussie-mode.md`.
+- **Aussie mode** (`aussiemode=1`, or the switch in MXB App's Game Integration settings). Beta 21
+  made the spring that holds other riders' collision bodies to them ten times softer, so a contact
+  gives way about three times as far and lasts about three times as long. Aussie mode puts the Beta
+  20 spring back on those bodies. It changes only what your own bike runs into on your screen.
+  Other riders' games, and your own bike's physics, are untouched. Details and measurements are in
+  `docs/aussie-mode.md`.
 
 ## 2026-11-03 - v0.51.0
 

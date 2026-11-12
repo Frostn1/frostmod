@@ -46,7 +46,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
-#include "aussie.h"     // aussiemode=1: remote riders guessed forward without a*dt^2
+#include "aussie.h"     // aussiemode=1: other riders' collision bodies on the Beta 20 spring
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
@@ -3733,83 +3733,95 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
-// ---- Aussie mode: remote riders without the acceleration guess ---------------
-// What this is, why, and what it changes for whom: aussie.h. One instruction in the game's
-// remote-rider extrapolation is repointed at a 0.0 we own, so riders are guessed forward at
-// their last speed instead of last speed plus a noisy squared acceleration term. Off unless
-// aussiemode=1. Same mechanism and the same checks as antifreeze above; the cell allocator is
-// shared.
+// ---- Aussie mode: other riders' collision bodies on the Beta 20 spring --------
+// What this is, why, and whom it affects: aussie.h. Three sites in the remote-body stepper
+// (0x166A10): the 20 x mass stiffness load is repointed at a 200.0 we own, and the vertical spring
+// and damper terms jump through a small cave that scales them back to 20 x mass. Off unless
+// aussiemode=1. Read at load, applied before any session exists, reverted at unload.
 static std::atomic<bool> g_auOn{false};
-static double*           g_auCell    = nullptr;
-static uintptr_t         g_auSite    = 0;
-static uint8_t           g_auOrig[aussie::kSiteLen] = {0};
+static uint8_t*          g_auPage    = nullptr;   // cells + caves, execute-read once written
 static bool              g_auPatched = false;
+
+// Write `n` bytes over game code. Returns false (and writes nothing) if the page cannot be made
+// writable.
+static bool AuWrite(uintptr_t at, const uint8_t* bytes, size_t n) {
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)at, n, PAGE_EXECUTE_READWRITE, &prot)) return false;
+    memcpy((void*)at, bytes, n);
+    VirtualProtect((void*)at, n, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, n);
+    return true;
+}
+
+static void AuPutBack() {
+    if (!g_base) return;
+    AuWrite(g_base + aussie::kRvaYd, aussie::kYdBytes, aussie::kYdLen);
+    AuWrite(g_base + aussie::kRvaY,  aussie::kYBytes,  aussie::kYLen);
+    AuWrite(g_base + aussie::kRvaK,  aussie::kKBytes,  aussie::kKLen);
+}
 
 static bool AuApply() {
     if (g_auPatched) return true;
     if (g_game != &GAME_MXB) {
-        Log("[aussie] not applied: this is %s, the offset is MX Bikes' only",
+        Log("[aussie] not applied: this is %s, the offsets are MX Bikes' only",
             g_game && g_game->display ? g_game->display : "another title");
         return false;
     }
     if (!g_base) { Log("[aussie] not applied: no module base"); return false; }
 
-    const uintptr_t site = g_base + aussie::kRvaSite;
-    const uint8_t*  p    = reinterpret_cast<const uint8_t*>(site);
-    if (!aussie::SiteMatches(p)) {
-        Log("[aussie] not applied: bytes at +0x%llX are not the load we expect "
-            "(game updated?). Nothing patched.", (unsigned long long)aussie::kRvaSite);
+    const uint8_t* k  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaK);
+    const uint8_t* y  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaY);
+    const uint8_t* yd = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaYd);
+    if (!aussie::Matches(k, aussie::kKBytes, aussie::kKLen) ||
+        !aussie::Matches(y, aussie::kYBytes, aussie::kYLen) ||
+        !aussie::Matches(yd, aussie::kYdBytes, aussie::kYdLen)) {
+        Log("[aussie] not applied: the spring code is not the bytes we expect (game updated?). "
+            "Nothing patched.");
         return false;
     }
-    g_auCell = AfAllocCellNear(site);
-    if (!g_auCell) { Log("[aussie] not applied: no free page within reach"); return false; }
-    *g_auCell = aussie::kAussieAccelFactor;
 
-    int32_t disp = 0;
-    if (!aussie::PlanDisp(site, reinterpret_cast<uintptr_t>(g_auCell), &disp)) {
-        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
-        Log("[aussie] not applied: cell out of rel32 reach");
+    // A page the sites can reach with rel32. AfAllocCellNear commits a whole page.
+    uint8_t* page = reinterpret_cast<uint8_t*>(AfAllocCellNear(g_base + aussie::kRvaK));
+    if (!page) { Log("[aussie] not applied: no free page within reach"); return false; }
+    aussie::Plan plan;
+    if (!aussie::MakePlan(g_base, reinterpret_cast<uintptr_t>(page), &plan)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: the cave is out of rel32 reach");
         return false;
     }
-    DWORD prot = 0;
-    if (!VirtualProtect((void*)site, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
-        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
-        Log("[aussie] not applied: VirtualProtect failed (%lu)", GetLastError());
+    memcpy(page, plan.page, aussie::kPageUsed);
+    DWORD old = 0;
+    if (!VirtualProtect(page, aussie::kPageUsed, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: could not make the cave executable (%lu)", GetLastError());
         return false;
     }
-    memcpy(g_auOrig, p, aussie::kSiteLen);
-    uint8_t* w = reinterpret_cast<uint8_t*>(site);
-    for (int i = 0; i < 4; ++i) w[aussie::kDispOffset + i] = (uint8_t)((uint32_t)disp >> (8 * i));
-    VirtualProtect((void*)site, aussie::kSiteLen, prot, &prot);
-    FlushInstructionCache(GetCurrentProcess(), (void*)site, aussie::kSiteLen);
+    FlushInstructionCache(GetCurrentProcess(), page, aussie::kPageUsed);
 
-    if (aussie::CurrentTarget(site, p) != reinterpret_cast<uintptr_t>(g_auCell)) {
-        VirtualProtect((void*)site, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot);
-        memcpy(w, g_auOrig, aussie::kSiteLen);
-        VirtualProtect((void*)site, aussie::kSiteLen, prot, &prot);
-        FlushInstructionCache(GetCurrentProcess(), (void*)site, aussie::kSiteLen);
-        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
+    // The caves first, so a jump never lands before its target exists; then the jumps; then k.
+    const bool ok = AuWrite(g_base + aussie::kRvaYd, plan.yd, aussie::kYdLen) &&
+                    AuWrite(g_base + aussie::kRvaY,  plan.y,  aussie::kYLen) &&
+                    AuWrite(g_base + aussie::kRvaK,  plan.k,  aussie::kKLen);
+    if (!ok || !aussie::Matches(yd, plan.yd, aussie::kYdLen) ||
+        !aussie::Matches(y, plan.y, aussie::kYLen) || !aussie::Matches(k, plan.k, aussie::kKLen)) {
+        AuPutBack();
+        VirtualFree(page, 0, MEM_RELEASE);
         Log("[aussie] not applied: the patch did not verify, reverted");
         return false;
     }
-    g_auSite = site; g_auPatched = true;
-    Log("[aussie] on: remote riders guessed forward at constant speed (acceleration factor "
-        "%.2f, stock %.2f), at +0x%llX", aussie::kAussieAccelFactor, aussie::kStockAccelFactor,
-        (unsigned long long)aussie::kRvaSite);
+    g_auPage = page; g_auPatched = true;
+    Log("[aussie] on: other riders' collision bodies on the Beta 20 spring (k %.0f x mass, "
+        "vertical %.0f x mass; stock %.0f x mass)", aussie::kAussieK,
+        aussie::kAussieK * aussie::kYSpring, aussie::kStockK);
     return true;
 }
 
 static void AuRevert() {
     if (!g_auPatched) return;
-    DWORD prot = 0;
-    if (VirtualProtect((void*)g_auSite, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
-        memcpy(reinterpret_cast<uint8_t*>(g_auSite), g_auOrig, aussie::kSiteLen);
-        VirtualProtect((void*)g_auSite, aussie::kSiteLen, prot, &prot);
-        FlushInstructionCache(GetCurrentProcess(), (void*)g_auSite, aussie::kSiteLen);
-    }
-    if (g_auCell) { VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr; }
+    AuPutBack();
+    if (g_auPage) { VirtualFree(g_auPage, 0, MEM_RELEASE); g_auPage = nullptr; }
     g_auPatched = false;
-    Log("[aussie] off: the game's own extrapolation is back");
+    Log("[aussie] off: the game's own Beta 21 spring is back");
 }
 
 // ---- vehicle teardown: the bike-change cleanup's free of the old own-vehicle record ------
@@ -4022,6 +4034,8 @@ static void LoadOverlaySettings() {
         g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
 }
+
+
 
 // ---- which rider is me ---------------------------------------------------
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet

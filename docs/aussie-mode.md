@@ -1,95 +1,105 @@
 # Aussie mode
 
-`aussiemode=1` in `frostmod_radar.cfg`, or **Settings → Game Integration → Aussie mode** in MXB
-App. Off by default. It takes effect the next time the game starts.
+Turn it on with `aussiemode=1` in `frostmod_radar.cfg`, or with **Settings → Game Integration →
+Aussie mode** in MXB App. It is off by default and takes effect the next time the game starts.
 
 ## What it changes
 
-At high ping, the game guesses where every other rider is now. It works from their newest
-snapshot and adds velocity × dt plus ½ × acceleration × dt². The acceleration is a finite
-difference of 30 ms snapshots, so it is noisy. At 150–250 ms the dt² term blows that noise
-up into metres of overshoot, then the next real snapshot snaps the rider back. That is the
-warping players describe.
+On your screen, every other rider has a physical collision body. It is a rigid body with the mass
+of bike plus rider (184.5 kg for an MX2 OEM KTM), and a spring pulls it toward where that rider
+is drawn. Your bike collides with that body.
 
-Aussie mode sets the factor in front of that term to 0, so other riders are guessed forward at
-their last speed. It is one instruction in the remote-rider extrapolation (`src/aussie.h`),
-repointed at a value FrostMod owns, the same mechanism as the antifreeze patch.
+Beta 21 made that spring ten times softer horizontally. That was its "harsh multiplayer
+collisions" fix.
 
-| | For the Aussie-mode rider | For everyone else |
-|---|---|---|
-| How other riders are drawn | Far fewer warps, and closer to where they really are on average | unchanged |
-| What they collide with | The drawn pose, which is now closer to the real one | unchanged |
-| Own bike physics, own state on the wire, how hard they hit anyone | unchanged | unchanged |
+| | Beta 20d | Beta 21e | Aussie mode |
+|---|---|---|---|
+| horizontal stiffness | 200 × m | 20 × m | 200 × m |
+| vertical stiffness | 0.1 × 200 × m = 20 × m | 20 × m | 20 × m |
+| damping | critical | critical | critical |
+| force limit per axis | 1.5 × k | 1.5 × k | 1.5 × k |
 
-When someone brakes hard, Aussie mode draws them running on at their last speed for one
-snapshot gap, instead of overshooting by the squared term. On average that is the smaller
-error (table below).
+Aussie mode puts the Beta 20 spring back on other riders' collision bodies, exactly. The vertical
+axis was already 20 × m in both builds, so it is kept there. It patches three sites in the
+stepper `0x166A10` (see `src/aussie.h`):
 
-## How it was measured
+- the 20 × m load is pointed at a 200.0 FrostMod owns, and the pooled 20.0 is not touched;
+- the vertical spring term gets one extra multiply, × 0.1, in a small code cave;
+- the vertical damper term gets one extra multiply, × √0.1, in the same cave.
 
-- **Truth.** 36 minutes of real riding: Sean's MXB Coach telemetry, 50 Hz, 7 sessions.
-- **Sender.** One snapshot every 30 ms, quantised.
-- **Wire.** Proxy semantics: fixed delay plus uniform 0..J jitter per datagram, and loss.
-  Server forwarding is 0–30 ms.
-- **Receiver.** The game's playback rules as read from the 21e binary:
-  - 8-deep ring, sorted insert, stale drop
-  - 0.3 s gap gate (2.0 s with antifreeze)
-  - ±800 ms window
-  - p + v·dt + k·a·dt² beyond the newest sample
-  - evaluated once per 30 ms net step, which is when the game runs it
-- **Clock.** Client clock = server time.
-- **Metrics:**
-  - position error = distance from drawn to true position, every step
-  - warp = a 30 ms step where the drawn motion differs from the true motion by more than 0.5 m
-  - step jump p99 = 99th percentile of that per-step difference
+Nothing else is touched. The netcode is not, and neither is the 300 ms gate.
 
-Then the same rules were run on **real wire arrivals**:
-- A local `mxbserver` on the stock club track.
-- One `mxbclient --ride` replaying 6 minutes of the real trajectory.
-- One `mxbclient --watch` joined through `mxbproxy` at 100 ms + 0–40 ms jitter each way and 1%
-  loss (≈ 200 ms RTT). The measured sender-to-watcher age was a median of 155 ms and a p95 of
-  171 ms.
+## Whose bodies it affects (measured in-engine)
 
-### 200 ms, real wire (mxbproxy, 5.8 min)
+A probe hooked all four world-step list steppers while the game was joined to a local server.
+The game went through `mxbproxy` at 100 ms + 0–40 ms each way. One headless rider was on track.
 
-| | mean error | p99 error | warps/min | step jump p99 |
+- **With me in the garage:** the stepper ran for exactly one body. When that remote rider
+  disconnected, the body's target froze at the same moment.
+- **With me on track:** still one body. My own bike never went through this stepper, or through
+  `0x1867D0`.
+- **Conclusion:** `0x166A10` drives only other riders' collision bodies.
+
+**For the Aussie-mode rider:** other riders feel as solid as in Beta 20 when you touch them. Your
+own bike's physics are unchanged.
+
+**For everyone else:** nothing changes. Each client resolves its own bike's contacts against the
+bodies on its own screen, and the server does not simulate collisions. So other riders' games,
+and how their bikes respond to you, are not affected. Aussie mode cannot make you hit anyone
+harder. It only makes you take a contact as firmly as Beta 20 did.
+
+## Measured: no contact, 200 ms
+
+The same 2.5-minute stretch of real riding was replayed through `mxbproxy` (100+0..40 ms each
+way, 1% loss). The source is Sean's MXB Coach telemetry, rotated and scaled 0.86 to fit the club
+track, median 15.7 m/s.
+
+The table is the distance from the remote rider's collision body to the pose it follows, with
+the body's fixed centre-of-mass offset removed:
+
+| | median | p90 | p99 | max |
 |---|---|---|---|---|
-| stock 21e | 0.28 m | 1.12 m | 333 | 1.40 m |
-| **Aussie mode** | **0.22 m** | **0.76 m** | **18** | **0.48 m** |
-| 100 ms interpolation delay | 1.58 m | 2.51 m | 8 | 0.37 m |
-| 150 ms interpolation delay | 2.36 m | 3.76 m | 0.7 | 0.21 m |
+| stock 21e | 0.003 m | 0.011 m | 0.089 m | 0.57 m |
+| Aussie mode | 0.003 m | 0.012 m | 0.053 m | 0.65 m |
 
-### Replay of all 36 minutes
+The game drives these bodies along with the pose, so with no contact they sit on the drawn rider
+at any ping, and stiffness makes no difference. This run also confirms the patch applies and runs
+in-engine (`[aussie] on`, a 4-minute session, no faults).
 
-| network | | mean error | p99 error | warps/min | step jump p99 |
+## Contacts: model with the game's constants
+
+The spring only matters when something pushes the body. An in-engine contact A/B was not
+possible in this rig. The headless rider passed straight through my parked bike in the pits, so
+collisions are off there. Driving my own bike out needs gamepad input.
+
+So these numbers come from a model, not the engine:
+- the measured mass and the exact stepper law, `F = clamp(k·e + c·ė, ±1.5k)` at 2 ms;
+- my bike at the same mass, closing on the other rider, with a rigid inelastic contact.
+
+| closing speed | | other rider gives way | contact lasts | my peak deceleration | speed I lose in 100 ms |
 |---|---|---|---|---|---|
-| LAN (10+10 ms) | stock | 0.05 m | 0.18 m | 2.0 | 0.23 m |
-| | Aussie | 0.04 m | 0.17 m | 0.7 | 0.15 m |
-| 200 ms (25 up, 100+0..40 down, 1% loss) | stock | 0.37 m | 1.30 m | 651 | 1.60 m |
-| | Aussie | 0.25 m | 0.85 m | 22 | 0.51 m |
-| 250 ms, heavy jitter (125+0..80, 2% loss) | stock | 0.54 m | 2.01 m | 913 | 2.36 m |
-| | Aussie | 0.35 m | 1.18 m | 47 | 0.66 m |
-| both riders far (100+0..40 each side) | stock | 0.83 m | 2.92 m | 1298 | 3.51 m |
-| | Aussie | 0.49 m | 1.55 m | 74 | 0.80 m |
+| 3 m/s | 21e | 0.22 m | 350 ms | 6.7 m/s² | 2.1 of 3.0 m/s |
+| | **Aussie** | **0.07 m** | **110 ms** | 21 m/s² | 2.9 of 3.0 m/s |
+| 6 m/s | 21e | 0.43 m | 350 ms | 13 m/s² | 4.2 of 6.0 m/s |
+| | **Aussie** | **0.13 m** | **110 ms** | 42 m/s² | 5.8 of 6.0 m/s |
 
-A quarter factor (0.25) was also tried. It landed between stock and 0 on every row, so 0 is
-what ships.
+In 21e the other rider gives way three times as far, and the contact drags on for a third of a
+second. That reads as "floaty". In Beta 20, and in Aussie mode, the contact is short and firm.
 
-## What was tried and not shipped
+## How this relates to ping
 
-- **Interpolation delay.** Drawing everyone 60–150 ms in the past removes warps, but at race
-  speed it puts each rider 1–2.5 m behind where they really are (tables above). You would hit
-  riders who have already moved on.
-- **Beta 20 rider-body stiffness.** Beta 21 softened the rider-to-bike spring from 200·m to
-  20·m. Putting it back cannot be limited to contacts with other riders: it changes the
-  player's own bike handling everywhere, which other riders do not get. Not shipped, for
-  fairness.
-- **Wider gap gate.** Already in FrostMod as antifreeze (on by default, 2 s). Neither run
-  above lost a rider to the gate.
+The spring behaves the same at any ping, as the no-contact table shows. Ping changes how often
+you touch a rider whose drawn pose is not where they really are. The playback pipeline is
+unchanged since 20d. At 150–250 ms those contacts are more frequent and less expected, and the
+soft Beta 21 response is what they feel like. That matches what AU riders report.
 
-## Limits
+The parked draft that changed extrapolation instead (#173's first commit) is not part of this
+mode.
 
-- The receiver is a model of the game's playback, not the game itself. The finite-difference
-  details of `dead_reckon` were approximated from the disassembly.
-- The client clock was taken to equal server time.
-- The live feel check is a real race at high ping, done by a rider.
+## Not done
+
+- **In-engine contact A/B:** needs a real rider. That is the "Sean tries the local build" step.
+- **The other 20·m site (`0x186DFC`, stepper `0x1867D0`):** never ran in any session here. Its
+  objects are unknown, so it is left alone.
+- **Beta 21's limb damping (0.4×) and 100 Hz limb sub-step:** visual, not ping-related, so left
+  alone.

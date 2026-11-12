@@ -46,6 +46,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
+#include "aussie.h"     // aussiemode=1: remote riders guessed forward without a*dt^2
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
@@ -3732,6 +3733,85 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
+// ---- Aussie mode: remote riders without the acceleration guess ---------------
+// What this is, why, and what it changes for whom: aussie.h. One instruction in the game's
+// remote-rider extrapolation is repointed at a 0.0 we own, so riders are guessed forward at
+// their last speed instead of last speed plus a noisy squared acceleration term. Off unless
+// aussiemode=1. Same mechanism and the same checks as antifreeze above; the cell allocator is
+// shared.
+static std::atomic<bool> g_auOn{false};
+static double*           g_auCell    = nullptr;
+static uintptr_t         g_auSite    = 0;
+static uint8_t           g_auOrig[aussie::kSiteLen] = {0};
+static bool              g_auPatched = false;
+
+static bool AuApply() {
+    if (g_auPatched) return true;
+    if (g_game != &GAME_MXB) {
+        Log("[aussie] not applied: this is %s, the offset is MX Bikes' only",
+            g_game && g_game->display ? g_game->display : "another title");
+        return false;
+    }
+    if (!g_base) { Log("[aussie] not applied: no module base"); return false; }
+
+    const uintptr_t site = g_base + aussie::kRvaSite;
+    const uint8_t*  p    = reinterpret_cast<const uint8_t*>(site);
+    if (!aussie::SiteMatches(p)) {
+        Log("[aussie] not applied: bytes at +0x%llX are not the load we expect "
+            "(game updated?). Nothing patched.", (unsigned long long)aussie::kRvaSite);
+        return false;
+    }
+    g_auCell = AfAllocCellNear(site);
+    if (!g_auCell) { Log("[aussie] not applied: no free page within reach"); return false; }
+    *g_auCell = aussie::kAussieAccelFactor;
+
+    int32_t disp = 0;
+    if (!aussie::PlanDisp(site, reinterpret_cast<uintptr_t>(g_auCell), &disp)) {
+        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
+        Log("[aussie] not applied: cell out of rel32 reach");
+        return false;
+    }
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)site, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
+        Log("[aussie] not applied: VirtualProtect failed (%lu)", GetLastError());
+        return false;
+    }
+    memcpy(g_auOrig, p, aussie::kSiteLen);
+    uint8_t* w = reinterpret_cast<uint8_t*>(site);
+    for (int i = 0; i < 4; ++i) w[aussie::kDispOffset + i] = (uint8_t)((uint32_t)disp >> (8 * i));
+    VirtualProtect((void*)site, aussie::kSiteLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)site, aussie::kSiteLen);
+
+    if (aussie::CurrentTarget(site, p) != reinterpret_cast<uintptr_t>(g_auCell)) {
+        VirtualProtect((void*)site, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot);
+        memcpy(w, g_auOrig, aussie::kSiteLen);
+        VirtualProtect((void*)site, aussie::kSiteLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)site, aussie::kSiteLen);
+        VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr;
+        Log("[aussie] not applied: the patch did not verify, reverted");
+        return false;
+    }
+    g_auSite = site; g_auPatched = true;
+    Log("[aussie] on: remote riders guessed forward at constant speed (acceleration factor "
+        "%.2f, stock %.2f), at +0x%llX", aussie::kAussieAccelFactor, aussie::kStockAccelFactor,
+        (unsigned long long)aussie::kRvaSite);
+    return true;
+}
+
+static void AuRevert() {
+    if (!g_auPatched) return;
+    DWORD prot = 0;
+    if (VirtualProtect((void*)g_auSite, aussie::kSiteLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        memcpy(reinterpret_cast<uint8_t*>(g_auSite), g_auOrig, aussie::kSiteLen);
+        VirtualProtect((void*)g_auSite, aussie::kSiteLen, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), (void*)g_auSite, aussie::kSiteLen);
+    }
+    if (g_auCell) { VirtualFree(g_auCell, 0, MEM_RELEASE); g_auCell = nullptr; }
+    g_auPatched = false;
+    Log("[aussie] off: the game's own extrapolation is back");
+}
+
 // ---- vehicle teardown: the bike-change cleanup's free of the old own-vehicle record ------
 // Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
 // its conditions, then the record is zeroed as session end zeroes all of them. Its only
@@ -3866,6 +3946,7 @@ static void SaveOverlaySettings() {
     }
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
+    if (g_auOn.load()) fprintf(f, "aussiemode=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
     if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
@@ -3912,6 +3993,8 @@ static void LoadOverlaySettings() {
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
+        // Only read at load: the patch goes in right after this, or not at all.
+        else if (sscanf_s(line, "aussiemode=%d", &v) == 1) g_auOn.store(v == 1);
         // Only read at load: the guard goes in right after this, or not at all.
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
@@ -8929,6 +9012,8 @@ DWORD WINAPI Init(LPVOID) {
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
+        // Same moment, same reason. Off unless MXB App (or the cfg) says aussiemode=1.
+        if (g_auOn.load()) AuApply();
         // Same moment, same reason: the saved setting is known. The flush it guards may already
         // be drawing the loading screen; the unmap call is written before the map call, so a
         // flush in between still pairs the game's own map with the game's own unmap.
@@ -9087,6 +9172,7 @@ static void TdDisableHooks(bool) {
 static void TdRevertPatches(bool) {
     TyreFallbackRevert();   // jumps into a stub that calls this dll
     AfRevert();             // points at our cell, not our code, but the game gets its bytes back
+    AuRevert();             // same shape as antifreeze
     MgRevert();             // two calls into stubs that jump into this dll
     SgRevert();             // one call into a stub that jumps back into the game
 }

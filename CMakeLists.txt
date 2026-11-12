@@ -263,6 +263,11 @@ add_test(NAME lean COMMAND lean_test)
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
 
+# --- Aussie-mode patch test ------------------------------------------------------
+# Same shape as antifreeze: one rip-relative load repointed at a cell we own (src/aussie.h).
+add_executable(aussie_test tests/aussie_test.cpp)
+add_test(NAME aussie COMMAND aussie_test)
+
 # --- tyre fallback patch test --------------------------------------------------
 # The guarded span, the three not-found sites in it, and the jump/stub bytes written over
 # them (src/tyrefallback.h). Pure, so it runs on any host.

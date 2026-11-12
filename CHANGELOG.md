@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-12 - v0.52.0
+
+Aussie mode, for riders on 150-250 ms ping. Off by default.
+
+### Added
+- **Aussie mode** (`aussiemode=1`, or the switch in MXB App's Game Integration settings). At high
+  ping the game guesses other riders forward with a noisy acceleration term, so they overshoot
+  and snap back. Aussie mode guesses them forward at their last speed instead. At about 200 ms
+  that cut warps from 333 to 18 a minute and position error from 0.28 to 0.22 m. It changes only
+  how you see other riders. Nothing on the wire changes, and nothing in your own bike's physics.
+  Measurements are in `docs/aussie-mode.md`.
+
 ## 2026-11-03 - v0.51.0
 
 The last four crashes on thomas4f's MXBMRP3 known-crash list are now handled, so FrostMod covers

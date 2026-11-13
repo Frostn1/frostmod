@@ -54,6 +54,7 @@
 #include "serverfilter.h"
 #include "session.h"
 #include "gamefeed.h"  // the Game SDK feed MXB App reads (raw plugin payloads)
+#include "actions.h"   // what happened to MXB App's commands, for the Game SDK
 #include "changefree.h" // bike change: free the old own-vehicle record
 #include "refreshgate.h" // content refresh kinds, and the pages a refresh waits out
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
@@ -144,6 +145,29 @@ static bool FeedInit(const GameOffsets* g) {
     const uint32_t game = g == &GAME_KRP ? 3 : g == &GAME_GPB ? 2 : 1;
     g_feed.Attach((frostmod::gamefeed::Block*)view, game, (uint32_t)g->plugin_data_version);
     return true;
+}
+
+// The answer half of the command channel (actions.h): what each command came to, and the
+// refresh state, in a block MXB App reads. The injected copy owns it: that is the copy that
+// runs commands.
+static frostmod::actions::Writer g_actions;
+static frostmod::actions::Pending g_actPending;
+
+static bool ActionsInit(const char* frostmodVersion) {
+    if (g_actions.attached()) return true;
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(frostmod::actions::Block),
+                                  frostmod::actions::kMappingName);
+    if (!h) return false;
+    void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostmod::actions::Block));
+    if (!view) { CloseHandle(h); return false; }
+    g_actions.Attach((frostmod::actions::Block*)view, frostmodVersion);
+    return true;
+}
+
+static void ActNote(const std::string& id, const char* verb, frostmod::actions::State st,
+                    const char* detail, uint32_t lists = 0) {
+    g_actions.Note(id.c_str(), verb, st, detail, GetTickCount64(), lists);
 }
 
 // Forget the session, keeping the block. Called when the event closes, so a rider back in
@@ -2154,6 +2178,52 @@ static void RunReloadStep(int i) {
     }
 }
 
+// ---- the refresh, as the Game SDK sees it (actions.h) --------------------------------
+// Which lists a refresh rebuilds, by the label its starter gives it. Paints nest in gear.
+static uint32_t ListsOfWhat(const char* what) {
+    using namespace frostmod::actions;
+    if (!what) return LIST_ALL;
+    if (strcmp(what, "paint refresh") == 0) return LIST_PAINTS;
+    if (strcmp(what, "gear refresh") == 0) return LIST_GEAR | LIST_PAINTS;
+    if (strcmp(what, "track refresh") == 0) return LIST_TRACKS;
+    if (strcmp(what, "bike refresh") == 0) return LIST_BIKES;
+    return LIST_ALL;
+}
+static uint32_t ListsOf(frostmod::RefreshKind k) {
+    using namespace frostmod::actions;
+    switch (k) {
+    case frostmod::RefreshKind::Paints: return LIST_PAINTS;
+    case frostmod::RefreshKind::Gear:   return LIST_GEAR | LIST_PAINTS;
+    case frostmod::RefreshKind::Tracks: return LIST_TRACKS;
+    case frostmod::RefreshKind::Bikes:  return LIST_BIKES;
+    case frostmod::RefreshKind::Full:   return LIST_ALL;
+    default: return 0;
+    }
+}
+static uint32_t g_actLists = 0;   // what the running refresh rebuilds
+
+static void ActRefreshStarted(uint32_t lists, int total, const char* what) {
+    g_actLists = lists;
+    g_actions.Refresh(true, lists, 0, (uint32_t)total, 0);
+    ActNote("", "refresh", frostmod::actions::RUNNING, what, lists);
+    for (const auto& it : g_actPending.Peek(lists))
+        ActNote(it.id, it.verb.c_str(), frostmod::actions::RUNNING, what, lists);
+}
+static void ActRefreshFinished(uint32_t lists, const char* what) {
+    for (const auto& it : g_actPending.Take(lists))
+        ActNote(it.id, it.verb.c_str(), frostmod::actions::DONE, what, lists);
+    ActNote("", "refresh", frostmod::actions::DONE, what, lists);
+    g_actions.Refresh(false, 0, 0, 0, 0);
+    g_actLists = 0;
+}
+static void ActRefreshWaiting(uint32_t lists, const char* page) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "waits until %s closes", page ? page : "the content page");
+    g_actions.Refresh(g_reloadActive.load(), g_actLists, 0, 0, lists);
+    for (const auto& it : g_actPending.Peek(lists))
+        ActNote(it.id, it.verb.c_str(), frostmod::actions::WAITING, detail, lists);
+}
+
 // Called once per frame on the render thread (from Tick). Runs at most ONE step, so a
 // frame is presented between steps and the progress bar advances instead of freezing.
 void AdvanceReload() {
@@ -2167,6 +2237,7 @@ void AdvanceReload() {
         // The hitch a player feels is the longest single step (one per frame): measured.
         Log("[reload]   step took %.1f ms", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)hz.QuadPart);
         ++g_reloadCur;
+        g_actions.Refresh(true, g_actLists, (uint32_t)g_reloadCur, (uint32_t)g_reloadPlanN, 0);
         // The overlay's bar is out of the full table's step count; scale a short plan to it.
         g_reloadDone.store(g_reloadPaintsOnly
                                ? g_reloadCur * g_game->reload_count / g_reloadPlanN
@@ -2175,6 +2246,7 @@ void AdvanceReload() {
         g_reloadActive.store(false);
         g_reloadPaintsOnly = false;
         Log("[reload] %s done - %d list(s) rebuilt from disk.", g_refreshWhat, g_reloadPlanN);
+        ActRefreshFinished(g_actLists, g_refreshWhat);
         ApplyArrivedPaints();
         CheckArrivedGear();
         frostmod::crash::Note("%s finished", g_refreshWhat);
@@ -2195,6 +2267,7 @@ void AdvanceReload() {
         ApplyArrivedPaints();
         CheckArrivedGear();
         frostmod::crash::Note("content reload finished");
+        ActRefreshFinished(frostmod::actions::LIST_ALL, "reload");
         SetStatus("reloaded - new mods listed", 4000);
     }
 }
@@ -2250,6 +2323,7 @@ static void StartFullReload() {
     SnapshotMissingPaints();      // which riders are stock only for want of their paint
     SnapshotMissingGear();        // and which wear a gear model this game lacks
     g_reloadActive.store(true);   // AdvanceReload() drives it, one step per frame
+    ActRefreshStarted(frostmod::actions::LIST_ALL, g_reloadPlanN, "reload");
     // The thread id is still logged, but it is no longer the open question: a v0.12.0
     // reporter log has it matching the boot [capture] scan tid in all three sessions, so
     // we do replay on the thread that owns the content lists. The race theory is dead.
@@ -2313,6 +2387,7 @@ static void StartPartialRefresh(const uintptr_t* rvas, int nrvas, const char* wh
     SnapshotMissingPaints();
     g_reloadActive.store(true);
     frostmod::crash::Note("%s started (%d steps)", what, g_reloadPlanN);
+    ActRefreshStarted(ListsOfWhat(what), g_reloadPlanN, what);
     Log("[reload] %s (%d of %d list(s), stepped over frames)", what, g_reloadPlanN,
         g_game->reload_count);
 }
@@ -2414,6 +2489,7 @@ void RequestRefresh(frostmod::RefreshKind k, const char* source) {
             frostmod::RefreshKindName(k), page, frostmod::RefreshKindName(g_refreshPending));
         if (was == frostmod::RefreshKind::None)
             SetStatus("refresh waits until you leave this screen", 4000);
+        ActRefreshWaiting(ListsOf(g_refreshPending), page);
         return;
     }
     // Something was waiting and this request is allowed now: run the merge of both.
@@ -6842,18 +6918,28 @@ void SeedCommandFiles() {
 
 // Act on one command document. `path` names where it came from, for the log.
 static void DispatchCommand(const std::string& doc, const std::string& path) {
-    std::string verb, bikeId;
+    using namespace frostmod::actions;
+    std::string verb, bikeId, id;
+    // The Game SDK's handle on this command; empty from older apps, which is fine.
+    JsonStringField(doc, "id", id);
     if (!JsonStringField(doc, "verb", verb)) {
         Log("[cmd] no 'verb' in %s - ignoring.", path.c_str());
+        ActNote(id, "", REFUSED, "the command names no verb");
         return;
     }
     JsonStringField(doc, "bikeId", bikeId);
-    Log("[cmd] verb='%s' bikeId='%s'", verb.c_str(), bikeId.c_str());
+    Log("[cmd] verb='%s' bikeId='%s' id='%s'", verb.c_str(), bikeId.c_str(), id.c_str());
+    // A refresh is answered when the refresh that covers it finishes (ActRefreshFinished).
+    auto refresh = [&](uint32_t lists) {
+        ActNote(id, verb.c_str(), ACCEPTED, "", lists);
+        g_actPending.Add(id, verb, lists);
+    };
 
     if (verb == "reload_mods") {
         // MXB App's Reload button, arriving as a file rather than as the reload event it
         // would rather pulse - see the header. Same work either way.
         Log("[cmd] reload requested by MXB App");
+        refresh(LIST_ALL);
         RequestReload();
     } else if (verb == "race_filter") {
         // MXB App's Auto race mode wrote (or deleted) frostmod_racemode.txt: re-read it and
@@ -6862,48 +6948,61 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
         Log("[cmd] race mode mod list changed - re-reading it and reloading");
         RaceFilterLoad("race_filter");
         RaceFilterEnsureHooks();
+        refresh(LIST_ALL);
         RequestReload();
     } else if (verb == "refresh_tracks") {
         // MXB App: only tracks changed (installed, removed, unlocked).
         Log("[cmd] track refresh requested by MXB App");
+        refresh(LIST_TRACKS);
         RequestTrackRefresh();
     } else if (verb == "refresh_bikes") {
         // MXB App: a bike changed - its list, the series and the bike paints rebuild.
         Log("[cmd] bike refresh requested by MXB App");
+        refresh(LIST_BIKES);
         RequestBikeRefresh();
     } else if (verb == "refresh_gear") {
         Log("[cmd] gear refresh requested by MXB App");
+        refresh(LIST_GEAR);
         RequestGearRefresh();
     } else if (verb == "refresh_paints") {
         // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
         // only the paint lists, and its live-paints pass applies whatever riders on track
         // were missing (see LIVE PAINTS). MXB App sends this only to v0.39.0 and later.
         Log("[cmd] paint refresh requested by MXB App");
+        refresh(LIST_PAINTS);
         RequestPaintRefresh();
     } else if (verb == "reload_bike_gfx") {
         // MXB App / Frost's Studio saved a bike's gfx.cfg: put its grips, levers, chain and
         // rider offset onto the bike now (LIVE BIKE GFX.CFG). bikeId narrows it to that bike
         // folder; without one every loaded bike is re-read.
-        (void)GfxApply(bikeId.c_str(), "MXB App");
+        const bool ok = GfxApply(bikeId.c_str(), "MXB App");
+        ActNote(id, verb.c_str(), ok ? DONE : FAILED, ok ? "" : "not applied; see frostmod.log");
     } else if (verb == "refresh_bike_model") {
         // Honoured as a notice, not as a re-apply: v0.9.9 acted on this by replaying a
         // captured bike-apply call, which crashed the game at the next hand-picked bike
         // (see the bike-apply block). MXB App v0.7.1+ withholds the verb from anything
         // below v0.9.11, so reaching here means an older app - answer it truthfully.
         NoteModelNeedsCategorySwitch(bikeId.c_str(), "MXB App model swap");
+        ActNote(id, verb.c_str(), DONE, "switch the bike category away and back to see it");
     } else if (verb == "reset_server_browser") {
         // The manual half of the server-browser fix: FrostMod clears this by itself when it
         // recognises the wedge (see WorldWatch), and this is the button for when it declines
         // to — a run that never logged in, or one that has used up its automatic resets.
         // Enqueued rather than run here so the bus call lands on the render thread, which is
         // the thread the game's own browser code runs on.
-        EnqueueGameThreadTask([] { ResetServerBrowser("MXB App", true); });
+        ActNote(id, verb.c_str(), ACCEPTED, "");
+        EnqueueGameThreadTask([id] {
+            ResetServerBrowser("MXB App", true);
+            ActNote(id, "reset_server_browser", DONE, "");
+        });
     } else if (verb == "swap_bike") {
         // Stage B (whole-bike in-garage switch) isn't built yet. Say so instead of
         // silently doing nothing - MXB App's garage_swap_bike sends this today.
         Log("[cmd] 'swap_bike' is not implemented yet (in-garage switcher = Stage B); ignoring.");
+        ActNote(id, verb.c_str(), REFUSED, "not implemented yet");
     } else {
         Log("[cmd] unknown verb '%s' - ignoring.", verb.c_str());
+        ActNote(id, verb.c_str(), REFUSED, "unknown verb");
     }
 }
 
@@ -9036,6 +9135,8 @@ DWORD WINAPI Init(LPVOID) {
         frostmod::serverfilter::Init(cfg, &SfLog);
         // The app may attach before or after us, so the block exists from the moment we
         // load rather than from the moment someone asks for it.
+        Log("[actions] %s", ActionsInit(FROSTMOD_VERSION) ? "command answers ready for MXB App"
+                                                           : "command answers unavailable");
         if (SessionInit()) {
             Log("[session] block ready for MXB App");
         } else {

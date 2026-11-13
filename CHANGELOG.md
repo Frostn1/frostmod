@@ -38,6 +38,15 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
   guards on the physics NaN count as one crash, and the map guard's empty-batch NULLs (which
   never crashed) are not counted.
 
+### FrostServer
+- **A rider who leaves is removed from every screen.** The game told clients to drop a leaving
+  rider from the list but not from the track, so a frozen copy stayed and a rejoin made two.
+  FrostServer now runs the game's own rider removal for them. `rejoin_fix: false` turns it off.
+- **The host crash at +0x7A860 is guarded on dedicated servers too.** `crash_guards: false` turns
+  it off.
+- **`GET /frostserver/protection`**: what fair send, the rejoin fix and the guards have done,
+  since start and in total, for MXB Servers and MXB App.
+
 ## 2026-11-12 - v0.52.0
 
 Aussie mode: other riders feel as solid as they did in Beta 20. Off by default.

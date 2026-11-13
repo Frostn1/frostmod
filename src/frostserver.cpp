@@ -39,6 +39,7 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 
 #ifndef FROSTSERVER_EXE
 #include <intrin.h>     // _ReturnAddress: which call site reached our writer_init detour
@@ -46,6 +47,8 @@
 #endif
 
 #include "fairsend.h"   // the promotion rule, and the game's candidate-list layout
+#include "serverrejoin.h"  // a rider who leaves is taken off everybody's screen
+#include "sessionguards.h" // the host-side crash at +0x7A860 (riderinfo), shared with FrostMod
 #include "servermsg.h"  // the announcement model + feed JSON, shared with FrostMod
 #include "version.h"
 
@@ -59,6 +62,7 @@ namespace {
 std::mutex g_logMutex;
 char       g_logPath[MAX_PATH]    = {0};
 char       g_configPath[MAX_PATH] = {0};
+char       g_protPath[MAX_PATH]   = {0};   // frostserver-protection.json: lifetime totals
 HMODULE    g_selfModule           = nullptr;   // set in DllMain (DLL build)
 
 // Fill 'out' with the folder (trailing '\') that this binary lives in.
@@ -79,6 +83,7 @@ void InitPaths() {
     if (dir[0]) {
         _snprintf_s(g_logPath,    sizeof(g_logPath),    _TRUNCATE, "%sfrostserver.log",  dir);
         _snprintf_s(g_configPath, sizeof(g_configPath), _TRUNCATE, "%sfrostserver.yaml", dir);
+        _snprintf_s(g_protPath,   sizeof(g_protPath),   _TRUNCATE, "%sfrostserver-protection.json", dir);
     } else {
         char t[MAX_PATH];
         if (GetTempPathA(sizeof(t), t)) {
@@ -177,6 +182,12 @@ struct Config {
     // cost of the fix is one tick of delay for a rider who has ticks to spare.
     bool        fairSend      = true;
     int         fairSendTicks = fairsend::kPromoteAtTicks;
+    // Remove a leaving rider's entity the way the game's own removal job does, so nobody keeps
+    // a frozen copy of them and a rejoin does not make two. See serverrejoin.h.
+    bool        rejoinFix     = true;
+    // The crash guards FrostMod has that also apply to a server (the host's connection
+    // handler, +0x7A860). See sessionguards.h, riderinfo.
+    bool        crashGuards   = true;
     // Styled announcements. These do not travel as chat - FrostMod fetches them and draws
     // them itself, so a rider without it is unaffected and still sees ordinary server chat.
     std::vector<Announce> announce;              // timed lines from this file
@@ -206,6 +217,13 @@ const char* kDefaultConfig =
     "fair_send: true      # set false to leave the server exactly as PiBoSo ships it\n"
     "fair_send_ticks: 9   # act this many 30ms ticks into a rider's silence (their game\n"
     "                     # gives up at 10, so 9 leaves one tick of margin)\n"
+    "\n"
+    "# When a rider leaves, the game tells everyone to drop them from the rider list but\n"
+    "# not from the track, so a frozen copy stays where they left and a rejoin makes two.\n"
+    "# rejoin_fix removes the leaving rider's bike the way the game's own removal does.\n"
+    "rejoin_fix: true     # set false to leave departures exactly as PiBoSo ships them\n"
+    "crash_guards: true   # FrostMod's server-side crash fixes (a join the game cannot\n"
+    "                     # find crashed the host at +0x7A860)\n"
     "\n"
     "# For each track this server runs, the mxb-mods.com page to download it.\n"
     "# The KEY must be the track name EXACTLY as FrostServer logs it - watch\n"
@@ -354,6 +372,8 @@ void LoadConfig() {
         else if (key == "announce_session") { std::string v = lower(stripComment(val)); c.announceSession = (v == "true" || v == "1" || v == "yes"); }
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
+        else if (key == "rejoin_fix") { std::string v = lower(stripComment(val)); c.rejoinFix = !(v == "false" || v == "0" || v == "no"); }
+        else if (key == "crash_guards") { std::string v = lower(stripComment(val)); c.crashGuards = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "fair_send") { std::string v = lower(stripComment(val)); c.fairSend = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "fair_send_ticks") {
             // Clamped, not trusted. Above the cliff the promotion would arrive too late to
@@ -487,6 +507,79 @@ std::atomic<bool> g_httpRunning{false};
 // Shared between the server thread and Stop* only at shutdown; on Win64 an
 // aligned pointer-sized read/write is atomic, which is all this needs.
 SOCKET            g_listenSock = INVALID_SOCKET;
+
+// ---------------------------------------------------------------------------
+// protection report: what this server's fixes did, for MSM and MXB App
+// (GET /frostserver/protection). Counts since start, and lifetime totals kept in
+// frostserver-protection.json beside the log.
+// ---------------------------------------------------------------------------
+struct ProtCounters {
+    std::atomic<unsigned long long> fairPromoted{0};   // riders kept drawn by fair_send
+    std::atomic<unsigned long long> fairPasses{0};     // packets fair_send looked at
+    std::atomic<unsigned long long> rejoinCleaned{0};  // leaving riders removed from every screen
+    std::atomic<unsigned long long> riderInfo{0};      // host crashes at +0x7A860 stopped
+};
+ProtCounters g_prot;                     // since this server started
+unsigned long long g_protBase[3] = {0, 0, 0};   // lifetime before this start: fair, rejoin, riderinfo
+long long g_protStart = 0, g_protFirst = 0;
+std::atomic<bool> g_fairArmed{false}, g_rejoinArmed{false}, g_guardsArmed{false};
+
+unsigned long long JsonNumber(const std::string& j, const char* key) {
+    const std::string k = std::string("\"") + key + "\":";
+    const size_t at = j.find(k);
+    return at == std::string::npos ? 0 : strtoull(j.c_str() + at + k.size(), nullptr, 10);
+}
+
+void LoadProtection() {
+    g_protStart = (long long)time(nullptr);
+    g_protFirst = g_protStart;
+    if (!g_protPath[0]) return;
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_protPath, "rb") || !f) return;
+    char buf[1024] = {0};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    const std::string j(buf, n);
+    g_protBase[0] = JsonNumber(j, "fairPromoted");
+    g_protBase[1] = JsonNumber(j, "rejoinCleaned");
+    g_protBase[2] = JsonNumber(j, "riderInfo");
+    const unsigned long long first = JsonNumber(j, "since");
+    if (first > 0) g_protFirst = (long long)first;
+}
+
+void SaveProtection() {
+    if (!g_protPath[0]) return;
+    char j[256];
+    _snprintf_s(j, sizeof(j), _TRUNCATE,
+                "{\"since\":%lld,\"fairPromoted\":%llu,\"rejoinCleaned\":%llu,\"riderInfo\":%llu}\n",
+                g_protFirst, g_protBase[0] + g_prot.fairPromoted.load(),
+                g_protBase[1] + g_prot.rejoinCleaned.load(), g_protBase[2] + g_prot.riderInfo.load());
+    const std::string tmp = std::string(g_protPath) + ".tmp";
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "wb") || !f) return;
+    fputs(j, f);
+    fclose(f);
+    MoveFileExA(tmp.c_str(), g_protPath, MOVEFILE_REPLACE_EXISTING);
+}
+
+std::string BuildProtectionJson() {
+    const unsigned long long fair = g_prot.fairPromoted.load(), rejoin = g_prot.rejoinCleaned.load(),
+                             ri = g_prot.riderInfo.load();
+    std::string j = "{\"frostserver\":\"" FROSTMOD_VERSION "\",";
+    j += "\"startedAt\":" + std::to_string(g_protStart) + ",\"since\":" + std::to_string(g_protFirst) + ",";
+    j += "\"fixes\":[";
+    j += "{\"id\":\"fair-send\",\"name\":\"Distant riders kept visible\",\"on\":" +
+         std::string(g_fairArmed.load() ? "true" : "false") + ",\"session\":" + std::to_string(fair) +
+         ",\"total\":" + std::to_string(g_protBase[0] + fair) + ",\"unit\":\"riders kept drawn\"},";
+    j += "{\"id\":\"rejoin\",\"name\":\"Riders who left removed from every screen\",\"on\":" +
+         std::string(g_rejoinArmed.load() ? "true" : "false") + ",\"session\":" + std::to_string(rejoin) +
+         ",\"total\":" + std::to_string(g_protBase[1] + rejoin) + ",\"unit\":\"departures cleaned up\"},";
+    j += "{\"id\":\"rider-info\",\"name\":\"Host crash when someone joins (+0x7A860)\",\"on\":" +
+         std::string(g_guardsArmed.load() ? "true" : "false") + ",\"session\":" + std::to_string(ri) +
+         ",\"total\":" + std::to_string(g_protBase[2] + ri) + ",\"unit\":\"crashes stopped\"}";
+    j += "]}";
+    return j;
+}
 
 std::string BuildInfoJson() {
     std::string track;
@@ -661,6 +754,8 @@ void HandleConnection(SOCKET c) {
 
     if (path == "/frostserver/info")
         SendResponse(c, "200 OK", "application/json", BuildInfoJson());
+    else if (path == "/frostserver/protection")
+        SendResponse(c, "200 OK", "application/json", BuildProtectionJson());
     else if (path == "/frostserver/maps")
         SendResponse(c, "200 OK", "application/json", BuildMapsJson());
     else if (path == "/frostserver/messages")
@@ -793,6 +888,135 @@ void LogAsciiRuns(const char* tag, const void* data, int size) {
 // stack frame, which is why this needs no trampoline and no hand-written assembly.
 #ifndef FROSTSERVER_EXE
 
+static bool MinHookReady() {
+    static int state = 0;   // 0 untried, 1 ok, -1 failed
+    if (state == 0) state = MH_Initialize() == MH_OK ? 1 : -1;
+    return state == 1;
+}
+
+/// MX Bikes' own exe, or nothing: every address below is that title's.
+static uintptr_t MxbBase(const char* tag) {
+    char exe[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, exe, sizeof(exe));
+    const char* leaf = strrchr(exe, '\\');
+    leaf = leaf ? leaf + 1 : exe;
+    if (_stricmp(leaf, "mxbikes.exe") != 0) {
+        Log("[%s] not applied: host is '%s', the offsets are MX Bikes'", tag, leaf);
+        return 0;
+    }
+    return reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+}
+
+static bool CodeIs(uintptr_t base, uintptr_t rva, const uint8_t* want, size_t n) {
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (rva + n > nt->OptionalHeader.SizeOfImage) return false;
+    return memcmp(reinterpret_cast<const void*>(base + rva), want, n) == 0;
+}
+
+// ---- rejoin: a rider who leaves is removed from every screen (serverrejoin.h) -----------
+using ClientLeftFn   = int (*)(void* client, int reason, int a, int b);
+using EntityRemoveFn = int (*)(int id);
+static ClientLeftFn   g_clientLeftOrig = nullptr;
+static EntityRemoveFn g_entityRemove   = nullptr;
+static uintptr_t      g_entities       = 0;   // VA of record 0's id
+
+static int RejoinClientLeft(void* client, int reason, int a, int b) {
+    const int rc = g_clientLeftOrig(client, reason, a, b);
+    if (!client || !g_entities) return rc;
+    const int32_t id = *reinterpret_cast<const int32_t*>(client);
+    int32_t owned[serverrejoin::kEntities];
+    const int n = serverrejoin::OwnedBy(id, [](int i, int32_t* flag, int32_t* eid, int32_t* owner) {
+        const uint8_t* rec = reinterpret_cast<const uint8_t*>(g_entities + (size_t)i * serverrejoin::kEntityStride);
+        *flag  = *reinterpret_cast<const int32_t*>(rec - 4);
+        *eid   = *reinterpret_cast<const int32_t*>(rec + serverrejoin::kIdAt);
+        *owner = *reinterpret_cast<const int32_t*>(rec + serverrejoin::kOwnerAt);
+        return true;
+    }, owned, serverrejoin::kEntities);
+    int removed = 0;
+    for (int i = 0; i < n; ++i)
+        if (g_entityRemove(owned[i]) == 0) ++removed;
+    if (removed) {
+        const unsigned long long total = g_prot.rejoinCleaned.fetch_add((unsigned)removed) + removed;
+        if (total <= 20 || (total & (total - 1)) == 0)
+            Log("[rejoin] client %d left (reason %d): removed %d rider entit%s from every screen "
+                "(%llu so far)", id, reason, removed, removed == 1 ? "y" : "ies", total);
+        SaveProtection();
+    }
+    return rc;
+}
+
+static void StartRejoinFix() {
+    bool on;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); on = g_cfg.rejoinFix; }
+    if (!on) { Log("[rejoin] off by config; a rider who leaves stays on screen as the game ships"); return; }
+    const uintptr_t base = MxbBase("rejoin");
+    if (!base) return;
+    using namespace serverrejoin;
+    if (!CodeIs(base, kRvaClientLeft, kLeft, kLeftLen) || !CodeIs(base, kRvaEntityRemove, kRemove, kRemoveLen) ||
+        !CodeIs(base, kRvaRemoveWalk, kRemoveWalk, kRemoveWalkLen) || DecodeTable(kRemoveWalk) != kRvaEntities) {
+        Log("[rejoin] not applied: the departure code is not the beta21e we know (game updated?)");
+        return;
+    }
+    if (!MinHookReady()) { Log("[rejoin] not applied: MinHook init failed"); return; }
+    g_entities = base + kRvaEntities;
+    g_entityRemove = reinterpret_cast<EntityRemoveFn>(base + kRvaEntityRemove);
+    void* target = reinterpret_cast<void*>(base + kRvaClientLeft);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&RejoinClientLeft),
+                      reinterpret_cast<void**>(&g_clientLeftOrig)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_entities = 0;
+        Log("[rejoin] not applied: could not hook +0x%llX", (unsigned long long)kRvaClientLeft);
+        return;
+    }
+    g_rejoinArmed.store(true);
+    Log("[rejoin] on: a rider who leaves is removed from every client's track, not just the "
+        "rider list (hook at +0x%llX)", (unsigned long long)kRvaClientLeft);
+}
+
+// ---- crash guards shared with FrostMod (sessionguards.h) -------------------------------
+using RiderInfoFn = int (*)(int id, void* out);
+static RiderInfoFn g_riderInfoOrig = nullptr;
+
+static int GuardRiderInfo(int id, void* out) {
+    const int rc = g_riderInfoOrig(id, out);
+    if (!sessionguards::riderinfo::ShouldClear(rc, out)) return rc;
+    memset(out, 0, sessionguards::riderinfo::kOutBytes);
+    const unsigned long long n = g_prot.riderInfo.fetch_add(1) + 1;
+    if (n <= 20 || (n & (n - 1)) == 0)
+        Log("[guard] rider %d asked about is not in the list; answered empty instead of the crash "
+            "at mxbikes.exe+0x7A860 (%llu so far)", id, n);
+    SaveProtection();
+    return rc;
+}
+
+static void StartCrashGuards() {
+    bool on;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); on = g_cfg.crashGuards; }
+    if (!on) { Log("[guard] crash guards off by config"); return; }
+    const uintptr_t base = MxbBase("guard");
+    if (!base) return;
+    using namespace sessionguards::riderinfo;
+    const uint8_t* entry = reinterpret_cast<const uint8_t*>(base + kRvaJumpTable + 4 * kJob);
+    if (!CodeIs(base, kRvaFn, kFn, kFnLen) || !CodeIs(base, kRvaCase, kCase, kCaseLen) ||
+        !CodeIs(base, kRvaCaller, kCaller, kCallerLen) ||
+        (uint32_t)sessionguards::Disp32(entry) != (uint32_t)kRvaCase) {
+        Log("[guard] rider-info guard not applied: the bytes are not beta21e's");
+        return;
+    }
+    if (!MinHookReady()) { Log("[guard] not applied: MinHook init failed"); return; }
+    void* target = reinterpret_cast<void*>(base + kRvaFn);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&GuardRiderInfo),
+                      reinterpret_cast<void**>(&g_riderInfoOrig)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        Log("[guard] rider-info guard not applied: could not hook +0x%llX", (unsigned long long)kRvaFn);
+        return;
+    }
+    g_guardsArmed.store(true);
+    Log("[guard] on: details asked for a rider who is not in the list come back empty "
+        "(the crash at +0x%llX)", (unsigned long long)kRvaFault);
+}
+
 constexpr uintptr_t kRvaWriterInit = 0x283590;   // writer_init(w, buf, cap)
 constexpr uintptr_t kRvaBuilderCallRet = 0x29D490;  // the instruction after the builder's call
 
@@ -813,7 +1037,9 @@ static void* FairWriterInit(void* w, void* buf, int cap) {
         const int n = fairsend::CountFilled(recs, (int)fairsend::kMaxRecords);
         const int moved = fairsend::Promote(recs, n, g_fairTicks.load(std::memory_order_relaxed));
         g_fairPasses.fetch_add(1, std::memory_order_relaxed);
+        g_prot.fairPasses.fetch_add(1, std::memory_order_relaxed);
         if (moved) {
+            g_prot.fairPromoted.fetch_add((unsigned)moved, std::memory_order_relaxed);
             const unsigned long long total =
                 g_fairPromoted.fetch_add((unsigned)moved, std::memory_order_relaxed);
             // Say it once. A promotion means this server was about to drop a rider off
@@ -847,7 +1073,7 @@ static void StartFairSend() {
     g_gameBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     if (!g_gameBase) { Log("[fairsend] not applied: no module base"); return; }
 
-    if (MH_Initialize() != MH_OK) { Log("[fairsend] not applied: MinHook init failed"); return; }
+    if (!MinHookReady()) { Log("[fairsend] not applied: MinHook init failed"); return; }
     void* target = reinterpret_cast<void*>(g_gameBase + kRvaWriterInit);
     if (MH_CreateHook(target, reinterpret_cast<void*>(&FairWriterInit),
                       reinterpret_cast<void**>(&g_writerInitOrig)) != MH_OK) {
@@ -860,12 +1086,15 @@ static void StartFairSend() {
     }
     g_fairTicks.store(ticks);
     g_fairOn.store(true);
+    g_fairArmed.store(true);
     Log("[fairsend] on: a rider silent for %d ticks goes to the front of the next packet "
         "(their game gives up at %d)", ticks, fairsend::kCliffTicks);
 }
 
 #else
 static void StartFairSend() {}   // the standalone exe is not inside a game
+static void StartRejoinFix() {}
+static void StartCrashGuards() {}
 #endif
 
 void FrostServerInit() {
@@ -873,8 +1102,15 @@ void FrostServerInit() {
     Log("=============== FrostServer %s starting ===============", FROSTMOD_VERSION);
     ensureConfig();
     LoadConfig();
+    LoadProtection();
     StartHttpServer();
     StartFairSend();
+    StartRejoinFix();
+    StartCrashGuards();
+    // fair_send counts thirty times a second; its lifetime total is saved once a minute.
+    std::thread([] {
+        for (;;) { std::this_thread::sleep_for(std::chrono::seconds(60)); SaveProtection(); }
+    }).detach();
 }
 
 } // namespace

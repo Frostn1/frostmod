@@ -304,6 +304,10 @@ add_test(NAME shockguard COMMAND shockguard_test)
 add_executable(sessionguards_test tests/sessionguards_test.cpp)
 add_test(NAME sessionguards COMMAND sessionguards_test)
 
+# What counts as one caught crash for MXB App, and the line format it reads.
+add_executable(protection_test tests/protection_test.cpp)
+add_test(NAME protection COMMAND protection_test)
+
 # --- NaN bike reset test ---------------------------------------------------------
 # The offsets the per-step check reads and the place-bike call it makes, proved against the
 # install's byte checks (src/nanrecover.h). The check runs against a fake bike: every finite

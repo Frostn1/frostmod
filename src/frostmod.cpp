@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
+#include <ctime>      // _time64: protection log timestamps
 #include <GL/gl.h>    // immediate-mode GL overlay
 #include <winhttp.h>  // the announcement feed (the launcher already uses WinHTTP)
 
@@ -60,6 +61,7 @@
 #include <io.h>         // _finddata64i32_t (the race filter's find hooks)
 #include <memory>
 #include "crashreport.h"
+#include "protection.h"  // what the guards caught, for MXB App (frostmod-protection.jsonl)
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
@@ -3959,6 +3961,8 @@ static std::atomic<bool> g_lbOn{true};
 static std::atomic<bool> g_p64On{true};
 static std::atomic<bool> g_riOn{true};   // riderinfoguard=: +0x7A860, the host's unfilled rider lists
 static void SessionGuardsTick();   // SESSION GUARDS section; called once a frame
+static void ProtCatch(protection::Kind k);   // PROTECTION section: a guard caught a crash
+static void ProtTick();                     // PROTECTION section: write what was caught
 // nanrecover=0 turns off the reset of a bike whose physics state went NaN (NANRECOVER section,
 // src/nanrecover.h); on by default. Read early by NtReadCfg(), with nantrap=, before the sim
 // step hook goes in; kept here so a save does not drop it.
@@ -5840,6 +5844,7 @@ void Tick() {
     WorldWatch();
     ShockGuardTick();    // the shock guard's counter: a log line and a crash-trail note
     SessionGuardsTick(); // the list-box and pointer stubs' counters, the same way
+    ProtTick();          // what the guards caught, to frostmod-protection.jsonl for MXB App
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     RaceFilterTick();
 
@@ -6999,6 +7004,7 @@ static int hkGhsClose(unsigned handle) {
             Log("[ghs] guarded a close of handle %u whose slot is already empty - this is "
                 "the crash at mxbikes.exe+0x11D753. Prevented %u so far.", handle, n);
         frostmod::crash::Note("guarded a double close of GHS handle %u", handle);
+        ProtCatch(protection::Kind::TrainerClose);
         return 1;   // the game's own answer for a handle that names no slot
     }
     return g_origGhsClose(handle);
@@ -7057,6 +7063,7 @@ static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y
             for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
         }
         frostmod::crash::Note("refused a NaN height query (%u so far)", n);
+        ProtCatch(protection::Kind::PhysicsNan);
         return 0;   // what the function itself returns for a query it cannot serve
     }
     return g_origTerrain(obj, a2, out, x, y);
@@ -7106,6 +7113,7 @@ static int32_t hkGhsLoad(int32_t pool, const char* path, const char* tag, int32_
                     "(msvcr90+0x36EDE). Cleaned %u so far.",
                     fixed, path ? path : "(no path)", n);
             frostmod::crash::Note("cleaned a trainer record on load (%u so far)", n);
+            ProtCatch(protection::Kind::BadText);
         }
     }
     return rc;
@@ -7233,6 +7241,7 @@ static int TyreFallbackPick(int site, const uint8_t* gameRsp, int bikeIndex) {
     else
         Log("[tyres] bike %s asked for tyre '%s' which isn't loaded; using '%s'.", bike, want, used);
     frostmod::crash::Note("tyre fallback for bike %s (%u so far)", bike, n);
+    ProtCatch(protection::Kind::BadText);
     return pick;
 }
 
@@ -7385,6 +7394,9 @@ static void* MgMap(void* vb) {
         frostmod::crash::Note("quad-batch map guard fired (%s, %s, %u of this kind, %u in all)",
                               mapguard::PathName(path), mapguard::VerdictName(v), k, n);
     }
+    if (!(path == mapguard::Path::NoBuffer && v == mapguard::Verdict::Null) &&
+        v != mapguard::Verdict::Forced)
+        ProtCatch(protection::Kind::RenderBatch);   // a NULL on the no-buffer path is an empty batch, never a crash
     if (!s) return p;
     s->live = size;
     s->path = path;
@@ -7508,6 +7520,7 @@ static LONG CALLBACK MgWalkerFault(EXCEPTION_POINTERS* ep) {
                 (unsigned long long)mbi.RegionSize, (unsigned)mbi.State, (unsigned)mbi.Protect, n);
             frostmod::crash::Note("quad walker store faulted, batch moved to FrostMod's copy (%u so far)", n);
         }
+        ProtCatch(protection::Kind::RenderBatch);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     // Stop: leave this frame through the walker's own epilogue.
@@ -7522,6 +7535,7 @@ static LONG CALLBACK MgWalkerFault(EXCEPTION_POINTERS* ep) {
             onScratch ? "on FrostMod's copy" : "on the game's memory", n);
         frostmod::crash::Note("quad walker stopped at the end of its buffer (%u so far)", n);
     }
+    ProtCatch(protection::Kind::RenderBatch);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -7664,6 +7678,7 @@ static int32_t hkTerrainSample2(void* obj, void* a2, void* a3, float x, float y)
             for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
         }
         frostmod::crash::Note("refused a NaN grid query (%u so far)", n);
+        ProtCatch(protection::Kind::PhysicsNan);
         return 1;   // this function's own "no answer"
     }
     return g_origTerrain2(obj, a2, a3, x, y);
@@ -7744,6 +7759,7 @@ static void ShockGuardTick() {
     if (!g_sgStub) return;
     const uint32_t n = *(volatile const uint32_t*)(g_sgStub + shockguard::kCountOff);
     if (n == g_sgLogged) return;
+    ProtCatch(protection::Kind::PhysicsNan);
     const uint32_t prev = g_sgLogged;
     g_sgLogged = n;
     // Log when the count crosses a line the rate limit allows, and always the first.
@@ -7908,6 +7924,7 @@ static int hkBikeCat(int bike, int* cat) {
             "%u so far.", bike, count, n);
         frostmod::crash::Note("refused bike-list index %d of %d (%u so far)", bike, count, n);
     }
+    ProtCatch(protection::Kind::BikeList);
     return sessionguards::bikelist::kEmpty;
 }
 
@@ -7966,6 +7983,7 @@ static int hkWake(float dt) {
             "crash at mxbikes.exe+0x3B940. %u so far.", n);
         frostmod::crash::Note("skipped a wake update after teardown (%u so far)", n);
     }
+    ProtCatch(protection::Kind::Wake);
     return 0;
 }
 
@@ -8087,6 +8105,7 @@ static int hkRiderInfo(int id, void* out) {
             "mxbikes.exe+0x7A860). The answer was cleared: every list empty. %u so far.", id, n);
         frostmod::crash::Note("cleared the details of unknown rider %d (%u so far)", id, n);
     }
+    ProtCatch(protection::Kind::RiderInfo);
     return rc;
 }
 
@@ -8134,6 +8153,8 @@ static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* 
 
 static void SessionGuardsTick() {
     uint32_t n = 0;
+    if (g_lbStub && *(volatile const uint32_t*)(g_lbStub + sessionguards::listbox::kCountOff) != g_lbLogged)
+        ProtCatch(protection::Kind::ListBox);
     if (SsgDue(g_lbStub, sessionguards::listbox::kCountOff, &g_lbLogged, &n)) {
         using namespace sessionguards::listbox;
         const uint32_t item = *(volatile const uint32_t*)(g_lbStub + kItemOff);
@@ -8144,6 +8165,8 @@ static void SessionGuardsTick() {
             (int)item, text, obj, n);
         frostmod::crash::Note("skipped a list-box line, item %d (%u so far)", (int)item, n);
     }
+    if (g_p64Stub && *(volatile const uint32_t*)(g_p64Stub + sessionguards::ptr64::kCountOff) != g_p64Logged)
+        ProtCatch(protection::Kind::StackPointer);
     if (SsgDue(g_p64Stub, sessionguards::ptr64::kCountOff, &g_p64Logged, &n)) {
         const uint64_t p = *(volatile const uint64_t*)(g_p64Stub + sessionguards::ptr64::kLastOff);
         Log("[ptr64] this launch's stack is above 4 GB: job 863 passed 0x%llX whole, where the "
@@ -8159,6 +8182,73 @@ static void InstallSessionGuards() {
     InstallListBoxGuard();
     InstallPtr64Fix();
     InstallRiderInfoGuard();
+}
+
+// ===========================================================================
+// PROTECTION  -  what the guards caught, kept for MXB App (src/protection.h)
+//
+// Each guard calls ProtCatch() where it already notes the catch in the crash trail. Once a
+// frame ProtTick() writes each kind that fired, once per session, as a line of
+// frostmod-protection.jsonl beside the crash reports. MXB App turns that into the home card,
+// the note after a session and the Crash protection page. A session is the track and server
+// the crash context holds (both copies of FrostMod see it, the plugin copy directly and the
+// injected one through MirrorPluginSession), so a new event, a track change or going back to
+// the menus starts one.
+// ===========================================================================
+static protection::Ledger g_prot;
+static std::string        g_protKey;          // inSession|track|server, the session it last saw
+static bool               g_protTrimmed = false;
+
+static void ProtCatch(protection::Kind k) { g_prot.Catch(k); }
+
+static bool ProtPath(char* out, size_t n) {
+    const char* dir = frostmod::crash::ReportDir();
+    if (!dir || !dir[0]) return false;   // the session plugin's copy writes nothing
+    _snprintf_s(out, n, _TRUNCATE, "%s\frostmod-protection.jsonl", dir);
+    return true;
+}
+
+static void ProtTrim(const char* path) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") || !f) return;
+    std::string text;
+    char buf[8192];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+    fclose(f);
+    const std::string kept = protection::KeepNewest(text, protection::kMaxLines);
+    if (kept.size() == text.size()) return;
+    if (fopen_s(&f, path, "wb") || !f) return;
+    fwrite(kept.data(), 1, kept.size(), f);
+    fclose(f);
+}
+
+static void ProtTick() {
+    char path[MAX_PATH];
+    if (!ProtPath(path, sizeof(path))) return;
+    if (!g_protTrimmed) { g_protTrimmed = true; ProtTrim(path); }
+    auto& ctx = frostmod::crash::TheContext();
+    // Read the session the catches belong to before deciding whether a new one began: what
+    // fired since the last frame happened in the session we last saw.
+    const uint32_t mask = g_prot.Take();
+    if (mask) {
+        FILE* f = nullptr;
+        if (!fopen_s(&f, path, "ab") && f) {
+            const int64_t now = (int64_t)_time64(nullptr);
+            for (int i = 0; i < protection::kKinds; ++i) {
+                if (!(mask & (1u << i))) continue;
+                const auto k = (protection::Kind)i;
+                const std::string line = protection::Line(k, now, ctx.track, ctx.server, FROSTMOD_VERSION);
+                fwrite(line.data(), 1, line.size(), f);
+                Log("[protection] caught: %s (%s) - counted once for this session.",
+                    protection::Info(k).name, protection::Info(k).site);
+            }
+            fclose(f);
+        }
+    }
+    std::string key = ctx.inSession.load(std::memory_order_relaxed) ? "1|" : "0|";
+    key += ctx.track; key += '|'; key += ctx.server;
+    if (key != g_protKey) { g_protKey = key; g_prot.NewSession(); }
 }
 
 // ===========================================================================
@@ -8635,6 +8725,7 @@ static void NrRecover(const NrFound& f, bool before) {
     if (SafeReadBytes((const char*)(f.bike + kBikeResets), (char*)&counter, 1) == 1)
         tr->PlacedByUs(counter);
     g_nrResets.store(n, std::memory_order_relaxed);
+    ProtCatch(protection::Kind::PhysicsNan);
     Bad after;
     const bool clean = rc == 0 && NrRescan(f.bike, &after);
     const bool say = ShouldLog(n);

@@ -28,6 +28,11 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
 - New plugin exports, each handing its payload to the feed and returning: `RunInit`,
   `RunDeinit`, `RunStart`, `RunStop`, `RunLap`, `RunSplit`, `RaceSessionState`, `RaceLap`,
   `RaceSplit`, `RaceCommunication`.
+- **What the crash guards caught, for MXB App.** Each kind of crash a guard stops is written once
+  per session to `frostmod-protection.jsonl` beside the log (time, kind, track, server). MXB App
+  reads it for its home card, the note after a session and the Crash protection page. The four
+  guards on the physics NaN count as one crash, and the map guard's empty-batch NULLs (which
+  never crashed) are not counted.
 
 ## 2026-11-12 - v0.52.0
 

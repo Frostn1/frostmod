@@ -46,6 +46,7 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
+#include "aussie.h"     // aussiemode=1: other riders' collision bodies on the Beta 20 spring
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
@@ -3732,6 +3733,97 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
+// ---- Aussie mode: other riders' collision bodies on the Beta 20 spring --------
+// What this is, why, and whom it affects: aussie.h. Three sites in the remote-body stepper
+// (0x166A10): the 20 x mass stiffness load is repointed at a 200.0 we own, and the vertical spring
+// and damper terms jump through a small cave that scales them back to 20 x mass. Off unless
+// aussiemode=1. Read at load, applied before any session exists, reverted at unload.
+static std::atomic<bool> g_auOn{false};
+static uint8_t*          g_auPage    = nullptr;   // cells + caves, execute-read once written
+static bool              g_auPatched = false;
+
+// Write `n` bytes over game code. Returns false (and writes nothing) if the page cannot be made
+// writable.
+static bool AuWrite(uintptr_t at, const uint8_t* bytes, size_t n) {
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)at, n, PAGE_EXECUTE_READWRITE, &prot)) return false;
+    memcpy((void*)at, bytes, n);
+    VirtualProtect((void*)at, n, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, n);
+    return true;
+}
+
+static void AuPutBack() {
+    if (!g_base) return;
+    AuWrite(g_base + aussie::kRvaYd, aussie::kYdBytes, aussie::kYdLen);
+    AuWrite(g_base + aussie::kRvaY,  aussie::kYBytes,  aussie::kYLen);
+    AuWrite(g_base + aussie::kRvaK,  aussie::kKBytes,  aussie::kKLen);
+}
+
+static bool AuApply() {
+    if (g_auPatched) return true;
+    if (g_game != &GAME_MXB) {
+        Log("[aussie] not applied: this is %s, the offsets are MX Bikes' only",
+            g_game && g_game->display ? g_game->display : "another title");
+        return false;
+    }
+    if (!g_base) { Log("[aussie] not applied: no module base"); return false; }
+
+    const uint8_t* k  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaK);
+    const uint8_t* y  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaY);
+    const uint8_t* yd = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaYd);
+    if (!aussie::Matches(k, aussie::kKBytes, aussie::kKLen) ||
+        !aussie::Matches(y, aussie::kYBytes, aussie::kYLen) ||
+        !aussie::Matches(yd, aussie::kYdBytes, aussie::kYdLen)) {
+        Log("[aussie] not applied: the spring code is not the bytes we expect (game updated?). "
+            "Nothing patched.");
+        return false;
+    }
+
+    // A page the sites can reach with rel32. AfAllocCellNear commits a whole page.
+    uint8_t* page = reinterpret_cast<uint8_t*>(AfAllocCellNear(g_base + aussie::kRvaK));
+    if (!page) { Log("[aussie] not applied: no free page within reach"); return false; }
+    aussie::Plan plan;
+    if (!aussie::MakePlan(g_base, reinterpret_cast<uintptr_t>(page), &plan)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: the cave is out of rel32 reach");
+        return false;
+    }
+    memcpy(page, plan.page, aussie::kPageUsed);
+    DWORD old = 0;
+    if (!VirtualProtect(page, aussie::kPageUsed, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: could not make the cave executable (%lu)", GetLastError());
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, aussie::kPageUsed);
+
+    // The caves first, so a jump never lands before its target exists; then the jumps; then k.
+    const bool ok = AuWrite(g_base + aussie::kRvaYd, plan.yd, aussie::kYdLen) &&
+                    AuWrite(g_base + aussie::kRvaY,  plan.y,  aussie::kYLen) &&
+                    AuWrite(g_base + aussie::kRvaK,  plan.k,  aussie::kKLen);
+    if (!ok || !aussie::Matches(yd, plan.yd, aussie::kYdLen) ||
+        !aussie::Matches(y, plan.y, aussie::kYLen) || !aussie::Matches(k, plan.k, aussie::kKLen)) {
+        AuPutBack();
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: the patch did not verify, reverted");
+        return false;
+    }
+    g_auPage = page; g_auPatched = true;
+    Log("[aussie] on: other riders' collision bodies on the Beta 20 spring (k %.0f x mass, "
+        "vertical %.0f x mass; stock %.0f x mass)", aussie::kAussieK,
+        aussie::kAussieK * aussie::kYSpring, aussie::kStockK);
+    return true;
+}
+
+static void AuRevert() {
+    if (!g_auPatched) return;
+    AuPutBack();
+    if (g_auPage) { VirtualFree(g_auPage, 0, MEM_RELEASE); g_auPage = nullptr; }
+    g_auPatched = false;
+    Log("[aussie] off: the game's own Beta 21 spring is back");
+}
+
 // ---- vehicle teardown: the bike-change cleanup's free of the old own-vehicle record ------
 // Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
 // its conditions, then the record is zeroed as session end zeroes all of them. Its only
@@ -3866,6 +3958,7 @@ static void SaveOverlaySettings() {
     }
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
+    if (g_auOn.load()) fprintf(f, "aussiemode=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
     if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
@@ -3912,6 +4005,8 @@ static void LoadOverlaySettings() {
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
+        // Only read at load: the patch goes in right after this, or not at all.
+        else if (sscanf_s(line, "aussiemode=%d", &v) == 1) g_auOn.store(v == 1);
         // Only read at load: the guard goes in right after this, or not at all.
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
@@ -3939,6 +4034,8 @@ static void LoadOverlaySettings() {
         g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
 }
+
+
 
 // ---- which rider is me ---------------------------------------------------
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
@@ -8929,6 +9026,8 @@ DWORD WINAPI Init(LPVOID) {
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
+        // Same moment, same reason. Off unless MXB App (or the cfg) says aussiemode=1.
+        if (g_auOn.load()) AuApply();
         // Same moment, same reason: the saved setting is known. The flush it guards may already
         // be drawing the loading screen; the unmap call is written before the map call, so a
         // flush in between still pairs the game's own map with the game's own unmap.
@@ -9087,6 +9186,7 @@ static void TdDisableHooks(bool) {
 static void TdRevertPatches(bool) {
     TyreFallbackRevert();   // jumps into a stub that calls this dll
     AfRevert();             // points at our cell, not our code, but the game gets its bytes back
+    AuRevert();             // same shape as antifreeze
     MgRevert();             // two calls into stubs that jump into this dll
     SgRevert();             // one call into a stub that jumps back into the game
 }

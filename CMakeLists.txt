@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.51.0")
+set(FROSTMOD_VERSION "0.52.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -262,6 +262,11 @@ add_test(NAME lean COMMAND lean_test)
 # Pure constants, so it runs on any host.
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
+
+# --- Aussie-mode patch test ------------------------------------------------------
+# Same shape as antifreeze: one rip-relative load repointed at a cell we own (src/aussie.h).
+add_executable(aussie_test tests/aussie_test.cpp)
+add_test(NAME aussie COMMAND aussie_test)
 
 # --- tyre fallback patch test --------------------------------------------------
 # The guarded span, the three not-found sites in it, and the jump/stub bytes written over

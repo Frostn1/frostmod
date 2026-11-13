@@ -10,6 +10,8 @@
 //   +0x3B940   wake effect update after the track freed its list    wakeguard=0
 //   +0x1FED9E  list box line naming an item it does not have        listboxguard=0
 //   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
+//   +0x7A860   host copies a rider's lists that were never filled    riderinfoguard=0
+//   +0x255F1F  mipmap level built from a NULL allocation             mipmapguard=0
 //
 // No Win32 here, so tests/sessionguards_test.cpp runs anywhere.
 #pragma once
@@ -387,5 +389,127 @@ inline uint64_t Passed(uint64_t slot, bool fixed) { return fixed ? slot : (uint6
 inline bool StockWouldTruncate(uint64_t slot) { return (slot >> 32) != 0; }
 
 }  // namespace ptr64
+
+
+// =====================================================================================
+// +0x7A860 / +0x7A8E0  -  THE HOST COPIES A RIDER'S LISTS THAT WERE NEVER FILLED
+//
+// The top host-side crash in the reports: 376 of 17,537 beta21e reports (2026-09-17 ..
+// 2026-11-12), 204 riders, every one "in the menus" - the player is hosting from the game's
+// own menu and someone is connecting. Both sites are the same byte copy, `movzx eax, [rcx]`
+// reading past the top of the stack.
+//
+// 0x787C0 is the host's handler for a connecting client (reached from on_connection 0x299220
+// via 0x299828). At 0x7A80B it asks job 0x279 (633) for a rider's details, into a 0x4E84-byte
+// struct on its own stack at rsp+0x160:
+//   0x7A806  mov ecx, 0x279 ; edx = id ; r8 = rsp+0x160
+//   0x7A80B  call [dispatcher]          ; the return value is never looked at
+//   0x7A811  mov eax, [rsp+0x305C]      ; list 1 count (struct +0x2EFC), room for 25
+//   0x7A850  ... copy count strings of 0x64 bytes        <- +0x7A860 faults
+//   0x7A88F  mov eax, [rsp+0x3A88]      ; list 2 count (struct +0x3928), room for 25
+//   0x7A8D0  ... the same copy                           <- +0x7A8E0 faults
+// Job 0x279 is 0x1B44C0: look the id up in the rider list; if it is not there, return 1 and
+// write nothing. Only a found rider goes on to 0x19A7A0, which fills the whole struct and
+// returns 0. So an id that is not (or no longer) in the list leaves both counts as whatever was
+// on the stack, and the copy walks until it leaves the stack. The fault addresses fit: reads
+// at 0xF08000, 0xFE4000 - page edges just above a thread stack.
+//
+// The guard: a detour on 0x1B44C0. A miss still returns 1, but the struct is zeroed first, so
+// every list in it is empty, as for a rider with nothing selected. A hit is untouched.
+// =====================================================================================
+namespace riderinfo {
+
+constexpr uintptr_t kRvaFn      = 0x1B44C0;   // int job633(int id, void* out)
+constexpr uintptr_t kRvaFill    = 0x19A7A0;   // the fill a found rider gets; returns 0
+constexpr uintptr_t kRvaCase    = 0x1251B3;   // the dispatcher's case for job 0x279
+constexpr uintptr_t kRvaCaller  = 0x7A80B;    // the call in the host's connection handler
+constexpr uintptr_t kRvaFault   = 0x7A860;
+constexpr uintptr_t kRvaFault2  = 0x7A8E0;
+constexpr uintptr_t kRvaJumpTable = 0x1280B0; // the dispatcher's table (image-relative i32s)
+constexpr int       kJob        = 0x279;
+constexpr size_t    kOutBytes   = 0x4E84;     // last store of 0x19A7A0 is [r8+0x4E80]
+constexpr size_t    kList1Count = 0x2EFC, kList2Count = 0x3928;
+constexpr int       kListRoom   = 25;
+constexpr int       kMiss       = 1;
+
+constexpr size_t  kFnLen = 0x39;
+constexpr uint8_t kFn[kFnLen] = {
+    0x40, 0x53, 0x48, 0x83, 0xec, 0x20,               // push rbx; sub rsp, 0x20
+    0x48, 0x8b, 0xda, 0x8b, 0xd1,                     // rbx = out; edx = id
+    0x48, 0x8b, 0x0d, 0xf6, 0x56, 0x3c, 0x00,         // mov rcx, [rider list]
+    0xe8, 0x99, 0x7d, 0xfa, 0xff,                     // call 0x15C270 (find)
+    0x48, 0x85, 0xc0, 0x75, 0x0b,                     // test rax, rax; jne found
+    0xb8, 0x01, 0x00, 0x00, 0x00,                     // mov eax, 1      <- miss, out untouched
+    0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3,
+    0x4c, 0x8b, 0xc3, 0x33, 0xd2, 0x48, 0x8b, 0xc8,   // r8 = out; edx = 0; rcx = rider
+    0x48, 0x83, 0xc4, 0x20, 0x5b,
+    0xe9, 0xa7, 0x62, 0xfe, 0xff,                     // jmp 0x19A7A0 (fill)
+};
+constexpr size_t kTailJmpAt = 0x34;
+// The case: rdx = args; ecx = id; rdx = out; call 0x1B44C0.
+constexpr size_t  kCaseLen = 0x13;
+constexpr uint8_t kCase[kCaseLen] = {
+    0x48, 0x8d, 0x94, 0x24, 0xd8, 0x02, 0x00, 0x00, 0x8b, 0x0a, 0x48, 0x8b, 0x52, 0x08,
+    0xe8, 0xfa, 0xf2, 0x08, 0x00,
+};
+// The caller that crashes: the dispatcher call, then the first count load.
+constexpr size_t  kCallerLen = 13;
+constexpr uint8_t kCaller[kCallerLen] = {
+    0xff, 0x15, 0x37, 0xc4, 0x4e, 0x00, 0x8b, 0x84, 0x24, 0x5c, 0x30, 0x00, 0x00,
+};
+
+/// What the detour does after the game's lookup: zero the struct on a miss.
+inline bool ShouldClear(int rc, const void* out) { return rc != 0 && out != nullptr; }
+
+}  // namespace riderinfo
+
+// =====================================================================================
+// +0x255F1F / +0x255EF0  -  A MIPMAP BUILT FROM MEMORY THAT WAS NEVER ALLOCATED
+//
+// 329 of 17,543 beta21e reports (2026-09-17 .. 11-12), 113 riders, 315 of them in the menus while
+// content loads. Both sites are in 0x255EA0, the 2x2 box filter that makes each smaller mipmap
+// level from the one above it:
+//   0x255EF0  movzx ecx, [r10 + rbp]       ; read the source row below   <- +0x255EF0
+//   0x255F1F  mov   [rsi - 1], al          ; write the averaged texel    <- +0x255F1F
+// The mip-chain builders (0x230300, 0x230780, 0x230B30, 0x2573F0) allocate each level with the
+// game's allocator 0x15B4F0 and pass the result straight to the filter (0x230478 / 0x2304B1 then
+// 0x230555 in 0x230300): nothing checks for NULL. A big texture under memory pressure gets a NULL
+// level, and the filter writes to address 0 (+0x255F1F, the reports' target 0x0). A texture whose
+// own pixels never arrived is a NULL source: the first read is at NULL + 2 * row, and the reports'
+// targets are 0x1000 to 0x10000 (0x4000 and 0x8000 most often) - two rows of a 512- to 8192-wide
+// RGBA image.
+//
+// The guard: detours on the box filter and its two one-texel-wide siblings (0x255DC0 for a
+// column, 0x255E30 for a row), which share its arguments (src, dst, w, h, bytes per texel). A NULL
+// source or destination returns the 0 every one of them returns, without touching either. That
+// level is left as it is; GL accepts a NULL level as "allocate, contents undefined".
+// =====================================================================================
+namespace mipmap {
+
+constexpr uintptr_t kRvaBox    = 0x255EA0;   // int box(src, dst, w, h, bpp)
+constexpr uintptr_t kRvaColumn = 0x255DC0;   // the same for a 1-wide level
+constexpr uintptr_t kRvaRow    = 0x255E30;   // the same for a 1-high level
+constexpr uintptr_t kRvaFaultWrite = 0x255F1F;
+constexpr uintptr_t kRvaFaultRead  = 0x255EF0;
+constexpr int       kDone = 0;               // what all three return
+
+constexpr size_t  kHeadLen = 0x18;
+constexpr uint8_t kBox[kHeadLen] = {
+    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x56, 0x41,
+    0x55, 0x8b, 0x5c, 0x24, 0x38, 0x41, 0x8b, 0xc0, 0x45, 0x8b, 0xe8, 0x48,
+};
+constexpr uint8_t kColumn[kHeadLen] = {
+    0x40, 0x57, 0x48, 0x8b, 0xfa, 0x4c, 0x8b, 0xc1, 0x45, 0x85, 0xc9, 0x7e,
+    0x50, 0x44, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x89, 0x5c, 0x24, 0x10, 0x41,
+};
+constexpr uint8_t kRow[kHeadLen] = {
+    0x40, 0x57, 0x48, 0x8b, 0xfa, 0x4c, 0x8b, 0xc9, 0x45, 0x85, 0xc0, 0x7e,
+    0x50, 0x44, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x89, 0x5c, 0x24, 0x10, 0x41,
+};
+
+/// Whether the game's filter may run.
+inline bool Admit(const void* src, const void* dst) { return src != nullptr && dst != nullptr; }
+
+}  // namespace mipmap
 
 }  // namespace sessionguards

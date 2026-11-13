@@ -272,6 +272,34 @@ static void TestKinds() {
     CHECK(ShouldLog(++counts[KindIndex(Path::Ram, Verdict::NotCommitted)]), "per kind it is logged");
 }
 
+static void TestWalkerFault() {
+    // The batch table the handler trusts is the one the flush's own lea names.
+    CHECK(RipTarget(kMapWin, kRvaMapWin, 0, 3, 7) == kRvaBatchTable, "lea r13 names the batch table");
+    // The store that crashes is inside the watched range, and so are its two siblings in the
+    // reports (+0x2408C4 texcoords, +0x240904 colours); the loop's count update is not.
+    CHECK(InWalkerStores(0x24085C) && InWalkerStores(0x2408C4) && InWalkerStores(0x240904), "stores watched");
+    CHECK(!InWalkerStores(0x240970) && !InWalkerStores(0x24084F) && !InWalkerStores(0x240B6C), "only the walker");
+    CHECK(kRvaWalkLoLoop + 12 == 0x24085C && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24085C");
+    // The exit we jump to is the walker's own epilogue: xor eax,eax ... pop rsi; ret.
+    CHECK(kWalkExit[0] == 0x33 && kWalkExit[kWalkExitLen - 1] == 0xc3 && kWalkExit[kWalkExitLen - 2] == 0x5e,
+          "epilogue ends pop rsi; ret");
+    // A rebase keeps the cursor's distance into its array, whichever adds already ran.
+    CHECK(Rebase(0x9869F2A0 + 0x30, 0x9869F2A0, 0x20000000) == 0x20000030, "rebase keeps the offset");
+    CHECK(Rebase(0x1000, 0x1000, 0x7FF000000000ull) == 0x7FF000000000ull, "rebase at the base");
+    const uint32_t ok[4] = {0, 192000, 320000, 384000}, bad[4] = {0, 192000, 600000, 384000};
+    CHECK(OffsetsFit(ok, 576000) && !OffsetsFit(bad, 576000) && !OffsetsFit(ok, 0), "offsets fit the scratch");
+    CHECK(OnWalkerFault(false, false, true) == FaultAction::Pass, "not a batch: pass");
+    CHECK(OnWalkerFault(true, false, true) == FaultAction::Move, "game memory: move");
+    CHECK(OnWalkerFault(true, true, true) == FaultAction::Stop, "already ours: stop");
+    CHECK(OnWalkerFault(true, false, false) == FaultAction::Stop, "cannot move: stop");
+    int32_t c = 16012, t = 8006; ClampDraw(&c, &t, 16000);
+    CHECK(c == 16000 && t == 8000, "clamped to the buffer");
+    c = 40; t = 20; ClampDraw(&c, &t, 16000);
+    CHECK(c == 40 && t == 20, "a batch that fits is untouched");
+    c = 9; t = 4; ClampDraw(&c, &t, 7);
+    CHECK(c == 4 && t == 2, "whole quads only");
+}
+
 int main() {
     TestSites();
     TestPatchBytes();
@@ -280,6 +308,7 @@ int main() {
     TestRates();
     TestPaths();
     TestKinds();
+    TestWalkerFault();
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("mapguard: all checks passed\n");
     return 0;

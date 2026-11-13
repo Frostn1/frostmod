@@ -305,11 +305,41 @@ static void TestPtr64Live() {
 }
 #endif
 
+static void TestRiderInfo() {
+    using namespace sessionguards;
+    using namespace sessionguards::riderinfo;
+    // The tail jump reaches the fill, and the case's call reaches the function.
+    CHECK(kFn[kTailJmpAt] == 0xe9 && RipTarget(kFn + kTailJmpAt, kRvaFn + kTailJmpAt, 1, 5) == kRvaFill,
+          "0x1B44C0 tail-jumps to 0x19A7A0");
+    CHECK(kCase[14] == 0xe8 && RipTarget(kCase + 14, kRvaCase + 14, 1, 5) == kRvaFn, "the case calls 0x1B44C0");
+    // The miss path: test rax,rax; jne over `mov eax, 1; ...; ret`, with nothing stored.
+    CHECK(kFn[0x1A] == 0x75 && kFn[0x1C] == 0xb8 && kFn[0x1D] == kMiss && kFn[0x26] == 0xc3, "miss returns 1");
+    // The caller: a dispatcher call whose result is dropped, then list 1's count from the struct.
+    CHECK(kCaller[0] == 0xff && kCaller[1] == 0x15 && kCaller[6] == 0x8b, "call [dispatcher]; mov eax, [count]");
+    CHECK(Disp32(kCaller + 9) == (int32_t)(0x160 + kList1Count), "list 1 count is struct +0x2EFC (rsp+0x305C)");
+    CHECK(kList2Count + 4 + kListRoom * 0x64 <= kOutBytes && kList1Count < kList2Count, "the lists lie inside the struct");
+    CHECK(kRvaFault == 0x7A860 && kRvaFault2 == 0x7A8E0, "sites");
+    CHECK(ShouldClear(1, (void*)1) && !ShouldClear(0, (void*)1) && !ShouldClear(1, nullptr), "clear only a miss");
+}
+
+static void TestMipmap() {
+    using namespace sessionguards::mipmap;
+    // All three take (src rcx, dst rdx, w r8d, h r9d, bpp on the stack) and return 0.
+    CHECK(kColumn[2] == 0x48 && kColumn[3] == 0x8b && kColumn[4] == 0xfa, "column: rdi = dst");
+    CHECK(kRow[2] == 0x48 && kRow[3] == 0x8b && kRow[4] == 0xfa, "row: rdi = dst");
+    CHECK(kBox[17] == 0x41 && kBox[18] == 0x8b && kBox[19] == 0xc0, "box: eax = w");
+    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x255F50, "faults inside the box filter");
+    uint8_t a = 0, b = 0;
+    CHECK(Admit(&a, &b) && !Admit(nullptr, &b) && !Admit(&a, nullptr), "NULL either side is refused");
+}
+
 int main() {
     TestBikeList();
     TestWake();
     TestListBox();
     TestPtr64();
+    TestRiderInfo();
+    TestMipmap();
     TestRates();
 #ifdef _WIN32
     TestListBoxLive();

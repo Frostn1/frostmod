@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Two more crashes from the beta21e reports, together 21% of what v0.51.0 still sends.
+
+### Fixed
+- **Render crash at +0x24085C, the rest of it.** v0.51.0's pointer check cut it down but it was
+  still 45% of v0.51.0's reports, every one in the quad walker after the check had passed. A
+  write fault on one of the walker's stores now moves that batch onto FrostMod's copy and the
+  store runs again; a walk that runs past a whole buffer is ended there and only whole quads are
+  drawn. Covers the same bug at +0x2408C4 and +0x240904. Off with `mapguard=0`.
+- **Host crash at +0x7A860 / +0x7A8E0 when someone joins your server.** The game asks for the
+  details of a rider who is not in its list, gets nothing written back, and copies two lists of
+  whatever length was on the stack. A miss now comes back with every list empty. Off with
+  `riderinfoguard=0`.
+
+- **Menu crash at +0x255F1F / +0x255EF0 while content loads.** The game builds each smaller
+  mipmap level of a texture in memory it never checks it got. A level with no memory behind it is
+  now skipped instead of written to address 0. Off with `mipmapguard=0`.
+
 ### Added
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,
@@ -15,6 +32,11 @@
 - New plugin exports, each handing its payload to the feed and returning: `RunInit`,
   `RunDeinit`, `RunStart`, `RunStop`, `RunLap`, `RunSplit`, `RaceSessionState`, `RaceLap`,
   `RaceSplit`, `RaceCommunication`.
+- **What the crash guards caught, for MXB App.** Each kind of crash a guard stops is written once
+  per session to `frostmod-protection.jsonl` beside the log (time, kind, track, server). MXB App
+  reads it for its home card, the note after a session and the Crash protection page. The four
+  guards on the physics NaN count as one crash, and the map guard's empty-batch NULLs (which
+  never crashed) are not counted.
 
 ## 2026-11-12 - v0.52.0
 

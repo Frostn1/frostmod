@@ -11,6 +11,7 @@
 //   +0x1FED9E  list box line naming an item it does not have        listboxguard=0
 //   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
 //   +0x7A860   host copies a rider's lists that were never filled    riderinfoguard=0
+//   +0x255F1F  mipmap level built from a NULL allocation             mipmapguard=0
 //
 // No Win32 here, so tests/sessionguards_test.cpp runs anywhere.
 #pragma once
@@ -461,5 +462,54 @@ constexpr uint8_t kCaller[kCallerLen] = {
 inline bool ShouldClear(int rc, const void* out) { return rc != 0 && out != nullptr; }
 
 }  // namespace riderinfo
+
+// =====================================================================================
+// +0x255F1F / +0x255EF0  -  A MIPMAP BUILT FROM MEMORY THAT WAS NEVER ALLOCATED
+//
+// 329 of 17,543 beta21e reports (2026-09-17 .. 11-12), 113 riders, 315 of them in the menus while
+// content loads. Both sites are in 0x255EA0, the 2x2 box filter that makes each smaller mipmap
+// level from the one above it:
+//   0x255EF0  movzx ecx, [r10 + rbp]       ; read the source row below   <- +0x255EF0
+//   0x255F1F  mov   [rsi - 1], al          ; write the averaged texel    <- +0x255F1F
+// The mip-chain builders (0x230300, 0x230780, 0x230B30, 0x2573F0) allocate each level with the
+// game's allocator 0x15B4F0 and pass the result straight to the filter (0x230478 / 0x2304B1 then
+// 0x230555 in 0x230300): nothing checks for NULL. A big texture under memory pressure gets a NULL
+// level, and the filter writes to address 0 (+0x255F1F, the reports' target 0x0). A texture whose
+// own pixels never arrived is a NULL source: the first read is at NULL + 2 * row, and the reports'
+// targets are 0x1000 to 0x10000 (0x4000 and 0x8000 most often) - two rows of a 512- to 8192-wide
+// RGBA image.
+//
+// The guard: detours on the box filter and its two one-texel-wide siblings (0x255DC0 for a
+// column, 0x255E30 for a row), which share its arguments (src, dst, w, h, bytes per texel). A NULL
+// source or destination returns the 0 every one of them returns, without touching either. That
+// level is left as it is; GL accepts a NULL level as "allocate, contents undefined".
+// =====================================================================================
+namespace mipmap {
+
+constexpr uintptr_t kRvaBox    = 0x255EA0;   // int box(src, dst, w, h, bpp)
+constexpr uintptr_t kRvaColumn = 0x255DC0;   // the same for a 1-wide level
+constexpr uintptr_t kRvaRow    = 0x255E30;   // the same for a 1-high level
+constexpr uintptr_t kRvaFaultWrite = 0x255F1F;
+constexpr uintptr_t kRvaFaultRead  = 0x255EF0;
+constexpr int       kDone = 0;               // what all three return
+
+constexpr size_t  kHeadLen = 0x18;
+constexpr uint8_t kBox[kHeadLen] = {
+    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x56, 0x41,
+    0x55, 0x8b, 0x5c, 0x24, 0x38, 0x41, 0x8b, 0xc0, 0x45, 0x8b, 0xe8, 0x48,
+};
+constexpr uint8_t kColumn[kHeadLen] = {
+    0x40, 0x57, 0x48, 0x8b, 0xfa, 0x4c, 0x8b, 0xc1, 0x45, 0x85, 0xc9, 0x7e,
+    0x50, 0x44, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x89, 0x5c, 0x24, 0x10, 0x41,
+};
+constexpr uint8_t kRow[kHeadLen] = {
+    0x40, 0x57, 0x48, 0x8b, 0xfa, 0x4c, 0x8b, 0xc9, 0x45, 0x85, 0xc0, 0x7e,
+    0x50, 0x44, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x89, 0x5c, 0x24, 0x10, 0x41,
+};
+
+/// Whether the game's filter may run.
+inline bool Admit(const void* src, const void* dst) { return src != nullptr && dst != nullptr; }
+
+}  // namespace mipmap
 
 }  // namespace sessionguards

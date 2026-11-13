@@ -3959,7 +3959,8 @@ static std::atomic<bool> g_blOn{true};
 static std::atomic<bool> g_wkOn{true};
 static std::atomic<bool> g_lbOn{true};
 static std::atomic<bool> g_p64On{true};
-static std::atomic<bool> g_riOn{true};   // riderinfoguard=: +0x7A860, the host's unfilled rider lists
+static std::atomic<bool> g_riOn{true};
+static std::atomic<bool> g_mmOn{true};   // mipmapguard=: +0x255F1F, a mip level with no memory   // riderinfoguard=: +0x7A860, the host's unfilled rider lists
 static void SessionGuardsTick();   // SESSION GUARDS section; called once a frame
 static void ProtCatch(protection::Kind k);   // PROTECTION section: a guard caught a crash
 static void ProtTick();                     // PROTECTION section: write what was caught
@@ -3997,6 +3998,7 @@ static void SaveOverlaySettings() {
     if (!g_lbOn.load()) fprintf(f, "listboxguard=0\n");
     if (!g_p64On.load()) fprintf(f, "ptr64fix=0\n");
     if (!g_riOn.load()) fprintf(f, "riderinfoguard=0\n");
+    if (!g_mmOn.load()) fprintf(f, "mipmapguard=0\n");
     if (!g_nrOn.load()) fprintf(f, "nanrecover=0\n");
     fclose(f);
 }
@@ -4042,6 +4044,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "listboxguard=%d", &v) == 1) g_lbOn.store(v != 0);
         else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) g_p64On.store(v != 0);
         else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) g_riOn.store(v != 0);
+        else if (sscanf_s(line, "mipmapguard=%d", &v) == 1) g_mmOn.store(v != 0);
         // Only kept for the next save: whether the reset went in was decided at load.
         else if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
@@ -8137,6 +8140,58 @@ static void InstallRiderInfoGuard() {
         (unsigned long long)kRvaFn, (unsigned long long)kRvaFault, (unsigned long long)kRvaFault2);
 }
 
+// ---- +0x255F1F: a mipmap level with no memory behind it ----------------------------
+using MipFilterFn = int (*)(const uint8_t* src, uint8_t* dst, int w, int h, int bpp);
+static MipFilterFn           g_origMip[3] = {};
+static std::atomic<uint32_t> g_mmSkipped{0};
+
+static int MipSkip(const uint8_t* src, uint8_t* dst, int w, int h) {
+    const uint32_t n = g_mmSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[mipmap] skipped a %dx%d mipmap level with a NULL %s - the game's allocator gave it "
+            "no memory (the crash at mxbikes.exe+0x255F1F / +0x255EF0). %u so far.",
+            w, h, !src ? "source" : "destination", n);
+        frostmod::crash::Note("skipped a %dx%d mip level with no memory (%u so far)", w, h, n);
+    }
+    ProtCatch(protection::Kind::MipMemory);
+    return sessionguards::mipmap::kDone;
+}
+static int hkMipBox(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[0](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+static int hkMipColumn(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[1](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+static int hkMipRow(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[2](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+
+static void InstallMipmapGuard() {
+    using namespace sessionguards::mipmap;
+    if (!SsgMxbOnly("mipmap")) return;
+    if (!g_mmOn.load()) { Log("[mipmap] guard off by config (mipmapguard=0)"); return; }
+    if (g_origMip[0] || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaBox, kBox, kHeadLen) || !SsgCodeIs(kRvaColumn, kColumn, kHeadLen) ||
+        !SsgCodeIs(kRvaRow, kRow, kHeadLen)) {
+        Log("[mipmap] guard not applied: the mipmap filters are not the bytes we expect (game "
+            "updated?). Nothing patched.");
+        return;
+    }
+    const struct { uintptr_t rva; void* hk; const char* name; } fns[3] = {
+        {kRvaBox, (void*)&hkMipBox, "mipBox(0x255ea0)"},
+        {kRvaColumn, (void*)&hkMipColumn, "mipColumn(0x255dc0)"},
+        {kRvaRow, (void*)&hkMipRow, "mipRow(0x255e30)"},
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (!InstallHook((void*)(g_base + fns[i].rva), fns[i].hk, (void**)&g_origMip[i], fns[i].name)) {
+            g_origMip[i] = nullptr;
+            Log("[mipmap] guard only partly applied: %s did not hook.", fns[i].name);
+        }
+    }
+    Log("[mipmap] guard on: a mipmap level the game got no memory for is skipped instead of "
+        "written to address 0 (the crash at +0x%llX).", (unsigned long long)kRvaFaultWrite);
+}
+
 /// A stub's counter crossed a line the rate limit allows (or is the first).
 static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* now) {
     if (!page) return false;
@@ -8182,6 +8237,7 @@ static void InstallSessionGuards() {
     InstallListBoxGuard();
     InstallPtr64Fix();
     InstallRiderInfoGuard();
+    InstallMipmapGuard();
 }
 
 // ===========================================================================

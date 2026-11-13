@@ -322,12 +322,24 @@ static void TestRiderInfo() {
     CHECK(ShouldClear(1, (void*)1) && !ShouldClear(0, (void*)1) && !ShouldClear(1, nullptr), "clear only a miss");
 }
 
+static void TestMipmap() {
+    using namespace sessionguards::mipmap;
+    // All three take (src rcx, dst rdx, w r8d, h r9d, bpp on the stack) and return 0.
+    CHECK(kColumn[2] == 0x48 && kColumn[3] == 0x8b && kColumn[4] == 0xfa, "column: rdi = dst");
+    CHECK(kRow[2] == 0x48 && kRow[3] == 0x8b && kRow[4] == 0xfa, "row: rdi = dst");
+    CHECK(kBox[17] == 0x41 && kBox[18] == 0x8b && kBox[19] == 0xc0, "box: eax = w");
+    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x255F50, "faults inside the box filter");
+    uint8_t a = 0, b = 0;
+    CHECK(Admit(&a, &b) && !Admit(nullptr, &b) && !Admit(&a, nullptr), "NULL either side is refused");
+}
+
 int main() {
     TestBikeList();
     TestWake();
     TestListBox();
     TestPtr64();
     TestRiderInfo();
+    TestMipmap();
     TestRates();
 #ifdef _WIN32
     TestListBoxLive();

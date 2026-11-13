@@ -15,6 +15,10 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
   whatever length was on the stack. A miss now comes back with every list empty. Off with
   `riderinfoguard=0`.
 
+- **Menu crash at +0x255F1F / +0x255EF0 while content loads.** The game builds each smaller
+  mipmap level of a texture in memory it never checks it got. A level with no memory behind it is
+  now skipped instead of written to address 0. Off with `mipmapguard=0`.
+
 ### Added
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,

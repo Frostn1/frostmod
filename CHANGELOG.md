@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Added
+- **Answers to MXB App's commands.** Commands from the app (reload mods, refresh tracks,
+  bikes, gear or paints, reload a bike's gfx.cfg, reset the server browser) used to be
+  fire-and-forget. FrostMod now reports what each one came to, keyed by an `id` the app puts in
+  the command: accepted, waiting for a content screen to close, running, done, refused or
+  failed. It also reports the refresh in progress (which lists, how far), whoever asked for
+  it, the in-game hotkey included. This is a second shared block, `Local\FrostModActions`
+  (`src/actions.h`), which MXB App's Game SDK reads to turn commands into actions with events.
+  Older apps send no `id` and see no change.
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,
   `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's

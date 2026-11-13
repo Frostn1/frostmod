@@ -186,6 +186,11 @@ find_package(Threads REQUIRED)
 target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
 add_test(NAME gamefeed COMMAND gamefeed_test)
 
+# --- command answers for MXB App (src/actions.h) -------------------------------
+add_executable(actions_test tests/actions_test.cpp)
+target_link_libraries(actions_test PRIVATE Threads::Threads)
+add_test(NAME actions COMMAND actions_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)

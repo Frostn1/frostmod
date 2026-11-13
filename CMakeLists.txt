@@ -178,6 +178,14 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
+# --- Game SDK feed for MXB App (src/gamefeed.h) --------------------------------
+# Raw plugin payloads in a seqlocked block written from two game threads; the layout is a
+# wire contract with the app's Rust reader, so the offsets are pinned here.
+add_executable(gamefeed_test tests/gamefeed_test.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
+add_test(NAME gamefeed COMMAND gamefeed_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)

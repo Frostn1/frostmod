@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
+  installs) now copies what the game's plugin API hands it into a second shared block,
+  `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's
+  track position and the entry list as snapshots, and laps, splits, session changes, riders
+  joining and leaving and race communications in a numbered ring. MXB App reads it for its Game
+  SDK (overlays, extensions, AI tools). It is a copy and nothing more: no decoding, no network,
+  nothing written to the game, and the block is readable by this Windows user only. The layout
+  is `src/gamefeed.h`, pinned by `tests/gamefeed_test.cpp`.
+- The session plugin now asks for telemetry at 50 Hz (it asked for 10 Hz and dropped it).
+- New plugin exports, each handing its payload to the feed and returning: `RunInit`,
+  `RunDeinit`, `RunStart`, `RunStop`, `RunLap`, `RunSplit`, `RaceSessionState`, `RaceLap`,
+  `RaceSplit`, `RaceCommunication`.
+
 ## 2026-11-12 - v0.52.0
 
 Aussie mode: other riders feel as solid as they did in Beta 20. Off by default.

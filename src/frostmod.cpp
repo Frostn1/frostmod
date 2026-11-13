@@ -53,6 +53,7 @@
 #include "masterlist.h"
 #include "serverfilter.h"
 #include "session.h"
+#include "gamefeed.h"  // the Game SDK feed MXB App reads (raw plugin payloads)
 #include "changefree.h" // bike change: free the old own-vehicle record
 #include "refreshgate.h" // content refresh kinds, and the pages a refresh waits out
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
@@ -123,6 +124,25 @@ static bool SessionInit() {
     g_sessionBlock = (frostmod::session::Block*)view;
     g_sessionBlock->version = frostmod::session::kVersion;
     g_sessionBlock->raceNum = -1;
+    return true;
+}
+
+// The Game SDK feed (gamefeed.h): every plugin callback's payload, copied into a block MXB App
+// reads. Only a copy the game loaded as a plugin is fed (the injected copy is never called).
+static frostmod::gamefeed::Writer g_feed;
+
+// Created rather than opened, for the same reasons as SessionInit. Held for the life of the
+// process: a reader may still be polling it.
+static bool FeedInit(const GameOffsets* g) {
+    if (g_feed.attached()) return true;
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(frostmod::gamefeed::Block),
+                                  frostmod::gamefeed::kMappingName);
+    if (!h) return false;
+    void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostmod::gamefeed::Block));
+    if (!view) { CloseHandle(h); return false; }
+    const uint32_t game = g == &GAME_KRP ? 3 : g == &GAME_GPB ? 2 : 1;
+    g_feed.Attach((frostmod::gamefeed::Block*)view, game, (uint32_t)g->plugin_data_version);
     return true;
 }
 
@@ -9309,11 +9329,14 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         Log("[session] %s", SessionInit()
                 ? "plugin block ready for MXB App"
                 : "plugin block unavailable - MXB App cannot name this server");
-        // A rate the game accepts, so it keeps us loaded and goes on delivering the event
-        // callbacks. The telemetry itself is dropped on the floor below.
-        return 3;
+        Log("[gamefeed] %s", FeedInit(HostGame()) ? "Game SDK feed ready for MXB App"
+                                         : "Game SDK feed unavailable");
+        // 50 Hz: the Game SDK feed passes the telemetry on (gamefeed.h). Nothing else in this
+        // copy reads it.
+        return frostmod::gamefeed::kTelemetryRate;
     }
     EnsureInit();
+    Log("[gamefeed] %s", FeedInit(HostGame()) ? "Game SDK feed ready for MXB App" : "Game SDK feed unavailable");
     return 3;
 }
 
@@ -9360,8 +9383,9 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
 // RunTelemetry: our own bike pose. Startup() returned rate 3, so the game calls
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
-__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.Telemetry(_pData, _iDataSize, _fTime, _fPos);
     if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
@@ -9369,29 +9393,33 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, flo
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceTrackPosition(_iNumVehicles, _pArray, _iElemSize);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceAddEntry(_pData, _iDataSize);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceRemoveEntry(_pData, _iDataSize);
     if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
 // Classification carries laps-done per race number -> the lap-status coloring.
 __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
-    if (g_sessionOnly) return;
     // KRP's header has an extra m_iSessionSeries ahead of the count, so both the minimum
     // size and where the count sits are this title's, not MX Bikes'.
     int n = (_pData && _iDataSize >= g_abi->cls_hdr_size)
             ? *(const int*)((const char*)_pData + g_abi->cls_num_entries) : 0;
+    g_feed.RaceClassification(_pData, _iDataSize, _pArray, n, _iElemSize);
+    if (g_sessionOnly) return;
     RadStoreClassification(_pArray, n, _iElemSize);
 }
 // On MX Bikes, EventInit is where the client learns which server it joined. RaceEvent --
@@ -9409,6 +9437,7 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 // a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.EventInit(_pData, _iDataSize);
     LogCallbackOnce("EventInit", _iDataSize);
     const PluginAbi* abi = g_abi;
     if (!_pData || _iDataSize < abi->ev_size) {
@@ -9460,6 +9489,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
 }
 __declspec(dllexport) void EventDeinit() {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.EventDeinit();
     Log("[session] event closed");
     frostmod::crash::Note("event closed");
     {
@@ -9482,6 +9512,7 @@ __declspec(dllexport) void EventDeinit() {
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
     LogCallbackOnce("RaceEvent", _iDataSize);
+    g_feed.RaceEvent(_pData, _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(sdk::RaceEvent)) return;
     const auto* e = (const sdk::RaceEvent*)_pData;
     char track[101] = {0}, name[101] = {0};
@@ -9500,11 +9531,43 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (takeServerName) frostmod::crash::TheContext().SetServer(name);
     frostmod::crash::Note("track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { if (g_standDown.load()) return;
+__declspec(dllexport) void RaceSession(void* _pData, int _iDataSize)  { if (g_standDown.load()) return;
+    g_feed.RaceSession(_pData, _iDataSize);
     if (g_sessionOnly) return;
     frostmod::crash::Note("session changed (practice/qualify/race)");
     RadResetRace();
 }
-__declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly && !g_standDown.load()) RadResetRace(); }
+__declspec(dllexport) void RaceDeinit() {
+    if (g_standDown.load()) return;
+    g_feed.RaceDeinit();
+    if (!g_sessionOnly) RadResetRace();
+}
+
+// The rest of the plugin API, for the Game SDK feed only. Nothing else in FrostMod reads these;
+// each hands its payload to the feed and returns.
+__declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunInit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RunDeinit()  { if (!g_standDown.load()) g_feed.RunDeinit(); }
+__declspec(dllexport) void RunStart()   { if (!g_standDown.load()) g_feed.RunStart(); }
+__declspec(dllexport) void RunStop()    { if (!g_standDown.load()) g_feed.RunStop(); }
+__declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunLap(_pData, _iDataSize);
+}
+__declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunSplit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceSessionState(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceSessionState(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceLap(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceSplit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceCommunication(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceCommunication(_pData, _iDataSize);
+}
 
 } // extern "C"

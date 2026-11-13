@@ -10,6 +10,7 @@
 //   +0x3B940   wake effect update after the track freed its list    wakeguard=0
 //   +0x1FED9E  list box line naming an item it does not have        listboxguard=0
 //   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
+//   +0x7A860   host copies a rider's lists that were never filled    riderinfoguard=0
 //
 // No Win32 here, so tests/sessionguards_test.cpp runs anywhere.
 #pragma once
@@ -387,5 +388,78 @@ inline uint64_t Passed(uint64_t slot, bool fixed) { return fixed ? slot : (uint6
 inline bool StockWouldTruncate(uint64_t slot) { return (slot >> 32) != 0; }
 
 }  // namespace ptr64
+
+
+// =====================================================================================
+// +0x7A860 / +0x7A8E0  -  THE HOST COPIES A RIDER'S LISTS THAT WERE NEVER FILLED
+//
+// The top host-side crash in the reports: 376 of 17,537 beta21e reports (2026-09-17 ..
+// 2026-11-12), 204 riders, every one "in the menus" - the player is hosting from the game's
+// own menu and someone is connecting. Both sites are the same byte copy, `movzx eax, [rcx]`
+// reading past the top of the stack.
+//
+// 0x787C0 is the host's handler for a connecting client (reached from on_connection 0x299220
+// via 0x299828). At 0x7A80B it asks job 0x279 (633) for a rider's details, into a 0x4E84-byte
+// struct on its own stack at rsp+0x160:
+//   0x7A806  mov ecx, 0x279 ; edx = id ; r8 = rsp+0x160
+//   0x7A80B  call [dispatcher]          ; the return value is never looked at
+//   0x7A811  mov eax, [rsp+0x305C]      ; list 1 count (struct +0x2EFC), room for 25
+//   0x7A850  ... copy count strings of 0x64 bytes        <- +0x7A860 faults
+//   0x7A88F  mov eax, [rsp+0x3A88]      ; list 2 count (struct +0x3928), room for 25
+//   0x7A8D0  ... the same copy                           <- +0x7A8E0 faults
+// Job 0x279 is 0x1B44C0: look the id up in the rider list; if it is not there, return 1 and
+// write nothing. Only a found rider goes on to 0x19A7A0, which fills the whole struct and
+// returns 0. So an id that is not (or no longer) in the list leaves both counts as whatever was
+// on the stack, and the copy walks until it leaves the stack. The fault addresses fit: reads
+// at 0xF08000, 0xFE4000 - page edges just above a thread stack.
+//
+// The guard: a detour on 0x1B44C0. A miss still returns 1, but the struct is zeroed first, so
+// every list in it is empty, as for a rider with nothing selected. A hit is untouched.
+// =====================================================================================
+namespace riderinfo {
+
+constexpr uintptr_t kRvaFn      = 0x1B44C0;   // int job633(int id, void* out)
+constexpr uintptr_t kRvaFill    = 0x19A7A0;   // the fill a found rider gets; returns 0
+constexpr uintptr_t kRvaCase    = 0x1251B3;   // the dispatcher's case for job 0x279
+constexpr uintptr_t kRvaCaller  = 0x7A80B;    // the call in the host's connection handler
+constexpr uintptr_t kRvaFault   = 0x7A860;
+constexpr uintptr_t kRvaFault2  = 0x7A8E0;
+constexpr uintptr_t kRvaJumpTable = 0x1280B0; // the dispatcher's table (image-relative i32s)
+constexpr int       kJob        = 0x279;
+constexpr size_t    kOutBytes   = 0x4E84;     // last store of 0x19A7A0 is [r8+0x4E80]
+constexpr size_t    kList1Count = 0x2EFC, kList2Count = 0x3928;
+constexpr int       kListRoom   = 25;
+constexpr int       kMiss       = 1;
+
+constexpr size_t  kFnLen = 0x39;
+constexpr uint8_t kFn[kFnLen] = {
+    0x40, 0x53, 0x48, 0x83, 0xec, 0x20,               // push rbx; sub rsp, 0x20
+    0x48, 0x8b, 0xda, 0x8b, 0xd1,                     // rbx = out; edx = id
+    0x48, 0x8b, 0x0d, 0xf6, 0x56, 0x3c, 0x00,         // mov rcx, [rider list]
+    0xe8, 0x99, 0x7d, 0xfa, 0xff,                     // call 0x15C270 (find)
+    0x48, 0x85, 0xc0, 0x75, 0x0b,                     // test rax, rax; jne found
+    0xb8, 0x01, 0x00, 0x00, 0x00,                     // mov eax, 1      <- miss, out untouched
+    0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3,
+    0x4c, 0x8b, 0xc3, 0x33, 0xd2, 0x48, 0x8b, 0xc8,   // r8 = out; edx = 0; rcx = rider
+    0x48, 0x83, 0xc4, 0x20, 0x5b,
+    0xe9, 0xa7, 0x62, 0xfe, 0xff,                     // jmp 0x19A7A0 (fill)
+};
+constexpr size_t kTailJmpAt = 0x34;
+// The case: rdx = args; ecx = id; rdx = out; call 0x1B44C0.
+constexpr size_t  kCaseLen = 0x13;
+constexpr uint8_t kCase[kCaseLen] = {
+    0x48, 0x8d, 0x94, 0x24, 0xd8, 0x02, 0x00, 0x00, 0x8b, 0x0a, 0x48, 0x8b, 0x52, 0x08,
+    0xe8, 0xfa, 0xf2, 0x08, 0x00,
+};
+// The caller that crashes: the dispatcher call, then the first count load.
+constexpr size_t  kCallerLen = 13;
+constexpr uint8_t kCaller[kCallerLen] = {
+    0xff, 0x15, 0x37, 0xc4, 0x4e, 0x00, 0x8b, 0x84, 0x24, 0x5c, 0x30, 0x00, 0x00,
+};
+
+/// What the detour does after the game's lookup: zero the struct on a miss.
+inline bool ShouldClear(int rc, const void* out) { return rc != 0 && out != nullptr; }
+
+}  // namespace riderinfo
 
 }  // namespace sessionguards

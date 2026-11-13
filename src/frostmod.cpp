@@ -3957,6 +3957,7 @@ static std::atomic<bool> g_blOn{true};
 static std::atomic<bool> g_wkOn{true};
 static std::atomic<bool> g_lbOn{true};
 static std::atomic<bool> g_p64On{true};
+static std::atomic<bool> g_riOn{true};   // riderinfoguard=: +0x7A860, the host's unfilled rider lists
 static void SessionGuardsTick();   // SESSION GUARDS section; called once a frame
 // nanrecover=0 turns off the reset of a bike whose physics state went NaN (NANRECOVER section,
 // src/nanrecover.h); on by default. Read early by NtReadCfg(), with nantrap=, before the sim
@@ -3991,6 +3992,7 @@ static void SaveOverlaySettings() {
     if (!g_wkOn.load()) fprintf(f, "wakeguard=0\n");
     if (!g_lbOn.load()) fprintf(f, "listboxguard=0\n");
     if (!g_p64On.load()) fprintf(f, "ptr64fix=0\n");
+    if (!g_riOn.load()) fprintf(f, "riderinfoguard=0\n");
     if (!g_nrOn.load()) fprintf(f, "nanrecover=0\n");
     fclose(f);
 }
@@ -4035,6 +4037,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "wakeguard=%d", &v) == 1) g_wkOn.store(v != 0);
         else if (sscanf_s(line, "listboxguard=%d", &v) == 1) g_lbOn.store(v != 0);
         else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) g_p64On.store(v != 0);
+        else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) g_riOn.store(v != 0);
         // Only kept for the next save: whether the reset went in was decided at load.
         else if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
         // Stored in milliseconds so the file stays integers like every other key here.
@@ -7301,6 +7304,7 @@ struct MgSlot {
     const void* vb; uint8_t* buf; size_t cap;
     size_t live;              // bytes lent, 0 = none
     mapguard::Path path;      // the path the game was on when we lent it
+    bool stopped;             // the walker was stopped this flush (MgWalkerFault)
 };
 static MgSlot                g_mgSlots[mapguard::kMaxSlots] = {};
 static uint64_t              g_mgMaps = 0;              // maps seen at this site (mapguardtest)
@@ -7388,9 +7392,18 @@ static void* MgMap(void* vb) {
 }
 
 // Called by the flush instead of 0x22ACC0. Anything we did not lend goes to the game's own.
+static void MgClampStopped(uint8_t* batch, MgSlot* s, bool onOurs);   // below, with the walker guard
+
 static int MgUnmap(void* vb, int first, int count) {
     MgSlot* s = nullptr;
     for (MgSlot& x : g_mgSlots) if (x.vb == vb) { s = &x; break; }
+    if (s && s->stopped) {
+        // The walker was stopped this flush (MgWalkerFault): draw only what is whole and ours.
+        s->stopped = false;
+        uint8_t* batch = (uint8_t*)vb - mapguard::kBatchVb;
+        MgClampStopped(batch, s, s->live != 0);
+        if (!s->live) count = 0;
+    }
     if (!s || !s->live)
         return ((MgUnmapFn)(g_base + mapguard::kRvaUnmapFn))(vb, first, count);
 
@@ -7426,9 +7439,127 @@ static int MgUnmap(void* vb, int first, int count) {
     return mapguard::UnmapResult(act, 0);
 }
 
+// ---- the second line: a walker store that faults anyway (mapguard.h) ------------------
+// MgMap checks the pointer once. v0.51.0 still crashed at +0x24085C with the check passed,
+// so the walker's own stores are watched too: a write fault on one of them moves the batch
+// onto our scratch (the same one MgMap lends) and the store runs again, now into our copy.
+// MgUnmap then uploads that copy exactly as if MgMap had lent it. A fault on our own scratch
+// means the walk ran off the end of a whole buffer: that walker frame leaves through its own
+// epilogue and the draw is clamped to whole quads. Only the faulting thread's frame changes,
+// and only for an rip inside the walker's quad loop.
+static PVOID                 g_mgVeh = nullptr;
+static uintptr_t             g_mgBatchTable = 0;      // VA of the ten batch pointers
+static std::atomic<unsigned> g_mgMoved{0}, g_mgStopped{0};
+
+static MgSlot* MgSlotOf(const void* vb) {
+    for (MgSlot& x : g_mgSlots) if (x.vb == vb) return &x;
+    return nullptr;
+}
+
+static LONG CALLBACK MgWalkerFault(EXCEPTION_POINTERS* ep) {
+    using namespace mapguard;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    CONTEXT* c = ep->ContextRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 ||
+        er->ExceptionInformation[0] != 1 /*write*/ || !g_mgSpan || !g_mgBatchTable)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (c->Rip < g_base || !InWalkerStores(c->Rip - g_base)) return EXCEPTION_CONTINUE_SEARCH;
+
+    uint8_t* b = (uint8_t*)c->Rsi;
+    bool known = false;
+    for (int i = 0; i < kBatches && !known; ++i)
+        known = b && *(uint8_t* const*)(g_mgBatchTable + 8 * i) == b;
+    const void* vb = known ? b + kBatchVb : nullptr;
+    const size_t size = known ? BufferBytes(*(const int32_t*)(b + kBatchVb + kVbCount),
+                                            *(const int32_t*)(b + kBatchVb + kVbStride)) : 0;
+    uint32_t offs[4] = {};
+    for (int k = 0; known && k < 4; ++k) offs[k] = *(const uint32_t*)(b + kArrayOffs[k]);
+    MgSlot* s = known ? MgSlotOf(vb) : nullptr;
+    const bool onScratch = s && s->live && s->buf &&
+        *(uint8_t**)(b + kBatchArrays) >= s->buf && *(uint8_t**)(b + kBatchArrays) < s->buf + s->cap;
+    if (known && !onScratch && size && OffsetsFit(offs, size)) s = MgSlotFor(vb, size);
+    const bool canMove = s && s->buf && s->cap >= size && size && OffsetsFit(offs, size);
+    const FaultAction act = OnWalkerFault(known, onScratch, canMove);
+    if (act == FaultAction::Pass) return EXCEPTION_CONTINUE_SEARCH;
+
+    const uintptr_t target = (uintptr_t)er->ExceptionInformation[1];
+    if (act == FaultAction::Move) {
+        memset(s->buf, 0, size);   // the quads already written are dropped, not drawn stale
+        DWORD64* cur[4] = {&c->R10, &c->R11, &c->Rdx, &c->Rcx};
+        uint64_t oldBase[4];
+        for (int k = 0; k < 4; ++k) {
+            uint8_t** arr = (uint8_t**)(b + kBatchArrays + 8 * k);
+            oldBase[k] = (uint64_t)*arr;
+            *arr = s->buf + offs[k];
+            *cur[k] = Rebase(*cur[k], oldBase[k], (uint64_t)*arr);
+        }
+        s->live = size;
+        s->path = MgPath(b + kBatchVb);
+        s->stopped = false;
+        const unsigned n = g_mgMoved.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLog(n)) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            VirtualQuery((const void*)target, &mbi, sizeof(mbi));
+            Log("[mapguard] %s: the quad walker's store at +0x%llX faulted writing %p (positions "
+                "%p, %d vertices in; region %p +0x%llx state 0x%x protect 0x%x) - the batch was "
+                "moved onto FrostMod's copy instead of crashing at mxbikes.exe+0x24085C. %u so far.",
+                PathName(s->path), (unsigned long long)(c->Rip - g_base), (void*)target,
+                (void*)oldBase[0], *(const int32_t*)(b + kBatchCount), mbi.BaseAddress,
+                (unsigned long long)mbi.RegionSize, (unsigned)mbi.State, (unsigned)mbi.Protect, n);
+            frostmod::crash::Note("quad walker store faulted, batch moved to FrostMod's copy (%u so far)", n);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Stop: leave this frame through the walker's own epilogue.
+    if (s) s->stopped = true;
+    const uintptr_t storeRva = c->Rip - g_base;
+    c->Rip = g_base + kRvaWalkExit;
+    const unsigned n = g_mgStopped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ShouldLog(n)) {
+        Log("[mapguard] the quad walker ran past its buffer (store at +0x%llX writing %p, %d "
+            "vertices, %s) - the walk was ended there and only whole quads are drawn. %u so far.",
+            (unsigned long long)storeRva, (void*)target, *(const int32_t*)(b + kBatchCount),
+            onScratch ? "on FrostMod's copy" : "on the game's memory", n);
+        frostmod::crash::Note("quad walker stopped at the end of its buffer (%u so far)", n);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// After a stop the batch's count can be past the buffer; clamp what the flush draws. A stop
+/// on the game's own memory draws nothing (that memory is what failed).
+static void MgClampStopped(uint8_t* batch, MgSlot* s, bool onOurs) {
+    int32_t* count = (int32_t*)(batch + mapguard::kBatchCount);
+    int32_t* tris  = (int32_t*)(batch + mapguard::kBatchTris);
+    if (!onOurs) { *count = 0; *tris = 0; return; }
+    const int32_t stride = *(const int32_t*)(batch + mapguard::kBatchVb + mapguard::kVbStride);
+    mapguard::ClampDraw(count, tris, stride > 0 ? (int32_t)(s->live / (size_t)stride) : 0);
+}
+
+static void InstallWalkerFaultGuard() {
+    using namespace mapguard;
+    if (!g_mgSpan || g_mgVeh) return;
+    // The table the flush indexes, decoded from its own `lea r13, [rip+disp]` at 0x240A89.
+    const uintptr_t table = (uintptr_t)((int64_t)(kRvaMapWin + 7) +
+        (int32_t)((uint32_t)kMapWin[3] | (uint32_t)kMapWin[4] << 8 | (uint32_t)kMapWin[5] << 16 |
+                  (uint32_t)kMapWin[6] << 24));
+    if (table != kRvaBatchTable ||
+        !Matches((const uint8_t*)(g_base + kRvaWalkLoLoop), kWalkHead, kWalkHeadLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaWalkExit), kWalkExit, kWalkExitLen)) {
+        Log("[mapguard] walker fault guard not applied: the walker's bytes are not what we expect.");
+        return;
+    }
+    g_mgBatchTable = g_base + table;
+    g_mgVeh = AddVectoredExceptionHandler(1 /*first*/, MgWalkerFault);
+    if (!g_mgVeh) { g_mgBatchTable = 0; Log("[mapguard] walker fault guard not applied: no handler"); return; }
+    Log("[mapguard] walker fault guard on: a quad-walker store that faults (+0x%llX..+0x%llX) "
+        "moves the batch onto FrostMod's copy.", (unsigned long long)kRvaWalkLoLoop,
+        (unsigned long long)kRvaWalkHiLoop);
+}
+
 // Put the two calls back exactly as they shipped. Called from Shutdown(): the stubs jump into
 // this dll, which the game unloads next.
 static void MgRevert() {
+    if (g_mgVeh) { RemoveVectoredExceptionHandler(g_mgVeh); g_mgVeh = nullptr; }
     if (!g_mgSpan) return;
     using namespace mapguard;
     const uintptr_t mapSite = g_base + kRvaMapCall, unmapSite = g_base + kRvaUnmapCall;
@@ -7504,6 +7635,7 @@ static void InstallMapGuard() {
         Log("[mapguard] not applied: the patch did not verify, reverted");
         return;
     }
+    InstallWalkerFaultGuard();
     const int every = g_mgTestEvery.load();
     Log("[mapguard] on: the quad batch's vertex pointer is checked before the game writes "
         "to it; a bad one is replaced by FrostMod's copy on any path (calls at +0x%llX / +0x%llX).",
@@ -7939,6 +8071,53 @@ static void InstallPtr64Fix() {
         (unsigned long long)kRvaCallee, (unsigned long long)kRvaSite);
 }
 
+// ---- +0x7A860: the host's unfilled rider lists ----------------------------------------
+using RiderInfoFn = int (*)(int id, void* out);
+static RiderInfoFn            g_origRiderInfo = nullptr;
+static std::atomic<uint32_t>  g_riCleared{0};
+
+static int hkRiderInfo(int id, void* out) {
+    const int rc = g_origRiderInfo(id, out);
+    if (!sessionguards::riderinfo::ShouldClear(rc, out)) return rc;
+    memset(out, 0, sessionguards::riderinfo::kOutBytes);
+    const uint32_t n = g_riCleared.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[riderinfo] job 633 asked for rider %d, who is not in the list - the game leaves its "
+            "answer unwritten and the host then copies lists of any length (the crash at "
+            "mxbikes.exe+0x7A860). The answer was cleared: every list empty. %u so far.", id, n);
+        frostmod::crash::Note("cleared the details of unknown rider %d (%u so far)", id, n);
+    }
+    return rc;
+}
+
+static void InstallRiderInfoGuard() {
+    using namespace sessionguards::riderinfo;
+    if (!SsgMxbOnly("riderinfo")) return;
+    if (!g_riOn.load()) { Log("[riderinfo] guard off by config (riderinfoguard=0)"); return; }
+    if (g_origRiderInfo || g_unloading.load()) return;
+    bool ok = SsgCodeIs(kRvaFn, kFn, kFnLen) && SsgCodeIs(kRvaCase, kCase, kCaseLen) &&
+              SsgCodeIs(kRvaCaller, kCaller, kCallerLen);
+    // The tail jump goes to the fill, and the dispatcher's table sends job 0x279 to the case.
+    ok = ok && sessionguards::RipTarget(kFn + kTailJmpAt, kRvaFn + kTailJmpAt, 1, 5) == kRvaFill;
+    uint8_t *tb, *te;
+    const uint8_t* entry = (const uint8_t*)(g_base + kRvaJumpTable + 4 * kJob);
+    ok = ok && GetExecRange(g_base, &tb, &te) && entry >= tb && entry + 4 <= te &&
+         (uint32_t)sessionguards::Disp32(entry) == (uint32_t)kRvaCase;
+    if (!ok) {
+        Log("[riderinfo] guard not applied: the bytes at +0x%llX are not job 633 as we expect it "
+            "(game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkRiderInfo, (void**)&g_origRiderInfo,
+                     "riderInfo(0x1b44c0)")) {
+        g_origRiderInfo = nullptr;
+        return;
+    }
+    Log("[riderinfo] guard on: details asked for a rider who is not in the list come back empty "
+        "instead of unwritten (fn +0x%llX, the crash at +0x%llX / +0x%llX).",
+        (unsigned long long)kRvaFn, (unsigned long long)kRvaFault, (unsigned long long)kRvaFault2);
+}
+
 /// A stub's counter crossed a line the rate limit allows (or is the first).
 static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* now) {
     if (!page) return false;
@@ -7979,6 +8158,7 @@ static void InstallSessionGuards() {
     InstallWakeGuard();
     InstallListBoxGuard();
     InstallPtr64Fix();
+    InstallRiderInfoGuard();
 }
 
 // ===========================================================================

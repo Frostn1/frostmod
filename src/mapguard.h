@@ -298,4 +298,91 @@ inline bool ShouldLog(uint64_t n) { return n > 0 && (n <= 3 || (n & (n - 1)) == 
 // Scratch buffers kept, one per vertex-buffer record. The quad batcher has ten.
 constexpr int kMaxSlots = 16;
 
+// ---- the second line: a store that faults anyway ------------------------------------
+// v0.51.0 still crashed at +0x24085C (449 of its 1003 beta21e reports, 2026-11-12), every one
+// after the map check above had passed the pointer, and every one in the tree walker
+// 0x240790 (via 0x2409A9 / 0x240B23), never in the flat loop. So the pointer the map handed
+// back was good when checked and bad by the first store, or the store is not where the check
+// looked; the reports carry no registers to say which. Rather than guess, the walker's own
+// stores are caught: a write fault on one of them moves the batch onto FrostMod's scratch
+// and the same store runs again there.
+//
+// The walker's quad loop (0x240850 .. 0x24096D) keeps four write cursors, one per array:
+//   r10 positions  (batch+0x80, map result + [batch+0xC8])
+//   r11 texcoords  (batch+0x88, + [batch+0xD8])
+//   rdx colours    (batch+0x90, + [batch+0xD0])
+//   rcx normals    (batch+0x98, + [batch+0xF8])
+// and rsi is the batch. Each recursion level reloads the cursors from the batch's four
+// pointers, so rewriting those four and the live frame's four registers moves every write
+// still to come. A cursor keeps its distance from its array's base, whichever adds of the
+// quad have already run, so the move is a rebase: new = cursor - oldBase + newBase.
+constexpr uintptr_t kRvaWalker     = 0x240790;   // void walk(batch, node, frustum)
+constexpr uintptr_t kRvaWalkLoLoop = 0x240850;   // first instruction of the quad loop
+constexpr uintptr_t kRvaWalkHiLoop = 0x240970;   // `add [rsi+0x78], 4`, after the last store
+constexpr uintptr_t kRvaWalkExit   = 0x2409B3;   // xor eax,eax; restore rdi/rbx/rbp; pop rsi; ret
+constexpr uintptr_t kRvaBatchTable = 0x5815A0;   // ten batch pointers (the flush's lea r13)
+constexpr int       kBatches       = 10;
+constexpr size_t    kBatchArrays   = 0x80;       // four pointers: pos, tex, col, nor
+constexpr size_t    kBatchVb       = 0xA8;       // the vertex-buffer record 0x22AC50 takes
+constexpr size_t    kBatchCount    = 0x78;       // vertices written this flush
+constexpr size_t    kBatchTris     = 0xA0;       // triangles (2 per quad); 0 = no draw
+constexpr size_t    kArrayOffs[4]  = {0xC8, 0xD8, 0xD0, 0xF8};   // dword offsets into the buffer
+
+// 0x240850 .. 0x24085F: the loop head through the first store, and the epilogue we jump to.
+constexpr size_t  kWalkHeadLen = 16;
+constexpr uint8_t kWalkHead[kWalkHeadLen] = {
+    0x41, 0x8b, 0x41, 0x04,               // mov eax, [r9+4]
+    0x49, 0x83, 0xc2, 0x30,               // add r10, 0x30
+    0x49, 0x83, 0xc3, 0x20,               // add r11, 0x20
+    0x41, 0x89, 0x42, 0xd0,               // mov [r10-0x30], eax   <- +0x24085C
+};
+constexpr size_t  kWalkExitLen = 23;
+constexpr uint8_t kWalkExit[kWalkExitLen] = {
+    0x33, 0xc0, 0x48, 0x8b, 0x7c, 0x24, 0x30, 0x48, 0x8b, 0x5c, 0x24, 0x38,
+    0x48, 0x8b, 0x6c, 0x24, 0x40, 0x48, 0x83, 0xc4, 0x20, 0x5e, 0xc3,
+};
+
+/// The fault is one of the walker's stores (rip as an RVA).
+inline bool InWalkerStores(uintptr_t ripRva) {
+    return ripRva >= kRvaWalkLoLoop && ripRva < kRvaWalkHiLoop;
+}
+
+/// Where a cursor goes when its array moves from `oldBase` to `newBase`.
+inline uint64_t Rebase(uint64_t cursor, uint64_t oldBase, uint64_t newBase) {
+    return cursor - oldBase + newBase;
+}
+
+/// Whether a scratch of `cap` bytes holds the buffer as the batch lays it out: every array
+/// offset inside it. A record whose offsets point past its own size is not one we move.
+inline bool OffsetsFit(const uint32_t offs[4], size_t cap) {
+    if (cap == 0) return false;
+    for (int k = 0; k < 4; ++k)
+        if ((size_t)offs[k] >= cap) return false;
+    return true;
+}
+
+/// What the fault handler does.
+///   Move  the batch is on the game's memory: move it onto our scratch and run the store again
+///   Stop  it is already on our scratch (so the walk ran off the end of a whole buffer), or
+///         it cannot be moved: leave this walker frame through its own epilogue; the frames
+///         above fault in turn and leave the same way, and the draw takes only whole quads
+///   Pass  not ours: the batch is not one of the ten, or the guard is not installed
+enum class FaultAction : int { Pass = 0, Move, Stop };
+inline FaultAction OnWalkerFault(bool knownBatch, bool onScratch, bool canMove) {
+    if (!knownBatch) return FaultAction::Pass;
+    if (onScratch || !canMove) return FaultAction::Stop;
+    return FaultAction::Move;
+}
+
+/// After a Stop the batch may say it wrote more than the buffer holds. The draw is clamped to
+/// the vertices that fit (whole quads) and two triangles per quad.
+inline void ClampDraw(int32_t* count, int32_t* tris, int32_t capVerts) {
+    if (capVerts < 0) capVerts = 0;
+    capVerts -= capVerts % 4;
+    if (*count > capVerts) *count = capVerts;
+    if (*count < 0) *count = 0;
+    if (*tris > *count / 2) *tris = *count / 2;
+    if (*tris < 0) *tris = 0;
+}
+
 }  // namespace mapguard

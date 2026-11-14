@@ -652,6 +652,8 @@ constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "st
 // block at +0x274, built by 0x4D8C0 -> 0x4CE00. That builder paints each of these handles
 // with the same .pnt path (bus 0x9E at 0x4CEE1, 0x4CF55 x2, 0x4CF7A/0x4CF86/0x4CF97).
 constexpr int       VEH_GFX           = 0x274;
+// Rider/bike gfx builder: 21 args; rider model a6, helmet a7, boots a13.
+constexpr uintptr_t RVA_RIDER_GFX_BUILD = 0x4CE00;
 constexpr int       VEH_GFX_PAINTED[] = { 0x00, 0x10, 0x14, 0x50, 0x60, 0x70 };
 
 // Rider gear. The same builder (0x4CE00) paints three more objects of the rider-gfx block,

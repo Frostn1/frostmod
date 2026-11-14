@@ -186,15 +186,18 @@ static void TestInventory() {
     CHECK(Has(patches, "SgRevert()"), "teardown reverts the shock-guard call");
 
     // Threads: each kept in a handle and stopped (and joined when it may block) first.
-    CHECK(Count(fm, "CreateThread(") == 3,
-          "CreateThread is called %d times (3 known: servermsg poll, memdiag report, Init); a new "
+    CHECK(Count(fm, "CreateThread(") == 4,
+          "CreateThread is called %d times (4 known: servermsg poll, memdiag report, Init, model "
+          "index); a new "
           "thread must be stopped in TdStopThreads - then update this count", Count(fm, "CreateThread("));
     CHECK(Has(fm, "g_msgThread = CreateThread("), "servermsg thread kept in a handle");
     CHECK(Has(fm, "g_mdThread = CreateThread("), "memdiag thread kept in a handle");
     CHECK(Has(fm, "g_initThread = CreateThread("), "init thread kept in a handle");
+    CHECK(Has(fm, "g_rsIndexThread = CreateThread("), "model index thread kept in a handle");
     const std::string threads = Body(fm, "static void TdStopThreads(");
-    CHECK(Has(threads, "MsgFeedStop(") && Has(threads, "MdStop(") && Has(threads, "g_initThread"),
-          "teardown stops all three threads");
+    CHECK(Has(threads, "MsgFeedStop(") && Has(threads, "MdStop(") &&
+          Has(threads, "g_rsIndexThread") && Has(threads, "g_initThread"),
+          "teardown stops all four threads");
     CHECK(Has(Body(fm, "static DWORD WINAPI MdThread("), "g_mdQuit"), "memdiag thread has a way out");
 
     // Exception handlers: removed, last.

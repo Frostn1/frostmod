@@ -1,6 +1,7 @@
 #pragma once
 
-#include "looksync.h"
+#include "riderlooks.h"
+#include "sha256.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -23,15 +24,13 @@ inline const char* PartName(Part p) {
     return p >= Rider && p < kParts ? names[p] : "";
 }
 
-inline const std::string& ModelId(const looksync::Look& look, Part p) {
-    if (p == Helmet) return look.helmet;
-    if (p == Boots) return look.boots;
-    return look.riderModel;
+inline const std::string& ModelId(const frostmod::RiderLook& look, Part p) {
+    return look.gear[p >= Rider && p < kParts ? p : Rider];
 }
-inline void SetModelId(looksync::Look& look, Part p, std::string id) {
-    if (p == Helmet) look.helmet = std::move(id);
-    else if (p == Boots) look.boots = std::move(id);
-    else look.riderModel = std::move(id);
+inline void SetModelId(frostmod::RiderLook& look, Part p, std::string id) {
+    if (p >= Rider && p < kParts) {
+        look.gear[p] = std::move(id);
+    }
 }
 
 inline std::string Lower(std::string s) {
@@ -96,16 +95,16 @@ public:
         sha_.Update(le, sizeof(le));
     }
     void Update(const void* data, size_t size) { sha_.Update(data, size); }
-    std::string Final() { unsigned char digest[32]; sha_.Final(digest); return looksync::Hex16(digest); }
+    std::string Final() { unsigned char digest[32]; sha_.Final(digest); return frostmod::Hex16(digest); }
 private:
-    looksync::Sha256 sha_{};
+    frostmod::Sha256 sha_{};
 };
 
 class GearIndex {
 public:
     void Set(Part p, const std::string& folder, const std::string& id) {
         if (p < Rider || p >= kParts || folder.empty() || folder.size() > 31 ||
-            id.empty() || !looksync::ValidSkin(id)) return;
+            !frostmod::ValidId(id)) return;
         const std::string key = Lower(folder);
         byFolder_[p][key] = id;
         auto it = byId_[p].find(id);
@@ -141,7 +140,7 @@ inline bool operator==(const Override& a, const Override& b) {
 }
 inline bool operator!=(const Override& a, const Override& b) { return !(a == b); }
 
-inline Override Decide(const looksync::Look* look, int key, const std::string own[kParts],
+inline Override Decide(const frostmod::RiderLook* look, int key, const std::string own[kParts],
                        const GearIndex& idx,
                        const std::function<bool(Part, const std::string&)>& installed) {
     Override result; result.key = key;

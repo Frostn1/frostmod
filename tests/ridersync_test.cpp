@@ -31,13 +31,24 @@ static void Hashing() {
     CHECK(a != Hash(ridersync::Rider, "body.edf", 3, "abd"), "bytes");
     CHECK(a != Hash(ridersync::Rider, "body.edf", 2, "ab"), "size");
     CHECK(a != Hash(ridersync::Rider, "other.edf", 3, "abc"), "name");
-    looksync::Sha256 s; s.Init();
+    frostmod::Sha256 s; s.Init();
     const char prefix[] = "frostmod-gear-v1"; s.Update(prefix, sizeof(prefix));
     const char part[] = "rider"; s.Update(part, sizeof(part));
     const char file[] = "body.edf"; s.Update(file, sizeof(file));
     const unsigned char le[8] = {3,0,0,0,0,0,0,0}; s.Update(le, 8); s.Update("abc", 3);
     unsigned char digest[32]; s.Final(digest);
-    CHECK(a == looksync::Hex16(digest), "direct vector got %s", a.c_str());
+    CHECK(a == frostmod::Hex16(digest), "direct vector got %s", a.c_str());
+
+    // shared test vector, mirrored in mxb-app-src
+    ridersync::GearHasher shared;
+    shared.Begin(ridersync::Helmet);
+    shared.File("helmet.dds", 10);
+    shared.Update("0123456789", 10);
+    shared.File("model.edf", 3);
+    shared.Update("abc", 3);
+    const std::string sharedId = shared.Final();
+    std::printf("shared gear test vector: %s\n", sharedId.c_str());
+    CHECK(sharedId == "87aceb9d2ac61ec6d2528e213a303cc5", "shared vector got %s", sharedId.c_str());
 }
 
 static void IndexAndDecision() {
@@ -48,32 +59,37 @@ static void IndexAndDecision() {
     CHECK(idx.Find(ridersync::Rider, Id('a'), v) && v == "alpha", "deterministic %s", v.c_str());
     CHECK(idx.IdOf(ridersync::Rider, "ALPHA", v) && v == Id('a'), "case folder");
     CHECK(idx.Size() == 3, "size %zu", idx.Size());
-    looksync::Look look; std::string own[ridersync::kParts] = {"own", "helm", "boots"};
+    frostmod::RiderLook look; std::string own[ridersync::kParts] = {"own", "helm", "boots"};
     auto yes = [](ridersync::Part, const std::string&) { return true; };
     auto no = [](ridersync::Part, const std::string&) { return false; };
     CHECK(!ridersync::Decide(nullptr, 7, own, idx, yes).Any(), "no look");
     CHECK(!ridersync::Decide(&look, 7, own, idx, yes).Any(), "empty id");
-    look.riderModel = Id('a'); own[0] = "Zulu";
+    look.gear[0] = Id('a'); own[0] = "Zulu";
     CHECK(!ridersync::Decide(&look, 7, own, idx, yes).Any(), "same model");
     own[0] = "own";
     CHECK(!ridersync::Decide(&look, 7, own, idx, no).Any(), "not installed");
     auto got = ridersync::Decide(&look, 7, own, idx, yes);
     CHECK(got.key == 7 && got.folder[0] == "alpha", "override");
-    look.boots = Id('c');
+    look.gear[2] = Id('c');
     CHECK(ridersync::Decide(&look, 7, own, idx, yes).folder[2].empty(), "long name");
     ridersync::Override copy = got;
     CHECK(copy == got, "equal"); copy.key++; CHECK(copy != got, "not equal");
 }
 
 static void LookHelpers() {
-    looksync::Look a; a.raceNum = 4; a.rider = "Rider"; a.bike = "Bike";
+    frostmod::RiderLook a; a.rider = "Rider";
     ridersync::SetModelId(a, ridersync::Rider, Id('a'));
     ridersync::SetModelId(a, ridersync::Helmet, Id('b'));
     ridersync::SetModelId(a, ridersync::Boots, Id('c'));
     CHECK(ridersync::ModelId(a, ridersync::Helmet) == Id('b'), "model helper");
-    looksync::Look b;
-    CHECK(looksync::ParseClaimJson(looksync::BuildClaimJson(a), b), "round trip parse");
-    CHECK(b.riderModel == Id('a') && b.helmet == Id('b') && b.boots == Id('c'), "round trip ids");
+    frostmod::RiderLook b;
+    std::vector<frostmod::RiderLook> parsed;
+    int skipped = 0;
+    CHECK(frostmod::ParseRiderLooks(frostmod::BuildRiderLooks({a}), parsed, &skipped), "round trip parse");
+    if (!parsed.empty()) {
+        b = parsed[0];
+    }
+    CHECK(b.gear[0] == Id('a') && b.gear[1] == Id('b') && b.gear[2] == Id('c'), "round trip ids");
 }
 
 int main() {

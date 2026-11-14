@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Added opt-in per-rider skin synchronization through FrostServer, using short paint hashes only and never transferring files.
-
 Two more crashes from the beta21e reports, together 21% of what v0.51.0 still sends.
 
 ### Fixed
@@ -25,7 +23,8 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
 - **Rider model sync (modelsync=1, off by default).** Remote riders whose rider, helmet or
   boots model you also have installed are drawn with it, matched by file content under any
   folder name; everyone else stays stock. Collision, physics and hitboxes are unchanged.
-  Needs `looksync=1` as well, and a FrostServer with `looksync: true`.
+  IDs come from MXB App's paint sync: turn on `modelsync=1` in FrostMod and the model option
+  in MXB App's paint sync settings.
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,
   `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's

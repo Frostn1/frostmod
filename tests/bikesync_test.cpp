@@ -42,8 +42,19 @@ int main() {
     // python -c "import hashlib,struct; print(hashlib.sha256(b'oem 450\0gfx.cfg\0'+struct.pack('<Q',3)+b'gfxmodel.edf\0'+struct.pack('<Q',5)+b'model').hexdigest()[:32])"
     CHECK(id == "259cdb277adeaa33cdeb8cade4fb98eb", "known SHA-256 vector: %s", id.c_str());
 
+    IdBuilder shared;
+    shared.Begin("TestBike");
+    shared.File("gfx.cfg", 3);
+    shared.Bytes("x=1", 3);
+    shared.File("model.edf", 3);
+    shared.Bytes("abc", 3);
+    const std::string sharedId = shared.Finish();
+    // Shared test vector, mirrored in mxb-app-src.
+    CHECK(sharedId == "a3ce7f3829886ed93fde62091278ff9d", "shared bike id: %s", sharedId.c_str());
+
     CHECK(ShadowName("OEM 450", id) == "OEM 450~" + id.substr(0, 8), "shadow name");
     CHECK(LooksLikeShadow("OEM 450~0123abcd"), "shadow shape");
+    CHECK(RealBikeOfShadow("OEM 450~0123abcd") == "OEM 450", "shadow real bike");
     CHECK(!LooksLikeShadow("OEM 450~0123ABCd") && !LooksLikeShadow("OEM~0123abcde") &&
           !LooksLikeShadow("OEM0123abcd"), "shadow rejects malformed suffixes");
 
@@ -67,12 +78,10 @@ int main() {
 
     ShadowIndex idx;
     idx.Set("OEM 450", id, "OEM 450~12345678");
-    looksync::Look look; look.bike = "oem 450"; look.swap = id;
-    CHECK(ChooseShadow(look, "OEM 450", "other", idx) == "OEM 450~12345678", "shadow selected");
-    look.swap.clear(); CHECK(ChooseShadow(look, "OEM 450", "other", idx).empty(), "empty announcement");
-    look.swap = id; look.bike = "OEM 250"; CHECK(ChooseShadow(look, "OEM 450", "other", idx).empty(), "bike mismatch");
-    look.bike = "OEM 450"; CHECK(ChooseShadow(look, "OEM 450", id, idx).empty(), "active model needs no shadow");
-    CHECK(ChooseShadow(look, "OEM 450", "other", ShadowIndex{}).empty(), "missing local model");
+    CHECK(ChooseShadow(id, "OEM 450", "other", idx) == "OEM 450~12345678", "shadow selected");
+    CHECK(ChooseShadow("", "OEM 450", "other", idx).empty(), "empty id");
+    CHECK(ChooseShadow(id, "OEM 450", id, idx).empty(), "active model needs no shadow");
+    CHECK(ChooseShadow(id, "OEM 450", "other", ShadowIndex{}).empty(), "missing local model");
 
     CHECK(SlotOfBlock(0x1274, 0x1000, 0x100, 0x274, 4) == 0, "exact first slot");
     CHECK(SlotOfBlock(0x1474, 0x1000, 0x100, 0x274, 4) == 2, "exact later slot");
@@ -82,11 +91,11 @@ int main() {
 
     RemapTable table;
     std::string shadow;
-    table.Set(3, 77, "Rider", "OEM 450~12345678");
+    table.Set(3, 77, "OEM 450~12345678");
     CHECK(table.Lookup(3, 77, shadow) && shadow == "OEM 450~12345678", "matching remap");
     CHECK(!table.Lookup(3, 78, shadow), "key mismatch");
     table.Clear(3); CHECK(!table.Lookup(3, 77, shadow), "clear");
-    table.Set(-1, 1, "x", "y"); CHECK(table.Get(-1) == nullptr, "out-of-range ignored");
+    table.Set(-1, 1, "y"); CHECK(table.Get(-1) == nullptr, "out-of-range ignored");
 
     if (g_failures) { std::printf("%d bikesync test(s) failed\n", g_failures); return 1; }
     std::printf("bikesync tests passed\n");

@@ -191,6 +191,14 @@ add_test(NAME gamefeed COMMAND gamefeed_test)
 add_executable(bikesync_test tests/bikesync_test.cpp)
 add_test(NAME bikesync COMMAND bikesync_test)
 
+# --- rider model sync rules (src/ridersync.h) ---------------------------------
+add_executable(ridersync_test tests/ridersync_test.cpp)
+add_test(NAME ridersync COMMAND ridersync_test)
+
+# --- MXB App rider-look command format (src/riderlooks.h) ----------------------
+add_executable(riderlooks_test tests/riderlooks_test.cpp)
+add_test(NAME riderlooks COMMAND riderlooks_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)
@@ -360,9 +368,6 @@ add_test(NAME fairsend COMMAND fairsend_test)
 # it - in two processes that never compile together, so the round trip is proved here.
 add_executable(servermsg_test tests/servermsg_test.cpp)
 add_test(NAME servermsg COMMAND servermsg_test)
-
-add_executable(looksync_test tests/looksync_test.cpp)
-add_test(NAME looksync COMMAND looksync_test)
 
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder

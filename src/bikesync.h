@@ -1,6 +1,6 @@
 #pragma once
 
-#include "looksync.h"
+#include "sha256.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -64,11 +64,11 @@ public:
         if (!begun_) sha_.Init();
         sha_.Final(digest);
         begun_ = false;
-        return looksync::Hex16(digest);
+        return frostmod::Hex16(digest);
     }
 
 private:
-    looksync::Sha256 sha_{};
+    frostmod::Sha256 sha_{};
     bool begun_ = false;
 };
 
@@ -80,6 +80,19 @@ inline bool LooksLikeShadow(const std::string& name) {
     if (name.size() < 9 || name[name.size() - 9] != '~') return false;
     for (size_t i = name.size() - 8; i < name.size(); ++i)
         if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f')))
+            return false;
+    return true;
+}
+
+inline std::string RealBikeOfShadow(const std::string& name) {
+    return LooksLikeShadow(name) ? name.substr(0, name.size() - 9) : std::string();
+}
+
+inline bool ValidBikeName(const std::string& bike) {
+    if (bike.empty() || bike == "." || bike == "..") return false;
+    for (unsigned char c : bike)
+        if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|')
             return false;
     return true;
 }
@@ -101,7 +114,7 @@ inline bool ParseMarker(const std::string& text, std::string& bike, std::string&
     }
     if (lines.size() == 4 && lines.back().empty()) lines.pop_back();
     if (lines.size() != 3 || lines[0] != "frostmod-modelsync 1" ||
-        !looksync::ValidBike(lines[1]) || lines[2].empty() || !looksync::ValidSkin(lines[2]))
+        !ValidBikeName(lines[1]) || !frostmod::ValidId(lines[2]))
         return false;
     bike = lines[1];
     id = lines[2];
@@ -152,13 +165,12 @@ private:
     std::map<std::pair<std::string, std::string>, std::string> values_;
 };
 
-inline std::string ChooseShadow(const looksync::Look& look, const std::string& rosterBike,
+inline std::string ChooseShadow(const std::string& swapId, const std::string& rosterBike,
                                 const std::string& localActiveId, const ShadowIndex& idx) {
-    if (look.swap.empty() || Lower(look.bike) != Lower(rosterBike) ||
-        look.swap == localActiveId)
+    if (swapId.empty() || swapId == localActiveId)
         return "";
     std::string shadow;
-    return idx.Find(rosterBike, look.swap, shadow) ? shadow : "";
+    return idx.Find(rosterBike, swapId, shadow) ? shadow : "";
 }
 
 inline int SlotOfBlock(uintptr_t block, uintptr_t vehiclesBase, int stride, int gfxOff, int max) {
@@ -171,11 +183,11 @@ inline int SlotOfBlock(uintptr_t block, uintptr_t vehiclesBase, int stride, int 
 
 class RemapTable {
 public:
-    struct Entry { int key = 0; std::string rider; std::string shadow; };
+    struct Entry { int key = 0; std::string shadow; };
 
-    void Set(int slot, int key, const std::string& rider, const std::string& shadow) {
+    void Set(int slot, int key, const std::string& shadow) {
         if (slot < 0 || slot >= 64) return;
-        entries_[slot] = {key, rider, shadow};
+        entries_[slot] = {key, shadow};
         used_[slot] = true;
     }
     void Clear(int slot) {

@@ -625,6 +625,14 @@ constexpr int       BIKE_STATE_STRIDE = 8;
 // 0x9259F crash. Only 0x8EF20 rebuilds it (from 0x91706 / 0x9232E); 0 is an empty chooser.
 constexpr uintptr_t RVA_BIKE_CHOOSER_N = 0x4C2F18;
 constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
+// Per-rider visual bike model sync (beta21e). These builders take a rider-gfx block at
+// vehicle+0x274. 0x4D8C0's callers are 0x5D930 (vehicle create), 0x5F386 (rider re-load
+// 0x5E570), and 0x6F1CC; the last passes some other block and must pass through unchanged.
+constexpr uintptr_t RVA_BIKE_BUILD = 0x4D8C0; // (void* gfxBlock, int bikeIdx, ...), 19 args
+constexpr uintptr_t RVA_BIKE_BUILD_DEFERRED = 0x45020; // (void* block, int bikeIdx, ...), 21 args
+constexpr uintptr_t RVA_BIKE_PAINT_LOOKUP = 0x455C0; // stand clone: (block, bikeIdx, paint, out)
+constexpr uintptr_t RVA_BIKE_GFX_LOAD = 0x48170; // int(bikeIdx, mode), skipped if entry+0x5D0 != 0
+constexpr int       BIKE_GFX_STATE = 0x5D0; // int in bike entry: 0 = gfx not loaded
 constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
 constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count
 constexpr int       PAINT_STRIDE      = 0x18C;     // +0x00 bike index, +0x04 name

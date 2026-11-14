@@ -67,6 +67,7 @@
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
 #include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
+#include "bikesync.h"   // per-rider visual bike models: pure ids, markers and remap rules
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
@@ -1607,6 +1608,17 @@ static const char* kMsLibDir   = "FrostMod Models";  // per-bike model library f
 static const char* kMsMarker   = "_active.txt";      // names the active variant
 static const char* kMsOriginal = "Original";         // name given to the model captured on first swap
 
+// Bike model sync is opt-in because it creates temporary bike folders before the game's
+// startup scan. Changing it while the game is running cannot safely change that scan.
+static std::atomic<bool> g_bmsOn{false};
+static frostmod::bikesync::ShadowIndex g_bmsShadows;
+static std::mutex g_bmsMutex;
+static std::vector<looksync::Look> g_bmsLooks;
+static std::map<std::string, std::string> g_bmsActiveId;
+static frostmod::bikesync::RemapTable g_bmsTable;
+static SRWLOCK g_bmsTableLock = SRWLOCK_INIT;
+static std::atomic<bool> g_bmsHooksReady{false};
+
 static std::string MsBikesRoot()                         { return std::string(g_modsPath) + "\\bikes"; }
 static std::string MsBikeDir(const std::string& b)       { return MsBikesRoot() + "\\" + b; }
 static std::string MsLibDir(const std::string& b)        { return MsBikeDir(b) + "\\" + kMsLibDir; }
@@ -1634,6 +1646,245 @@ static void MsListFiles(const std::string& dir, std::vector<std::string>& out) {
         out.push_back(fd.cFileName);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+}
+
+// ---------------------------------------------------------------------------
+// BIKE MODEL SYNC - startup shadow folders
+//
+// A shadow is a second bike-list entry with the real bike's non-visual files (therefore
+// the same physics) and one library variant's visual files. The detours below substitute
+// that entry only while the game builds a remote rider's gfx objects.
+// ---------------------------------------------------------------------------
+static const char* kBmsMarker = "_modelsync.txt";
+
+static bool BmsReadFile(const std::string& path, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0 && out.size() <= sizeof(buf); )
+        out.append(buf, n);
+    const bool ok = ferror(f) == 0 && out.size() <= sizeof(buf);
+    fclose(f);
+    return ok;
+}
+
+static bool BmsMarkerOf(const std::string& dir, std::string& bike, std::string& id) {
+    std::string text;
+    return BmsReadFile(dir + "\\" + kBmsMarker, text) &&
+           frostmod::bikesync::ParseMarker(text, bike, id);
+}
+
+static void BmsListDirs(const std::string& dir, std::vector<std::string>& out) {
+    out.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.' || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        out.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        return _stricmp(a.c_str(), b.c_str()) < 0;
+    });
+}
+
+struct BmsStamp { std::string name; uint64_t size; uint64_t mtime; };
+struct BmsHashCache { std::vector<BmsStamp> stamps; std::string id; };
+static std::map<std::string, BmsHashCache> g_bmsHashCache;
+
+static bool BmsSameStamps(const std::vector<BmsStamp>& a, const std::vector<BmsStamp>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].size != b[i].size || a[i].mtime != b[i].mtime)
+            return false;
+    return true;
+}
+
+// Hash in canonical name order but open the spelling that exists on disk. The stamp cache
+// avoids re-reading a large model.edf when the look poll asks for our unchanged active id.
+static std::string BmsModelId(const std::string& bike, const std::string& dir, bool cache) {
+    std::vector<std::string> files;
+    MsListFiles(dir, files);
+    const std::vector<std::string> order = frostmod::bikesync::CanonicalVisualOrder(files);
+    if (std::find(order.begin(), order.end(), "model.edf") == order.end()) return "";
+
+    std::map<std::string, std::string> actual;
+    for (const std::string& file : files)
+        if (frostmod::bikesync::IsVisualFile(file)) actual[frostmod::bikesync::Lower(file)] = file;
+
+    std::vector<BmsStamp> stamps;
+    for (const std::string& lower : order) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        const std::string path = dir + "\\" + actual[lower];
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return "";
+        ULARGE_INTEGER size{}, time{};
+        size.LowPart = data.nFileSizeLow; size.HighPart = data.nFileSizeHigh;
+        time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        stamps.push_back({lower, size.QuadPart, time.QuadPart});
+    }
+
+    const std::string cacheKey = frostmod::bikesync::Lower(dir);
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsHashCache.find(cacheKey);
+        if (it != g_bmsHashCache.end() && BmsSameStamps(it->second.stamps, stamps)) return it->second.id;
+    }
+
+    frostmod::bikesync::IdBuilder hash;
+    hash.Begin(bike);
+    unsigned char buf[64 * 1024];
+    for (size_t i = 0; i < order.size(); ++i) {
+        hash.File(order[i], stamps[i].size);
+        const std::string path = dir + "\\" + actual[order[i]];
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return "";
+        bool ok = true;
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0; ) hash.Bytes(buf, n);
+        if (ferror(f)) ok = false;
+        fclose(f);
+        if (!ok) return "";
+    }
+    const std::string id = hash.Finish();
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        g_bmsHashCache[cacheKey] = {stamps, id};
+    }
+    return id;
+}
+
+static bool BmsLinkOrCopy(const std::string& from, const std::string& to) {
+    if (MsFileExists(to)) return true;
+    if (CreateHardLinkA(to.c_str(), from.c_str(), nullptr)) return true;
+    return CopyFileA(from.c_str(), to.c_str(), TRUE) != FALSE;
+}
+
+static bool BmsLinkSet(const std::string& fromDir, const std::string& toDir,
+                       const std::vector<std::string>& files) {
+    for (const std::string& file : files)
+        if (!BmsLinkOrCopy(fromDir + "\\" + file, toDir + "\\" + file)) return false;
+    return true;
+}
+
+static bool BmsLinkPaints(const std::string& bikeDir, const std::string& shadowDir) {
+    const std::string from = bikeDir + "\\paints", to = shadowDir + "\\paints";
+    if (!MsDirExists(from)) return true;
+    if (!MsDirExists(to) && !CreateDirectoryA(to.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    std::vector<std::string> files;
+    MsListFiles(from, files);
+    return BmsLinkSet(from, to, files);
+}
+
+// This knows the exact shallow shape we create, so cleanup of a marked shadow or a failed
+// half-build never recursively follows or removes an unrelated directory.
+static bool BmsRemoveShadow(const std::string& dir) {
+    std::vector<std::string> files;
+    MsListFiles(dir + "\\paints", files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\paints\\" + file).c_str());
+    RemoveDirectoryA((dir + "\\paints").c_str());
+    MsListFiles(dir, files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\" + file).c_str());
+    return RemoveDirectoryA(dir.c_str()) != FALSE;
+}
+
+static bool BmsWriteMarker(const std::string& dir, const std::string& bike, const std::string& id) {
+    const std::string text = frostmod::bikesync::BuildMarker(bike, id);
+    FILE* f = nullptr;
+    if (fopen_s(&f, (dir + "\\" + kBmsMarker).c_str(), "wb") != 0 || !f) return false;
+    const bool wrote = fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = fclose(f) == 0;
+    return wrote && closed;
+}
+
+static void BikeSyncMaterialize() {
+    using namespace frostmod::bikesync;
+    g_bmsShadows.Clear();
+    { std::lock_guard<std::mutex> lk(g_bmsMutex); g_bmsActiveId.clear(); }
+    int ready = 0, removed = 0;
+    if (g_game != &GAME_MXB) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    if (!g_modsPath[0]) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    const std::string root = MsBikesRoot();
+    std::vector<std::string> bikes;
+    BmsListDirs(root, bikes);
+
+    if (!g_bmsOn.load()) {
+        for (const std::string& name : bikes) {
+            if (!LooksLikeShadow(name)) continue;
+            std::string bike, id;
+            const std::string dir = root + "\\" + name;
+            if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+        }
+        Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
+        return;
+    }
+
+    std::set<std::string> wanted;
+    for (const std::string& bike : bikes) {
+        if (LooksLikeShadow(bike)) continue;
+        const std::string bikeDir = root + "\\" + bike;
+        const std::string libDir = bikeDir + "\\" + kMsLibDir;
+        if (!MsDirExists(libDir)) continue;
+        const std::string active = BmsModelId(bike, bikeDir, true);
+        if (!active.empty()) {
+            std::lock_guard<std::mutex> lk(g_bmsMutex);
+            g_bmsActiveId[Lower(bike)] = active;
+        }
+        std::vector<std::string> rootFiles, variants;
+        MsListFiles(bikeDir, rootFiles);
+        BmsListDirs(libDir, variants);
+        for (const std::string& variant : variants) {
+            if ((int)wanted.size() >= kMaxShadowFolders) break;
+            const std::string variantDir = libDir + "\\" + variant;
+            std::vector<std::string> variantFiles;
+            MsListFiles(variantDir, variantFiles);
+            const ShadowPlan plan = PlanShadow(rootFiles, variantFiles);
+            if (!plan.ok) continue;
+            const std::string id = BmsModelId(bike, variantDir, false);
+            if (id.empty()) continue;
+            const std::string name = ShadowName(bike, id), dir = root + "\\" + name;
+            const std::string wantedKey = Lower(name);
+            if (wanted.count(wantedKey)) continue;
+
+            bool ok = false;
+            if (MsDirExists(dir)) {
+                std::string markedBike, markedId;
+                if (!BmsMarkerOf(dir, markedBike, markedId)) {
+                    Log("[modelsync] %s exists without a valid marker - left alone", dir.c_str());
+                    continue;
+                }
+                if (_stricmp(markedBike.c_str(), bike.c_str()) != 0 || markedId != id) {
+                    Log("[modelsync] %s has a marker for a different model - left alone", dir.c_str());
+                    wanted.insert(wantedKey); // an id8 collision must not delete the occupied folder below
+                    continue;
+                }
+                ok = BmsLinkPaints(bikeDir, dir);
+            } else if (CreateDirectoryA(dir.c_str(), nullptr)) {
+                ok = BmsLinkSet(bikeDir, dir, plan.fromRoot) &&
+                     BmsLinkSet(variantDir, dir, plan.fromVariant) &&
+                     BmsLinkPaints(bikeDir, dir) && BmsWriteMarker(dir, bike, id);
+                if (!ok) BmsRemoveShadow(dir);
+            }
+            if (!ok) {
+                Log("[modelsync] could not prepare %s (error %lu)", dir.c_str(), GetLastError());
+                continue;
+            }
+            wanted.insert(wantedKey);
+            g_bmsShadows.Set(bike, id, name);
+            ++ready;
+        }
+    }
+
+    BmsListDirs(root, bikes);
+    for (const std::string& name : bikes) {
+        if (!LooksLikeShadow(name) || wanted.count(Lower(name))) continue;
+        std::string bike, id;
+        const std::string dir = root + "\\" + name;
+        if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+    }
+    Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
 }
 // Move each named file from srcDir to dstDir (created if needed). All-or-nothing: on the
 // first failure the ones already moved are moved back and it returns false.
@@ -1689,6 +1940,10 @@ static void MsScanBikes() {
         if (fd.cFileName[0] == '.') continue;
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::string bike = fd.cFileName;
+        if (frostmod::bikesync::LooksLikeShadow(bike)) {
+            std::string markerBike, markerId;
+            if (BmsMarkerOf(MsBikeDir(bike), markerBike, markerId)) continue;
+        }
         if (MsFileExists(MsActiveEdf(bike)) || MsDirExists(MsLibDir(bike)))
             g_msBikes.push_back(bike);
     } while (FindNextFileA(h, &fd));
@@ -3064,6 +3319,172 @@ static bool RebuildRidersIn(uint64_t slots, const char* why) {
 
 void RebuildRiders() { RebuildRidersIn(~0ull, "F8 menu"); }
 
+// ---- per-rider bike model sync ------------------------------------------------------
+void BikeSyncSetLooks(const std::vector<looksync::Look>& looks) {
+    std::lock_guard<std::mutex> lk(g_bmsMutex);
+    g_bmsLooks = looks;
+}
+
+std::string BikeSyncOwnModelId(const char* bike) {
+    if (!g_bmsOn.load() || g_game != &GAME_MXB || !bike || !looksync::ValidBike(bike) || !g_modsPath[0]) return "";
+    const std::string key = frostmod::bikesync::Lower(bike);
+    const std::string id = BmsModelId(bike, MsBikeDir(bike), true);
+    std::lock_guard<std::mutex> lk(g_bmsMutex);
+    if (!id.empty()) g_bmsActiveId[key] = id;
+    else g_bmsActiveId.erase(key);
+    return id;
+}
+
+static std::string BmsActiveIdOf(const char* bike) {
+    const std::string key = frostmod::bikesync::Lower(bike);
+    {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsActiveId.find(key);
+        if (it != g_bmsActiveId.end()) return it->second;
+    }
+    // Render thread: never hash here (a model.edf is tens of MB). Library bikes were hashed
+    // at Init and the own bike is refreshed by the look poll; a bike with no library has no
+    // shadows, so ChooseShadow cannot pick one for it whatever this returns.
+    return "";
+}
+
+static uintptr_t BmsBikeEntry(int index) {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (index < 0 || index >= count || count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr))
+        return 0;
+    return arr ? arr + (uintptr_t)index * mxb::BIKE_STRIDE : 0;
+}
+
+static bool BmsGfxLoaded(uintptr_t entry) {
+    int state = 0;
+    return entry && SafeReadBytes((const char*)(entry + mxb::BIKE_GFX_STATE),
+                                  (char*)&state, sizeof(state)) == sizeof(state) && state != 0;
+}
+
+static int BmsLoadedBikeGfx() {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr) || !arr)
+        return frostmod::bikesync::kMaxLoadedBikeGfx;
+    int loaded = 0;
+    for (int i = 0; i < count; ++i)
+        if (BmsGfxLoaded(arr + (uintptr_t)i * mxb::BIKE_STRIDE))
+            ++loaded;
+    return loaded;
+}
+
+using BmsGfxLoad_t = int(__fastcall*)(int, int);
+static bool BmsCallGfxLoad(int bike) {
+    __try { ((BmsGfxLoad_t)(g_base + mxb::RVA_BIKE_GFX_LOAD))(bike, 0); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static int BmsDistinctShadows(int exceptSlot) {
+    std::set<std::string> shadows;
+    AcquireSRWLockShared(&g_bmsTableLock);
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (i == exceptSlot) continue;
+        const auto* entry = g_bmsTable.Get(i);
+        if (entry && !entry->shadow.empty()) shadows.insert(entry->shadow);
+    }
+    ReleaseSRWLockShared(&g_bmsTableLock);
+    return (int)shadows.size();
+}
+
+void BikeSyncTick() {
+    using namespace frostmod::bikesync;
+    if (!g_bmsOn.load() || !g_bmsHooksReady.load() || g_reloadActive.load() || !PaintsSupported()) return;
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 500;
+
+    std::vector<looksync::Look> looks;
+    {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        looks = g_bmsLooks;
+    }
+    static std::set<std::string> said;
+    static bool waiting = false;
+    static std::set<std::string> bad;
+    const char* me = frostmod::crash::TheContext().rider;
+    const bool defers = GameDefersRiderBuild();
+    if (!defers) waiting = false;
+
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0) {
+            AcquireSRWLockExclusive(&g_bmsTableLock); g_bmsTable.Clear(i); ReleaseSRWLockExclusive(&g_bmsTableLock);
+            continue;
+        }
+        if (IsLocalRider(i, me)) continue;
+        char bike[32] = {0}, paint[32] = {0}, rider[32] = {0};
+        if (!ReadVehicle(i, bike, paint)) continue;
+        RiderNameOf(LoadRequestOf(i), rider);
+        const int key = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+
+        const looksync::Look* look = nullptr;
+        for (const auto& candidate : looks)
+            if (candidate.raceNum == key && candidate.rider == rider) { look = &candidate; break; }
+        std::string want = look ? ChooseShadow(*look, bike, BmsActiveIdOf(bike), g_bmsShadows) : "";
+
+        RemapTable::Entry old;
+        bool haveOld = false;
+        AcquireSRWLockShared(&g_bmsTableLock);
+        if (const auto* entry = g_bmsTable.Get(i)) { old = *entry; haveOld = true; }
+        ReleaseSRWLockShared(&g_bmsTableLock);
+        const bool newRider = !haveOld || old.key != key || old.rider != rider;
+        const bool changed = newRider || old.shadow != want;
+        if (!changed) continue;
+
+        // A stock rider already built stock. Remember it without making the expensive rider
+        // re-load; a shadow request, or a return from a shadow to stock, does require one.
+        bool rebuild = !want.empty() || (haveOld && !old.shadow.empty());
+        if (rebuild && defers) {
+            if (!waiting) { Log("[modelsync] waiting for the pits"); waiting = true; }
+            continue;
+        }
+
+        if (!want.empty()) {
+            const std::string badKey = Lower(want);
+            int shadowIdx = bad.count(badKey) ? -1 : BikeIndexOf(want.c_str());
+            uintptr_t entry = shadowIdx >= 0 ? BmsBikeEntry(shadowIdx) : 0;
+            if (shadowIdx < 0 || !entry) {
+                if (said.insert("missing:" + badKey).second)
+                    Log("[modelsync] shadow bike '%s' is not in the game bike list - staying stock", want.c_str());
+                want.clear();
+            } else if (!BmsGfxLoaded(entry)) {
+                const bool shadowCap = BmsDistinctShadows(i) >= kMaxShadowsInUse;
+                const bool gfxCap = BmsLoadedBikeGfx() >= kMaxLoadedBikeGfx;
+                if (shadowCap || gfxCap) {
+                    const std::string reason = shadowCap ? "shadow-cap:" : "gfx-cap:";
+                    if (said.insert(reason + badKey).second)
+                        Log("[modelsync] refusing to preload '%s': %s - staying stock", want.c_str(),
+                            shadowCap ? "six distinct shadows are already in use" : "eight bike gfx entries are already loaded");
+                    want.clear();
+                } else if (!BmsCallGfxLoad(shadowIdx) || !BmsGfxLoaded(entry)) {
+                    bad.insert(badKey);
+                    Log("[modelsync] gfx load faulted or did not load '%s' - bad for this session, staying stock",
+                        want.c_str());
+                    want.clear();
+                }
+            }
+        }
+
+        rebuild = !want.empty() || (haveOld && !old.shadow.empty());
+        AcquireSRWLockExclusive(&g_bmsTableLock);
+        if (want.empty() && haveOld && !old.shadow.empty()) g_bmsTable.Clear(i);
+        else g_bmsTable.Set(i, key, rider, want);
+        ReleaseSRWLockExclusive(&g_bmsTableLock);
+        if (rebuild) {
+            RebuildRidersIn(1ull << i, "model sync");
+            return; // one rider rebuild at most per frame
+        }
+    }
+}
+
 // ---- automatic: a gear refresh brought in a model a rider on the server is wearing ------
 // Before the refresh, note every remote rider whose rider, helmet or boots model is not in
 // the lists (the game built them with a stand-in). After it, the ones whose models are all
@@ -4004,6 +4425,7 @@ static void SaveOverlaySettings() {
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     fprintf(f, "looksync=%d\n", g_lsOn.load() ? 1 : 0);
+    fprintf(f, "modelsync=%d\n", g_bmsOn.load() ? 1 : 0);
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (MenuKey() != frostmod::hotkey::Default()) {
@@ -4080,6 +4502,7 @@ static void LoadOverlaySettings() {
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
         else if (sscanf_s(line, "servermsg=%d",  &v) == 1) g_msgOn.store(v != 0);
         else if (sscanf_s(line, "looksync=%d", &v) == 1) g_lsOn.store(v == 1);
+        else if (sscanf_s(line, "modelsync=%d", &v) == 1) g_bmsOn.store(v == 1);
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
@@ -4088,9 +4511,9 @@ static void LoadOverlaySettings() {
     // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
     // fix) match nothing above and are skipped; the next save drops them.
     char mk[48]; MenuKeyName(mk, sizeof(mk));
-    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d looksync=%d y=%d port=%d menukey=%s%s",
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d looksync=%d modelsync=%d y=%d port=%d menukey=%s%s",
         g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_lsOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_lsOn.load(), g_bmsOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
 }
 
@@ -4717,6 +5140,7 @@ static bool LsOwnLook(looksync::Look& look) {
     look.raceNum = SafeReadInt((const int*)(VehicleAt(own) + mxb::VEH_KEY));
     look.rider = rider;
     look.bike = bike;
+    look.swap = BikeSyncOwnModelId(bike);   // bike model id; "" unless modelsync=1
     look.skin = LsHashFile(LsPaintPath(bike, paint));
     return looksync::ValidLook(look);
 }
@@ -4750,6 +5174,7 @@ static void LookSyncPoll(uint32_t ip, int& fails, int& lastPaintCount) {
     fails = 0;
     std::lock_guard<std::mutex> lk(g_lsMutex);
     g_lsLooks.swap(looks);
+    BikeSyncSetLooks(g_lsLooks);   // the bike model sync reads the same feed
 }
 
 static double MsgNowSec() { return (double)GetTickCount64() / 1000.0; }
@@ -6163,6 +6588,7 @@ void Tick() {
     ProtTick();          // what the guards caught, to frostmod-protection.jsonl for MXB App
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
     LookSyncTick();      // opt-in visual paint matching; capped and render-thread only
+    BikeSyncTick();      // one remote visual bike-model reconciliation at most
     RaceFilterTick();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
@@ -8220,6 +8646,104 @@ static bool SsgMxbOnly(const char* tag) {
     return false;
 }
 
+// ---- per-rider bike model sync builders -------------------------------------------
+// Only the bike index passed to gfx construction changes. The vehicle record, physics bike
+// index and collision objects are never written, so this remains a visual substitution.
+using BmsBuild_t = int64_t(__fastcall*)(void*, int, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsDeferred_t = int64_t(__fastcall*)(void*, int, int, void*, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsPaintLookup_t = int64_t(__fastcall*)(void*, int, const char*, int*);
+static BmsBuild_t g_origBmsBuild = nullptr;
+static BmsDeferred_t g_origBmsDeferred = nullptr;
+static BmsPaintLookup_t g_origBmsPaintLookup = nullptr;
+static LONG g_bmsLoggedKey[64]{};
+static LONG g_bmsLoggedValid[64]{};
+
+// Kept as a POD/SEH function: a malformed block or bike table can only make this builder use
+// the game's original index. The table overload writes a fixed stack buffer, so this hot path
+// does not allocate.
+static int RemapBikeIndex(void* block, int bikeIdx) {
+    int result = bikeIdx;
+    bool held = false;
+    __try {
+        if (!g_bmsOn.load(std::memory_order_relaxed)) return bikeIdx;
+        const int slot = frostmod::bikesync::SlotOfBlock((uintptr_t)block,
+            g_base + mxb::RVA_VEHICLES, mxb::VEHICLE_STRIDE, mxb::VEH_GFX, mxb::VEHICLE_MAX);
+        if (slot < 0 || slot == SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1)
+            return bikeIdx;
+        const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+        char shadow[64] = {0};
+        AcquireSRWLockShared(&g_bmsTableLock); held = true;
+        const bool found = g_bmsTable.Lookup(slot, key, shadow, sizeof(shadow));
+        ReleaseSRWLockShared(&g_bmsTableLock); held = false;
+        if (!found) return bikeIdx;
+        const int shadowIdx = BikeIndexOf(shadow);
+        const uintptr_t entry = BmsBikeEntry(shadowIdx);
+        if (shadowIdx < 0 || !BmsGfxLoaded(entry)) return bikeIdx;
+        result = shadowIdx;
+        const bool first = InterlockedCompareExchange(&g_bmsLoggedValid[slot], 1, 0) == 0;
+        const LONG previousKey = InterlockedExchange(&g_bmsLoggedKey[slot], key);
+        if (first || previousKey != key)
+            Log("[modelsync] slot %d key %d: visual bike '%s' (index %d instead of %d)",
+                slot, key, shadow, shadowIdx, bikeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (held) ReleaseSRWLockShared(&g_bmsTableLock);
+        return bikeIdx;
+    }
+    return result;
+}
+
+static int64_t __fastcall hkBmsBuild(void* block, int bike, uint64_t a2, uint64_t a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsBuild(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                          a12, a13, a14, a15, a16, a17, a18);
+}
+
+static int64_t __fastcall hkBmsDeferred(void* block, int bike, int a2, void* a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18, uint64_t a19, uint64_t a20) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsDeferred(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                             a12, a13, a14, a15, a16, a17, a18, a19, a20);
+}
+
+static int64_t __fastcall hkBmsPaintLookup(void* block, int bike, const char* paint, int* out) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsPaintLookup(block, idx, paint, out);
+}
+
+static void InstallBikeModelSync() {
+    if (!g_bmsOn.load() || g_origBmsBuild || g_unloading.load()) return;
+    if (!SsgMxbOnly("modelsync")) return;
+    static const uint8_t build[] = {0x4C,0x8B,0xDC,0x55,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t deferred[] = {0x48,0x89,0x5C,0x24,0x18,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
+    static const uint8_t paint[] = {0x55,0x56,0x41,0x54,0x41,0x55,0x41,0x56,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t load[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57};
+    if (!SsgCodeIs(mxb::RVA_BIKE_BUILD, build, sizeof(build)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_BUILD_DEFERRED, deferred, sizeof(deferred)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_PAINT_LOOKUP, paint, sizeof(paint)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_GFX_LOAD, load, sizeof(load))) {
+        Log("[modelsync] hooks not installed: beta21e builder/load bytes do not match (game updated?)");
+        return;
+    }
+    const bool a = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD), (void*)&hkBmsBuild,
+                               (void**)&g_origBmsBuild, "modelSyncBikeBuild(0x4D8C0)");
+    const bool b = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD_DEFERRED), (void*)&hkBmsDeferred,
+                               (void**)&g_origBmsDeferred, "modelSyncDeferred(0x45020)");
+    const bool c = InstallHook((void*)(g_base + mxb::RVA_BIKE_PAINT_LOOKUP), (void*)&hkBmsPaintLookup,
+                               (void**)&g_origBmsPaintLookup, "modelSyncPaintLookup(0x455C0)");
+    g_bmsHooksReady.store(a && b && c);
+    Log("[modelsync] visual bike builders %s (%d/3 hooks)", a && b && c ? "on" : "incomplete",
+        (int)a + (int)b + (int)c);
+}
+
 // ---- +0x45B0: the bike list ----------------------------------------------------------
 using BikeCatFn = int (*)(int bike, int* cat);
 static BikeCatFn                g_origBikeCat = nullptr;
@@ -8547,6 +9071,7 @@ static void SessionGuardsTick() {
 
 static void InstallSessionGuards() {
     InstallBikeListGuard();
+    InstallBikeModelSync();
     InstallWakeGuard();
     InstallListBoxGuard();
     InstallPtr64Fix();
@@ -9683,6 +10208,9 @@ DWORD WINAPI Init(LPVOID) {
             Log("[session] block unavailable - MXB App cannot see this session");
         }
         LoadOverlaySettings();  // restore radar / outline toggles, range, overlay size
+        // Shadows must exist before the game's first bike scan; when the feature is off this
+        // same point removes only folders carrying our marker from an earlier launch.
+        BikeSyncMaterialize();
         // Now that the saved limit is known, put the rider-visibility patch in. Before any
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);

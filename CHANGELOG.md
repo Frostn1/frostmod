@@ -22,6 +22,11 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
   now skipped instead of written to address 0. Off with `mipmapguard=0`.
 
 ### Added
+- **Bike model sync (off by default, `modelsync=1` with `looksync=1`).** You announce which
+  bike model you ride, and a remote rider on a model you also have in that bike's FrostMod Models
+  library is drawn with it; anyone else stays stock. Visual only: physics, collision and hitboxes
+  keep the real bike. Each library model gets a `<bike>~<id8>` folder at start (hard links), removed
+  again with `modelsync=0`. Needs a server that relays looks (FrostServer).
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,
   `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's

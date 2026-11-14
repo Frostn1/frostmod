@@ -117,6 +117,10 @@ struct Look {
     std::string rider;
     std::string bike;
     std::string skin;
+    std::string bikeModel;
+    std::string riderModel;
+    std::string helmetModel;
+    std::string bootsModel;
 };
 
 inline bool ValidBike(const std::string& s) {
@@ -145,14 +149,21 @@ inline bool ValidSkin(const std::string& s) {
 
 inline bool ValidLook(const Look& look) {
     return look.raceNum >= 0 && ValidRider(look.rider) &&
-           ValidBike(look.bike) && ValidSkin(look.skin);
+           ValidBike(look.bike) && ValidSkin(look.skin) &&
+           ValidSkin(look.bikeModel) && ValidSkin(look.riderModel) &&
+           ValidSkin(look.helmetModel) && ValidSkin(look.bootsModel);
 }
 
 inline std::string BuildClaimJson(const Look& look) {
-    return "{\"raceNumber\":" + std::to_string(look.raceNum) +
-           ",\"rider\":\"" + servermsg::JsonEscape(look.rider) +
-           "\",\"bike\":\"" + servermsg::JsonEscape(look.bike) +
-           "\",\"skin\":\"" + servermsg::JsonEscape(look.skin) + "\"}";
+    std::string json = "{\"raceNumber\":" + std::to_string(look.raceNum) +
+                       ",\"rider\":\"" + servermsg::JsonEscape(look.rider) +
+                       "\",\"bike\":\"" + servermsg::JsonEscape(look.bike) +
+                       "\",\"skin\":\"" + servermsg::JsonEscape(look.skin) + "\"";
+    if (!look.bikeModel.empty()) json += ",\"bikeModel\":\"" + look.bikeModel + "\"";
+    if (!look.riderModel.empty()) json += ",\"riderModel\":\"" + look.riderModel + "\"";
+    if (!look.helmetModel.empty()) json += ",\"helmetModel\":\"" + look.helmetModel + "\"";
+    if (!look.bootsModel.empty()) json += ",\"bootsModel\":\"" + look.bootsModel + "\"";
+    return json + '}';
 }
 
 inline bool ParseClaimJson(const std::string& body, Look& look) {
@@ -168,6 +179,15 @@ inline bool ParseClaimJson(const std::string& body, Look& look) {
         !servermsg::ObjectString(body, "rider", parsed.rider) ||
         !servermsg::ObjectString(body, "bike", parsed.bike) ||
         !servermsg::ObjectString(body, "skin", parsed.skin)) return false;
+    const char* modelKeys[] = {"bikeModel", "riderModel", "helmetModel", "bootsModel"};
+    std::string* modelValues[] = {&parsed.bikeModel, &parsed.riderModel,
+                                  &parsed.helmetModel, &parsed.bootsModel};
+    for (size_t i = 0; i < 4; ++i) {
+        const std::string needle = std::string("\"") + modelKeys[i] + "\"";
+        if (body.find(needle) != std::string::npos &&
+            (!servermsg::ObjectString(body, modelKeys[i], *modelValues[i]) ||
+             !ValidSkin(*modelValues[i]))) return false;
+    }
     parsed.raceNum = static_cast<int>(raceNumber);
     if (!ValidLook(parsed)) return false;
     look = parsed;
@@ -227,7 +247,9 @@ private:
         return a.raceNum == b.raceNum && a.rider == b.rider;
     }
     static bool Same(const Look& a, const Look& b) {
-        return SameRider(a, b) && a.bike == b.bike && a.skin == b.skin;
+        return SameRider(a, b) && a.bike == b.bike && a.skin == b.skin &&
+               a.bikeModel == b.bikeModel && a.riderModel == b.riderModel &&
+               a.helmetModel == b.helmetModel && a.bootsModel == b.bootsModel;
     }
     std::vector<Entry> entries_;
     uint32_t seq_ = 0;

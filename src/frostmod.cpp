@@ -49,6 +49,7 @@
 #include "antifreeze.h"
 #include "aussie.h"     // aussiemode=1: other riders' collision bodies on the Beta 20 spring
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
+#include "looksync.h"
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "masterlist.h"
@@ -2659,6 +2660,30 @@ static uintptr_t StockEntry(uintptr_t table_rva, uintptr_t count_rva, int model)
     return first;
 }
 
+// Apply a known paint name to every bike object. Shared by refresh repair and look sync.
+static bool ApplyBikePaintNamed(int i, const char* named) {
+    char bike[32], own[32];
+    if (!ReadVehicle(i, bike, own)) return false;
+    const int idx = BikeIndexOf(bike);
+    if (idx < 0 || !named || !PaintInTable(idx, named)) return false;
+    const uintptr_t v = VehicleAt(i);
+    int* handles[_countof(mxb::VEH_GFX_PAINTED) + 1];
+    int nh = 0;
+    for (int off : mxb::VEH_GFX_PAINTED)
+        handles[nh++] = (int*)(v + mxb::VEH_GFX + off);
+    handles[nh++] = (int*)(v + mxb::VEH_HANDLE);
+    Log("[paint] rider slot %d: applying bike paint '%s' on %s (bike %d, body handle %d)",
+        i, named, bike, idx, SafeReadInt(handles[0]));
+    int ok = 0;
+    for (int h = 0; h < nh; ++h) {
+        if (SafeReadInt(handles[h]) <= 0) continue;
+        if (CallPaintApply(idx, named, handles[h])) ++ok;
+        else Log("[paint] rider slot %d: paint_apply faulted on handle %d", i,
+                 SafeReadInt(handles[h]));
+    }
+    return ok > 0;
+}
+
 // Paint the bike on every object the game painted when it built it: the ridden bike's
 // parts in the rider-gfx block, then the cloned stand bike. paint_apply only reads the
 // handle through the pointer, so it is called once per handle, as 0x4CE00 does.
@@ -2680,6 +2705,7 @@ static bool ApplyBikePaint(int i, bool to_stock) {
     } else if (!PaintInTable(idx, own)) {
         return false;
     }
+    if (!to_stock) return ApplyBikePaintNamed(i, paint);
     const uintptr_t v = VehicleAt(i);
     int* handles[_countof(mxb::VEH_GFX_PAINTED) + 1];
     int nh = 0;
@@ -3904,6 +3930,7 @@ static void VehTearDown(int i) {
 static std::atomic<bool> g_msgOn{true};        // a rider can mute a server's overlay
 static std::atomic<int>  g_msgAnchor{150};     // design px up from the bottom of the screen
 static std::atomic<int>  g_msgPort{54210};     // FrostServer's API port; its own default
+static std::atomic<bool> g_lsOn{false};         // per-rider installed skins; opt in
 // gfxwatch=1: re-apply the ridden bike's gfx.cfg when it is saved (LIVE BIKE GFX.CFG). Off by
 // default; F8 -> G toggles it and the choice is kept here.
 static std::atomic<bool> g_gfxWatch{false};
@@ -3976,6 +4003,7 @@ static void SaveOverlaySettings() {
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
+    fprintf(f, "looksync=%d\n", g_lsOn.load() ? 1 : 0);
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (MenuKey() != frostmod::hotkey::Default()) {
@@ -4051,6 +4079,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
         else if (sscanf_s(line, "servermsg=%d",  &v) == 1) g_msgOn.store(v != 0);
+        else if (sscanf_s(line, "looksync=%d", &v) == 1) g_lsOn.store(v == 1);
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
@@ -4059,9 +4088,9 @@ static void LoadOverlaySettings() {
     // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
     // fix) match nothing above and are skipped; the next save drops them.
     char mk[48]; MenuKeyName(mk, sizeof(mk));
-    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d menukey=%s%s",
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d looksync=%d y=%d port=%d menukey=%s%s",
         g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_lsOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
 }
 
@@ -4515,6 +4544,214 @@ static HANDLE                g_msgThread = nullptr;
 static constexpr int kMsgPollMs  = 5000;   // how often we ask
 static constexpr int kMsgMaxFail = 3;      // then stop asking this server
 
+static std::mutex g_lsMutex;
+static std::vector<looksync::Look> g_lsLooks;
+static looksync::SkinIndex g_lsIndex;
+static looksync::AppliedKey g_lsApplied[mxb::VEHICLE_MAX];
+static std::set<std::string> g_lsNotInstalled;
+struct LsHashCache {
+    uint64_t size = 0;
+    uint64_t stamp = 0;
+    std::string id;
+};
+static std::mutex g_lsHashMutex;
+static std::map<std::string, LsHashCache> g_lsHash;
+static std::atomic<bool> g_lsIndexRunning{false};
+
+static std::string LsHashFile(const std::string& path) {
+    WIN32_FILE_ATTRIBUTE_DATA attr = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attr)) return "";
+    uint64_t size = ((uint64_t)attr.nFileSizeHigh << 32) | attr.nFileSizeLow;
+    uint64_t stamp = ((uint64_t)attr.ftLastWriteTime.dwHighDateTime << 32) |
+                     attr.ftLastWriteTime.dwLowDateTime;
+    if (size > 64ull * 1024 * 1024) return "";
+    {
+        std::lock_guard<std::mutex> lk(g_lsHashMutex);
+        auto it = g_lsHash.find(path);
+        if (it != g_lsHash.end() && it->second.size == size && it->second.stamp == stamp)
+            return it->second.id;
+    }
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return "";
+    looksync::Sha256 sha;
+    sha.Init();
+    unsigned char buffer[65536];
+    DWORD got = 0;
+    bool ok = true;
+    for (;;) {
+        if (g_msgQuit.load() || !ReadFile(file, buffer, sizeof(buffer), &got, nullptr)) {
+            ok = false;
+            break;
+        }
+        if (!got) break;
+        sha.Update(buffer, got);
+    }
+    CloseHandle(file);
+    if (!ok) return "";
+    unsigned char digest[32];
+    sha.Final(digest);
+    std::string id = looksync::Hex16(digest);
+    {
+        std::lock_guard<std::mutex> lk(g_lsHashMutex);
+        g_lsHash[path] = {size, stamp, id};
+    }
+    return id;
+}
+
+static std::string LsPaintPath(const char* bike, const char* paint) {
+    return std::string(g_modsPath) + "\\bikes\\" + bike + "\\paints\\" + paint + ".pnt";
+}
+
+static bool LsHttp(uint32_t ipNet, int port, const wchar_t* verb, const wchar_t* path,
+                   const std::string& request, std::string& out) {
+    out.clear();
+    const unsigned char* bytes = (const unsigned char*)&ipNet;
+    wchar_t host[32];
+    _snwprintf_s(host, _countof(host), _TRUNCATE, L"%u.%u.%u.%u",
+                 bytes[0], bytes[1], bytes[2], bytes[3]);
+    HINTERNET session = WinHttpOpen(L"FrostMod", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 1500, 1500, 2500, 2500);
+    bool ok = false;
+    HINTERNET connection = WinHttpConnect(session, host, (INTERNET_PORT)port, 0);
+    if (connection) {
+        HINTERNET query = WinHttpOpenRequest(connection, verb, path, nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (query) {
+            const wchar_t* headers = L"Content-Type: application/json\r\n";
+            if (WinHttpSendRequest(query, headers, (DWORD)-1L,
+                    request.empty() ? WINHTTP_NO_REQUEST_DATA : (void*)request.data(),
+                    (DWORD)request.size(), (DWORD)request.size(), 0) &&
+                WinHttpReceiveResponse(query, nullptr)) {
+                DWORD code = 0;
+                DWORD size = sizeof(code);
+                WinHttpQueryHeaders(query, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
+                if (code == 200) {
+                    ok = true;
+                    for (;;) {
+                        DWORD available = 0;
+                        if (!WinHttpQueryDataAvailable(query, &available) || !available) break;
+                        if (out.size() + available > 65536) {
+                            ok = false;
+                            break;
+                        }
+                        std::string chunk(available, '\0');
+                        DWORD got = 0;
+                        if (!WinHttpReadData(query, &chunk[0], available, &got)) {
+                            ok = false;
+                            break;
+                        }
+                        out.append(chunk.data(), got);
+                    }
+                }
+            }
+            WinHttpCloseHandle(query);
+        }
+        WinHttpCloseHandle(connection);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+static void LsRebuildIndex() {
+    looksync::SkinIndex next;
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_PAINT_COUNT));
+    const uintptr_t table = ReadPtr(mxb::RVA_PAINT_TABLE);
+    if (!table || count < 0 || count > 1000000) return;
+    int hashed = 0;
+    for (int i = 0; i < count && !g_msgQuit.load(); ++i) {
+        uintptr_t entry = table + (uintptr_t)i * mxb::PAINT_STRIDE;
+        int bikeIndex = SafeReadInt((const int*)(entry + mxb::PAINT_BIKE));
+        char paint[0x84] = {};
+        char bike[64] = {};
+        if (!SafeCopyStr((void*)(entry + mxb::PAINT_NAME), paint, sizeof(paint)) || !paint[0])
+            continue;
+        uintptr_t bikes = ReadPtr(mxb::RVA_BIKE_LIST);
+        int bikeCount = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+        if (!bikes || bikeIndex < 0 || bikeIndex >= bikeCount ||
+            !SafeCopyStr((void*)(bikes + (uintptr_t)bikeIndex * mxb::BIKE_STRIDE +
+                         mxb::BIKE_FOLDER), bike, sizeof(bike))) continue;
+        std::string id = LsHashFile(LsPaintPath(bike, paint));
+        if (!id.empty()) {
+            next.Set(bike, id, paint);
+            ++hashed;
+        }
+    }
+    if (!g_msgQuit.load()) {
+        std::lock_guard<std::mutex> lk(g_lsMutex);
+        g_lsIndex = next;
+        Log("[looksync] indexed %d installed bike paints", hashed);
+    }
+}
+
+static DWORD WINAPI LsIndexThread(LPVOID) {
+    LsRebuildIndex();
+    g_lsIndexRunning.store(false);
+    return 0;
+}
+
+// Indexing may touch every installed paint, so never make feed polling wait for it.
+static bool LsStartIndexRebuild() {
+    bool expected = false;
+    if (!g_lsIndexRunning.compare_exchange_strong(expected, true) || g_msgQuit.load()) return false;
+    HANDLE thread = CreateThread(nullptr, 0, LsIndexThread, nullptr, 0, nullptr);
+    if (!thread) {
+        g_lsIndexRunning.store(false);
+        return false;
+    }
+    SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+    CloseHandle(thread); // The atomic flag owns its lifetime; shutdown is signalled by g_msgQuit.
+    return true;
+}
+
+static bool LsOwnLook(looksync::Look& look) {
+    int own = SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1;
+    if (own < 0 || own >= mxb::VEHICLE_MAX) return false;
+    char bike[32], paint[32], rider[32];
+    if (!ReadVehicle(own, bike, paint)) return false;
+    RiderNameOf(LoadRequestOf(own), rider);
+    look.raceNum = SafeReadInt((const int*)(VehicleAt(own) + mxb::VEH_KEY));
+    look.rider = rider;
+    look.bike = bike;
+    look.skin = LsHashFile(LsPaintPath(bike, paint));
+    return looksync::ValidLook(look);
+}
+
+static void LookSyncPoll(uint32_t ip, int& fails, int& lastPaintCount) {
+    if (!g_lsOn.load() || !PaintsSupported() || fails >= kMsgMaxFail) return;
+    int paintCount = SafeReadInt((const int*)(g_base + mxb::RVA_PAINT_COUNT));
+    if (paintCount != lastPaintCount && LsStartIndexRebuild()) {
+        lastPaintCount = paintCount;
+    }
+    looksync::Look own;
+    if (!LsOwnLook(own)) return;
+    std::string response;
+    if (!LsHttp(ip, g_msgPort.load(), L"POST", L"/frostserver/look",
+                looksync::BuildClaimJson(own), response)) {
+        ++fails;
+        return;
+    }
+    std::string feed;
+    if (!LsHttp(ip, g_msgPort.load(), L"GET", L"/frostserver/looks", "", feed)) {
+        ++fails;
+        return;
+    }
+    std::vector<looksync::Look> looks;
+    uint32_t seq;
+    if (!looksync::ParseFeedJson(feed, looks, seq)) {
+        if (++fails >= kMsgMaxFail)
+            Log("[looksync] invalid or unavailable feed - not asking this server again.");
+        return;
+    }
+    fails = 0;
+    std::lock_guard<std::mutex> lk(g_lsMutex);
+    g_lsLooks.swap(looks);
+}
+
 static double MsgNowSec() { return (double)GetTickCount64() / 1000.0; }
 
 static bool MsgFeedLive() {
@@ -4576,6 +4813,8 @@ static std::string MsgHttpGet(uint32_t ipNet, int port, uint32_t since) {
 static DWORD WINAPI MsgFeedThread(LPVOID) {
     uint32_t lastIp = 0;
     int      fails  = 0;
+    int      lsFails = 0;
+    int      lastPaintCount = -1;
     bool     logged = false;
     while (!g_msgQuit.load()) {
         // Sliced so Shutdown does not wait a whole poll interval for us.
@@ -4592,11 +4831,24 @@ static DWORD WINAPI MsgFeedThread(LPVOID) {
         }
 
         const uint32_t ip = g_msgServerIp.load();
-        if (!ip) { lastIp = 0; fails = 0; logged = false; continue; }   // not on a server
-        if (ip != lastIp) {
-            lastIp = ip; fails = 0; logged = false;
-            MsgResetForNewServer();
+        if (!ip) {
+            lastIp = 0;
+            fails = lsFails = 0;
+            lastPaintCount = -1;
+            logged = false;
+            continue; // Not on a server.
         }
+        if (ip != lastIp) {
+            lastIp = ip;
+            fails = lsFails = 0;
+            lastPaintCount = -1;
+            logged = false;
+            MsgResetForNewServer();
+            std::lock_guard<std::mutex> lk(g_lsMutex);
+            g_lsLooks.clear();
+            g_lsNotInstalled.clear();
+        }
+        LookSyncPoll(ip, lsFails, lastPaintCount);
         if (!g_msgOn.load() || fails >= kMsgMaxFail) continue;
 
         uint32_t since;
@@ -4628,6 +4880,7 @@ static DWORD WINAPI MsgFeedThread(LPVOID) {
 static void MsgFeedStart() {
     if (g_msgThread) return;
     g_msgThread = CreateThread(nullptr, 0, MsgFeedThread, nullptr, 0, nullptr);
+    if (g_msgThread) SetThreadPriority(g_msgThread, THREAD_PRIORITY_BELOW_NORMAL);
     Log("[servermsg] poll thread %s", g_msgThread ? "started" : "could NOT start");
 }
 
@@ -4637,6 +4890,66 @@ static void MsgFeedStop(bool canBlock) {
         WaitForSingleObject(g_msgThread, 2000);
         CloseHandle(g_msgThread);
         g_msgThread = nullptr;
+    }
+}
+
+static void LookSyncTick() {
+    static uint64_t next = 0;
+    uint64_t now = GetTickCount64();
+    if (now < next) return;
+    next = now + 2000;
+    if (!g_lsOn.load() || !PaintsSupported()) return;
+    std::vector<looksync::Look> looks;
+    {
+        std::lock_guard<std::mutex> lk(g_lsMutex);
+        looks = g_lsLooks;
+    }
+    int work = 0;
+    const char* me = frostmod::crash::TheContext().rider;
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        uintptr_t vehicle = VehicleAt(i);
+        if (SafeReadInt((const int*)vehicle) == 0) {
+            g_lsApplied[i] = {};
+            continue;
+        }
+        int key = SafeReadInt((const int*)(vehicle + mxb::VEH_KEY));
+        if (g_lsApplied[i].key && g_lsApplied[i].key != key) g_lsApplied[i] = {};
+        if (IsLocalRider(i, me)) continue;
+        char rider[32], bike[32], rosterPaint[32];
+        RiderNameOf(LoadRequestOf(i), rider);
+        if (!ReadVehicle(i, bike, rosterPaint)) continue;
+        const looksync::Look* match = nullptr;
+        for (const auto& look : looks) {
+            if (look.raceNum == key && look.rider == rider) {
+                match = &look;
+                break;
+            }
+        }
+        if (!match || match->skin.empty() || _stricmp(match->bike.c_str(), bike) != 0) continue;
+        {
+            std::lock_guard<std::mutex> lk(g_lsHashMutex);
+            auto it = g_lsHash.find(LsPaintPath(bike, rosterPaint));
+            if (it != g_lsHash.end() && it->second.id == match->skin) continue;
+        }
+        std::string paint;
+        {
+            std::lock_guard<std::mutex> lk(g_lsMutex);
+            if (!g_lsIndex.Find(bike, match->skin, paint)) {
+                std::string missing = match->rider + '\n' + match->skin;
+                if (g_lsNotInstalled.insert(missing).second)
+                    Log("[looksync] '%s': skin %.8s is not installed here",
+                        match->rider.c_str(), match->skin.c_str());
+                continue;
+            }
+        }
+        int handle = SafeReadInt((const int*)(vehicle + mxb::VEH_GFX));
+        if (!looksync::NeedsApply(g_lsApplied[i], key, handle)) continue;
+        if (work++ >= 3) break;
+        if (ApplyBikePaintNamed(i, paint.c_str())) {
+            g_lsApplied[i] = {key, handle};
+            Log("[looksync] slot %d '%s': skin %.8s applied as '%s'",
+                i, rider, match->skin.c_str(), paint.c_str());
+        }
     }
 }
 
@@ -5849,6 +6162,7 @@ void Tick() {
     SessionGuardsTick(); // the list-box and pointer stubs' counters, the same way
     ProtTick();          // what the guards caught, to frostmod-protection.jsonl for MXB App
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
+    LookSyncTick();      // opt-in visual paint matching; capped and render-thread only
     RaceFilterTick();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),

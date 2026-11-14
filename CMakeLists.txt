@@ -186,6 +186,19 @@ find_package(Threads REQUIRED)
 target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
 add_test(NAME gamefeed COMMAND gamefeed_test)
 
+# --- per-rider bike model sync -------------------------------------------------
+# Pure naming, hashing and remap rules shared by disk setup and the render-thread hooks.
+add_executable(bikesync_test tests/bikesync_test.cpp)
+add_test(NAME bikesync COMMAND bikesync_test)
+
+# --- rider model sync rules (src/ridersync.h) ---------------------------------
+add_executable(ridersync_test tests/ridersync_test.cpp)
+add_test(NAME ridersync COMMAND ridersync_test)
+
+# --- MXB App rider-look command format (src/riderlooks.h) ----------------------
+add_executable(riderlooks_test tests/riderlooks_test.cpp)
+add_test(NAME riderlooks COMMAND riderlooks_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)

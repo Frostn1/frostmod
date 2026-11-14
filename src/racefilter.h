@@ -18,6 +18,8 @@
 // Pure - no Win32, no game - so tests/racefilter_test.cpp runs it in CI.
 #pragma once
 
+#include "bikesync.h"
+
 #include <string>
 #include <set>
 
@@ -98,10 +100,16 @@ public:
     }
 
     // May entry `name`, found while scanning `scope` (from Scope), be shown?
-    bool Allows(const std::string& scope, const std::string& name) const {
+    bool Allows(const std::string& scope, const std::string& name,
+                bool allowModelSyncShadows = false) const {
         if (name == "." || name == "..") return true;
         const std::string child = Stem(scope + "/" + Norm(name));
-        return allowed_.count(child) || ancestors_.count(child);
+        if (allowed_.count(child) || ancestors_.count(child)) return true;
+        if (!allowModelSyncShadows || scope != "bikes") return false;
+        const std::string real = bikesync::RealBikeOfShadow(Norm(name));
+        if (real.empty()) return false;
+        const std::string realChild = Stem(scope + "/" + real);
+        return allowed_.count(realChild) || ancestors_.count(realChild);
     }
 
 private:

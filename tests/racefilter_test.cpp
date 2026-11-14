@@ -64,6 +64,9 @@ int main() {
     s = f.Scope(std::string(kMods) + "\\bikes", kMods);
     CHECK(s == "bikes", "scope bikes");
     CHECK(f.Allows(s, "KTM 450.pkz") && !f.Allows(s, "Honda 450"), "bikes filtered");
+    CHECK(!f.Allows(s, "KTM 450~0123abcd"), "shadow hidden when model sync is off");
+    CHECK(f.Allows(s, "KTM 450~0123abcd", true), "allowed bike's shadow passes with model sync");
+    CHECK(!f.Allows(s, "Honda 450~0123abcd", true), "unlisted bike's shadow stays hidden");
 
     // Outside mods, or a root the file does not name: untouched.
     CHECK(f.Scope("tracks/motocross", kMods).empty(), "stock game tracks untouched");

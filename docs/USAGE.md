@@ -194,6 +194,18 @@ which are tuned to that mesh and swap together. Only `paints\` (universal liveri
 If the model files are locked (you're currently riding that bike), the swap rolls back with
 the bike left intact and asks you to exit the bike first.
 
+### Model swaps per rider
+
+FrostMod can draw each remote rider with their rider, helmet, boots and bike model swaps when
+the same swaps are installed locally. This is visual only: physics, collision and hitboxes do
+not change. Set `modelsync=1` in `frostmod_radar.cfg` and turn on **Share model swaps** in MXB
+App's paint sync settings. MXB App's paint sync supplies the model IDs, and a friend needs the
+same swap installed to see it.
+
+For bike swaps, FrostMod makes catalog folders named `<Bike>~xxxxxxxx` from models in the
+bike's `FrostMod Models` library. They are safe to delete while the game is closed; FrostMod
+creates them again when model sync is on.
+
 Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
 immediately — no restart, no loading screen.
 
@@ -216,7 +228,7 @@ and `frostmod.dll`), so the launcher and the injected DLL always agree on them.
 | `frostmod.log` | The live log, streamed into the console. Falls back to `%TEMP%\frostmod.log` if that folder is read-only. |
 | `frostmod_serverfilter.yaml` | Your server-filter rules. Auto-created on first run with a documented header, and auto-upgraded when the shipped defaults change (the old file is backed up to `.bak` first). Edit it and reload (`R`) to apply — see the comments inside, or the rule types below. |
 | `frostmod_filter.flag`, `frostmod_dumplist.flag`, `frostmod_probe.flag`, `frostmod_unsafe_reload.flag` | Internal on/off markers the launcher writes so the DLL knows which optional hooks to install. You don't edit these; the flags above manage them. |
-| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync), `refresh_gear` (a gear model changed), `refresh_tracks` (only tracks changed), `refresh_bikes` (a bike changed: bikes, series and bike paints), `reload_bike_gfx` (a bike's `gfx.cfg` was saved; `bikeId` = the bike folder) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
+| `frostmod_cmd.json` | One command from [MXB App](https://github.com/Frostn1/mxb-app) — `{"verb":…}`, today `reload_mods`, `refresh_paints` (after a paint sync), `refresh_gear` (a gear model changed), `set_rider_looks` (the model IDs learned by paint sync), `refresh_tracks` (only tracks changed), `refresh_bikes` (a bike changed: bikes, series and bike paints), `reload_bike_gfx` (a bike's `gfx.cfg` was saved; `bikeId` = the bike folder) or `refresh_bike_model`. The app writes it, the DLL acts on it and remembers it, and nothing deletes it. `%TEMP%\frostmod_cmd.json` is read as well, because that is where MXB App on Windows writes. |
 
 ### Running inside a Wine prefix (Linux and macOS)
 

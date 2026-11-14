@@ -66,6 +66,7 @@
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
 #include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
+#include "bikesync.h"   // per-rider visual bike models: pure ids, markers and remap rules
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
@@ -75,6 +76,7 @@
 #include "nanrecover.h"   // a bike whose physics state goes NaN is put back with the game's own reset
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
+#include "ridersync.h"    // content-addressed rider, helmet and boots model sync
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
 #include <psapi.h>      // GetProcessMemoryInfo (memdiag)
 
@@ -186,6 +188,10 @@ std::atomic<bool> g_unloading{false};
 char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin mode)
 char    g_modsPath[MAX_PATH] = {0};   // mods folder (from frostmod_mods.txt the launcher writes)
 char    g_inactivePath[MAX_PATH] = {0}; // <MX Bikes>\FrostMod Inactive Tracks (deactivated .pkz store)
+static std::atomic<bool> g_rsOn{false};
+static std::mutex g_riderLooksMutex;
+static std::vector<frostmod::RiderLook> g_riderLooks;
+void RiderLooksSet(std::vector<frostmod::RiderLook> looks);
 
 // frostmod.dir: where FrostMod's files live when the dll does not sit with them. As a
 // plugin, FrostMod is <game>\plugins\frostmod.dlo, but its log, settings, flags, command
@@ -631,7 +637,7 @@ static std::string RfUtf8(const char* acp) {
 }
 static bool RfPass(const _finddata64i32_t* fd) {
     const std::string name = RfUtf8(fd->name);
-    const bool ok = t_rf->Allows(*t_rfScope, name);
+    const bool ok = t_rf->Allows(*t_rfScope, name, g_rsOn.load());
     if (name != "." && name != "..") {
         const std::string key = *t_rfScope + "/" + frostmod::RaceFilter::Norm(name);
         std::lock_guard<std::mutex> lk(g_rfMutex);
@@ -1606,6 +1612,36 @@ static const char* kMsLibDir   = "FrostMod Models";  // per-bike model library f
 static const char* kMsMarker   = "_active.txt";      // names the active variant
 static const char* kMsOriginal = "Original";         // name given to the model captured on first swap
 
+// Model sync is opt-in because bike swaps create temporary bike folders before the game's
+// startup scan. Changing it while the game is running cannot safely change that scan.
+static frostmod::bikesync::ShadowIndex g_bmsShadows;
+static std::mutex g_bmsMutex;
+static std::map<std::string, std::string> g_bmsActiveId;
+static frostmod::bikesync::RemapTable g_bmsTable;
+static SRWLOCK g_bmsTableLock = SRWLOCK_INIT;
+static std::atomic<bool> g_bmsHooksReady{false};
+static uint64_t g_modelSyncPending = 0;
+static int g_modelSyncPendingKey[mxb::VEHICLE_MAX] = {};
+
+static void QueueModelSyncRebuild(int slot, int key) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64 || !key) return;
+    g_modelSyncPending |= 1ull << slot;
+    g_modelSyncPendingKey[slot] = key;
+}
+
+static void DropModelSyncPending(int slot) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64) return;
+    g_modelSyncPending &= ~(1ull << slot);
+    g_modelSyncPendingKey[slot] = 0;
+}
+
+static void DropStaleModelSyncPending(int slot, int key) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64) return;
+    if ((g_modelSyncPending & (1ull << slot)) && g_modelSyncPendingKey[slot] != key) {
+        DropModelSyncPending(slot);
+    }
+}
+
 static std::string MsBikesRoot()                         { return std::string(g_modsPath) + "\\bikes"; }
 static std::string MsBikeDir(const std::string& b)       { return MsBikesRoot() + "\\" + b; }
 static std::string MsLibDir(const std::string& b)        { return MsBikeDir(b) + "\\" + kMsLibDir; }
@@ -1633,6 +1669,245 @@ static void MsListFiles(const std::string& dir, std::vector<std::string>& out) {
         out.push_back(fd.cFileName);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+}
+
+// ---------------------------------------------------------------------------
+// BIKE MODEL SYNC - startup shadow folders
+//
+// A shadow is a second bike-list entry with the real bike's non-visual files (therefore
+// the same physics) and one library variant's visual files. The detours below substitute
+// that entry only while the game builds a remote rider's gfx objects.
+// ---------------------------------------------------------------------------
+static const char* kBmsMarker = "_modelsync.txt";
+
+static bool BmsReadFile(const std::string& path, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0 && out.size() <= sizeof(buf); )
+        out.append(buf, n);
+    const bool ok = ferror(f) == 0 && out.size() <= sizeof(buf);
+    fclose(f);
+    return ok;
+}
+
+static bool BmsMarkerOf(const std::string& dir, std::string& bike, std::string& id) {
+    std::string text;
+    return BmsReadFile(dir + "\\" + kBmsMarker, text) &&
+           frostmod::bikesync::ParseMarker(text, bike, id);
+}
+
+static void BmsListDirs(const std::string& dir, std::vector<std::string>& out) {
+    out.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.' || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        out.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        return _stricmp(a.c_str(), b.c_str()) < 0;
+    });
+}
+
+struct BmsStamp { std::string name; uint64_t size; uint64_t mtime; };
+struct BmsHashCache { std::vector<BmsStamp> stamps; std::string id; };
+static std::map<std::string, BmsHashCache> g_bmsHashCache;
+
+static bool BmsSameStamps(const std::vector<BmsStamp>& a, const std::vector<BmsStamp>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].size != b[i].size || a[i].mtime != b[i].mtime)
+            return false;
+    return true;
+}
+
+// Hash in canonical name order but open the spelling that exists on disk. The stamp cache
+// avoids re-reading a large model.edf when startup checks an unchanged active id.
+static std::string BmsModelId(const std::string& bike, const std::string& dir, bool cache) {
+    std::vector<std::string> files;
+    MsListFiles(dir, files);
+    const std::vector<std::string> order = frostmod::bikesync::CanonicalVisualOrder(files);
+    if (std::find(order.begin(), order.end(), "model.edf") == order.end()) return "";
+
+    std::map<std::string, std::string> actual;
+    for (const std::string& file : files)
+        if (frostmod::bikesync::IsVisualFile(file)) actual[frostmod::bikesync::Lower(file)] = file;
+
+    std::vector<BmsStamp> stamps;
+    for (const std::string& lower : order) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        const std::string path = dir + "\\" + actual[lower];
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return "";
+        ULARGE_INTEGER size{}, time{};
+        size.LowPart = data.nFileSizeLow; size.HighPart = data.nFileSizeHigh;
+        time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        stamps.push_back({lower, size.QuadPart, time.QuadPart});
+    }
+
+    const std::string cacheKey = frostmod::bikesync::Lower(dir);
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsHashCache.find(cacheKey);
+        if (it != g_bmsHashCache.end() && BmsSameStamps(it->second.stamps, stamps)) return it->second.id;
+    }
+
+    frostmod::bikesync::IdBuilder hash;
+    hash.Begin(bike);
+    unsigned char buf[64 * 1024];
+    for (size_t i = 0; i < order.size(); ++i) {
+        hash.File(order[i], stamps[i].size);
+        const std::string path = dir + "\\" + actual[order[i]];
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return "";
+        bool ok = true;
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0; ) hash.Bytes(buf, n);
+        if (ferror(f)) ok = false;
+        fclose(f);
+        if (!ok) return "";
+    }
+    const std::string id = hash.Finish();
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        g_bmsHashCache[cacheKey] = {stamps, id};
+    }
+    return id;
+}
+
+static bool BmsLinkOrCopy(const std::string& from, const std::string& to) {
+    if (MsFileExists(to)) return true;
+    if (CreateHardLinkA(to.c_str(), from.c_str(), nullptr)) return true;
+    return CopyFileA(from.c_str(), to.c_str(), TRUE) != FALSE;
+}
+
+static bool BmsLinkSet(const std::string& fromDir, const std::string& toDir,
+                       const std::vector<std::string>& files) {
+    for (const std::string& file : files)
+        if (!BmsLinkOrCopy(fromDir + "\\" + file, toDir + "\\" + file)) return false;
+    return true;
+}
+
+static bool BmsLinkPaints(const std::string& bikeDir, const std::string& shadowDir) {
+    const std::string from = bikeDir + "\\paints", to = shadowDir + "\\paints";
+    if (!MsDirExists(from)) return true;
+    if (!MsDirExists(to) && !CreateDirectoryA(to.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    std::vector<std::string> files;
+    MsListFiles(from, files);
+    return BmsLinkSet(from, to, files);
+}
+
+// This knows the exact shallow shape we create, so cleanup of a marked shadow or a failed
+// half-build never recursively follows or removes an unrelated directory.
+static bool BmsRemoveShadow(const std::string& dir) {
+    std::vector<std::string> files;
+    MsListFiles(dir + "\\paints", files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\paints\\" + file).c_str());
+    RemoveDirectoryA((dir + "\\paints").c_str());
+    MsListFiles(dir, files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\" + file).c_str());
+    return RemoveDirectoryA(dir.c_str()) != FALSE;
+}
+
+static bool BmsWriteMarker(const std::string& dir, const std::string& bike, const std::string& id) {
+    const std::string text = frostmod::bikesync::BuildMarker(bike, id);
+    FILE* f = nullptr;
+    if (fopen_s(&f, (dir + "\\" + kBmsMarker).c_str(), "wb") != 0 || !f) return false;
+    const bool wrote = fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = fclose(f) == 0;
+    return wrote && closed;
+}
+
+static void BikeSyncMaterialize() {
+    using namespace frostmod::bikesync;
+    g_bmsShadows.Clear();
+    { std::lock_guard<std::mutex> lk(g_bmsMutex); g_bmsActiveId.clear(); }
+    int ready = 0, removed = 0;
+    if (g_game != &GAME_MXB) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    if (!g_modsPath[0]) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    const std::string root = MsBikesRoot();
+    std::vector<std::string> bikes;
+    BmsListDirs(root, bikes);
+
+    if (!g_rsOn.load()) {
+        for (const std::string& name : bikes) {
+            if (!LooksLikeShadow(name)) continue;
+            std::string bike, id;
+            const std::string dir = root + "\\" + name;
+            if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+        }
+        Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
+        return;
+    }
+
+    std::set<std::string> wanted;
+    for (const std::string& bike : bikes) {
+        if (LooksLikeShadow(bike)) continue;
+        const std::string bikeDir = root + "\\" + bike;
+        const std::string libDir = bikeDir + "\\" + kMsLibDir;
+        if (!MsDirExists(libDir)) continue;
+        const std::string active = BmsModelId(bike, bikeDir, true);
+        if (!active.empty()) {
+            std::lock_guard<std::mutex> lk(g_bmsMutex);
+            g_bmsActiveId[Lower(bike)] = active;
+        }
+        std::vector<std::string> rootFiles, variants;
+        MsListFiles(bikeDir, rootFiles);
+        BmsListDirs(libDir, variants);
+        for (const std::string& variant : variants) {
+            if ((int)wanted.size() >= kMaxShadowFolders) break;
+            const std::string variantDir = libDir + "\\" + variant;
+            std::vector<std::string> variantFiles;
+            MsListFiles(variantDir, variantFiles);
+            const ShadowPlan plan = PlanShadow(rootFiles, variantFiles);
+            if (!plan.ok) continue;
+            const std::string id = BmsModelId(bike, variantDir, false);
+            if (id.empty()) continue;
+            const std::string name = ShadowName(bike, id), dir = root + "\\" + name;
+            const std::string wantedKey = Lower(name);
+            if (wanted.count(wantedKey)) continue;
+
+            bool ok = false;
+            if (MsDirExists(dir)) {
+                std::string markedBike, markedId;
+                if (!BmsMarkerOf(dir, markedBike, markedId)) {
+                    Log("[modelsync] %s exists without a valid marker - left alone", dir.c_str());
+                    continue;
+                }
+                if (_stricmp(markedBike.c_str(), bike.c_str()) != 0 || markedId != id) {
+                    Log("[modelsync] %s has a marker for a different model - left alone", dir.c_str());
+                    wanted.insert(wantedKey); // an id8 collision must not delete the occupied folder below
+                    continue;
+                }
+                ok = BmsLinkPaints(bikeDir, dir);
+            } else if (CreateDirectoryA(dir.c_str(), nullptr)) {
+                ok = BmsLinkSet(bikeDir, dir, plan.fromRoot) &&
+                     BmsLinkSet(variantDir, dir, plan.fromVariant) &&
+                     BmsLinkPaints(bikeDir, dir) && BmsWriteMarker(dir, bike, id);
+                if (!ok) BmsRemoveShadow(dir);
+            }
+            if (!ok) {
+                Log("[modelsync] could not prepare %s (error %lu)", dir.c_str(), GetLastError());
+                continue;
+            }
+            wanted.insert(wantedKey);
+            g_bmsShadows.Set(bike, id, name);
+            ++ready;
+        }
+    }
+
+    BmsListDirs(root, bikes);
+    for (const std::string& name : bikes) {
+        if (!LooksLikeShadow(name) || wanted.count(Lower(name))) continue;
+        std::string bike, id;
+        const std::string dir = root + "\\" + name;
+        if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+    }
+    Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
 }
 // Move each named file from srcDir to dstDir (created if needed). All-or-nothing: on the
 // first failure the ones already moved are moved back and it returns false.
@@ -1688,6 +1963,7 @@ static void MsScanBikes() {
         if (fd.cFileName[0] == '.') continue;
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::string bike = fd.cFileName;
+        if (frostmod::bikesync::LooksLikeShadow(bike)) continue;
         if (MsFileExists(MsActiveEdf(bike)) || MsDirExists(MsLibDir(bike)))
             g_msBikes.push_back(bike);
     } while (FindNextFileA(h, &fd));
@@ -1742,6 +2018,8 @@ static void MsApply(const std::string& bike, const std::string& target) {
     std::vector<std::string> rootFiles, targetFiles;
     MsListFiles(rootDir,   rootFiles);                          // current model files to back up
     MsListFiles(targetDir, targetFiles);                       // variant files to bring in
+    // Preserve the target's id before its files move so "same as mine" stays current.
+    const std::string targetId = g_rsOn.load() ? BmsModelId(bike, targetDir, false) : std::string();
     // 1) back up the current set into the library (all-or-nothing; MsMoveSet rolls itself back).
     if (!rootFiles.empty() && !MsMoveSet(rootDir, backupDir, rootFiles, "backup")) {
         SetStatus("model swap: files in use - exit the bike first", 6000);
@@ -1754,6 +2032,15 @@ static void MsApply(const std::string& bike, const std::string& target) {
         return;
     }
     MsWriteActive(bike, target);
+    if (g_rsOn.load()) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const std::string key = frostmod::bikesync::Lower(bike);
+        if (!targetId.empty()) {
+            g_bmsActiveId[key] = targetId;
+        } else {
+            g_bmsActiveId.erase(key);
+        }
+    }
     Log("[model] %s: model set '%s' -> '%s' (%zu files) - reloading.",
         bike.c_str(), activeLabel.c_str(), target.c_str(), targetFiles.size());
     SetStatus("model swapped - reloading", 4000);
@@ -3038,6 +3325,158 @@ static bool RebuildRidersIn(uint64_t slots, const char* why) {
 
 void RebuildRiders() { RebuildRidersIn(~0ull, "F8 menu"); }
 
+// ---- per-rider bike model sync ------------------------------------------------------
+static std::string BmsActiveIdOf(const char* bike) {
+    const std::string key = frostmod::bikesync::Lower(bike);
+    {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsActiveId.find(key);
+        if (it != g_bmsActiveId.end()) return it->second;
+    }
+    // Render thread: never hash here (a model.edf is tens of MB). Library bikes were hashed
+    // at Init; a bike with no library has no shadows, so ChooseShadow cannot pick one.
+    return "";
+}
+
+static uintptr_t BmsBikeEntry(int index) {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (index < 0 || index >= count || count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr))
+        return 0;
+    return arr ? arr + (uintptr_t)index * mxb::BIKE_STRIDE : 0;
+}
+
+static bool BmsGfxLoaded(uintptr_t entry) {
+    int state = 0;
+    return entry && SafeReadBytes((const char*)(entry + mxb::BIKE_GFX_STATE),
+                                  (char*)&state, sizeof(state)) == sizeof(state) && state != 0;
+}
+
+static int BmsLoadedBikeGfx() {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr) || !arr)
+        return frostmod::bikesync::kMaxLoadedBikeGfx;
+    int loaded = 0;
+    for (int i = 0; i < count; ++i)
+        if (BmsGfxLoaded(arr + (uintptr_t)i * mxb::BIKE_STRIDE))
+            ++loaded;
+    return loaded;
+}
+
+using BmsGfxLoad_t = int(__fastcall*)(int, int);
+static bool BmsCallGfxLoad(int bike) {
+    __try { ((BmsGfxLoad_t)(g_base + mxb::RVA_BIKE_GFX_LOAD))(bike, 0); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static int BmsDistinctShadows(int exceptSlot) {
+    std::set<std::string> shadows;
+    AcquireSRWLockShared(&g_bmsTableLock);
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (i == exceptSlot) continue;
+        const auto* entry = g_bmsTable.Get(i);
+        if (entry && !entry->shadow.empty()) shadows.insert(entry->shadow);
+    }
+    ReleaseSRWLockShared(&g_bmsTableLock);
+    return (int)shadows.size();
+}
+
+void BikeSyncTick() {
+    using namespace frostmod::bikesync;
+    if (!g_rsOn.load() || !g_bmsHooksReady.load() || g_reloadActive.load() || !PaintsSupported()) return;
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 500;
+
+    std::vector<frostmod::RiderLook> looks;
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        looks = g_riderLooks;
+    }
+    static std::set<std::string> said;
+    static std::set<std::string> bad;
+    const char* me = frostmod::crash::TheContext().rider;
+
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0) {
+            AcquireSRWLockExclusive(&g_bmsTableLock);
+            g_bmsTable.Clear(i);
+            ReleaseSRWLockExclusive(&g_bmsTableLock);
+            DropModelSyncPending(i);
+            continue;
+        }
+        if (IsLocalRider(i, me)) continue;
+        char bike[32] = {0};
+        char paint[32] = {0};
+        char rider[32] = {0};
+        if (!ReadVehicle(i, bike, paint)) continue;
+        RiderNameOf(LoadRequestOf(i), rider);
+        if (!rider[0]) continue;
+        const int key = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+
+        const frostmod::RiderLook* look = nullptr;
+        for (const auto& candidate : looks) {
+            if (frostmod::NameMatches(candidate.rider, rider)) {
+                look = &candidate;
+                break;
+            }
+        }
+        const std::string swapId = look ? frostmod::BikeSwapId(*look, bike) : std::string();
+        std::string want = ChooseShadow(swapId, bike, BmsActiveIdOf(bike), g_bmsShadows);
+
+        RemapTable::Entry old;
+        bool haveOld = false;
+        AcquireSRWLockShared(&g_bmsTableLock);
+        if (const auto* entry = g_bmsTable.Get(i)) {
+            old = *entry;
+            haveOld = true;
+        }
+        ReleaseSRWLockShared(&g_bmsTableLock);
+        const bool sameVehicle = haveOld && old.key == key;
+        if (sameVehicle && old.shadow == want) continue;
+
+        if (!want.empty()) {
+            const std::string badKey = Lower(want);
+            int shadowIdx = bad.count(badKey) ? -1 : BikeIndexOf(want.c_str());
+            uintptr_t entry = shadowIdx >= 0 ? BmsBikeEntry(shadowIdx) : 0;
+            if (shadowIdx < 0 || !entry) {
+                if (said.insert("missing:" + badKey).second) {
+                    Log("[modelsync] shadow bike '%s' is not in the game bike list - staying stock",
+                        want.c_str());
+                }
+                want.clear();
+            } else if (!BmsGfxLoaded(entry)) {
+                const bool shadowCap = BmsDistinctShadows(i) >= kMaxShadowsInUse;
+                const bool gfxCap = BmsLoadedBikeGfx() >= kMaxLoadedBikeGfx;
+                if (shadowCap || gfxCap) {
+                    const std::string reason = shadowCap ? "shadow-cap:" : "gfx-cap:";
+                    if (said.insert(reason + badKey).second) {
+                        Log("[modelsync] refusing to preload '%s': %s - staying stock", want.c_str(),
+                            shadowCap ? "six distinct shadows are already in use"
+                                      : "eight bike gfx entries are already loaded");
+                    }
+                    want.clear();
+                } else if (!BmsCallGfxLoad(shadowIdx) || !BmsGfxLoaded(entry)) {
+                    bad.insert(badKey);
+                    Log("[modelsync] gfx load faulted or did not load '%s' - bad for this session, staying stock",
+                        want.c_str());
+                    want.clear();
+                }
+            }
+        }
+
+        const bool rebuild = !want.empty() || (sameVehicle && !old.shadow.empty());
+        AcquireSRWLockExclusive(&g_bmsTableLock);
+        g_bmsTable.Set(i, key, want);
+        ReleaseSRWLockExclusive(&g_bmsTableLock);
+        if (rebuild) QueueModelSyncRebuild(i, key);
+    }
+}
+
 // ---- automatic: a gear refresh brought in a model a rider on the server is wearing ------
 // Before the refresh, note every remote rider whose rider, helmet or boots model is not in
 // the lists (the game built them with a stand-in). After it, the ones whose models are all
@@ -3109,6 +3548,320 @@ void ArrivedGearTick() {
     const uint64_t slots = g_gearArrived;
     g_gearArrived = 0;
     RebuildRidersIn(slots, "new gear models arrived");
+}
+
+// ===========================================================================
+// RIDER MODEL SYNC
+static ridersync::GearIndex g_rsIndex;
+static ridersync::Override g_rsOverride[mxb::VEHICLE_MAX];
+static char g_rsFolder[mxb::VEHICLE_MAX][ridersync::kParts][32] = {};
+static HANDLE g_rsIndexThread = nullptr;
+static std::atomic<bool> g_rsIndexRunning{false};
+struct RsCacheEntry { uint64_t mtime, size; std::string id; };
+static std::mutex g_rsCacheMutex;
+static std::map<std::string, RsCacheEntry> g_rsCache;
+
+static const mxb::GearPart& RsGearPart(ridersync::Part p) {
+    return mxb::kGearParts[p == ridersync::Rider ? 0 : p == ridersync::Boots ? 1 : 2];
+}
+static int RsVehOffset(ridersync::Part p) {
+    return p == ridersync::Rider ? 0xD0 : p == ridersync::Helmet ? 0xF0 : 0x1B0;
+}
+static bool RsInstalled(ridersync::Part p, const std::string& folder) {
+    return GearModelIndex(RsGearPart(p), folder.c_str()) >= 0;
+}
+// budget: bytes this call may read on a cache miss (nullptr = no limit). The receiver index
+// spends at most kRsIndexBudget per pass, so a big gear folder library is hashed over several
+// passes instead of in one burst of disk reads.
+static constexpr uint64_t kRsIndexBudget = 512ull * 1024 * 1024;
+static bool RsHashFolder(ridersync::Part part, const std::string& path, std::string& id,
+                         uint64_t* budget = nullptr) {
+    std::vector<ridersync::FileEntry> found, files;
+    uint64_t maxTime = 0, total = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((path + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        const uint64_t mt = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (mt > maxTime) maxTime = mt;
+        total += size;
+        found.push_back({fd.cFileName, size});
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (!ridersync::CanonicalFiles(std::move(found), files)) return false;
+    const std::string cacheKey = ridersync::Lower(path) + "|" + std::to_string((int)part);
+    {
+        std::lock_guard<std::mutex> lk(g_rsCacheMutex);
+        auto it = g_rsCache.find(cacheKey);
+        if (it != g_rsCache.end() && it->second.mtime == maxTime && it->second.size == total) {
+            id = it->second.id;
+            return true;
+        }
+    }
+    if (budget) {
+        if (total > *budget) return false;
+        *budget -= total;
+    }
+    ridersync::GearHasher hash;
+    hash.Begin(part);
+    unsigned char buf[64 * 1024];
+    for (const auto& file : files) {
+        if (g_unloading.load()) return false;
+        hash.File(file.name, file.size);
+        HANDLE in = CreateFileA((path + "\\" + file.name).c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (in == INVALID_HANDLE_VALUE) return false;
+        uint64_t readTotal = 0;
+        DWORD got = 0;
+        BOOL ok;
+        do {
+            ok = ReadFile(in, buf, sizeof(buf), &got, nullptr);
+            if (ok && got) {
+                hash.Update(buf, got);
+                readTotal += got;
+            }
+        } while (ok && got && !g_unloading.load());
+        CloseHandle(in);
+        if (!ok || readTotal != file.size || g_unloading.load()) return false;
+    }
+    id = hash.Final();
+    {
+        std::lock_guard<std::mutex> lk(g_rsCacheMutex);
+        g_rsCache[cacheKey] = {maxTime, total, id};
+    }
+    return true;
+}
+static std::string RsPartRoot(ridersync::Part p) {
+    return std::string(g_modsPath) + "\\rider\\" + ridersync::PartDir(p);
+}
+
+static void RsBuildIndex(ridersync::GearIndex& index) {
+    if (!g_modsPath[0]) return;
+    uint64_t budget = kRsIndexBudget;
+    for (int pi = 0; pi < ridersync::kParts; ++pi) {
+        if (g_unloading.load()) return;
+        const auto p = (ridersync::Part)pi;
+        const std::string root = RsPartRoot(p);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((root + "\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        int folders = 0;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || strlen(fd.cFileName) > 31) continue;
+            if (++folders > 400) break;
+            std::string id;
+            if (RsHashFolder(p, root + "\\" + fd.cFileName, id, &budget)) index.Set(p, fd.cFileName, id);
+        } while (!g_unloading.load() && FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+}
+
+static DWORD WINAPI RsIndexThread(LPVOID) {
+    ridersync::GearIndex next;
+    RsBuildIndex(next);
+    const size_t count = next.Size();
+    if (!g_unloading.load()) {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        g_rsIndex = std::move(next);
+    }
+    static int logs = 0;
+    if (!g_unloading.load() && logs++ < 5) {
+        Log("[modelsync] indexed %zu installed gear model folders", count);
+    }
+    g_rsIndexRunning.store(false);
+    return 0;
+}
+
+static void RsStartIndexBuild() {
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (last && now - last < 30000) return;
+    if (g_unloading.load()) return;
+    bool expected = false;
+    if (!g_rsIndexRunning.compare_exchange_strong(expected, true)) return;
+    if (g_unloading.load()) {
+        g_rsIndexRunning.store(false);
+        return;
+    }
+    if (g_rsIndexThread) {
+        CloseHandle(g_rsIndexThread);
+        g_rsIndexThread = nullptr;
+    }
+    g_rsIndexThread = CreateThread(nullptr, 0, RsIndexThread, nullptr, 0, nullptr);
+    if (!g_rsIndexThread) {
+        g_rsIndexRunning.store(false);
+        Log("[modelsync] could not start the gear index thread");
+        return;
+    }
+    last = now;
+    SetThreadPriority(g_rsIndexThread, THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+void RiderLooksSet(std::vector<frostmod::RiderLook> looks) {
+    if (!g_rsOn.load()) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log("[modelsync] set_rider_looks ignored because modelsync=0");
+        }
+        return;
+    }
+    const bool needIndex = !looks.empty();
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        g_riderLooks = std::move(looks);
+    }
+    if (needIndex) {
+        RsStartIndexBuild();
+    }
+}
+
+using RiderGfxBuild_t = uintptr_t(__fastcall*)(uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,
+    uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,
+    uintptr_t,uintptr_t,uintptr_t);
+static RiderGfxBuild_t g_rsOrigBuild = nullptr;
+static bool g_rsHookTried = false;
+static void RsSwapArgs(uintptr_t a1, uintptr_t& a6, uintptr_t& a7, uintptr_t& a13) {
+    if (!g_rsOn.load() || g_reloadActive.load() || a1 < g_base + mxb::RVA_VEHICLES + mxb::VEH_GFX) return;
+    const uintptr_t delta = a1 - mxb::VEH_GFX - (g_base + mxb::RVA_VEHICLES);
+    if (delta % mxb::VEHICLE_STRIDE) return;
+    const int slot = (int)(delta / mxb::VEHICLE_STRIDE);
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1 == slot) return;
+    const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+    const ridersync::Override& o = g_rsOverride[slot]; if (!key || o.key != key) return;
+    uintptr_t* args[] = {&a6, &a7, &a13};
+    for (int i = 0; i < ridersync::kParts; ++i) if (!o.folder[i].empty() && RsInstalled((ridersync::Part)i, o.folder[i])) {
+        strcpy_s(g_rsFolder[slot][i], o.folder[i].c_str()); *args[i] = (uintptr_t)g_rsFolder[slot][i];
+    }
+}
+static uintptr_t hkRiderGfxBuild(uintptr_t a1,uintptr_t a2,uintptr_t a3,uintptr_t a4,uintptr_t a5,uintptr_t a6,
+    uintptr_t a7,uintptr_t a8,uintptr_t a9,uintptr_t a10,uintptr_t a11,uintptr_t a12,uintptr_t a13,uintptr_t a14,
+    uintptr_t a15,uintptr_t a16,uintptr_t a17,uintptr_t a18,uintptr_t a19,uintptr_t a20,uintptr_t a21) {
+    static bool faultLogged = false;
+    const uintptr_t original6 = a6, original7 = a7, original13 = a13;
+    __try { RsSwapArgs(a1, a6, a7, a13); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        a6 = original6; a7 = original7; a13 = original13;
+        if (!faultLogged) { faultLogged = true; Log("[modelsync] rider builder decision faulted; passing original args"); }
+    }
+    return g_rsOrigBuild(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18,a19,a20,a21);
+}
+static void RsEnsureHook() {
+    if (g_rsHookTried || !g_rsOn.load() || !PaintsSupported() || g_unloading.load()) return;
+    g_rsHookTried = true; uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_RIDER_GFX_BUILD);
+    static const uint8_t sig[] = {0x40,0x53,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x81,0xEC,0xB8,0x09,0x00,0x00};
+    if (mxb::LooksDetoured(fn) || memcmp(fn, sig, sizeof(sig))) { Log("[modelsync] rider builder 0x4CE00 is detoured or has an unknown prologue; disabled"); return; }
+    if (InstallHook(fn, (void*)&hkRiderGfxBuild, (void**)&g_rsOrigBuild, "riderGfxBuild(0x4CE00)")) Log("[modelsync] rider builder hook installed");
+}
+static void RsScan() {
+    std::vector<frostmod::RiderLook> looks;
+    ridersync::GearIndex index;
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        looks = g_riderLooks;
+        index = g_rsIndex;
+    }
+    const char* me = frostmod::crash::TheContext().rider;
+    if (!me[0]) return;
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        const int key = SafeReadInt((const int*)(v + mxb::VEH_KEY));
+        if (!SafeReadInt((const int*)v)) {
+            g_rsOverride[i] = {};
+            DropModelSyncPending(i);
+            continue;
+        }
+        if (g_rsOverride[i].key && g_rsOverride[i].key != key) {
+            g_rsOverride[i] = {};
+            DropStaleModelSyncPending(i, key);
+            continue;
+        }
+        if (IsLocalRider(i, me)) continue;
+        char name[32];
+        RiderNameOf(LoadRequestOf(i), name);
+        if (!name[0]) continue;
+        const frostmod::RiderLook* look = nullptr;
+        for (const auto& candidate : looks) {
+            if (frostmod::NameMatches(candidate.rider, name)) {
+                look = &candidate;
+                break;
+            }
+        }
+        std::string own[ridersync::kParts];
+        for (int p = 0; p < ridersync::kParts; ++p) {
+            char folder[32] = {};
+            SafeCopyStr((void*)(v + RsVehOffset((ridersync::Part)p)), folder, sizeof(folder));
+            own[p] = folder;
+        }
+        auto next = ridersync::Decide(look, key, own, index, RsInstalled);
+        // Nothing to draw differently before or after: remember the key, no rebuild.
+        if (!next.Any() && !g_rsOverride[i].Any()) {
+            g_rsOverride[i] = std::move(next);
+            continue;
+        }
+        if (next != g_rsOverride[i]) {
+            g_rsOverride[i] = std::move(next);
+            QueueModelSyncRebuild(i, key);
+        }
+    }
+}
+void RiderSyncTick() {
+    RsEnsureHook();
+    if (!g_rsOn.load()) return;
+    static uint64_t nextScan = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= nextScan) {
+        nextScan = now + 2000;
+        __try {
+            RsScan();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                Log("[modelsync] vehicle scan faulted");
+            }
+        }
+    }
+}
+
+static void ModelSyncRebuildTick() {
+    if (!g_modelSyncPending || g_reloadActive.load()) return;
+    // One rider per rebuild, spaced out: a full grid arriving at once must not rebuild a rider
+    // every frame, and a rebuild the game turns down is not retried on the next frame.
+    static uint64_t nextBuild = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < nextBuild) return;
+    static bool waiting = false;
+    if (GameDefersRiderBuild()) {
+        if (!waiting) Log("[modelsync] waiting for the pits");
+        waiting = true;
+        return;
+    }
+    waiting = false;
+    int slot = 0;
+    while (slot < mxb::VEHICLE_MAX && !(g_modelSyncPending & (1ull << slot))) {
+        ++slot;
+    }
+    if (slot >= mxb::VEHICLE_MAX) return;
+    const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+    if (!SafeReadInt((const int*)VehicleAt(slot)) || key != g_modelSyncPendingKey[slot]) {
+        DropModelSyncPending(slot);
+        return;
+    }
+    char name[32];
+    RiderNameOf(LoadRequestOf(slot), name);
+    Log("[modelsync] slot %d '%s': rider='%s' helmet='%s' boots='%s'", slot, name,
+        g_rsOverride[slot].folder[0].c_str(), g_rsOverride[slot].folder[1].c_str(),
+        g_rsOverride[slot].folder[2].c_str());
+    nextBuild = now + 2000;
+    if (RebuildRidersIn(1ull << slot, "model sync")) {
+        DropModelSyncPending(slot);
+        // The builder may have used a shadow index; roster paint lookup must use the real bike.
+        ApplyBikePaint(slot, false);
+    }
 }
 
 // ===========================================================================
@@ -3272,7 +4025,8 @@ void OpenChange() {
         const uintptr_t arr = ReadPtr(mxb::RVA_BIKE_LIST);
         char name[64];
         for (int i = 0; arr && i < n && i < 100000; ++i)
-            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) && name[0])
+            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) &&
+                name[0] && !frostmod::bikesync::LooksLikeShadow(name))
                 bikes.push_back(name);
         g_chRows[CH_BIKE].opts = bikes;
     }
@@ -3976,6 +4730,7 @@ static void SaveOverlaySettings() {
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
+    fprintf(f, "modelsync=%d\n", g_rsOn.load() ? 1 : 0);
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (MenuKey() != frostmod::hotkey::Default()) {
@@ -4051,6 +4806,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
         else if (sscanf_s(line, "servermsg=%d",  &v) == 1) g_msgOn.store(v != 0);
+        else if (sscanf_s(line, "modelsync=%d", &v) == 1) g_rsOn.store(v == 1);
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
@@ -4059,10 +4815,11 @@ static void LoadOverlaySettings() {
     // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
     // fix) match nothing above and are skipped; the next save drops them.
     char mk[48]; MenuKeyName(mk, sizeof(mk));
-    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d menukey=%s%s",
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d modelsync=%d y=%d port=%d menukey=%s%s",
         g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_rsOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
+    if (g_rsOn.load()) Log("[modelsync] modelsync=1: remote rider, gear and bike models are matched by content");
 }
 
 
@@ -5849,6 +6606,9 @@ void Tick() {
     SessionGuardsTick(); // the list-box and pointer stubs' counters, the same way
     ProtTick();          // what the guards caught, to frostmod-protection.jsonl for MXB App
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
+    RiderSyncTick();     // content-matched remote rider/helmet/boots models, when enabled
+    BikeSyncTick();      // content-matched remote bike models, when enabled
+    ModelSyncRebuildTick(); // one shared rider rebuild serves gear and bike changes
     RaceFilterTick();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
@@ -6885,6 +7645,14 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
     } else if (verb == "refresh_gear") {
         Log("[cmd] gear refresh requested by MXB App");
         RequestGearRefresh();
+    } else if (verb == "set_rider_looks") {
+        std::string encoded;
+        if (!JsonStringField(doc, "looks", encoded)) return;
+        std::vector<frostmod::RiderLook> looks;
+        int skipped = 0;
+        frostmod::ParseRiderLooks(encoded, looks, &skipped);
+        Log("[cmd] set_rider_looks: %zu riders (%d skipped)", looks.size(), skipped);
+        RiderLooksSet(std::move(looks));
     } else if (verb == "refresh_paints") {
         // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
         // only the paint lists, and its live-paints pass applies whatever riders on track
@@ -7906,6 +8674,104 @@ static bool SsgMxbOnly(const char* tag) {
     return false;
 }
 
+// ---- per-rider bike model sync builders -------------------------------------------
+// Only the bike index passed to gfx construction changes. The vehicle record, physics bike
+// index and collision objects are never written, so this remains a visual substitution.
+using BmsBuild_t = int64_t(__fastcall*)(void*, int, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsDeferred_t = int64_t(__fastcall*)(void*, int, int, void*, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsPaintLookup_t = int64_t(__fastcall*)(void*, int, const char*, int*);
+static BmsBuild_t g_origBmsBuild = nullptr;
+static BmsDeferred_t g_origBmsDeferred = nullptr;
+static BmsPaintLookup_t g_origBmsPaintLookup = nullptr;
+static LONG g_bmsLoggedKey[64]{};
+static LONG g_bmsLoggedValid[64]{};
+
+// Kept as a POD/SEH function: a malformed block or bike table can only make this builder use
+// the game's original index. The table overload writes a fixed stack buffer, so this hot path
+// does not allocate.
+static int RemapBikeIndex(void* block, int bikeIdx) {
+    int result = bikeIdx;
+    bool held = false;
+    __try {
+        if (!g_rsOn.load(std::memory_order_relaxed)) return bikeIdx;
+        const int slot = frostmod::bikesync::SlotOfBlock((uintptr_t)block,
+            g_base + mxb::RVA_VEHICLES, mxb::VEHICLE_STRIDE, mxb::VEH_GFX, mxb::VEHICLE_MAX);
+        if (slot < 0 || slot == SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1)
+            return bikeIdx;
+        const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+        char shadow[64] = {0};
+        AcquireSRWLockShared(&g_bmsTableLock); held = true;
+        const bool found = g_bmsTable.Lookup(slot, key, shadow, sizeof(shadow));
+        ReleaseSRWLockShared(&g_bmsTableLock); held = false;
+        if (!found) return bikeIdx;
+        const int shadowIdx = BikeIndexOf(shadow);
+        const uintptr_t entry = BmsBikeEntry(shadowIdx);
+        if (shadowIdx < 0 || !BmsGfxLoaded(entry)) return bikeIdx;
+        result = shadowIdx;
+        const bool first = InterlockedCompareExchange(&g_bmsLoggedValid[slot], 1, 0) == 0;
+        const LONG previousKey = InterlockedExchange(&g_bmsLoggedKey[slot], key);
+        if (first || previousKey != key)
+            Log("[modelsync] slot %d key %d: visual bike '%s' (index %d instead of %d)",
+                slot, key, shadow, shadowIdx, bikeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (held) ReleaseSRWLockShared(&g_bmsTableLock);
+        return bikeIdx;
+    }
+    return result;
+}
+
+static int64_t __fastcall hkBmsBuild(void* block, int bike, uint64_t a2, uint64_t a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsBuild(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                          a12, a13, a14, a15, a16, a17, a18);
+}
+
+static int64_t __fastcall hkBmsDeferred(void* block, int bike, int a2, void* a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18, uint64_t a19, uint64_t a20) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsDeferred(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                             a12, a13, a14, a15, a16, a17, a18, a19, a20);
+}
+
+static int64_t __fastcall hkBmsPaintLookup(void* block, int bike, const char* paint, int* out) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsPaintLookup(block, idx, paint, out);
+}
+
+static void InstallBikeModelSync() {
+    if (!g_rsOn.load() || g_origBmsBuild || g_unloading.load()) return;
+    if (!SsgMxbOnly("modelsync")) return;
+    static const uint8_t build[] = {0x4C,0x8B,0xDC,0x55,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t deferred[] = {0x48,0x89,0x5C,0x24,0x18,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
+    static const uint8_t paint[] = {0x55,0x56,0x41,0x54,0x41,0x55,0x41,0x56,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t load[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57};
+    if (!SsgCodeIs(mxb::RVA_BIKE_BUILD, build, sizeof(build)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_BUILD_DEFERRED, deferred, sizeof(deferred)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_PAINT_LOOKUP, paint, sizeof(paint)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_GFX_LOAD, load, sizeof(load))) {
+        Log("[modelsync] hooks not installed: beta21e builder/load bytes do not match (game updated?)");
+        return;
+    }
+    const bool a = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD), (void*)&hkBmsBuild,
+                               (void**)&g_origBmsBuild, "modelSyncBikeBuild(0x4D8C0)");
+    const bool b = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD_DEFERRED), (void*)&hkBmsDeferred,
+                               (void**)&g_origBmsDeferred, "modelSyncDeferred(0x45020)");
+    const bool c = InstallHook((void*)(g_base + mxb::RVA_BIKE_PAINT_LOOKUP), (void*)&hkBmsPaintLookup,
+                               (void**)&g_origBmsPaintLookup, "modelSyncPaintLookup(0x455C0)");
+    g_bmsHooksReady.store(a && b && c);
+    Log("[modelsync] visual bike builders %s (%d/3 hooks)", a && b && c ? "on" : "incomplete",
+        (int)a + (int)b + (int)c);
+}
+
 // ---- +0x45B0: the bike list ----------------------------------------------------------
 using BikeCatFn = int (*)(int bike, int* cat);
 static BikeCatFn                g_origBikeCat = nullptr;
@@ -8233,6 +9099,7 @@ static void SessionGuardsTick() {
 
 static void InstallSessionGuards() {
     InstallBikeListGuard();
+    InstallBikeModelSync();
     InstallWakeGuard();
     InstallListBoxGuard();
     InstallPtr64Fix();
@@ -9369,6 +10236,9 @@ DWORD WINAPI Init(LPVOID) {
             Log("[session] block unavailable - MXB App cannot see this session");
         }
         LoadOverlaySettings();  // restore radar / outline toggles, range, overlay size
+        // Shadows must exist before the game's first bike scan; when the feature is off this
+        // same point removes only folders carrying our marker from an earlier launch.
+        BikeSyncMaterialize();
         // Now that the saved limit is known, put the rider-visibility patch in. Before any
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
@@ -9514,6 +10384,13 @@ static void PinSelf() {
 static void TdStopThreads(bool canBlock) {
     MsgFeedStop(canBlock);   // no-op in the plugin copy, which never started one
     MdStop(canBlock);
+    // The model index checks g_unloading between files, so shutdown can join it promptly.
+    if (g_rsIndexThread && canBlock) {
+        if (WaitForSingleObject(g_rsIndexThread, 2000) != WAIT_OBJECT_0)
+            Log("[unload] model index thread still running");
+        CloseHandle(g_rsIndexThread);
+        g_rsIndexThread = nullptr;
+    }
     // Init can sit up to 30 s waiting for the scanner; g_unloading already stops it hooking.
     if (g_initThread && canBlock) {
         if (WaitForSingleObject(g_initThread, 2000) != WAIT_OBJECT_0)

@@ -4877,6 +4877,7 @@ static void LsRebuildIndex() {
     }
 }
 
+static HANDLE g_lsIndexThread = nullptr;   // joined in TdStopThreads; the dll must outlive it
 static DWORD WINAPI LsIndexThread(LPVOID) {
     LsRebuildIndex();
     g_lsIndexRunning.store(false);
@@ -4887,14 +4888,14 @@ static DWORD WINAPI LsIndexThread(LPVOID) {
 static bool LsStartIndexRebuild() {
     bool expected = false;
     if (!g_lsIndexRunning.compare_exchange_strong(expected, true) || g_msgQuit.load()) return false;
-    HANDLE thread = CreateThread(nullptr, 0, LsIndexThread, nullptr, 0, nullptr);
-    if (!thread) {
+    if (g_lsIndexThread) { CloseHandle(g_lsIndexThread); g_lsIndexThread = nullptr; }   // the last one has finished
+    g_lsIndexThread = CreateThread(nullptr, 0, LsIndexThread, nullptr, 0, nullptr);
+    if (!g_lsIndexThread) {
         g_lsIndexRunning.store(false);
         return false;
     }
-    SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
-    CloseHandle(thread); // The atomic flag owns its lifetime; shutdown is signalled by g_msgQuit.
-    return true;
+    SetThreadPriority(g_lsIndexThread, THREAD_PRIORITY_BELOW_NORMAL);
+    return true;   // shutdown is signalled by g_msgQuit; TdStopThreads joins it
 }
 
 static bool LsOwnLook(looksync::Look& look) {
@@ -10020,6 +10021,13 @@ static void PinSelf() {
 static void TdStopThreads(bool canBlock) {
     MsgFeedStop(canBlock);   // no-op in the plugin copy, which never started one
     MdStop(canBlock);
+    // The looksync paint index stops on g_msgQuit (set by MsgFeedStop) between files.
+    if (g_lsIndexThread && canBlock) {
+        if (WaitForSingleObject(g_lsIndexThread, 2000) != WAIT_OBJECT_0)
+            Log("[unload] looksync index thread still running");
+        CloseHandle(g_lsIndexThread);
+        g_lsIndexThread = nullptr;
+    }
     // Init can sit up to 30 s waiting for the scanner; g_unloading already stops it hooking.
     if (g_initThread && canBlock) {
         if (WaitForSingleObject(g_initThread, 2000) != WAIT_OBJECT_0)

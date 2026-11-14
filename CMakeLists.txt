@@ -186,6 +186,10 @@ find_package(Threads REQUIRED)
 target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
 add_test(NAME gamefeed COMMAND gamefeed_test)
 
+# --- rider model sync rules (src/ridersync.h) ---------------------------------
+add_executable(ridersync_test tests/ridersync_test.cpp)
+add_test(NAME ridersync COMMAND ridersync_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)

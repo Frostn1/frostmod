@@ -72,7 +72,7 @@ struct Sha256 {
         const unsigned char* p = static_cast<const unsigned char*>(data);
         bytes += n;
         while (n) {
-            size_t take = std::min(n, sizeof(block) - used);
+            size_t take = (std::min)(n, sizeof(block) - used);
             std::memcpy(block + used, p, take);
             used += take;
             p += take;

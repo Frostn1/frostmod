@@ -48,6 +48,7 @@ restart the server (or the `.exe`) to pick up changes.
 # frostserver v1
 port: 54210          # TCP port for the HTTP API; clients reach <server-ip>:<port>
 name: 'My MX Server' # optional friendly name reported in /frostserver/info
+looksync: true       # relay installed-skin IDs between FrostMod riders
 
 fair_send: true      # keep distant riders from going invisible; see below
 fair_send_ticks: 9   # how far into a rider's silence to act, in 30ms ticks
@@ -63,13 +64,30 @@ maps:
 
 - **`port`** — the API port. Clients reach the server at `http://<server-ip>:<port>`.
   Make sure it's open in the server's firewall / forwarded, like the game port.
-- **`name`** — cosmetic; echoed back in `/frostserver/info`.
+- **`name`** - cosmetic; echoed back in `/frostserver/info`.
+- **`looksync`** - enables the rider-look routes below. Set it to `false` to make
+  both routes return 404.
 - **`fair_send`** / **`fair_send_ticks`** — see
   [Keeping distant riders visible](#keeping-distant-riders-visible). On by default.
 - **`maps`** — the track-name → link table. The key must match the track name the
   server reports; FrostServer logs that exact string every time a race starts, so
   the reliable way to fill this in is to run the track once and copy the name from
   `frostserver.log`.
+
+## Rider looks API
+
+FrostMod may post `{"raceNumber":N,"rider":"name","bike":"folder","skin":"32 lowercase hex"}`
+to `/frostserver/look`. The skin is the first 16 bytes of the paint file's SHA-256;
+files are never uploaded or downloaded. The claim may also carry `swap`, `riderModel`, `helmet` and
+`boots` ids in the same format, which later FrostMod versions use for model swaps; a server relays
+them without reading them. `GET /frostserver/looks` returns the complete
+current list as `{"seq":N,"looks":[...]}`. A client only applies a listed skin when the
+same bytes are already installed locally, so this is visual only.
+
+Up to four riders may claim looks from one source address. Each claim is keyed by source
+address, rider name and race number, so changing a rider's skin replaces only that rider's
+entry. The first address to claim a rider name and race number keeps it while live; claims
+expire after 20 seconds, so riders who leave vanish.
 
 ## Keeping distant riders visible
 

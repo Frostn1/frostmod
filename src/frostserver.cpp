@@ -50,6 +50,7 @@
 #include "serverrejoin.h"  // a rider who leaves is taken off everybody's screen
 #include "sessionguards.h" // the host-side crash at +0x7A860 (riderinfo), shared with FrostMod
 #include "servermsg.h"  // the announcement model + feed JSON, shared with FrostMod
+#include "looksync.h"
 #include "version.h"
 
 #pragma comment(lib, "ws2_32.lib")   // harmless duplicate of the CMake link
@@ -193,6 +194,7 @@ struct Config {
     std::vector<Announce> announce;              // timed lines from this file
     std::string           announceToken;         // bearer token for POST; empty = endpoint off
     bool                  announceSession = false;  // a line when the track changes
+    bool                  lookSync = true;
 };
 std::mutex g_cfgMutex;
 Config     g_cfg;
@@ -207,6 +209,7 @@ const char* kDefaultConfig =
     "\n"
     "port: 54210          # TCP port for the HTTP API; clients reach <server-ip>:<port>\n"
     "name: ''             # optional friendly server name reported in /frostserver/info\n"
+    "looksync: true       # relay riders' bike skin IDs; false disables both look routes\n"
     "\n"
     "# On a full gate this server cannot fit every rider into one update packet, so it\n"
     "# sends the riders nearest each player first and drops the rest. The riders furthest\n"
@@ -372,6 +375,10 @@ void LoadConfig() {
         else if (key == "announce_session") { std::string v = lower(stripComment(val)); c.announceSession = (v == "true" || v == "1" || v == "yes"); }
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
+        else if (key == "looksync") {
+            std::string v = lower(stripComment(val));
+            c.lookSync = !(v == "false" || v == "0" || v == "no");
+        }
         else if (key == "rejoin_fix") { std::string v = lower(stripComment(val)); c.rejoinFix = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "crash_guards") { std::string v = lower(stripComment(val)); c.crashGuards = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "fair_send") { std::string v = lower(stripComment(val)); c.fairSend = !(v == "false" || v == "0" || v == "no"); }
@@ -394,9 +401,9 @@ void LoadConfig() {
             c.announce.erase(c.announce.begin() + (long)i);
         }
 
-    Log("[config] loaded: port=%d name='%s' maps=%zu announce=%zu session=%d push=%s",
+    Log("[config] loaded: port=%d name='%s' maps=%zu announce=%zu session=%d push=%s looksync=%d",
         c.port, c.name.c_str(), c.maps.size(), c.announce.size(), (int)c.announceSession,
-        c.announceToken.empty() ? "off" : "on");
+        c.announceToken.empty() ? "off" : "on", (int)c.lookSync);
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     g_cfg = std::move(c);
 }
@@ -684,6 +691,69 @@ std::string HeaderValue(const std::string& req, const char* name) {
 // about it is bounded: the body has a cap, the token must match, and the message goes
 // through exactly the same clamps as a line configured in the file.
 constexpr size_t kMaxBody = 4096;
+std::mutex g_lookMutex;
+looksync::Registry g_looks;
+
+static bool LookSyncEnabled() {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    return g_cfg.lookSync;
+}
+
+static uint32_t NowSec() {
+    return (uint32_t)std::time(nullptr);
+}
+
+void HandleLook(SOCKET c, std::string& req, uint32_t ip) {
+    if (!LookSyncEnabled()) {
+        SendResponse(c, "404 Not Found", "text/plain", "not found");
+        return;
+    }
+    size_t headerEnd = req.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        SendResponse(c, "400 Bad Request", "text/plain", "malformed request");
+        return;
+    }
+    const size_t declared = (size_t)atoi(HeaderValue(req, "content-length").c_str());
+    if (declared > 1024) {
+        SendResponse(c, "413 Payload Too Large", "text/plain", "body too large");
+        return;
+    }
+    std::string body = req.substr(headerEnd + 4);
+    char more[512];
+    while (body.size() < declared && body.size() < 1024) {
+        int n = recv(c, more, sizeof(more), 0);
+        if (n <= 0) break;
+        body.append(more, (size_t)n);
+    }
+    if (body.size() != declared) {
+        SendResponse(c, "400 Bad Request", "text/plain", "incomplete body");
+        return;
+    }
+    looksync::Look look;
+    if (!looksync::ParseClaimJson(body, look)) {
+        SendResponse(c, "400 Bad Request", "application/json", "{\"error\":\"invalid look claim\"}");
+        return;
+    }
+    looksync::Registry::Result result;
+    {
+        std::lock_guard<std::mutex> lk(g_lookMutex);
+        result = g_looks.Claim(ip, look, NowSec());
+    }
+    if (result == looksync::Registry::Accepted)
+        SendResponse(c, "200 OK", "application/json", "{\"ok\":true}");
+    else if (result == looksync::Registry::Rejected_Taken)
+        SendResponse(c, "409 Conflict", "application/json", "{\"error\":\"rider already claimed\"}");
+    else if (result == looksync::Registry::Rejected_Full)
+        SendResponse(c, "409 Conflict", "application/json", "{\"error\":\"registry full\"}");
+    else
+        SendResponse(c, "400 Bad Request", "application/json", "{\"error\":\"invalid look claim\"}");
+}
+
+std::string BuildLooksJson() {
+    std::lock_guard<std::mutex> lk(g_lookMutex);
+    g_looks.Expire(NowSec());
+    return g_looks.BuildFeedJson();
+}
 
 void HandleAnnounce(SOCKET c, std::string& req) {
     std::string token;
@@ -731,7 +801,7 @@ void HandleAnnounce(SOCKET c, std::string& req) {
     SendResponse(c, "200 OK", "application/json", "{\"seq\":" + std::to_string(seq) + "}");
 }
 
-void HandleConnection(SOCKET c) {
+void HandleConnection(SOCKET c, uint32_t peerIp) {
     char buf[4096];
     int len = recv(c, buf, sizeof(buf) - 1, 0);
     if (len <= 0) return;
@@ -748,6 +818,7 @@ void HandleConnection(SOCKET c) {
 
     if (isPost) {
         if (path == "/frostserver/announce") HandleAnnounce(c, req);
+        else if (path == "/frostserver/look") HandleLook(c, req, peerIp);
         else SendResponse(c, "404 Not Found", "text/plain", "not found");
         return;
     }
@@ -761,6 +832,8 @@ void HandleConnection(SOCKET c) {
     else if (path == "/frostserver/messages")
         SendResponse(c, "200 OK", "application/json",
                      BuildMessagesJson(ParseQueryUInt(req, "since", 0)));
+    else if (path == "/frostserver/looks" && LookSyncEnabled())
+        SendResponse(c, "200 OK", "application/json", BuildLooksJson());
     else if (path == "/health" || path == "/frostserver/health")
         SendResponse(c, "200 OK", "text/plain", "ok");
     else
@@ -798,7 +871,7 @@ void HttpServerLoop(int port) {
     }
 
     Log("[http] listening on 0.0.0.0:%d  (GET /frostserver/info, /frostserver/maps, "
-        "/frostserver/messages, /health; POST /frostserver/announce)", port);
+        "/frostserver/messages, /frostserver/looks, /health; POST /frostserver/announce, /frostserver/look)", port);
     while (g_httpRunning.load()) {
         // A timeout rather than a blocking accept, so due announcements go out whether or
         // not anybody happens to call. One thread still, as before.
@@ -811,13 +884,18 @@ void HttpServerLoop(int port) {
         ScheduleTick();
         if (ready <= 0) continue;
 
-        SOCKET c = accept(g_listenSock, nullptr, nullptr);
+        sockaddr_in peer = {};
+        int peerLen = sizeof(peer);
+        SOCKET c = accept(g_listenSock, (sockaddr*)&peer, &peerLen);
         if (c == INVALID_SOCKET) {
             if (!g_httpRunning.load()) break;    // closed by StopHttpServer
             continue;
         }
+        // Bind claims to the actual connected peer, never to a header supplied by it.
+        peerLen = sizeof(peer);
+        if (getpeername(c, (sockaddr*)&peer, &peerLen) == SOCKET_ERROR) peer.sin_addr.s_addr = 0;
         // Never let a bad request take down the listener.
-        __try { HandleConnection(c); }
+        __try { HandleConnection(c, peer.sin_addr.s_addr); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[http] request handler faulted - caught."); }
         closesocket(c);
     }

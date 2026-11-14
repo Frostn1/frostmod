@@ -1,4 +1,6 @@
-#include "looksync.h"
+// Asserts must stay live in Release builds, or this test proves nothing.
+#undef NDEBUG
+#include "../src/looksync.h"
 
 #include <cassert>
 #include <iostream>

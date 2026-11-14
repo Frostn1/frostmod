@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added opt-in per-rider skin synchronization through FrostServer, using short paint hashes only and never transferring files.
+
 Two more crashes from the beta21e reports, together 21% of what v0.51.0 still sends.
 
 ### Fixed

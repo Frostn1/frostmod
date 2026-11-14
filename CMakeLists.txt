@@ -356,6 +356,9 @@ add_test(NAME fairsend COMMAND fairsend_test)
 add_executable(servermsg_test tests/servermsg_test.cpp)
 add_test(NAME servermsg COMMAND servermsg_test)
 
+add_executable(looksync_test tests/looksync_test.cpp)
+add_test(NAME looksync COMMAND looksync_test)
+
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder
 # writes them. src/others.h keeps that apart from Win32.

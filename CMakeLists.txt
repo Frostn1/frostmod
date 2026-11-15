@@ -186,6 +186,11 @@ find_package(Threads REQUIRED)
 target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
 add_test(NAME gamefeed COMMAND gamefeed_test)
 
+# --- per-rider bike model sync -------------------------------------------------
+# Pure naming, hashing and remap rules shared by disk setup and the render-thread hooks.
+add_executable(bikesync_test tests/bikesync_test.cpp)
+add_test(NAME bikesync COMMAND bikesync_test)
+
 # --- rider model sync rules (src/ridersync.h) ---------------------------------
 add_executable(ridersync_test tests/ridersync_test.cpp)
 add_test(NAME ridersync COMMAND ridersync_test)

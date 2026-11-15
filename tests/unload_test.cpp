@@ -20,6 +20,10 @@
 #include <string>
 #include <vector>
 
+#ifndef FROSTMOD_SRC
+#define FROSTMOD_SRC "src"
+#endif
+
 static int g_failures = 0;
 
 #define CHECK(cond, ...)                                                        \

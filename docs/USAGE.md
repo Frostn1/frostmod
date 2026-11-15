@@ -194,12 +194,17 @@ which are tuned to that mesh and swap together. Only `paints\` (universal liveri
 If the model files are locked (you're currently riding that bike), the swap rolls back with
 the bike left intact and asks you to exit the bike first.
 
-### Rider model sync
+### Model swaps per rider
 
-FrostMod can draw a remote rider with their rider, helmet and boots models when the same model
-files are installed locally. Turn on `modelsync=1` in `frostmod_radar.cfg`, then turn on the
-model option in MXB App's paint sync settings. MXB App's paint sync supplies the content IDs;
-FrostMod does not send rider looks through FrostServer or transfer model files.
+FrostMod can draw each remote rider with their rider, helmet, boots and bike model swaps when
+the same swaps are installed locally. This is visual only: physics, collision and hitboxes do
+not change. Set `modelsync=1` in `frostmod_radar.cfg` and turn on **Share model swaps** in MXB
+App's paint sync settings. MXB App's paint sync supplies the model IDs, and a friend needs the
+same swap installed to see it.
+
+For bike swaps, FrostMod makes catalog folders named `<Bike>~xxxxxxxx` from models in the
+bike's `FrostMod Models` library. They are safe to delete while the game is closed; FrostMod
+creates them again when model sync is on.
 
 Reloading (menu `1`, or `R` in the console) makes new tracks, bikes, and skins appear
 immediately — no restart, no loading screen.

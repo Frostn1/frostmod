@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <intrin.h>   // _ReturnAddress
 #include <cmath>      // radar/ESP geometry (sinf/cosf/sqrtf/atan2f)
+#include <ctime>      // _time64: protection log timestamps
 #include <GL/gl.h>    // immediate-mode GL overlay
 #include <winhttp.h>  // the announcement feed (the launcher already uses WinHTTP)
 
@@ -46,28 +47,36 @@
 #include "MinHook.h"
 #include "offsets.h"
 #include "antifreeze.h"
+#include "aussie.h"     // aussiemode=1: other riders' collision bodies on the Beta 20 spring
 #include "servermsg.h" // rider-visibility patch: the numbers and the arithmetic
 #include "trainer.h"
 #include "pluginsdk.h"  // per-title callback payload layouts
 #include "masterlist.h"
 #include "serverfilter.h"
 #include "session.h"
+#include "gamefeed.h"  // the Game SDK feed MXB App reads (raw plugin payloads)
 #include "changefree.h" // bike change: free the old own-vehicle record
 #include "refreshgate.h" // content refresh kinds, and the pages a refresh waits out
 #include "racefilter.h" // race mode: which tracks/bikes the mods scan shows
 #include <io.h>         // _finddata64i32_t (the race filter's find hooks)
 #include <memory>
 #include "crashreport.h"
+#include "protection.h"  // what the guards caught, for MXB App (frostmod-protection.jsonl)
 #include "worldwatch.h" // when a timed-out master login is the wedge, and when it is an outage
 #include "memdiag.h"    // memdiag=1: where the game's RAM goes (GL uploads vs the process)
 #include "texcompress.h" // texcompress=1: which texture uploads are stored as DXT
 #include "gfxcfg.h"     // live bike gfx.cfg: the keys, their descriptor offsets, the parser
+#include "bikesync.h"   // per-rider visual bike models: pure ids, markers and remap rules
 #include "nantrap.h"     // nantrap=1: where the first physics NaN is made (diagnostic, off by default)
 #include "tyrelog.h"     // nantrap=1: the last ~2 s of tyre state, dumped when the NaN shows up
 #include "tyrefallback.h" // a bike naming a tyre that isn't loaded: first loaded tyre, no crash
 #include "mapguard.h"     // the quad batch's glMapBuffer: a bad pointer gets our scratch, not a write
+#include "shockguard.h"   // the rear shock's curve lookup: a NaN gets curve[0], not a read 8 GB off
+#include "sessionguards.h" // four end-of-session / ASLR crashes, each sent down the game's own empty path
+#include "nanrecover.h"   // a bike whose physics state goes NaN is put back with the game's own reset
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
+#include "ridersync.h"    // content-addressed rider, helmet and boots model sync
 #include "shaderup.h"     // shaders=1: upgraded material shading in the game's own GLSL (off by default)
 #include "shaderswitch.h" // shaders=1: the live A/B relink that keeps the game's uniform locations
 #include <intrin.h>     // _ReturnAddress (texcompress: uploads from the game only)
@@ -124,6 +133,25 @@ static bool SessionInit() {
     return true;
 }
 
+// The Game SDK feed (gamefeed.h): every plugin callback's payload, copied into a block MXB App
+// reads. Only a copy the game loaded as a plugin is fed (the injected copy is never called).
+static frostmod::gamefeed::Writer g_feed;
+
+// Created rather than opened, for the same reasons as SessionInit. Held for the life of the
+// process: a reader may still be polling it.
+static bool FeedInit(const GameOffsets* g) {
+    if (g_feed.attached()) return true;
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(frostmod::gamefeed::Block),
+                                  frostmod::gamefeed::kMappingName);
+    if (!h) return false;
+    void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostmod::gamefeed::Block));
+    if (!view) { CloseHandle(h); return false; }
+    const uint32_t game = g == &GAME_KRP ? 3 : g == &GAME_GPB ? 2 : 1;
+    g_feed.Attach((frostmod::gamefeed::Block*)view, game, (uint32_t)g->plugin_data_version);
+    return true;
+}
+
 // Forget the session, keeping the block. Called when the event closes, so a rider back in
 // the menus does not leave the app talking to a room they have left.
 static void SessionClear() {
@@ -162,6 +190,10 @@ std::atomic<bool> g_unloading{false};
 char    g_savePath[MAX_PATH] = {0};   // PiBoSo Startup() save/data path (plugin mode)
 char    g_modsPath[MAX_PATH] = {0};   // mods folder (from frostmod_mods.txt the launcher writes)
 char    g_inactivePath[MAX_PATH] = {0}; // <MX Bikes>\FrostMod Inactive Tracks (deactivated .pkz store)
+static std::atomic<bool> g_rsOn{false};
+static std::mutex g_riderLooksMutex;
+static std::vector<frostmod::RiderLook> g_riderLooks;
+void RiderLooksSet(std::vector<frostmod::RiderLook> looks);
 
 // frostmod.dir: where FrostMod's files live when the dll does not sit with them. As a
 // plugin, FrostMod is <game>\plugins\frostmod.dlo, but its log, settings, flags, command
@@ -607,7 +639,7 @@ static std::string RfUtf8(const char* acp) {
 }
 static bool RfPass(const _finddata64i32_t* fd) {
     const std::string name = RfUtf8(fd->name);
-    const bool ok = t_rf->Allows(*t_rfScope, name);
+    const bool ok = t_rf->Allows(*t_rfScope, name, g_rsOn.load());
     if (name != "." && name != "..") {
         const std::string key = *t_rfScope + "/" + frostmod::RaceFilter::Norm(name);
         std::lock_guard<std::mutex> lk(g_rfMutex);
@@ -1582,6 +1614,36 @@ static const char* kMsLibDir   = "FrostMod Models";  // per-bike model library f
 static const char* kMsMarker   = "_active.txt";      // names the active variant
 static const char* kMsOriginal = "Original";         // name given to the model captured on first swap
 
+// Model sync is opt-in because bike swaps create temporary bike folders before the game's
+// startup scan. Changing it while the game is running cannot safely change that scan.
+static frostmod::bikesync::ShadowIndex g_bmsShadows;
+static std::mutex g_bmsMutex;
+static std::map<std::string, std::string> g_bmsActiveId;
+static frostmod::bikesync::RemapTable g_bmsTable;
+static SRWLOCK g_bmsTableLock = SRWLOCK_INIT;
+static std::atomic<bool> g_bmsHooksReady{false};
+static uint64_t g_modelSyncPending = 0;
+static int g_modelSyncPendingKey[mxb::VEHICLE_MAX] = {};
+
+static void QueueModelSyncRebuild(int slot, int key) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64 || !key) return;
+    g_modelSyncPending |= 1ull << slot;
+    g_modelSyncPendingKey[slot] = key;
+}
+
+static void DropModelSyncPending(int slot) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64) return;
+    g_modelSyncPending &= ~(1ull << slot);
+    g_modelSyncPendingKey[slot] = 0;
+}
+
+static void DropStaleModelSyncPending(int slot, int key) {
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || slot >= 64) return;
+    if ((g_modelSyncPending & (1ull << slot)) && g_modelSyncPendingKey[slot] != key) {
+        DropModelSyncPending(slot);
+    }
+}
+
 static std::string MsBikesRoot()                         { return std::string(g_modsPath) + "\\bikes"; }
 static std::string MsBikeDir(const std::string& b)       { return MsBikesRoot() + "\\" + b; }
 static std::string MsLibDir(const std::string& b)        { return MsBikeDir(b) + "\\" + kMsLibDir; }
@@ -1609,6 +1671,245 @@ static void MsListFiles(const std::string& dir, std::vector<std::string>& out) {
         out.push_back(fd.cFileName);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+}
+
+// ---------------------------------------------------------------------------
+// BIKE MODEL SYNC - startup shadow folders
+//
+// A shadow is a second bike-list entry with the real bike's non-visual files (therefore
+// the same physics) and one library variant's visual files. The detours below substitute
+// that entry only while the game builds a remote rider's gfx objects.
+// ---------------------------------------------------------------------------
+static const char* kBmsMarker = "_modelsync.txt";
+
+static bool BmsReadFile(const std::string& path, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0 && out.size() <= sizeof(buf); )
+        out.append(buf, n);
+    const bool ok = ferror(f) == 0 && out.size() <= sizeof(buf);
+    fclose(f);
+    return ok;
+}
+
+static bool BmsMarkerOf(const std::string& dir, std::string& bike, std::string& id) {
+    std::string text;
+    return BmsReadFile(dir + "\\" + kBmsMarker, text) &&
+           frostmod::bikesync::ParseMarker(text, bike, id);
+}
+
+static void BmsListDirs(const std::string& dir, std::vector<std::string>& out) {
+    out.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.' || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        out.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        return _stricmp(a.c_str(), b.c_str()) < 0;
+    });
+}
+
+struct BmsStamp { std::string name; uint64_t size; uint64_t mtime; };
+struct BmsHashCache { std::vector<BmsStamp> stamps; std::string id; };
+static std::map<std::string, BmsHashCache> g_bmsHashCache;
+
+static bool BmsSameStamps(const std::vector<BmsStamp>& a, const std::vector<BmsStamp>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].size != b[i].size || a[i].mtime != b[i].mtime)
+            return false;
+    return true;
+}
+
+// Hash in canonical name order but open the spelling that exists on disk. The stamp cache
+// avoids re-reading a large model.edf when startup checks an unchanged active id.
+static std::string BmsModelId(const std::string& bike, const std::string& dir, bool cache) {
+    std::vector<std::string> files;
+    MsListFiles(dir, files);
+    const std::vector<std::string> order = frostmod::bikesync::CanonicalVisualOrder(files);
+    if (std::find(order.begin(), order.end(), "model.edf") == order.end()) return "";
+
+    std::map<std::string, std::string> actual;
+    for (const std::string& file : files)
+        if (frostmod::bikesync::IsVisualFile(file)) actual[frostmod::bikesync::Lower(file)] = file;
+
+    std::vector<BmsStamp> stamps;
+    for (const std::string& lower : order) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        const std::string path = dir + "\\" + actual[lower];
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return "";
+        ULARGE_INTEGER size{}, time{};
+        size.LowPart = data.nFileSizeLow; size.HighPart = data.nFileSizeHigh;
+        time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        stamps.push_back({lower, size.QuadPart, time.QuadPart});
+    }
+
+    const std::string cacheKey = frostmod::bikesync::Lower(dir);
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsHashCache.find(cacheKey);
+        if (it != g_bmsHashCache.end() && BmsSameStamps(it->second.stamps, stamps)) return it->second.id;
+    }
+
+    frostmod::bikesync::IdBuilder hash;
+    hash.Begin(bike);
+    unsigned char buf[64 * 1024];
+    for (size_t i = 0; i < order.size(); ++i) {
+        hash.File(order[i], stamps[i].size);
+        const std::string path = dir + "\\" + actual[order[i]];
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return "";
+        bool ok = true;
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) != 0; ) hash.Bytes(buf, n);
+        if (ferror(f)) ok = false;
+        fclose(f);
+        if (!ok) return "";
+    }
+    const std::string id = hash.Finish();
+    if (cache) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        g_bmsHashCache[cacheKey] = {stamps, id};
+    }
+    return id;
+}
+
+static bool BmsLinkOrCopy(const std::string& from, const std::string& to) {
+    if (MsFileExists(to)) return true;
+    if (CreateHardLinkA(to.c_str(), from.c_str(), nullptr)) return true;
+    return CopyFileA(from.c_str(), to.c_str(), TRUE) != FALSE;
+}
+
+static bool BmsLinkSet(const std::string& fromDir, const std::string& toDir,
+                       const std::vector<std::string>& files) {
+    for (const std::string& file : files)
+        if (!BmsLinkOrCopy(fromDir + "\\" + file, toDir + "\\" + file)) return false;
+    return true;
+}
+
+static bool BmsLinkPaints(const std::string& bikeDir, const std::string& shadowDir) {
+    const std::string from = bikeDir + "\\paints", to = shadowDir + "\\paints";
+    if (!MsDirExists(from)) return true;
+    if (!MsDirExists(to) && !CreateDirectoryA(to.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    std::vector<std::string> files;
+    MsListFiles(from, files);
+    return BmsLinkSet(from, to, files);
+}
+
+// This knows the exact shallow shape we create, so cleanup of a marked shadow or a failed
+// half-build never recursively follows or removes an unrelated directory.
+static bool BmsRemoveShadow(const std::string& dir) {
+    std::vector<std::string> files;
+    MsListFiles(dir + "\\paints", files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\paints\\" + file).c_str());
+    RemoveDirectoryA((dir + "\\paints").c_str());
+    MsListFiles(dir, files);
+    for (const std::string& file : files) DeleteFileA((dir + "\\" + file).c_str());
+    return RemoveDirectoryA(dir.c_str()) != FALSE;
+}
+
+static bool BmsWriteMarker(const std::string& dir, const std::string& bike, const std::string& id) {
+    const std::string text = frostmod::bikesync::BuildMarker(bike, id);
+    FILE* f = nullptr;
+    if (fopen_s(&f, (dir + "\\" + kBmsMarker).c_str(), "wb") != 0 || !f) return false;
+    const bool wrote = fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = fclose(f) == 0;
+    return wrote && closed;
+}
+
+static void BikeSyncMaterialize() {
+    using namespace frostmod::bikesync;
+    g_bmsShadows.Clear();
+    { std::lock_guard<std::mutex> lk(g_bmsMutex); g_bmsActiveId.clear(); }
+    int ready = 0, removed = 0;
+    if (g_game != &GAME_MXB) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    if (!g_modsPath[0]) { Log("[modelsync] 0 shadow bike folder(s) ready, 0 removed"); return; }
+    const std::string root = MsBikesRoot();
+    std::vector<std::string> bikes;
+    BmsListDirs(root, bikes);
+
+    if (!g_rsOn.load()) {
+        for (const std::string& name : bikes) {
+            if (!LooksLikeShadow(name)) continue;
+            std::string bike, id;
+            const std::string dir = root + "\\" + name;
+            if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+        }
+        Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
+        return;
+    }
+
+    std::set<std::string> wanted;
+    for (const std::string& bike : bikes) {
+        if (LooksLikeShadow(bike)) continue;
+        const std::string bikeDir = root + "\\" + bike;
+        const std::string libDir = bikeDir + "\\" + kMsLibDir;
+        if (!MsDirExists(libDir)) continue;
+        const std::string active = BmsModelId(bike, bikeDir, true);
+        if (!active.empty()) {
+            std::lock_guard<std::mutex> lk(g_bmsMutex);
+            g_bmsActiveId[Lower(bike)] = active;
+        }
+        std::vector<std::string> rootFiles, variants;
+        MsListFiles(bikeDir, rootFiles);
+        BmsListDirs(libDir, variants);
+        for (const std::string& variant : variants) {
+            if ((int)wanted.size() >= kMaxShadowFolders) break;
+            const std::string variantDir = libDir + "\\" + variant;
+            std::vector<std::string> variantFiles;
+            MsListFiles(variantDir, variantFiles);
+            const ShadowPlan plan = PlanShadow(rootFiles, variantFiles);
+            if (!plan.ok) continue;
+            const std::string id = BmsModelId(bike, variantDir, false);
+            if (id.empty()) continue;
+            const std::string name = ShadowName(bike, id), dir = root + "\\" + name;
+            const std::string wantedKey = Lower(name);
+            if (wanted.count(wantedKey)) continue;
+
+            bool ok = false;
+            if (MsDirExists(dir)) {
+                std::string markedBike, markedId;
+                if (!BmsMarkerOf(dir, markedBike, markedId)) {
+                    Log("[modelsync] %s exists without a valid marker - left alone", dir.c_str());
+                    continue;
+                }
+                if (_stricmp(markedBike.c_str(), bike.c_str()) != 0 || markedId != id) {
+                    Log("[modelsync] %s has a marker for a different model - left alone", dir.c_str());
+                    wanted.insert(wantedKey); // an id8 collision must not delete the occupied folder below
+                    continue;
+                }
+                ok = BmsLinkPaints(bikeDir, dir);
+            } else if (CreateDirectoryA(dir.c_str(), nullptr)) {
+                ok = BmsLinkSet(bikeDir, dir, plan.fromRoot) &&
+                     BmsLinkSet(variantDir, dir, plan.fromVariant) &&
+                     BmsLinkPaints(bikeDir, dir) && BmsWriteMarker(dir, bike, id);
+                if (!ok) BmsRemoveShadow(dir);
+            }
+            if (!ok) {
+                Log("[modelsync] could not prepare %s (error %lu)", dir.c_str(), GetLastError());
+                continue;
+            }
+            wanted.insert(wantedKey);
+            g_bmsShadows.Set(bike, id, name);
+            ++ready;
+        }
+    }
+
+    BmsListDirs(root, bikes);
+    for (const std::string& name : bikes) {
+        if (!LooksLikeShadow(name) || wanted.count(Lower(name))) continue;
+        std::string bike, id;
+        const std::string dir = root + "\\" + name;
+        if (BmsMarkerOf(dir, bike, id) && BmsRemoveShadow(dir)) ++removed;
+    }
+    Log("[modelsync] %d shadow bike folder(s) ready, %d removed", ready, removed);
 }
 // Move each named file from srcDir to dstDir (created if needed). All-or-nothing: on the
 // first failure the ones already moved are moved back and it returns false.
@@ -1664,6 +1965,7 @@ static void MsScanBikes() {
         if (fd.cFileName[0] == '.') continue;
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::string bike = fd.cFileName;
+        if (frostmod::bikesync::LooksLikeShadow(bike)) continue;
         if (MsFileExists(MsActiveEdf(bike)) || MsDirExists(MsLibDir(bike)))
             g_msBikes.push_back(bike);
     } while (FindNextFileA(h, &fd));
@@ -1718,6 +2020,8 @@ static void MsApply(const std::string& bike, const std::string& target) {
     std::vector<std::string> rootFiles, targetFiles;
     MsListFiles(rootDir,   rootFiles);                          // current model files to back up
     MsListFiles(targetDir, targetFiles);                       // variant files to bring in
+    // Preserve the target's id before its files move so "same as mine" stays current.
+    const std::string targetId = g_rsOn.load() ? BmsModelId(bike, targetDir, false) : std::string();
     // 1) back up the current set into the library (all-or-nothing; MsMoveSet rolls itself back).
     if (!rootFiles.empty() && !MsMoveSet(rootDir, backupDir, rootFiles, "backup")) {
         SetStatus("model swap: files in use - exit the bike first", 6000);
@@ -1730,6 +2034,15 @@ static void MsApply(const std::string& bike, const std::string& target) {
         return;
     }
     MsWriteActive(bike, target);
+    if (g_rsOn.load()) {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const std::string key = frostmod::bikesync::Lower(bike);
+        if (!targetId.empty()) {
+            g_bmsActiveId[key] = targetId;
+        } else {
+            g_bmsActiveId.erase(key);
+        }
+    }
     Log("[model] %s: model set '%s' -> '%s' (%zu files) - reloading.",
         bike.c_str(), activeLabel.c_str(), target.c_str(), targetFiles.size());
     SetStatus("model swapped - reloading", 4000);
@@ -3014,6 +3327,158 @@ static bool RebuildRidersIn(uint64_t slots, const char* why) {
 
 void RebuildRiders() { RebuildRidersIn(~0ull, "F8 menu"); }
 
+// ---- per-rider bike model sync ------------------------------------------------------
+static std::string BmsActiveIdOf(const char* bike) {
+    const std::string key = frostmod::bikesync::Lower(bike);
+    {
+        std::lock_guard<std::mutex> lk(g_bmsMutex);
+        const auto it = g_bmsActiveId.find(key);
+        if (it != g_bmsActiveId.end()) return it->second;
+    }
+    // Render thread: never hash here (a model.edf is tens of MB). Library bikes were hashed
+    // at Init; a bike with no library has no shadows, so ChooseShadow cannot pick one.
+    return "";
+}
+
+static uintptr_t BmsBikeEntry(int index) {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (index < 0 || index >= count || count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr))
+        return 0;
+    return arr ? arr + (uintptr_t)index * mxb::BIKE_STRIDE : 0;
+}
+
+static bool BmsGfxLoaded(uintptr_t entry) {
+    int state = 0;
+    return entry && SafeReadBytes((const char*)(entry + mxb::BIKE_GFX_STATE),
+                                  (char*)&state, sizeof(state)) == sizeof(state) && state != 0;
+}
+
+static int BmsLoadedBikeGfx() {
+    const int count = SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_COUNT));
+    uintptr_t arr = 0;
+    if (count <= 0 || count > 100000 ||
+        SafeReadBytes((const char*)(g_base + mxb::RVA_BIKE_LIST), (char*)&arr, sizeof(arr)) != sizeof(arr) || !arr)
+        return frostmod::bikesync::kMaxLoadedBikeGfx;
+    int loaded = 0;
+    for (int i = 0; i < count; ++i)
+        if (BmsGfxLoaded(arr + (uintptr_t)i * mxb::BIKE_STRIDE))
+            ++loaded;
+    return loaded;
+}
+
+using BmsGfxLoad_t = int(__fastcall*)(int, int);
+static bool BmsCallGfxLoad(int bike) {
+    __try { ((BmsGfxLoad_t)(g_base + mxb::RVA_BIKE_GFX_LOAD))(bike, 0); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static int BmsDistinctShadows(int exceptSlot) {
+    std::set<std::string> shadows;
+    AcquireSRWLockShared(&g_bmsTableLock);
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (i == exceptSlot) continue;
+        const auto* entry = g_bmsTable.Get(i);
+        if (entry && !entry->shadow.empty()) shadows.insert(entry->shadow);
+    }
+    ReleaseSRWLockShared(&g_bmsTableLock);
+    return (int)shadows.size();
+}
+
+void BikeSyncTick() {
+    using namespace frostmod::bikesync;
+    if (!g_rsOn.load() || !g_bmsHooksReady.load() || g_reloadActive.load() || !PaintsSupported()) return;
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 500;
+
+    std::vector<frostmod::RiderLook> looks;
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        looks = g_riderLooks;
+    }
+    static std::set<std::string> said;
+    static std::set<std::string> bad;
+    const char* me = frostmod::crash::TheContext().rider;
+
+    for (int i = 0; i < mxb::VEHICLE_MAX; ++i) {
+        if (SafeReadInt((const int*)VehicleAt(i)) == 0) {
+            AcquireSRWLockExclusive(&g_bmsTableLock);
+            g_bmsTable.Clear(i);
+            ReleaseSRWLockExclusive(&g_bmsTableLock);
+            DropModelSyncPending(i);
+            continue;
+        }
+        if (IsLocalRider(i, me)) continue;
+        char bike[32] = {0};
+        char paint[32] = {0};
+        char rider[32] = {0};
+        if (!ReadVehicle(i, bike, paint)) continue;
+        RiderNameOf(LoadRequestOf(i), rider);
+        if (!rider[0]) continue;
+        const int key = SafeReadInt((const int*)(VehicleAt(i) + mxb::VEH_KEY));
+
+        const frostmod::RiderLook* look = nullptr;
+        for (const auto& candidate : looks) {
+            if (frostmod::NameMatches(candidate.rider, rider)) {
+                look = &candidate;
+                break;
+            }
+        }
+        const std::string swapId = look ? frostmod::BikeSwapId(*look, bike) : std::string();
+        std::string want = ChooseShadow(swapId, bike, BmsActiveIdOf(bike), g_bmsShadows);
+
+        RemapTable::Entry old;
+        bool haveOld = false;
+        AcquireSRWLockShared(&g_bmsTableLock);
+        if (const auto* entry = g_bmsTable.Get(i)) {
+            old = *entry;
+            haveOld = true;
+        }
+        ReleaseSRWLockShared(&g_bmsTableLock);
+        const bool sameVehicle = haveOld && old.key == key;
+        if (sameVehicle && old.shadow == want) continue;
+
+        if (!want.empty()) {
+            const std::string badKey = Lower(want);
+            int shadowIdx = bad.count(badKey) ? -1 : BikeIndexOf(want.c_str());
+            uintptr_t entry = shadowIdx >= 0 ? BmsBikeEntry(shadowIdx) : 0;
+            if (shadowIdx < 0 || !entry) {
+                if (said.insert("missing:" + badKey).second) {
+                    Log("[modelsync] shadow bike '%s' is not in the game bike list - staying stock",
+                        want.c_str());
+                }
+                want.clear();
+            } else if (!BmsGfxLoaded(entry)) {
+                const bool shadowCap = BmsDistinctShadows(i) >= kMaxShadowsInUse;
+                const bool gfxCap = BmsLoadedBikeGfx() >= kMaxLoadedBikeGfx;
+                if (shadowCap || gfxCap) {
+                    const std::string reason = shadowCap ? "shadow-cap:" : "gfx-cap:";
+                    if (said.insert(reason + badKey).second) {
+                        Log("[modelsync] refusing to preload '%s': %s - staying stock", want.c_str(),
+                            shadowCap ? "six distinct shadows are already in use"
+                                      : "eight bike gfx entries are already loaded");
+                    }
+                    want.clear();
+                } else if (!BmsCallGfxLoad(shadowIdx) || !BmsGfxLoaded(entry)) {
+                    bad.insert(badKey);
+                    Log("[modelsync] gfx load faulted or did not load '%s' - bad for this session, staying stock",
+                        want.c_str());
+                    want.clear();
+                }
+            }
+        }
+
+        const bool rebuild = !want.empty() || (sameVehicle && !old.shadow.empty());
+        AcquireSRWLockExclusive(&g_bmsTableLock);
+        g_bmsTable.Set(i, key, want);
+        ReleaseSRWLockExclusive(&g_bmsTableLock);
+        if (rebuild) QueueModelSyncRebuild(i, key);
+    }
+}
+
 // ---- automatic: a gear refresh brought in a model a rider on the server is wearing ------
 // Before the refresh, note every remote rider whose rider, helmet or boots model is not in
 // the lists (the game built them with a stand-in). After it, the ones whose models are all
@@ -3085,6 +3550,320 @@ void ArrivedGearTick() {
     const uint64_t slots = g_gearArrived;
     g_gearArrived = 0;
     RebuildRidersIn(slots, "new gear models arrived");
+}
+
+// ===========================================================================
+// RIDER MODEL SYNC
+static ridersync::GearIndex g_rsIndex;
+static ridersync::Override g_rsOverride[mxb::VEHICLE_MAX];
+static char g_rsFolder[mxb::VEHICLE_MAX][ridersync::kParts][32] = {};
+static HANDLE g_rsIndexThread = nullptr;
+static std::atomic<bool> g_rsIndexRunning{false};
+struct RsCacheEntry { uint64_t mtime, size; std::string id; };
+static std::mutex g_rsCacheMutex;
+static std::map<std::string, RsCacheEntry> g_rsCache;
+
+static const mxb::GearPart& RsGearPart(ridersync::Part p) {
+    return mxb::kGearParts[p == ridersync::Rider ? 0 : p == ridersync::Boots ? 1 : 2];
+}
+static int RsVehOffset(ridersync::Part p) {
+    return p == ridersync::Rider ? 0xD0 : p == ridersync::Helmet ? 0xF0 : 0x1B0;
+}
+static bool RsInstalled(ridersync::Part p, const std::string& folder) {
+    return GearModelIndex(RsGearPart(p), folder.c_str()) >= 0;
+}
+// budget: bytes this call may read on a cache miss (nullptr = no limit). The receiver index
+// spends at most kRsIndexBudget per pass, so a big gear folder library is hashed over several
+// passes instead of in one burst of disk reads.
+static constexpr uint64_t kRsIndexBudget = 512ull * 1024 * 1024;
+static bool RsHashFolder(ridersync::Part part, const std::string& path, std::string& id,
+                         uint64_t* budget = nullptr) {
+    std::vector<ridersync::FileEntry> found, files;
+    uint64_t maxTime = 0, total = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((path + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        const uint64_t mt = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (mt > maxTime) maxTime = mt;
+        total += size;
+        found.push_back({fd.cFileName, size});
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (!ridersync::CanonicalFiles(std::move(found), files)) return false;
+    const std::string cacheKey = ridersync::Lower(path) + "|" + std::to_string((int)part);
+    {
+        std::lock_guard<std::mutex> lk(g_rsCacheMutex);
+        auto it = g_rsCache.find(cacheKey);
+        if (it != g_rsCache.end() && it->second.mtime == maxTime && it->second.size == total) {
+            id = it->second.id;
+            return true;
+        }
+    }
+    if (budget) {
+        if (total > *budget) return false;
+        *budget -= total;
+    }
+    ridersync::GearHasher hash;
+    hash.Begin(part);
+    unsigned char buf[64 * 1024];
+    for (const auto& file : files) {
+        if (g_unloading.load()) return false;
+        hash.File(file.name, file.size);
+        HANDLE in = CreateFileA((path + "\\" + file.name).c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (in == INVALID_HANDLE_VALUE) return false;
+        uint64_t readTotal = 0;
+        DWORD got = 0;
+        BOOL ok;
+        do {
+            ok = ReadFile(in, buf, sizeof(buf), &got, nullptr);
+            if (ok && got) {
+                hash.Update(buf, got);
+                readTotal += got;
+            }
+        } while (ok && got && !g_unloading.load());
+        CloseHandle(in);
+        if (!ok || readTotal != file.size || g_unloading.load()) return false;
+    }
+    id = hash.Final();
+    {
+        std::lock_guard<std::mutex> lk(g_rsCacheMutex);
+        g_rsCache[cacheKey] = {maxTime, total, id};
+    }
+    return true;
+}
+static std::string RsPartRoot(ridersync::Part p) {
+    return std::string(g_modsPath) + "\\rider\\" + ridersync::PartDir(p);
+}
+
+static void RsBuildIndex(ridersync::GearIndex& index) {
+    if (!g_modsPath[0]) return;
+    uint64_t budget = kRsIndexBudget;
+    for (int pi = 0; pi < ridersync::kParts; ++pi) {
+        if (g_unloading.load()) return;
+        const auto p = (ridersync::Part)pi;
+        const std::string root = RsPartRoot(p);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((root + "\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        int folders = 0;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || strlen(fd.cFileName) > 31) continue;
+            if (++folders > 400) break;
+            std::string id;
+            if (RsHashFolder(p, root + "\\" + fd.cFileName, id, &budget)) index.Set(p, fd.cFileName, id);
+        } while (!g_unloading.load() && FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+}
+
+static DWORD WINAPI RsIndexThread(LPVOID) {
+    ridersync::GearIndex next;
+    RsBuildIndex(next);
+    const size_t count = next.Size();
+    if (!g_unloading.load()) {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        g_rsIndex = std::move(next);
+    }
+    static int logs = 0;
+    if (!g_unloading.load() && logs++ < 5) {
+        Log("[modelsync] indexed %zu installed gear model folders", count);
+    }
+    g_rsIndexRunning.store(false);
+    return 0;
+}
+
+static void RsStartIndexBuild() {
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (last && now - last < 30000) return;
+    if (g_unloading.load()) return;
+    bool expected = false;
+    if (!g_rsIndexRunning.compare_exchange_strong(expected, true)) return;
+    if (g_unloading.load()) {
+        g_rsIndexRunning.store(false);
+        return;
+    }
+    if (g_rsIndexThread) {
+        CloseHandle(g_rsIndexThread);
+        g_rsIndexThread = nullptr;
+    }
+    g_rsIndexThread = CreateThread(nullptr, 0, RsIndexThread, nullptr, 0, nullptr);
+    if (!g_rsIndexThread) {
+        g_rsIndexRunning.store(false);
+        Log("[modelsync] could not start the gear index thread");
+        return;
+    }
+    last = now;
+    SetThreadPriority(g_rsIndexThread, THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+void RiderLooksSet(std::vector<frostmod::RiderLook> looks) {
+    if (!g_rsOn.load()) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log("[modelsync] set_rider_looks ignored because modelsync=0");
+        }
+        return;
+    }
+    const bool needIndex = !looks.empty();
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        g_riderLooks = std::move(looks);
+    }
+    if (needIndex) {
+        RsStartIndexBuild();
+    }
+}
+
+using RiderGfxBuild_t = uintptr_t(__fastcall*)(uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,
+    uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,
+    uintptr_t,uintptr_t,uintptr_t);
+static RiderGfxBuild_t g_rsOrigBuild = nullptr;
+static bool g_rsHookTried = false;
+static void RsSwapArgs(uintptr_t a1, uintptr_t& a6, uintptr_t& a7, uintptr_t& a13) {
+    if (!g_rsOn.load() || g_reloadActive.load() || a1 < g_base + mxb::RVA_VEHICLES + mxb::VEH_GFX) return;
+    const uintptr_t delta = a1 - mxb::VEH_GFX - (g_base + mxb::RVA_VEHICLES);
+    if (delta % mxb::VEHICLE_STRIDE) return;
+    const int slot = (int)(delta / mxb::VEHICLE_STRIDE);
+    if (slot < 0 || slot >= mxb::VEHICLE_MAX || SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1 == slot) return;
+    const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+    const ridersync::Override& o = g_rsOverride[slot]; if (!key || o.key != key) return;
+    uintptr_t* args[] = {&a6, &a7, &a13};
+    for (int i = 0; i < ridersync::kParts; ++i) if (!o.folder[i].empty() && RsInstalled((ridersync::Part)i, o.folder[i])) {
+        strcpy_s(g_rsFolder[slot][i], o.folder[i].c_str()); *args[i] = (uintptr_t)g_rsFolder[slot][i];
+    }
+}
+static uintptr_t hkRiderGfxBuild(uintptr_t a1,uintptr_t a2,uintptr_t a3,uintptr_t a4,uintptr_t a5,uintptr_t a6,
+    uintptr_t a7,uintptr_t a8,uintptr_t a9,uintptr_t a10,uintptr_t a11,uintptr_t a12,uintptr_t a13,uintptr_t a14,
+    uintptr_t a15,uintptr_t a16,uintptr_t a17,uintptr_t a18,uintptr_t a19,uintptr_t a20,uintptr_t a21) {
+    static bool faultLogged = false;
+    const uintptr_t original6 = a6, original7 = a7, original13 = a13;
+    __try { RsSwapArgs(a1, a6, a7, a13); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        a6 = original6; a7 = original7; a13 = original13;
+        if (!faultLogged) { faultLogged = true; Log("[modelsync] rider builder decision faulted; passing original args"); }
+    }
+    return g_rsOrigBuild(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18,a19,a20,a21);
+}
+static void RsEnsureHook() {
+    if (g_rsHookTried || !g_rsOn.load() || !PaintsSupported() || g_unloading.load()) return;
+    g_rsHookTried = true; uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_RIDER_GFX_BUILD);
+    static const uint8_t sig[] = {0x40,0x53,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x81,0xEC,0xB8,0x09,0x00,0x00};
+    if (mxb::LooksDetoured(fn) || memcmp(fn, sig, sizeof(sig))) { Log("[modelsync] rider builder 0x4CE00 is detoured or has an unknown prologue; disabled"); return; }
+    if (InstallHook(fn, (void*)&hkRiderGfxBuild, (void**)&g_rsOrigBuild, "riderGfxBuild(0x4CE00)")) Log("[modelsync] rider builder hook installed");
+}
+static void RsScan() {
+    std::vector<frostmod::RiderLook> looks;
+    ridersync::GearIndex index;
+    {
+        std::lock_guard<std::mutex> lk(g_riderLooksMutex);
+        looks = g_riderLooks;
+        index = g_rsIndex;
+    }
+    const char* me = frostmod::crash::TheContext().rider;
+    if (!me[0]) return;
+    for (int i = 0; i < mxb::VEHICLE_MAX && i < 64; ++i) {
+        const uintptr_t v = VehicleAt(i);
+        const int key = SafeReadInt((const int*)(v + mxb::VEH_KEY));
+        if (!SafeReadInt((const int*)v)) {
+            g_rsOverride[i] = {};
+            DropModelSyncPending(i);
+            continue;
+        }
+        if (g_rsOverride[i].key && g_rsOverride[i].key != key) {
+            g_rsOverride[i] = {};
+            DropStaleModelSyncPending(i, key);
+            continue;
+        }
+        if (IsLocalRider(i, me)) continue;
+        char name[32];
+        RiderNameOf(LoadRequestOf(i), name);
+        if (!name[0]) continue;
+        const frostmod::RiderLook* look = nullptr;
+        for (const auto& candidate : looks) {
+            if (frostmod::NameMatches(candidate.rider, name)) {
+                look = &candidate;
+                break;
+            }
+        }
+        std::string own[ridersync::kParts];
+        for (int p = 0; p < ridersync::kParts; ++p) {
+            char folder[32] = {};
+            SafeCopyStr((void*)(v + RsVehOffset((ridersync::Part)p)), folder, sizeof(folder));
+            own[p] = folder;
+        }
+        auto next = ridersync::Decide(look, key, own, index, RsInstalled);
+        // Nothing to draw differently before or after: remember the key, no rebuild.
+        if (!next.Any() && !g_rsOverride[i].Any()) {
+            g_rsOverride[i] = std::move(next);
+            continue;
+        }
+        if (next != g_rsOverride[i]) {
+            g_rsOverride[i] = std::move(next);
+            QueueModelSyncRebuild(i, key);
+        }
+    }
+}
+void RiderSyncTick() {
+    RsEnsureHook();
+    if (!g_rsOn.load()) return;
+    static uint64_t nextScan = 0;
+    const uint64_t now = GetTickCount64();
+    if (now >= nextScan) {
+        nextScan = now + 2000;
+        __try {
+            RsScan();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                Log("[modelsync] vehicle scan faulted");
+            }
+        }
+    }
+}
+
+static void ModelSyncRebuildTick() {
+    if (!g_modelSyncPending || g_reloadActive.load()) return;
+    // One rider per rebuild, spaced out: a full grid arriving at once must not rebuild a rider
+    // every frame, and a rebuild the game turns down is not retried on the next frame.
+    static uint64_t nextBuild = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < nextBuild) return;
+    static bool waiting = false;
+    if (GameDefersRiderBuild()) {
+        if (!waiting) Log("[modelsync] waiting for the pits");
+        waiting = true;
+        return;
+    }
+    waiting = false;
+    int slot = 0;
+    while (slot < mxb::VEHICLE_MAX && !(g_modelSyncPending & (1ull << slot))) {
+        ++slot;
+    }
+    if (slot >= mxb::VEHICLE_MAX) return;
+    const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+    if (!SafeReadInt((const int*)VehicleAt(slot)) || key != g_modelSyncPendingKey[slot]) {
+        DropModelSyncPending(slot);
+        return;
+    }
+    char name[32];
+    RiderNameOf(LoadRequestOf(slot), name);
+    Log("[modelsync] slot %d '%s': rider='%s' helmet='%s' boots='%s'", slot, name,
+        g_rsOverride[slot].folder[0].c_str(), g_rsOverride[slot].folder[1].c_str(),
+        g_rsOverride[slot].folder[2].c_str());
+    nextBuild = now + 2000;
+    if (RebuildRidersIn(1ull << slot, "model sync")) {
+        DropModelSyncPending(slot);
+        // The builder may have used a shadow index; roster paint lookup must use the real bike.
+        ApplyBikePaint(slot, false);
+    }
 }
 
 // ===========================================================================
@@ -3248,7 +4027,8 @@ void OpenChange() {
         const uintptr_t arr = ReadPtr(mxb::RVA_BIKE_LIST);
         char name[64];
         for (int i = 0; arr && i < n && i < 100000; ++i)
-            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) && name[0])
+            if (SafeCopyStr((void*)(arr + (uintptr_t)i * mxb::BIKE_STRIDE + mxb::BIKE_FOLDER), name, sizeof(name)) &&
+                name[0] && !frostmod::bikesync::LooksLikeShadow(name))
                 bikes.push_back(name);
         g_chRows[CH_BIKE].opts = bikes;
     }
@@ -3731,6 +4511,97 @@ static void AfRevert() {
     Log("[antifreeze] off: the game's own %.2fs limit is back", antifreeze::kStockLimitSeconds);
 }
 
+// ---- Aussie mode: other riders' collision bodies on the Beta 20 spring --------
+// What this is, why, and whom it affects: aussie.h. Three sites in the remote-body stepper
+// (0x166A10): the 20 x mass stiffness load is repointed at a 200.0 we own, and the vertical spring
+// and damper terms jump through a small cave that scales them back to 20 x mass. Off unless
+// aussiemode=1. Read at load, applied before any session exists, reverted at unload.
+static std::atomic<bool> g_auOn{false};
+static uint8_t*          g_auPage    = nullptr;   // cells + caves, execute-read once written
+static bool              g_auPatched = false;
+
+// Write `n` bytes over game code. Returns false (and writes nothing) if the page cannot be made
+// writable.
+static bool AuWrite(uintptr_t at, const uint8_t* bytes, size_t n) {
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)at, n, PAGE_EXECUTE_READWRITE, &prot)) return false;
+    memcpy((void*)at, bytes, n);
+    VirtualProtect((void*)at, n, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, n);
+    return true;
+}
+
+static void AuPutBack() {
+    if (!g_base) return;
+    AuWrite(g_base + aussie::kRvaYd, aussie::kYdBytes, aussie::kYdLen);
+    AuWrite(g_base + aussie::kRvaY,  aussie::kYBytes,  aussie::kYLen);
+    AuWrite(g_base + aussie::kRvaK,  aussie::kKBytes,  aussie::kKLen);
+}
+
+static bool AuApply() {
+    if (g_auPatched) return true;
+    if (g_game != &GAME_MXB) {
+        Log("[aussie] not applied: this is %s, the offsets are MX Bikes' only",
+            g_game && g_game->display ? g_game->display : "another title");
+        return false;
+    }
+    if (!g_base) { Log("[aussie] not applied: no module base"); return false; }
+
+    const uint8_t* k  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaK);
+    const uint8_t* y  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaY);
+    const uint8_t* yd = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaYd);
+    if (!aussie::Matches(k, aussie::kKBytes, aussie::kKLen) ||
+        !aussie::Matches(y, aussie::kYBytes, aussie::kYLen) ||
+        !aussie::Matches(yd, aussie::kYdBytes, aussie::kYdLen)) {
+        Log("[aussie] not applied: the spring code is not the bytes we expect (game updated?). "
+            "Nothing patched.");
+        return false;
+    }
+
+    // A page the sites can reach with rel32. AfAllocCellNear commits a whole page.
+    uint8_t* page = reinterpret_cast<uint8_t*>(AfAllocCellNear(g_base + aussie::kRvaK));
+    if (!page) { Log("[aussie] not applied: no free page within reach"); return false; }
+    aussie::Plan plan;
+    if (!aussie::MakePlan(g_base, reinterpret_cast<uintptr_t>(page), &plan)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: the cave is out of rel32 reach");
+        return false;
+    }
+    memcpy(page, plan.page, aussie::kPageUsed);
+    DWORD old = 0;
+    if (!VirtualProtect(page, aussie::kPageUsed, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: could not make the cave executable (%lu)", GetLastError());
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, aussie::kPageUsed);
+
+    // The caves first, so a jump never lands before its target exists; then the jumps; then k.
+    const bool ok = AuWrite(g_base + aussie::kRvaYd, plan.yd, aussie::kYdLen) &&
+                    AuWrite(g_base + aussie::kRvaY,  plan.y,  aussie::kYLen) &&
+                    AuWrite(g_base + aussie::kRvaK,  plan.k,  aussie::kKLen);
+    if (!ok || !aussie::Matches(yd, plan.yd, aussie::kYdLen) ||
+        !aussie::Matches(y, plan.y, aussie::kYLen) || !aussie::Matches(k, plan.k, aussie::kKLen)) {
+        AuPutBack();
+        VirtualFree(page, 0, MEM_RELEASE);
+        Log("[aussie] not applied: the patch did not verify, reverted");
+        return false;
+    }
+    g_auPage = page; g_auPatched = true;
+    Log("[aussie] on: other riders' collision bodies on the Beta 20 spring (k %.0f x mass, "
+        "vertical %.0f x mass; stock %.0f x mass)", aussie::kAussieK,
+        aussie::kAussieK * aussie::kYSpring, aussie::kStockK);
+    return true;
+}
+
+static void AuRevert() {
+    if (!g_auPatched) return;
+    AuPutBack();
+    if (g_auPage) { VirtualFree(g_auPage, 0, MEM_RELEASE); g_auPage = nullptr; }
+    g_auPatched = false;
+    Log("[aussie] off: the game's own Beta 21 spring is back");
+}
+
 // ---- vehicle teardown: the bike-change cleanup's free of the old own-vehicle record ------
 // Session end's per-vehicle teardown (0x71D50, rbx = rec + 0x50AC), in its order and under
 // its conditions, then the record is zeroed as session end zeroes all of them. Its only
@@ -3834,6 +4705,25 @@ static tyrelog::Config g_tlCfg;
 // default. mapguardtest=N fakes a bad map on every Nth flush so the fallback can be tested.
 static std::atomic<bool> g_mgOn{true};
 static std::atomic<int>  g_mgTestEvery{0};
+// shockguard=0 turns the rear-shock NaN guard off (SHOCK GUARD section, src/shockguard.h); on
+// by default.
+static std::atomic<bool> g_sgOn{true};
+static void ShockGuardTick();   // SHOCK GUARD section; called once a frame
+// bikelistguard=0, wakeguard=0, listboxguard=0, ptr64fix=0 turn the session guards off one by
+// one (SESSION GUARDS section, src/sessionguards.h); all on by default.
+static std::atomic<bool> g_blOn{true};
+static std::atomic<bool> g_wkOn{true};
+static std::atomic<bool> g_lbOn{true};
+static std::atomic<bool> g_p64On{true};
+static std::atomic<bool> g_riOn{true};
+static std::atomic<bool> g_mmOn{true};   // mipmapguard=: +0x255F1F, a mip level with no memory   // riderinfoguard=: +0x7A860, the host's unfilled rider lists
+static void SessionGuardsTick();   // SESSION GUARDS section; called once a frame
+static void ProtCatch(protection::Kind k);   // PROTECTION section: a guard caught a crash
+static void ProtTick();                     // PROTECTION section: write what was caught
+// nanrecover=0 turns off the reset of a bike whose physics state went NaN (NANRECOVER section,
+// src/nanrecover.h); on by default. Read early by NtReadCfg(), with nantrap=, before the sim
+// step hook goes in; kept here so a save does not drop it.
+static std::atomic<bool> g_nrOn{true};
 // shaders=1 and its strengths (SHADERS section, src/shaderup.h); off by default. Read once at
 // load; F8 > S and the A/B key change it, and the live state, on the render thread only.
 static shaderup::Config  g_suCfg;
@@ -3850,6 +4740,7 @@ static void SaveOverlaySettings() {
             g_uiPct.load(), g_afOn.load() ? 1 : 0, (int)(g_afLimit * 1000.0 + 0.5));
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
+    fprintf(f, "modelsync=%d\n", g_rsOn.load() ? 1 : 0);
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (MenuKey() != frostmod::hotkey::Default()) {
@@ -3858,6 +4749,7 @@ static void SaveOverlaySettings() {
     }
     if (g_memDiag.load()) fprintf(f, "memdiag=1\n");
     if (g_texCompress.load()) fprintf(f, "texcompress=1\n");
+    if (g_auOn.load()) fprintf(f, "aussiemode=1\n");
     if (g_tcDebug.load()) fprintf(f, "texcompressdebug=1\n");
     if (g_tcMinDim.load() != 256) fprintf(f, "texcompressmin=%d\n", g_tcMinDim.load());
     if (g_ntCfg.on) fprintf(f, "nantrap=1\n");
@@ -3865,6 +4757,14 @@ static void SaveOverlaySettings() {
     if (!g_tlCfg.on) fprintf(f, "tyrelog=0\n");
     if (!g_mgOn.load()) fprintf(f, "mapguard=0\n");
     if (g_mgTestEvery.load() > 0) fprintf(f, "mapguardtest=%d\n", g_mgTestEvery.load());
+    if (!g_sgOn.load()) fprintf(f, "shockguard=0\n");
+    if (!g_blOn.load()) fprintf(f, "bikelistguard=0\n");
+    if (!g_wkOn.load()) fprintf(f, "wakeguard=0\n");
+    if (!g_lbOn.load()) fprintf(f, "listboxguard=0\n");
+    if (!g_p64On.load()) fprintf(f, "ptr64fix=0\n");
+    if (!g_riOn.load()) fprintf(f, "riderinfoguard=0\n");
+    if (!g_mmOn.load()) fprintf(f, "mipmapguard=0\n");
+    if (!g_nrOn.load()) fprintf(f, "nanrecover=0\n");
     fputs(shaderup::CfgLines(g_suCfg).c_str(), f);
     if (frostmod::hotkey::Unpack(g_suKey.load()) != SuDefaultKey()) {
         char sk[48]; frostmod::hotkey::Format(frostmod::hotkey::Unpack(g_suKey.load()), sk, sizeof(sk));
@@ -3903,9 +4803,20 @@ static void LoadOverlaySettings() {
         else if (nantrap::ParseCfgLine(line, g_ntCfg)) {}
         else if (tyrelog::ParseCfgLine(line, g_tlCfg)) {}
         else if (sscanf_s(line, "antifreeze=%d", &v) == 1) g_afOn.store(v != 0);
+        // Only read at load: the patch goes in right after this, or not at all.
+        else if (sscanf_s(line, "aussiemode=%d", &v) == 1) g_auOn.store(v == 1);
         // Only read at load: the guard goes in right after this, or not at all.
         else if (sscanf_s(line, "mapguardtest=%d", &v) == 1) g_mgTestEvery.store(v > 0 ? v : 0);
         else if (sscanf_s(line, "mapguard=%d", &v) == 1) g_mgOn.store(v != 0);
+        else if (sscanf_s(line, "shockguard=%d", &v) == 1) g_sgOn.store(v != 0);
+        else if (sscanf_s(line, "bikelistguard=%d", &v) == 1) g_blOn.store(v != 0);
+        else if (sscanf_s(line, "wakeguard=%d", &v) == 1) g_wkOn.store(v != 0);
+        else if (sscanf_s(line, "listboxguard=%d", &v) == 1) g_lbOn.store(v != 0);
+        else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) g_p64On.store(v != 0);
+        else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) g_riOn.store(v != 0);
+        else if (sscanf_s(line, "mipmapguard=%d", &v) == 1) g_mmOn.store(v != 0);
+        // Only kept for the next save: whether the reset went in was decided at load.
+        else if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
         // shaders=, shaderbump=, ..., grade=. Read here once; whether the hooks go in is
         // decided right after this, at load.
         else if (shaderup::ParseCfgLine(line, g_suCfg)) {}
@@ -3928,6 +4839,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "antifreezems=%d", &v) == 1 && v > 0)
             g_afLimit = antifreeze::ClampLimit((double)v / 1000.0);
         else if (sscanf_s(line, "servermsg=%d",  &v) == 1) g_msgOn.store(v != 0);
+        else if (sscanf_s(line, "modelsync=%d", &v) == 1) g_rsOn.store(v == 1);
         // Clamped so a hand-edited file cannot park the stack off the top or bottom.
         else if (sscanf_s(line, "servermsgy=%d", &v) == 1 && v >= 40 && v <= 800) g_msgAnchor.store(v);
         else if (sscanf_s(line, "servermsgport=%d", &v) == 1 && v > 0 && v < 65536) g_msgPort.store(v);
@@ -3936,11 +4848,14 @@ static void LoadOverlaySettings() {
     // Keys this version no longer knows (rejoinfix=, settingsver= from the removed rejoin
     // fix) match nothing above and are skipped; the next save drops them.
     char mk[48]; MenuKeyName(mk, sizeof(mk));
-    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d y=%d port=%d menukey=%s%s",
+    Log("[overlay] settings loaded: size=%d%% antifreeze=%d/%.2fs servermsg=%d modelsync=%d y=%d port=%d menukey=%s%s",
         g_uiPct.load(),
-        g_afOn.load(), g_afLimit, g_msgOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
+        g_afOn.load(), g_afLimit, g_msgOn.load(), g_rsOn.load(), g_msgAnchor.load(), g_msgPort.load(), mk,
         g_devMenu ? " devmenu=1" : "");
+    if (g_rsOn.load()) Log("[modelsync] modelsync=1: remote rider, gear and bike models are matched by content");
 }
+
+
 
 // ---- which rider is me ---------------------------------------------------
 // Returns the count of OTHER riders (0..maxOut), or -1 if we have no "me" yet
@@ -4054,7 +4969,7 @@ static const MenuItem kMenu[] = {
     { '7', "Overlay size",                  true,  6  },
     { '8', "Toggle this overlay",           false, 2  },
     { '9', "Hide overlay (recording)",      false, 7  },
-    { '0', "Rebuild riders (load new gear models)", false, 9 },
+    { '0', "Rebuild riders (new gear)", false, 9 },
     { 'K', "Change menu key",               false, 16 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
@@ -6206,7 +7121,13 @@ void Tick() {
     // to do here rather than on a timer, and the window it watches for is only five seconds
     // wide.
     WorldWatch();
+    ShockGuardTick();    // the shock guard's counter: a log line and a crash-trail note
+    SessionGuardsTick(); // the list-box and pointer stubs' counters, the same way
+    ProtTick();          // what the guards caught, to frostmod-protection.jsonl for MXB App
     ArrivedGearTick();   // riders wearing gear models a gear refresh just brought in
+    RiderSyncTick();     // content-matched remote rider/helmet/boots models, when enabled
+    BikeSyncTick();      // content-matched remote bike models, when enabled
+    ModelSyncRebuildTick(); // one shared rider rebuild serves gear and bike changes
     RaceFilterTick();
 
     // TEMP DIAGNOSTIC (fix/reload-plugin-draw-dispatch): while armed by RequestReload(),
@@ -7244,6 +8165,14 @@ static void DispatchCommand(const std::string& doc, const std::string& path) {
     } else if (verb == "refresh_gear") {
         Log("[cmd] gear refresh requested by MXB App");
         RequestGearRefresh();
+    } else if (verb == "set_rider_looks") {
+        std::string encoded;
+        if (!JsonStringField(doc, "looks", encoded)) return;
+        std::vector<frostmod::RiderLook> looks;
+        int skipped = 0;
+        frostmod::ParseRiderLooks(encoded, looks, &skipped);
+        Log("[cmd] set_rider_looks: %zu riders (%d skipped)", looks.size(), skipped);
+        RiderLooksSet(std::move(looks));
     } else if (verb == "refresh_paints") {
         // MXB App's paint sync has written or removed .pnt files. The paint refresh rebuilds
         // only the paint lists, and its live-paints pass applies whatever riders on track
@@ -7366,6 +8295,7 @@ static int hkGhsClose(unsigned handle) {
             Log("[ghs] guarded a close of handle %u whose slot is already empty - this is "
                 "the crash at mxbikes.exe+0x11D753. Prevented %u so far.", handle, n);
         frostmod::crash::Note("guarded a double close of GHS handle %u", handle);
+        ProtCatch(protection::Kind::TrainerClose);
         return 1;   // the game's own answer for a handle that names no slot
     }
     return g_origGhsClose(handle);
@@ -7424,6 +8354,7 @@ static int32_t hkTerrainSample(void* obj, void* a2, float* out, float x, float y
             for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
         }
         frostmod::crash::Note("refused a NaN height query (%u so far)", n);
+        ProtCatch(protection::Kind::PhysicsNan);
         return 0;   // what the function itself returns for a query it cannot serve
     }
     return g_origTerrain(obj, a2, out, x, y);
@@ -7473,6 +8404,7 @@ static int32_t hkGhsLoad(int32_t pool, const char* path, const char* tag, int32_
                     "(msvcr90+0x36EDE). Cleaned %u so far.",
                     fixed, path ? path : "(no path)", n);
             frostmod::crash::Note("cleaned a trainer record on load (%u so far)", n);
+            ProtCatch(protection::Kind::BadText);
         }
     }
     return rc;
@@ -7600,6 +8532,7 @@ static int TyreFallbackPick(int site, const uint8_t* gameRsp, int bikeIndex) {
     else
         Log("[tyres] bike %s asked for tyre '%s' which isn't loaded; using '%s'.", bike, want, used);
     frostmod::crash::Note("tyre fallback for bike %s (%u so far)", bike, n);
+    ProtCatch(protection::Kind::BadText);
     return pick;
 }
 
@@ -7647,13 +8580,14 @@ static void InstallTyreFallback(intptr_t delta) {
 }
 
 // ===========================================================================
-// MAP GUARD  -  the quad-batch flush no longer writes through a bad glMapBuffer pointer
+// MAP GUARD  -  the quad-batch flush no longer writes through a bad vertex-buffer pointer
 //
-// mapguard.h has the chain. The flush at 0x2409D0 maps its batch's vertex buffer and writes
-// through the result unchecked; on one RTX 5080 + ReShade setup that result is junk (never
-// NULL in the dumps) and the first store faults at mxbikes.exe+0x24085C. The flush's map and
-// unmap calls now go through MgMap / MgUnmap: a pointer that is committed and writable is
-// handed back untouched, anything else gets a scratch buffer of ours, uploaded at the unmap.
+// mapguard.h has the chain. The flush at 0x2409D0 gets its batch's vertex pointer from
+// 0x22AC50 and writes through it unchecked; on one RTX 5080 + ReShade setup that pointer is
+// junk (the ram path's shadow pointer, in the 0.49.17 dumps) and the first store faults at
+// mxbikes.exe+0x24085C. The flush's map and unmap calls now go through MgMap / MgUnmap: a
+// pointer that is committed and writable is handed back untouched, anything else gets a
+// scratch buffer of ours on every path, uploaded at the unmap (or kept, with no GL buffer).
 // Only those two call instructions change; every other caller of the map function, and
 // glMapBuffer itself, are left alone. mapguard=0 turns it off; mapguardtest=N fakes a bad
 // pointer on every Nth map so the fallback can be watched in game.
@@ -7666,10 +8600,16 @@ using MgUnmapBufferFn = GLboolean(APIENTRY*)(GLenum);
 using MgGetBufParamFn = void(APIENTRY*)(GLenum, GLenum, GLint*);
 
 // Render thread only, except the counter (read at teardown for the summary line).
-struct MgSlot { const void* vb; uint8_t* buf; size_t cap; size_t live; };   // live: bytes lent, 0 = none
+struct MgSlot {
+    const void* vb; uint8_t* buf; size_t cap;
+    size_t live;              // bytes lent, 0 = none
+    mapguard::Path path;      // the path the game was on when we lent it
+    bool stopped;             // the walker was stopped this flush (MgWalkerFault)
+};
 static MgSlot                g_mgSlots[mapguard::kMaxSlots] = {};
 static uint64_t              g_mgMaps = 0;              // maps seen at this site (mapguardtest)
 static std::atomic<unsigned> g_mgFired{0};
+static unsigned              g_mgKindFired[mapguard::kKinds] = {};   // per (path, verdict), for the log
 static MgGetBufParamFn       g_mgGetBufParam = nullptr;
 static bool                  g_mgGetBufParamLooked = false;
 static uintptr_t             g_mgSpan = 0;              // VA of the map call, 0 = not patched
@@ -7683,6 +8623,13 @@ static mapguard::Verdict MgClassify(const void* p, size_t size, mapguard::Region
         r->state = mbi.State; r->protect = mbi.Protect;
         return true;
     }, bad);
+}
+
+// Which of 0x22AC50's paths this record takes right now (same three ints the game tests).
+static mapguard::Path MgPath(const uint8_t* rec) {
+    return mapguard::PathOf(*(const int32_t*)(g_base + mapguard::kRvaGlOk),
+                            *(const int32_t*)(g_base + mapguard::kRvaUseMap),
+                            *(const int32_t*)(rec + mapguard::kVbGlName));
 }
 
 // The scratch kept for this record, grown to `size`. nullptr when there is no room for one.
@@ -7712,66 +8659,212 @@ static void* MgMap(void* vb) {
     const mapguard::Verdict v = forced ? mapguard::Verdict::Forced : MgClassify(p, size, &bad);
     if (v == mapguard::Verdict::Ok) return p;
 
-    // Only the glMapBuffer path is ours to stand in for. With buffers off, or no buffer name,
-    // the game returns what it always did and its own unmap does what it always did.
-    const bool glPath = *(const int32_t*)(g_base + mapguard::kRvaGlOk) != 0 &&
-                        *(const int32_t*)(g_base + mapguard::kRvaUseMap) != 0 &&
-                        *(const int32_t*)(rec + mapguard::kVbGlName) != 0;
-    MgSlot* s = (glPath && size) ? MgSlotFor(vb, size) : nullptr;
+    // Whatever path the game is on, a bad pointer is never handed to the flush: it writes
+    // into our scratch, and MgUnmap does the right thing with that for the path.
+    const mapguard::Path path = MgPath(rec);
+    MgSlot* s = size ? MgSlotFor(vb, size) : nullptr;
     const unsigned n = g_mgFired.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (mapguard::ShouldLog(n)) {
+    const unsigned k = ++g_mgKindFired[mapguard::KindIndex(path, v)];
+    if (mapguard::ShouldLog(k)) {
         if (!s)
-            Log("[mapguard] the quad batch's glMapBuffer gave %p (%s) for a %zu-byte buffer and "
-                "there is no scratch to stand in (%s) - the game's pointer is kept. Fired %u so far.",
-                p, mapguard::VerdictName(v), size,
-                !glPath ? "not the glMapBuffer path" : !size ? "record size out of range" : "out of memory",
-                n);
+            Log("[mapguard] %s: the quad batch's map gave %p (%s) for a %zu-byte buffer and "
+                "there is no scratch to stand in (%s) - the game's pointer is kept. This kind "
+                "%u, all kinds %u so far.",
+                mapguard::PathName(path), p, mapguard::VerdictName(v), size,
+                !size ? "record size out of range" : "out of memory", k, n);
         else if (v == mapguard::Verdict::Forced)
-            Log("[mapguard] mapguardtest=%d: map %llu treated as bad (real pointer %p) - this "
-                "batch is drawn from FrostMod's copy. Fired %u so far.",
-                every, (unsigned long long)g_mgMaps, p, n);
+            Log("[mapguard] %s: mapguardtest=%d: map %llu treated as bad (real pointer %p) - this "
+                "batch is written to FrostMod's copy. This kind %u, all kinds %u so far.",
+                mapguard::PathName(path), every, (unsigned long long)g_mgMaps, p, k, n);
         else
-            Log("[mapguard] the quad batch's glMapBuffer gave %p, %s (region %p +0x%llx state 0x%x "
-                "protect 0x%x), for a %zu-byte buffer - drawn from FrostMod's copy instead of "
-                "crashing at mxbikes.exe+0x24085C. Fired %u so far.",
-                p, mapguard::VerdictName(v), (void*)bad.base, (unsigned long long)bad.size,
-                bad.state, bad.protect, size, n);
-        frostmod::crash::Note("quad-batch map guard fired (%u so far, %s)", n, mapguard::VerdictName(v));
+            Log("[mapguard] %s: the quad batch's map gave %p, %s (region %p +0x%llx state 0x%x "
+                "protect 0x%x), for a %zu-byte buffer - written to FrostMod's copy instead of "
+                "crashing at mxbikes.exe+0x24085C. This kind %u, all kinds %u so far.",
+                mapguard::PathName(path), p, mapguard::VerdictName(v), (void*)bad.base,
+                (unsigned long long)bad.size, bad.state, bad.protect, size, k, n);
+        frostmod::crash::Note("quad-batch map guard fired (%s, %s, %u of this kind, %u in all)",
+                              mapguard::PathName(path), mapguard::VerdictName(v), k, n);
     }
+    if (!(path == mapguard::Path::NoBuffer && v == mapguard::Verdict::Null) &&
+        v != mapguard::Verdict::Forced)
+        ProtCatch(protection::Kind::RenderBatch);   // a NULL on the no-buffer path is an empty batch, never a crash
     if (!s) return p;
     s->live = size;
+    s->path = path;
     return s->buf;
 }
 
 // Called by the flush instead of 0x22ACC0. Anything we did not lend goes to the game's own.
+static void MgClampStopped(uint8_t* batch, MgSlot* s, bool onOurs);   // below, with the walker guard
+
 static int MgUnmap(void* vb, int first, int count) {
     MgSlot* s = nullptr;
     for (MgSlot& x : g_mgSlots) if (x.vb == vb) { s = &x; break; }
+    if (s && s->stopped) {
+        // The walker was stopped this flush (MgWalkerFault): draw only what is whole and ours.
+        s->stopped = false;
+        uint8_t* batch = (uint8_t*)vb - mapguard::kBatchVb;
+        MgClampStopped(batch, s, s->live != 0);
+        if (!s->live) count = 0;
+    }
     if (!s || !s->live)
         return ((MgUnmapFn)(g_base + mapguard::kRvaUnmapFn))(vb, first, count);
 
     const size_t n = s->live;
     s->live = 0;
+    const mapguard::UnmapAction act = mapguard::UnmapFor(s->path, MgPath((const uint8_t*)vb));
+    if (act == mapguard::UnmapAction::Game) {
+        // No GL buffer: the game's unmap returns 1 without touching GL. The flush's writes
+        // went into our scratch, which stays allocated, so nothing is left pointing at junk.
+        return mapguard::UnmapResult(act, ((MgUnmapFn)(g_base + mapguard::kRvaUnmapFn))(vb, first, count));
+    }
     auto subData = *(MgSubDataFn*)(g_base + mapguard::kRvaGlBufferSubData);
     auto unmapBuf = *(MgUnmapBufferFn*)(g_base + mapguard::kRvaGlUnmapBuffer);
-    if (!g_mgGetBufParamLooked) {
-        g_mgGetBufParamLooked = true;
-        g_mgGetBufParam = (MgGetBufParamFn)wglGetProcAddress("glGetBufferParameteriv");
-    }
     // The buffer the map bound; re-bound through the game's cache so the cache stays right.
     ((MgBindFn)(g_base + mapguard::kRvaBindFn))(vb);
-    // SubData on a buffer GL still has mapped is an error, so a mapping that "succeeded" with a
-    // junk pointer (or a forced one) is closed first. If GL says it is not mapped, leave it.
-    GLint mapped = 1;
-    if (g_mgGetBufParam) g_mgGetBufParam(mapguard::kGlArrayBuffer, mapguard::kGlBufferMapped, &mapped);
-    if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
-    if (subData) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)n, s->buf);
-    return 0;   // what 0x22ACC0's glMapBuffer path returns
+    if (act == mapguard::UnmapAction::CloseThenUpload) {
+        // SubData on a buffer GL still has mapped is an error, so a mapping that "succeeded"
+        // with a junk pointer (or a forced one) is closed first. If GL says it is not mapped,
+        // leave it.
+        if (!g_mgGetBufParamLooked) {
+            g_mgGetBufParamLooked = true;
+            g_mgGetBufParam = (MgGetBufParamFn)wglGetProcAddress("glGetBufferParameteriv");
+        }
+        GLint mapped = 1;
+        if (g_mgGetBufParam) g_mgGetBufParam(mapguard::kGlArrayBuffer, mapguard::kGlBufferMapped, &mapped);
+        if (mapped && unmapBuf) unmapBuf(mapguard::kGlArrayBuffer);
+    }
+    // On the ram path this is the game's own upload, from our copy instead of its bad RAM
+    // pointer. An empty batch uploads nothing (as the game's unmap does); any other goes up
+    // whole, since the four arrays sit at fixed offsets across all of it.
+    const size_t up = mapguard::UploadBytes(n, count);
+    if (subData && up) subData(mapguard::kGlArrayBuffer, 0, (ptrdiff_t)up, s->buf);
+    return mapguard::UnmapResult(act, 0);
+}
+
+// ---- the second line: a walker store that faults anyway (mapguard.h) ------------------
+// MgMap checks the pointer once. v0.51.0 still crashed at +0x24085C with the check passed,
+// so the walker's own stores are watched too: a write fault on one of them moves the batch
+// onto our scratch (the same one MgMap lends) and the store runs again, now into our copy.
+// MgUnmap then uploads that copy exactly as if MgMap had lent it. A fault on our own scratch
+// means the walk ran off the end of a whole buffer: that walker frame leaves through its own
+// epilogue and the draw is clamped to whole quads. Only the faulting thread's frame changes,
+// and only for an rip inside the walker's quad loop.
+static PVOID                 g_mgVeh = nullptr;
+static uintptr_t             g_mgBatchTable = 0;      // VA of the ten batch pointers
+static std::atomic<unsigned> g_mgMoved{0}, g_mgStopped{0};
+
+static MgSlot* MgSlotOf(const void* vb) {
+    for (MgSlot& x : g_mgSlots) if (x.vb == vb) return &x;
+    return nullptr;
+}
+
+static LONG CALLBACK MgWalkerFault(EXCEPTION_POINTERS* ep) {
+    using namespace mapguard;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    CONTEXT* c = ep->ContextRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 ||
+        er->ExceptionInformation[0] != 1 /*write*/ || !g_mgSpan || !g_mgBatchTable)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (c->Rip < g_base || !InWalkerStores(c->Rip - g_base)) return EXCEPTION_CONTINUE_SEARCH;
+
+    uint8_t* b = (uint8_t*)c->Rsi;
+    bool known = false;
+    for (int i = 0; i < kBatches && !known; ++i)
+        known = b && *(uint8_t* const*)(g_mgBatchTable + 8 * i) == b;
+    const void* vb = known ? b + kBatchVb : nullptr;
+    const size_t size = known ? BufferBytes(*(const int32_t*)(b + kBatchVb + kVbCount),
+                                            *(const int32_t*)(b + kBatchVb + kVbStride)) : 0;
+    uint32_t offs[4] = {};
+    for (int k = 0; known && k < 4; ++k) offs[k] = *(const uint32_t*)(b + kArrayOffs[k]);
+    MgSlot* s = known ? MgSlotOf(vb) : nullptr;
+    const bool onScratch = s && s->live && s->buf &&
+        *(uint8_t**)(b + kBatchArrays) >= s->buf && *(uint8_t**)(b + kBatchArrays) < s->buf + s->cap;
+    if (known && !onScratch && size && OffsetsFit(offs, size)) s = MgSlotFor(vb, size);
+    const bool canMove = s && s->buf && s->cap >= size && size && OffsetsFit(offs, size);
+    const FaultAction act = OnWalkerFault(known, onScratch, canMove);
+    if (act == FaultAction::Pass) return EXCEPTION_CONTINUE_SEARCH;
+
+    const uintptr_t target = (uintptr_t)er->ExceptionInformation[1];
+    if (act == FaultAction::Move) {
+        memset(s->buf, 0, size);   // the quads already written are dropped, not drawn stale
+        DWORD64* cur[4] = {&c->R10, &c->R11, &c->Rdx, &c->Rcx};
+        uint64_t oldBase[4];
+        for (int k = 0; k < 4; ++k) {
+            uint8_t** arr = (uint8_t**)(b + kBatchArrays + 8 * k);
+            oldBase[k] = (uint64_t)*arr;
+            *arr = s->buf + offs[k];
+            *cur[k] = Rebase(*cur[k], oldBase[k], (uint64_t)*arr);
+        }
+        s->live = size;
+        s->path = MgPath(b + kBatchVb);
+        s->stopped = false;
+        const unsigned n = g_mgMoved.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLog(n)) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            VirtualQuery((const void*)target, &mbi, sizeof(mbi));
+            Log("[mapguard] %s: the quad walker's store at +0x%llX faulted writing %p (positions "
+                "%p, %d vertices in; region %p +0x%llx state 0x%x protect 0x%x) - the batch was "
+                "moved onto FrostMod's copy instead of crashing at mxbikes.exe+0x24085C. %u so far.",
+                PathName(s->path), (unsigned long long)(c->Rip - g_base), (void*)target,
+                (void*)oldBase[0], *(const int32_t*)(b + kBatchCount), mbi.BaseAddress,
+                (unsigned long long)mbi.RegionSize, (unsigned)mbi.State, (unsigned)mbi.Protect, n);
+            frostmod::crash::Note("quad walker store faulted, batch moved to FrostMod's copy (%u so far)", n);
+        }
+        ProtCatch(protection::Kind::RenderBatch);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Stop: leave this frame through the walker's own epilogue.
+    if (s) s->stopped = true;
+    const uintptr_t storeRva = c->Rip - g_base;
+    c->Rip = g_base + kRvaWalkExit;
+    const unsigned n = g_mgStopped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ShouldLog(n)) {
+        Log("[mapguard] the quad walker ran past its buffer (store at +0x%llX writing %p, %d "
+            "vertices, %s) - the walk was ended there and only whole quads are drawn. %u so far.",
+            (unsigned long long)storeRva, (void*)target, *(const int32_t*)(b + kBatchCount),
+            onScratch ? "on FrostMod's copy" : "on the game's memory", n);
+        frostmod::crash::Note("quad walker stopped at the end of its buffer (%u so far)", n);
+    }
+    ProtCatch(protection::Kind::RenderBatch);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// After a stop the batch's count can be past the buffer; clamp what the flush draws. A stop
+/// on the game's own memory draws nothing (that memory is what failed).
+static void MgClampStopped(uint8_t* batch, MgSlot* s, bool onOurs) {
+    int32_t* count = (int32_t*)(batch + mapguard::kBatchCount);
+    int32_t* tris  = (int32_t*)(batch + mapguard::kBatchTris);
+    if (!onOurs) { *count = 0; *tris = 0; return; }
+    const int32_t stride = *(const int32_t*)(batch + mapguard::kBatchVb + mapguard::kVbStride);
+    mapguard::ClampDraw(count, tris, stride > 0 ? (int32_t)(s->live / (size_t)stride) : 0);
+}
+
+static void InstallWalkerFaultGuard() {
+    using namespace mapguard;
+    if (!g_mgSpan || g_mgVeh) return;
+    // The table the flush indexes, decoded from its own `lea r13, [rip+disp]` at 0x240A89.
+    const uintptr_t table = (uintptr_t)((int64_t)(kRvaMapWin + 7) +
+        (int32_t)((uint32_t)kMapWin[3] | (uint32_t)kMapWin[4] << 8 | (uint32_t)kMapWin[5] << 16 |
+                  (uint32_t)kMapWin[6] << 24));
+    if (table != kRvaBatchTable ||
+        !Matches((const uint8_t*)(g_base + kRvaWalkLoLoop), kWalkHead, kWalkHeadLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaWalkExit), kWalkExit, kWalkExitLen)) {
+        Log("[mapguard] walker fault guard not applied: the walker's bytes are not what we expect.");
+        return;
+    }
+    g_mgBatchTable = g_base + table;
+    g_mgVeh = AddVectoredExceptionHandler(1 /*first*/, MgWalkerFault);
+    if (!g_mgVeh) { g_mgBatchTable = 0; Log("[mapguard] walker fault guard not applied: no handler"); return; }
+    Log("[mapguard] walker fault guard on: a quad-walker store that faults (+0x%llX..+0x%llX) "
+        "moves the batch onto FrostMod's copy.", (unsigned long long)kRvaWalkLoLoop,
+        (unsigned long long)kRvaWalkHiLoop);
 }
 
 // Put the two calls back exactly as they shipped. Called from Shutdown(): the stubs jump into
 // this dll, which the game unloads next.
 static void MgRevert() {
+    if (g_mgVeh) { RemoveVectoredExceptionHandler(g_mgVeh); g_mgVeh = nullptr; }
     if (!g_mgSpan) return;
     using namespace mapguard;
     const uintptr_t mapSite = g_base + kRvaMapCall, unmapSite = g_base + kRvaUnmapCall;
@@ -7847,9 +8940,10 @@ static void InstallMapGuard() {
         Log("[mapguard] not applied: the patch did not verify, reverted");
         return;
     }
+    InstallWalkerFaultGuard();
     const int every = g_mgTestEvery.load();
-    Log("[mapguard] on: the quad batch's glMapBuffer result is checked before the game writes "
-        "to it; a bad one is replaced by FrostMod's copy (calls at +0x%llX / +0x%llX).",
+    Log("[mapguard] on: the quad batch's vertex pointer is checked before the game writes "
+        "to it; a bad one is replaced by FrostMod's copy on any path (calls at +0x%llX / +0x%llX).",
         (unsigned long long)kRvaMapCall, (unsigned long long)kRvaUnmapCall);
     if (every > 0)
         Log("[mapguard] TEST MODE (mapguardtest=%d): every %dth map is treated as bad on purpose. "
@@ -7875,6 +8969,7 @@ static int32_t hkTerrainSample2(void* obj, void* a2, void* a3, float x, float y)
             for (int i = 0; i < got; ++i) Log("[terrain]   #%-2d %s", i, frames[i]);
         }
         frostmod::crash::Note("refused a NaN grid query (%u so far)", n);
+        ProtCatch(protection::Kind::PhysicsNan);
         return 1;   // this function's own "no answer"
     }
     return g_origTerrain2(obj, a2, a3, x, y);
@@ -7932,6 +9027,674 @@ static void InstallTerrainGuard(intptr_t delta) {
 }
 
 // ===========================================================================
+// SHOCK GUARD  -  the rear shock's curve lookup no longer indexes with a NaN (+0x1A29AE)
+//
+// shockguard.h has the chain. The terrain guard above turns a NaN bike's height queries away,
+// but the bike is still NaN, and the next thing to read it is the rear shock: 0x1A2970 looks
+// up the shock curve with x = 1 - length / stroke, NaN passes both of its range checks, and
+// the read at +0x1A29AE lands 8 GB below the curve. That is the top crash in the reports, and
+// it is what OB's 2026-10-28 report is.
+//
+// The one call to 0x1A2970 now goes through a machine-code stub that makes a NaN x into 0 -
+// the function's own "x <= 0" branch, curve[0] - and counts it. A finite x goes straight on.
+// The stub keeps every register the game's leaf keeps (the caller relies on xmm5 surviving
+// the call), so it does no logging of its own: ShockGuardTick() reads its counter once a
+// frame, on the render thread, and writes the log line and the crash-trail note from there.
+// shockguard=0 turns it off.
+// ===========================================================================
+static uintptr_t         g_sgSite   = 0;         // VA of the call we repointed, 0 = not patched
+static uint8_t*          g_sgStub   = nullptr;   // kept after revert: a thread may be on its way through
+static uint32_t          g_sgLogged = 0;         // the count at the last log line
+
+static void ShockGuardTick() {
+    if (!g_sgStub) return;
+    const uint32_t n = *(volatile const uint32_t*)(g_sgStub + shockguard::kCountOff);
+    if (n == g_sgLogged) return;
+    ProtCatch(protection::Kind::PhysicsNan);
+    const uint32_t prev = g_sgLogged;
+    g_sgLogged = n;
+    // Log when the count crosses a line the rate limit allows, and always the first.
+    bool due = prev == 0;
+    for (uint64_t k = (uint64_t)prev + 1; !due && k <= n && k <= (uint64_t)prev + 64; ++k)
+        due = shockguard::ShouldLog(k);
+    if (!due && n - prev > 64) due = true;
+    if (!due) return;
+    const uint8_t* bike = *(uint8_t* volatile const*)(g_sgStub + shockguard::kBikeOff);
+    double len = 0, stroke = 0;
+    if (bike) {
+        SafeReadBytes((const char*)(bike + shockguard::kBikeShockLen), (char*)&len, sizeof(len));
+        SafeReadBytes((const char*)(bike + shockguard::kBikeStroke), (char*)&stroke, sizeof(stroke));
+    }
+    Log("[shock] turned away a NaN shock-curve lookup (bike %p, shock length %g, stroke %g). "
+        "This is the crash at mxbikes.exe+0x%zx; the game got curve[0] instead. %u so far.",
+        (const void*)bike, len, stroke, (size_t)shockguard::kRvaFault, n);
+    frostmod::crash::Note("refused a NaN shock lookup (%u so far)", n);
+}
+
+// Put the call back exactly as it shipped. The stub only jumps into the game, never into this
+// dll, but the game gets its bytes back on unload like every other patch.
+static void SgRevert() {
+    if (!g_sgSite) return;
+    using namespace shockguard;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)g_sgSite, kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[shock] could not revert: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    // Same as the install: only the rel32 differs, and the physics thread may be running this
+    // call, so it goes back with one aligned store where it can.
+    int32_t orig = 0;
+    memcpy(&orig, kWin + kCallInWin + 1, sizeof(orig));
+    if (((g_sgSite + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(g_sgSite + 1), (LONG)orig);
+    else                           memcpy((void*)(g_sgSite + 1), &orig, sizeof(orig));
+    VirtualProtect((void*)g_sgSite, kCallLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)g_sgSite, kCallLen);
+    g_sgSite = 0;
+    const uint32_t n = g_sgStub ? *(volatile const uint32_t*)(g_sgStub + kCountOff) : 0;
+    if (n) Log("[shock] off: the rear shock's own call is back (turned away %u NaN lookup(s) this run)", n);
+    else   Log("[shock] off: the rear shock's own call is back (it never fired this run)");
+}
+
+static void InstallShockGuard() {
+    using namespace shockguard;
+    if (g_game != &GAME_MXB) {
+        Log("[shock] guard off for %s - the offsets are MX Bikes' only.", g_game->display);
+        return;
+    }
+    if (!g_sgOn.load()) { Log("[shock] guard off by config (shockguard=0)"); return; }
+    if (g_sgSite) return;
+    if (g_unloading.load()) return;
+    const uintptr_t site = g_base + kRvaCall;
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te) ||
+        (uint8_t*)(g_base + kRvaCurveFn) < tb || (uint8_t*)(g_base + kRvaWin + kWinLen) > te ||
+        !Matches((const uint8_t*)(g_base + kRvaWin), kWin, kWinLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaCurveFn), kFnBytes, kFnLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaLenLoad), kLenLoad, kLoadLen) ||
+        !Matches((const uint8_t*)(g_base + kRvaStrokeLoad), kStrokeLoad, kLoadLen)) {
+        Log("[shock] guard not applied: the bytes at +0x%llX are not the rear shock's curve "
+            "lookup we expect (game updated?). Nothing patched.", (unsigned long long)kRvaCall);
+        return;
+    }
+    if (!g_sgStub) g_sgStub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_sgStub) { Log("[shock] guard not applied: no free page within reach"); return; }
+    memset(g_sgStub, 0xCC, kPageBytes);
+    memset(g_sgStub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_sgStub, (uintptr_t)g_sgStub, (uint64_t)(g_base + kRvaCurveFn));
+    FlushInstructionCache(GetCurrentProcess(), g_sgStub, kPageBytes);
+    g_sgLogged = 0;
+
+    int32_t rel = 0;
+    if (!CallRel(site, (uintptr_t)g_sgStub, &rel)) {
+        Log("[shock] guard not applied: stub out of rel32 reach");
+        return;
+    }
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)site, kCallLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        Log("[shock] guard not applied: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    // Only the rel32 changes, and it is 4-byte aligned in this build (0x1A2E80), so the physics
+    // thread sees the old call or the new one, never half of each.
+    if (((site + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(site + 1), (LONG)rel);
+    else                       memcpy((void*)(site + 1), &rel, sizeof(rel));
+    VirtualProtect((void*)site, kCallLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)site, kCallLen);
+    g_sgSite = site;
+
+    if (CallTarget(site, (const uint8_t*)site) != (uintptr_t)g_sgStub) {
+        SgRevert();
+        Log("[shock] guard not applied: the patch did not verify, reverted");
+        return;
+    }
+    Log("[shock] guard on: a NaN rear-shock curve lookup gets curve[0] instead of reading 8 GB "
+        "off the table (call at +0x%llX, the crash at +0x%llX).",
+        (unsigned long long)kRvaCall, (unsigned long long)kRvaFault);
+}
+
+// ===========================================================================
+// SESSION GUARDS  -  four crashes from thomas4f's beta21e list (src/sessionguards.h)
+//
+//   +0x45B0    bike list read with an index that is not a bike      bikelistguard=0
+//   +0x3B940   wake effect update after the track freed its list    wakeguard=0
+//   +0x1FED9E  list box line naming an item it does not have        listboxguard=0
+//   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
+//
+// sessionguards.h has the code for each. The first two are MinHook detours on the game's
+// function that answer the way the function already answers an empty list. The last two are
+// MinHook jumps in the middle of a function to a machine-code stub (as the server filter's
+// loop-top is): MinHook holds the game's threads while it writes, which a hand-written
+// multi-byte patch here could not promise. Every one checks its bytes first and stays off on
+// a mismatch; the stubs only jump back into the game, and MH_DisableHook at unload puts the
+// bytes back. The stubs count what they turn away and SessionGuardsTick() logs it from the
+// frame, as the shock guard does; the detours log from the call, at most ~20 lines a session.
+// ===========================================================================
+
+/// The bytes at `rva` are `want`, inside .text. beta21e only: every guard below refuses
+/// rather than looking elsewhere.
+static bool SsgCodeIs(uintptr_t rva, const uint8_t* want, size_t n) {
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te)) return false;
+    const uint8_t* p = (const uint8_t*)(g_base + rva);
+    return p >= tb && p + n <= te && sessionguards::Matches(p, want, n);
+}
+
+/// The data cell a rip-relative operand we have already matched names, if it is in the image.
+static void* SsgCell(const uint8_t* insn, uintptr_t rva, size_t dispAt, size_t len, size_t bytes) {
+    const uintptr_t cell = sessionguards::RipTarget(insn, rva, dispAt, len);
+    auto* dos = (IMAGE_DOS_HEADER*)g_base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
+    if (cell < 0x1000 || cell + bytes > nt->OptionalHeader.SizeOfImage) return nullptr;
+    return (void*)(g_base + cell);
+}
+
+static bool SsgMxbOnly(const char* tag) {
+    if (g_game == &GAME_MXB) return true;
+    Log("[%s] guard off for %s - the offsets are MX Bikes' only.", tag, g_game->display);
+    return false;
+}
+
+// ---- per-rider bike model sync builders -------------------------------------------
+// Only the bike index passed to gfx construction changes. The vehicle record, physics bike
+// index and collision objects are never written, so this remains a visual substitution.
+using BmsBuild_t = int64_t(__fastcall*)(void*, int, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsDeferred_t = int64_t(__fastcall*)(void*, int, int, void*, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using BmsPaintLookup_t = int64_t(__fastcall*)(void*, int, const char*, int*);
+static BmsBuild_t g_origBmsBuild = nullptr;
+static BmsDeferred_t g_origBmsDeferred = nullptr;
+static BmsPaintLookup_t g_origBmsPaintLookup = nullptr;
+static LONG g_bmsLoggedKey[64]{};
+static LONG g_bmsLoggedValid[64]{};
+
+// Kept as a POD/SEH function: a malformed block or bike table can only make this builder use
+// the game's original index. The table overload writes a fixed stack buffer, so this hot path
+// does not allocate.
+static int RemapBikeIndex(void* block, int bikeIdx) {
+    int result = bikeIdx;
+    bool held = false;
+    __try {
+        if (!g_rsOn.load(std::memory_order_relaxed)) return bikeIdx;
+        const int slot = frostmod::bikesync::SlotOfBlock((uintptr_t)block,
+            g_base + mxb::RVA_VEHICLES, mxb::VEHICLE_STRIDE, mxb::VEH_GFX, mxb::VEHICLE_MAX);
+        if (slot < 0 || slot == SafeReadInt((const int*)(g_base + mxb::RVA_OWN_VEHICLE)) - 1)
+            return bikeIdx;
+        const int key = SafeReadInt((const int*)(VehicleAt(slot) + mxb::VEH_KEY));
+        char shadow[64] = {0};
+        AcquireSRWLockShared(&g_bmsTableLock); held = true;
+        const bool found = g_bmsTable.Lookup(slot, key, shadow, sizeof(shadow));
+        ReleaseSRWLockShared(&g_bmsTableLock); held = false;
+        if (!found) return bikeIdx;
+        const int shadowIdx = BikeIndexOf(shadow);
+        const uintptr_t entry = BmsBikeEntry(shadowIdx);
+        if (shadowIdx < 0 || !BmsGfxLoaded(entry)) return bikeIdx;
+        result = shadowIdx;
+        const bool first = InterlockedCompareExchange(&g_bmsLoggedValid[slot], 1, 0) == 0;
+        const LONG previousKey = InterlockedExchange(&g_bmsLoggedKey[slot], key);
+        if (first || previousKey != key)
+            Log("[modelsync] slot %d key %d: visual bike '%s' (index %d instead of %d)",
+                slot, key, shadow, shadowIdx, bikeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (held) ReleaseSRWLockShared(&g_bmsTableLock);
+        return bikeIdx;
+    }
+    return result;
+}
+
+static int64_t __fastcall hkBmsBuild(void* block, int bike, uint64_t a2, uint64_t a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsBuild(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                          a12, a13, a14, a15, a16, a17, a18);
+}
+
+static int64_t __fastcall hkBmsDeferred(void* block, int bike, int a2, void* a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8, uint64_t a9,
+    uint64_t a10, uint64_t a11, uint64_t a12, uint64_t a13, uint64_t a14,
+    uint64_t a15, uint64_t a16, uint64_t a17, uint64_t a18, uint64_t a19, uint64_t a20) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsDeferred(block, idx, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                             a12, a13, a14, a15, a16, a17, a18, a19, a20);
+}
+
+static int64_t __fastcall hkBmsPaintLookup(void* block, int bike, const char* paint, int* out) {
+    const int idx = RemapBikeIndex(block, bike);
+    return g_origBmsPaintLookup(block, idx, paint, out);
+}
+
+static void InstallBikeModelSync() {
+    if (!g_rsOn.load() || g_origBmsBuild || g_unloading.load()) return;
+    if (!SsgMxbOnly("modelsync")) return;
+    static const uint8_t build[] = {0x4C,0x8B,0xDC,0x55,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t deferred[] = {0x48,0x89,0x5C,0x24,0x18,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
+    static const uint8_t paint[] = {0x55,0x56,0x41,0x54,0x41,0x55,0x41,0x56,0x48,0x81,0xEC,0x90,0x03,0x00,0x00};
+    static const uint8_t load[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57};
+    if (!SsgCodeIs(mxb::RVA_BIKE_BUILD, build, sizeof(build)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_BUILD_DEFERRED, deferred, sizeof(deferred)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_PAINT_LOOKUP, paint, sizeof(paint)) ||
+        !SsgCodeIs(mxb::RVA_BIKE_GFX_LOAD, load, sizeof(load))) {
+        Log("[modelsync] hooks not installed: beta21e builder/load bytes do not match (game updated?)");
+        return;
+    }
+    const bool a = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD), (void*)&hkBmsBuild,
+                               (void**)&g_origBmsBuild, "modelSyncBikeBuild(0x4D8C0)");
+    const bool b = InstallHook((void*)(g_base + mxb::RVA_BIKE_BUILD_DEFERRED), (void*)&hkBmsDeferred,
+                               (void**)&g_origBmsDeferred, "modelSyncDeferred(0x45020)");
+    const bool c = InstallHook((void*)(g_base + mxb::RVA_BIKE_PAINT_LOOKUP), (void*)&hkBmsPaintLookup,
+                               (void**)&g_origBmsPaintLookup, "modelSyncPaintLookup(0x455C0)");
+    g_bmsHooksReady.store(a && b && c);
+    Log("[modelsync] visual bike builders %s (%d/3 hooks)", a && b && c ? "on" : "incomplete",
+        (int)a + (int)b + (int)c);
+}
+
+// ---- +0x45B0: the bike list ----------------------------------------------------------
+using BikeCatFn = int (*)(int bike, int* cat);
+static BikeCatFn                g_origBikeCat = nullptr;
+static void* volatile*          g_blList      = nullptr;   // &bike list pointer
+static volatile const int32_t*  g_blCount     = nullptr;
+static void* volatile*          g_blCats      = nullptr;   // &category list pointer
+static volatile const int32_t*  g_blCatCount  = nullptr;
+static std::atomic<uint32_t>    g_blRefused{0};
+
+static int hkBikeCat(int bike, int* cat) {
+    const int32_t count = *g_blCount;
+    if (sessionguards::bikelist::Admit(bike, count, *g_blList != nullptr, cat, *g_blCatCount,
+                                       *g_blCats != nullptr))
+        return g_origBikeCat(bike, cat);
+    const uint32_t n = g_blRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[bikelist] turned away a bike-list read for bike %d (the list has %d) - the crash at "
+            "mxbikes.exe+0x45B0. The game got 'no names in common', as for a bike with none. "
+            "%u so far.", bike, count, n);
+        frostmod::crash::Note("refused bike-list index %d of %d (%u so far)", bike, count, n);
+    }
+    ProtCatch(protection::Kind::BikeList);
+    return sessionguards::bikelist::kEmpty;
+}
+
+static void InstallBikeListGuard() {
+    using namespace sessionguards::bikelist;
+    if (!SsgMxbOnly("bikelist")) return;
+    if (!g_blOn.load()) { Log("[bikelist] guard off by config (bikelistguard=0)"); return; }
+    if (g_origBikeCat || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaFn, kFn, kFnLen) ||
+        !SsgCodeIs(kRvaBikeCount, kBikeCount, sizeof(kBikeCount)) ||
+        !SsgCodeIs(kRvaBikeTable, kBikeTable, sizeof(kBikeTable)) ||
+        !SsgCodeIs(kRvaCatCount, kCatCount, sizeof(kCatCount)) ||
+        !SsgCodeIs(kRvaCatTable, kCatTable, sizeof(kCatTable))) {
+        Log("[bikelist] guard not applied: the bytes at +0x%llX are not the bike-list lookup we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    // The cells, decoded from the function's own loads; the counts from the loops that read
+    // the same tables, which must decode to the same cells.
+    void* list  = SsgCell(kFn + kBikeTableAt, kRvaFn + kBikeTableAt, kLoadDisp, kLoadLen, 8);
+    void* cats  = SsgCell(kFn + kCatTableAt, kRvaFn + kCatTableAt, kLoadDisp, kLoadLen, 8);
+    void* list2 = SsgCell(kBikeTable, kRvaBikeTable, 3, 7, 8);
+    void* cats2 = SsgCell(kCatTable, kRvaCatTable, 3, 7, 8);
+    void* count = SsgCell(kBikeCount, kRvaBikeCount, 2, 6, 4);
+    void* catn  = SsgCell(kCatCount, kRvaCatCount, 2, 6, 4);
+    if (!list || !cats || !count || !catn || list != list2 || cats != cats2) {
+        Log("[bikelist] guard not applied: the list and count cells do not decode consistently.");
+        return;
+    }
+    g_blList = (void* volatile*)list;  g_blCount = (volatile const int32_t*)count;
+    g_blCats = (void* volatile*)cats;  g_blCatCount = (volatile const int32_t*)catn;
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkBikeCat, (void**)&g_origBikeCat,
+                     "bikeListLookup(0x4580)")) {
+        g_origBikeCat = nullptr;
+        return;
+    }
+    Log("[bikelist] guard on: a bike index outside the bike list gets 'no names in common' "
+        "instead of a read off the list (fn +0x%llX, the crash at +0x%llX; %d bikes loaded).",
+        (unsigned long long)kRvaFn, (unsigned long long)kRvaFault, (int)*g_blCount);
+}
+
+// ---- +0x3B940: the wake effects ------------------------------------------------------
+using WakeFn = int (*)(float dt);
+static WakeFn                  g_origWake  = nullptr;
+static void* volatile*         g_wkList    = nullptr;
+static void* volatile*         g_wkVerts   = nullptr;
+static volatile int32_t*       g_wkCount   = nullptr;
+static std::atomic<uint32_t>   g_wkSkipped{0};
+
+static int hkWake(float dt) {
+    if (sessionguards::wake::Admit(*g_wkList, *g_wkVerts)) return g_origWake(dt);
+    *g_wkCount = 0;   // what the update stores first; 0x5AA50 uploads this many vertices
+    const uint32_t n = g_wkSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[wake] skipped a wake-effect update: the track teardown already freed its list - the "
+            "crash at mxbikes.exe+0x3B940. %u so far.", n);
+        frostmod::crash::Note("skipped a wake update after teardown (%u so far)", n);
+    }
+    ProtCatch(protection::Kind::Wake);
+    return 0;
+}
+
+static void InstallWakeGuard() {
+    using namespace sessionguards::wake;
+    if (!SsgMxbOnly("wake")) return;
+    if (!g_wkOn.load()) { Log("[wake] guard off by config (wakeguard=0)"); return; }
+    if (g_origWake || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaFn, kHead, kHeadLen) ||
+        !SsgCodeIs(kRvaCountStore, kCountStore, sizeof(kCountStore)) ||
+        !SsgCodeIs(kRvaLoop, kLoop, kLoopLen)) {
+        Log("[wake] guard not applied: the bytes at +0x%llX are not the wake-effect update we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    void* list  = SsgCell(kHead + kListAt, kRvaFn + kListAt, 3, 7, 8);
+    void* verts = SsgCell(kHead + kVertsAt, kRvaFn + kVertsAt, 3, 7, 8);
+    void* count = SsgCell(kCountStore, kRvaCountStore, 3, 7, 4);
+    if (!list || !verts || !count) {
+        Log("[wake] guard not applied: the decoded cells are outside the module.");
+        return;
+    }
+    g_wkList = (void* volatile*)list; g_wkVerts = (void* volatile*)verts;
+    g_wkCount = (volatile int32_t*)count;
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkWake, (void**)&g_origWake,
+                     "wakeUpdate(0x3b8e0)")) {
+        g_origWake = nullptr;
+        return;
+    }
+    Log("[wake] guard on: a wake-effect update after the track freed its list is skipped "
+        "(fn +0x%llX, the crash at +0x%llX).", (unsigned long long)kRvaFn, (unsigned long long)kRvaFault);
+}
+
+// ---- +0x1FED9E: the list box line ----------------------------------------------------
+static uint8_t* g_lbStub   = nullptr;   // kept after unload: a thread may be on its way through
+static void*    g_lbTramp  = nullptr;   // MinHook's; unused, the stub jumps back itself
+static uint32_t g_lbLogged = 0;
+
+static void InstallListBoxGuard() {
+    using namespace sessionguards::listbox;
+    if (!SsgMxbOnly("listbox")) return;
+    if (!g_lbOn.load()) { Log("[listbox] guard off by config (listboxguard=0)"); return; }
+    if (g_lbTramp || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaWin, kWin, kWinLen) || !SsgCodeIs(kRvaTail, kTail, sizeof(kTail)) ||
+        !SsgCodeIs(kRvaAdd, kAdd, kAddLen)) {
+        Log("[listbox] guard not applied: the bytes at +0x%llX are not the list-box draw we "
+            "expect (game updated?). Nothing patched.", (unsigned long long)kRvaSite);
+        return;
+    }
+    const uintptr_t site = g_base + kRvaSite;
+    if (!g_lbStub) g_lbStub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_lbStub) { Log("[listbox] guard not applied: no page for the stub"); return; }
+    memset(g_lbStub, 0xCC, kPageBytes);
+    memset(g_lbStub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_lbStub, (uintptr_t)g_lbStub, (uint64_t)(g_base + kRvaBack), (uint64_t)(g_base + kRvaSkip));
+    FlushInstructionCache(GetCurrentProcess(), g_lbStub, kPageBytes);
+    g_lbLogged = 0;
+    if (!InstallHook((void*)site, g_lbStub, &g_lbTramp, "listBoxLine(0x1fed8c)")) {
+        g_lbTramp = nullptr;
+        return;
+    }
+    Log("[listbox] guard on: a list-box line naming an item the box does not have is skipped "
+        "instead of read (at +0x%llX, the crash at +0x%llX).",
+        (unsigned long long)kRvaSite, (unsigned long long)kRvaFault);
+}
+
+// ---- +0x2A42F0: the 32-bit pointer ---------------------------------------------------
+static uint8_t* g_p64Stub   = nullptr;
+static void*    g_p64Tramp  = nullptr;
+static uint32_t g_p64Logged = 0;
+
+static void InstallPtr64Fix() {
+    using namespace sessionguards::ptr64;
+    if (!SsgMxbOnly("ptr64")) return;
+    if (!g_p64On.load()) { Log("[ptr64] fix off by config (ptr64fix=0)"); return; }
+    if (g_p64Tramp || g_unloading.load()) return;
+    bool ok = SsgCodeIs(kRvaSite, kSite, kSiteLen) && SsgCodeIs(kRvaCallee, kCallee, sizeof(kCallee)) &&
+              SsgCodeIs(kRvaDispatch, kDispatch, kDispatchLen);
+    // And the dispatcher's table sends job 863 here.
+    uint8_t *tb, *te;
+    const uint8_t* entry = (const uint8_t*)(g_base + kRvaJumpTable + 4 * kJob);
+    ok = ok && GetExecRange(g_base, &tb, &te) && entry >= tb && entry + 4 <= te &&
+         (uint32_t)sessionguards::Disp32(entry) == (uint32_t)kRvaSite;
+    if (!ok) {
+        Log("[ptr64] fix not applied: the bytes at +0x%llX are not job 863 as we expect it "
+            "(game updated?). Nothing patched.", (unsigned long long)kRvaSite);
+        return;
+    }
+    const uintptr_t site = g_base + kRvaSite;
+    if (!g_p64Stub) g_p64Stub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_p64Stub) { Log("[ptr64] fix not applied: no page for the stub"); return; }
+    memset(g_p64Stub, 0xCC, kPageBytes);
+    memset(g_p64Stub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_p64Stub, (uintptr_t)g_p64Stub, (uint64_t)(g_base + kRvaBack));
+    FlushInstructionCache(GetCurrentProcess(), g_p64Stub, kPageBytes);
+    g_p64Logged = 0;
+    if (!InstallHook((void*)site, g_p64Stub, &g_p64Tramp, "job863Pointer(0x127109)")) {
+        g_p64Tramp = nullptr;
+        return;
+    }
+    Log("[ptr64] fix on: job 863 hands +0x%llX its pointer in 64 bits, not 32 (at +0x%llX). "
+        "Launches with the stack below 4 GB see no change; above, this is the crash.",
+        (unsigned long long)kRvaCallee, (unsigned long long)kRvaSite);
+}
+
+// ---- +0x7A860: the host's unfilled rider lists ----------------------------------------
+using RiderInfoFn = int (*)(int id, void* out);
+static RiderInfoFn            g_origRiderInfo = nullptr;
+static std::atomic<uint32_t>  g_riCleared{0};
+
+static int hkRiderInfo(int id, void* out) {
+    const int rc = g_origRiderInfo(id, out);
+    if (!sessionguards::riderinfo::ShouldClear(rc, out)) return rc;
+    memset(out, 0, sessionguards::riderinfo::kOutBytes);
+    const uint32_t n = g_riCleared.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[riderinfo] job 633 asked for rider %d, who is not in the list - the game leaves its "
+            "answer unwritten and the host then copies lists of any length (the crash at "
+            "mxbikes.exe+0x7A860). The answer was cleared: every list empty. %u so far.", id, n);
+        frostmod::crash::Note("cleared the details of unknown rider %d (%u so far)", id, n);
+    }
+    ProtCatch(protection::Kind::RiderInfo);
+    return rc;
+}
+
+static void InstallRiderInfoGuard() {
+    using namespace sessionguards::riderinfo;
+    if (!SsgMxbOnly("riderinfo")) return;
+    if (!g_riOn.load()) { Log("[riderinfo] guard off by config (riderinfoguard=0)"); return; }
+    if (g_origRiderInfo || g_unloading.load()) return;
+    bool ok = SsgCodeIs(kRvaFn, kFn, kFnLen) && SsgCodeIs(kRvaCase, kCase, kCaseLen) &&
+              SsgCodeIs(kRvaCaller, kCaller, kCallerLen);
+    // The tail jump goes to the fill, and the dispatcher's table sends job 0x279 to the case.
+    ok = ok && sessionguards::RipTarget(kFn + kTailJmpAt, kRvaFn + kTailJmpAt, 1, 5) == kRvaFill;
+    uint8_t *tb, *te;
+    const uint8_t* entry = (const uint8_t*)(g_base + kRvaJumpTable + 4 * kJob);
+    ok = ok && GetExecRange(g_base, &tb, &te) && entry >= tb && entry + 4 <= te &&
+         (uint32_t)sessionguards::Disp32(entry) == (uint32_t)kRvaCase;
+    if (!ok) {
+        Log("[riderinfo] guard not applied: the bytes at +0x%llX are not job 633 as we expect it "
+            "(game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    if (!InstallHook((void*)(g_base + kRvaFn), (void*)&hkRiderInfo, (void**)&g_origRiderInfo,
+                     "riderInfo(0x1b44c0)")) {
+        g_origRiderInfo = nullptr;
+        return;
+    }
+    Log("[riderinfo] guard on: details asked for a rider who is not in the list come back empty "
+        "instead of unwritten (fn +0x%llX, the crash at +0x%llX / +0x%llX).",
+        (unsigned long long)kRvaFn, (unsigned long long)kRvaFault, (unsigned long long)kRvaFault2);
+}
+
+// ---- +0x255F1F: a mipmap level with no memory behind it ----------------------------
+using MipFilterFn = int (*)(const uint8_t* src, uint8_t* dst, int w, int h, int bpp);
+static MipFilterFn           g_origMip[3] = {};
+static std::atomic<uint32_t> g_mmSkipped{0};
+
+static int MipSkip(const uint8_t* src, uint8_t* dst, int w, int h) {
+    const uint32_t n = g_mmSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sessionguards::ShouldLog(n)) {
+        Log("[mipmap] skipped a %dx%d mipmap level with a NULL %s - the game's allocator gave it "
+            "no memory (the crash at mxbikes.exe+0x255F1F / +0x255EF0). %u so far.",
+            w, h, !src ? "source" : "destination", n);
+        frostmod::crash::Note("skipped a %dx%d mip level with no memory (%u so far)", w, h, n);
+    }
+    ProtCatch(protection::Kind::MipMemory);
+    return sessionguards::mipmap::kDone;
+}
+static int hkMipBox(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[0](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+static int hkMipColumn(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[1](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+static int hkMipRow(const uint8_t* s, uint8_t* d, int w, int h, int b) {
+    return sessionguards::mipmap::Admit(s, d) ? g_origMip[2](s, d, w, h, b) : MipSkip(s, d, w, h);
+}
+
+static void InstallMipmapGuard() {
+    using namespace sessionguards::mipmap;
+    if (!SsgMxbOnly("mipmap")) return;
+    if (!g_mmOn.load()) { Log("[mipmap] guard off by config (mipmapguard=0)"); return; }
+    if (g_origMip[0] || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaBox, kBox, kHeadLen) || !SsgCodeIs(kRvaColumn, kColumn, kHeadLen) ||
+        !SsgCodeIs(kRvaRow, kRow, kHeadLen)) {
+        Log("[mipmap] guard not applied: the mipmap filters are not the bytes we expect (game "
+            "updated?). Nothing patched.");
+        return;
+    }
+    const struct { uintptr_t rva; void* hk; const char* name; } fns[3] = {
+        {kRvaBox, (void*)&hkMipBox, "mipBox(0x255ea0)"},
+        {kRvaColumn, (void*)&hkMipColumn, "mipColumn(0x255dc0)"},
+        {kRvaRow, (void*)&hkMipRow, "mipRow(0x255e30)"},
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (!InstallHook((void*)(g_base + fns[i].rva), fns[i].hk, (void**)&g_origMip[i], fns[i].name)) {
+            g_origMip[i] = nullptr;
+            Log("[mipmap] guard only partly applied: %s did not hook.", fns[i].name);
+        }
+    }
+    Log("[mipmap] guard on: a mipmap level the game got no memory for is skipped instead of "
+        "written to address 0 (the crash at +0x%llX).", (unsigned long long)kRvaFaultWrite);
+}
+
+/// A stub's counter crossed a line the rate limit allows (or is the first).
+static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* now) {
+    if (!page) return false;
+    const uint32_t n = *(volatile const uint32_t*)(page + off);
+    if (n == *logged) return false;
+    const uint32_t prev = *logged;
+    *logged = n;
+    *now = n;
+    bool due = prev == 0;
+    for (uint64_t k = (uint64_t)prev + 1; !due && k <= n && k <= (uint64_t)prev + 64; ++k)
+        due = sessionguards::ShouldLog(k);
+    return due || n - prev > 64;
+}
+
+static void SessionGuardsTick() {
+    uint32_t n = 0;
+    if (g_lbStub && *(volatile const uint32_t*)(g_lbStub + sessionguards::listbox::kCountOff) != g_lbLogged)
+        ProtCatch(protection::Kind::ListBox);
+    if (SsgDue(g_lbStub, sessionguards::listbox::kCountOff, &g_lbLogged, &n)) {
+        using namespace sessionguards::listbox;
+        const uint32_t item = *(volatile const uint32_t*)(g_lbStub + kItemOff);
+        const uint32_t text = *(volatile const uint32_t*)(g_lbStub + kTextOff);
+        const void* obj = *(void* volatile const*)(g_lbStub + kObjOff);
+        Log("[listbox] skipped a list-box line naming item %d (text offset %u) in box %p - the "
+            "crash at mxbikes.exe+0x1FED9E. That line is not drawn this frame. %u so far.",
+            (int)item, text, obj, n);
+        frostmod::crash::Note("skipped a list-box line, item %d (%u so far)", (int)item, n);
+    }
+    if (g_p64Stub && *(volatile const uint32_t*)(g_p64Stub + sessionguards::ptr64::kCountOff) != g_p64Logged)
+        ProtCatch(protection::Kind::StackPointer);
+    if (SsgDue(g_p64Stub, sessionguards::ptr64::kCountOff, &g_p64Logged, &n)) {
+        const uint64_t p = *(volatile const uint64_t*)(g_p64Stub + sessionguards::ptr64::kLastOff);
+        Log("[ptr64] this launch's stack is above 4 GB: job 863 passed 0x%llX whole, where the "
+            "game alone would have passed 0x%llX and crashed at mxbikes.exe+0x2A42F0. %u call(s) "
+            "so far.", (unsigned long long)p, (unsigned long long)(uint32_t)p, n);
+        if (n == 1) frostmod::crash::Note("job 863 pointer above 4 GB, passed whole");
+    }
+}
+
+static void InstallSessionGuards() {
+    InstallBikeListGuard();
+    InstallBikeModelSync();
+    InstallWakeGuard();
+    InstallListBoxGuard();
+    InstallPtr64Fix();
+    InstallRiderInfoGuard();
+    InstallMipmapGuard();
+}
+
+// ===========================================================================
+// PROTECTION  -  what the guards caught, kept for MXB App (src/protection.h)
+//
+// Each guard calls ProtCatch() where it already notes the catch in the crash trail. Once a
+// frame ProtTick() writes each kind that fired, once per session, as a line of
+// frostmod-protection.jsonl beside the crash reports. MXB App turns that into the home card,
+// the note after a session and the Crash protection page. A session is the track and server
+// the crash context holds (both copies of FrostMod see it, the plugin copy directly and the
+// injected one through MirrorPluginSession), so a new event, a track change or going back to
+// the menus starts one.
+// ===========================================================================
+static protection::Ledger g_prot;
+static std::string        g_protKey;          // inSession|track|server, the session it last saw
+static bool               g_protTrimmed = false;
+
+static void ProtCatch(protection::Kind k) { g_prot.Catch(k); }
+
+static bool ProtPath(char* out, size_t n) {
+    const char* dir = frostmod::crash::ReportDir();
+    if (!dir || !dir[0]) return false;   // the session plugin's copy writes nothing
+    _snprintf_s(out, n, _TRUNCATE, "%s\frostmod-protection.jsonl", dir);
+    return true;
+}
+
+static void ProtTrim(const char* path) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") || !f) return;
+    std::string text;
+    char buf[8192];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+    fclose(f);
+    const std::string kept = protection::KeepNewest(text, protection::kMaxLines);
+    if (kept.size() == text.size()) return;
+    if (fopen_s(&f, path, "wb") || !f) return;
+    fwrite(kept.data(), 1, kept.size(), f);
+    fclose(f);
+}
+
+static void ProtTick() {
+    char path[MAX_PATH];
+    if (!ProtPath(path, sizeof(path))) return;
+    if (!g_protTrimmed) { g_protTrimmed = true; ProtTrim(path); }
+    auto& ctx = frostmod::crash::TheContext();
+    // Read the session the catches belong to before deciding whether a new one began: what
+    // fired since the last frame happened in the session we last saw.
+    const uint32_t mask = g_prot.Take();
+    if (mask) {
+        FILE* f = nullptr;
+        if (!fopen_s(&f, path, "ab") && f) {
+            const int64_t now = (int64_t)_time64(nullptr);
+            for (int i = 0; i < protection::kKinds; ++i) {
+                if (!(mask & (1u << i))) continue;
+                const auto k = (protection::Kind)i;
+                const std::string line = protection::Line(k, now, ctx.track, ctx.server, FROSTMOD_VERSION);
+                fwrite(line.data(), 1, line.size(), f);
+                Log("[protection] caught: %s (%s) - counted once for this session.",
+                    protection::Info(k).name, protection::Info(k).site);
+            }
+            fclose(f);
+        }
+    }
+    std::string key = ctx.inSession.load(std::memory_order_relaxed) ? "1|" : "0|";
+    key += ctx.track; key += '|'; key += ctx.server;
+    if (key != g_protKey) { g_protKey = key; g_prot.NewSession(); }
+}
+
+// ===========================================================================
 // NANTRAP  -  where the physics NaN is made (opt-in: nantrap=1 in frostmod_radar.cfg)
 //
 // The terrain guard above refuses a NaN position; it cannot say where the NaN came from,
@@ -7950,22 +9713,30 @@ static SimStepFn g_origSimStep = nullptr;
 static void TlAfterStep(int32_t slot, float dt);
 static bool NtSpawnStep(int32_t slot);
 static std::atomic<bool> g_tlOn{false};
+static void NrCheck(int32_t slot, bool before);   // NANRECOVER section, below
+static std::atomic<bool> g_nrLive{false};
 
 static int32_t hkSimStep(int32_t slot, float dt) {
+    const bool nr = g_nrLive.load(std::memory_order_relaxed);
+    // A NaN put into a bike between steps (by anything but the step) is reset before the bike
+    // code reads it.
+    if (nr) NrCheck(slot, true);
     // A bike's first steps run stock: the game's own throwaway 0 * inf there is not the NaN we
     // want, and it would use up the report (tyrelog::kSpawnSettle).
     if (!nantrap::Armed() || NtSpawnStep(slot)) {
         const int32_t rc = g_origSimStep(slot, dt);
         if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
+        if (nr) NrCheck(slot, false);
         return rc;
     }
     const uint32_t saved = nantrap::Enter();
     const int32_t rc = g_origSimStep(slot, dt);
     nantrap::Restore(saved);   // the game's MXCSR, exactly as it was
     // The ring takes this step before a trap report goes out, so the report's CSV ends on the
-    // step that made the NaN.
+    // step that made the NaN. The reset comes after both, so they show the NaN, not the fix.
     if (g_tlOn.load(std::memory_order_relaxed)) TlAfterStep(slot, dt);
     nantrap::Flush();          // a pending report, if the step trapped; nothing otherwise
+    if (nr) NrCheck(slot, false);
     return rc;
 }
 
@@ -8222,21 +9993,306 @@ static void TlInstall(const uint8_t* fn) {
         "trap, the first refused NaN height query, or a crash. Read-only.", tyrelog::kSteps);
 }
 
+// ===========================================================================
+// NANRECOVER  -  a bike whose physics state went NaN gets the game's own reset (on by default)
+//
+// src/nanrecover.h has the evidence and the reasoning. Short version: the physics NaN is 46% of
+// the MX Bikes crashes FrostMod collects, the bike goes from calm to NaN inside one sim step,
+// and the bike code reads it in the next one and faults (+0x1A29AE and friends). The terrain
+// and shock guards each turn away one reader; this takes the NaN away from all of them.
+//
+// After each sim step (and once before it), every active bike in the slot is checked with
+// integer tests on its floats. A finite bike costs the check and nothing else: no write, no
+// call. A non-finite one is handed to place-bike 0x197060 - the function the game's own
+// respawn runs - with the main body's position and heading from a snapshot taken while it was
+// still finite and sane. Then it is checked again and the result is logged ("[nanrecover]")
+// and noted in the crash trail, so a crash that still follows says what was tried.
+//
+// Runs on the physics thread, between steps, where the game's own respawn job also runs. Every
+// read of the game's memory is under SEH; one fault turns this off for the session.
+// ===========================================================================
+static const uint8_t* g_nrWorlds = nullptr;   // the sim step's world slot array
+static nanrecover::ResetFn g_nrReset = nullptr;
+static nanrecover::Track g_nrTracks[8];        // per bike, most recently seen
+static std::atomic<uint32_t> g_nrResets{0};
+static std::atomic<uint32_t> g_nrFailed{0};
+static constexpr unsigned kNrTimedSteps = 5000;
+
+struct NrFound {
+    uint8_t* bike;
+    int32_t handle;
+    nanrecover::Bad bad;
+};
+
+static nanrecover::Track* NrTrackFor(const uint8_t* bike, int32_t handle, float t) {
+    nanrecover::Track* spare = nullptr;
+    for (auto& tr : g_nrTracks) {
+        if (tr.bike == bike) {
+            // Another bike at the same address, or the same one spawned again (its clock went
+            // back): start over. A clock that is not a number says nothing either way.
+            if (tr.handle != handle || (t == t && t < tr.lastTime)) tr.Clear(bike, handle, t);
+            if (t == t) tr.lastTime = t;
+            return &tr;
+        }
+        if (!spare && !tr.bike) spare = &tr;
+    }
+    if (!spare) {   // a full table: drop the one with the least history
+        spare = &g_nrTracks[0];
+        for (auto& tr : g_nrTracks)
+            if (tr.steps < spare->steps) spare = &tr;
+    }
+    spare->Clear(bike, handle, t == t ? t : 0.0f);
+    return spare;
+}
+
+// No C++ objects with destructors: the caller wraps it in __try. Fills up to `max` bikes that
+// failed the check; snapshots the ones that passed (after the step only).
+static int NrScanRaw(int32_t slot, bool before, NrFound* found, int max) {
+    if (slot < 1 || slot > 3 || !g_nrWorlds) return 0;
+    const uint8_t* world = g_nrWorlds + (size_t)(slot - 1) * tyrelog::kWorldStride;
+    const uint8_t* list = nullptr;
+    memcpy(&list, world + tyrelog::kWorldBikeList, sizeof(list));
+    const int n = tyrelog::ListCount(list);
+    if (n <= 0 || n > tyrelog::kMaxBikes) return 0;
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        uint8_t* bike = (uint8_t*)tyrelog::ListItem(list, i);
+        if (!bike) continue;
+        int32_t on = 0;
+        memcpy(&on, bike + nanrecover::kBikeActive, 4);
+        if (on == 0) continue;   // the bike sim skips it, and so does this
+        nanrecover::Bad bad;
+        if (!nanrecover::Scan(bike, &bad)) {
+            if (k < max) {
+                found[k].bike = bike;
+                memcpy(&found[k].handle, bike + nanrecover::kBikeHandle, 4);
+                found[k].bad = bad;
+                ++k;
+            }
+            continue;
+        }
+        if (before) continue;
+        int32_t handle = 0;
+        float t = 0;
+        memcpy(&handle, bike + nanrecover::kBikeHandle, 4);
+        memcpy(&t, bike + nanrecover::kBikeTime, 4);
+        const uint8_t* body = nullptr;
+        memcpy(&body, bike + nanrecover::kBodyMain, sizeof(body));
+        if (!body) continue;
+        float pos[3], lvel[3], avel[3], R[12];
+        memcpy(pos, body + nanrecover::kBodyPos, sizeof(pos));
+        memcpy(lvel, body + nanrecover::kBodyLvel, sizeof(lvel));
+        memcpy(avel, body + nanrecover::kBodyAvel, sizeof(avel));
+        memcpy(R, body + nanrecover::kBodyR, sizeof(R));
+        nanrecover::Track* tr = NrTrackFor(bike, handle, t);
+        tr->SawCounter(bike[nanrecover::kBikeResets]);
+        tr->Passed(pos, lvel, avel, R);
+    }
+    return k;
+}
+
+static int NrScan(int32_t slot, bool before, NrFound* found, int max, bool* faulted) {
+    *faulted = false;
+    __try {
+        return NrScanRaw(slot, before, found, max);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faulted = true;
+        return 0;
+    }
+}
+
+// The forces the step accumulated on the bike's bodies: zero between steps in a stock game
+// (ODE clears them at the end of each step), so clearing them before a reset only matters when
+// a NaN got into them from outside.
+static void NrClearForcesRaw(uint8_t* bike) {
+    const uint8_t* body[7];
+    uint32_t off[7];
+    nanrecover::Bodies(bike, body, off);
+    for (const uint8_t* b : body)
+        if (b) {
+            memset((void*)(b + nanrecover::kBodyFacc), 0, 12);
+            memset((void*)(b + nanrecover::kBodyTacc), 0, 12);
+        }
+}
+
+// place-bike under SEH. -1: it faulted; otherwise what it returned (0 placed, 1 no such bike).
+static int NrPlace(uint8_t* bike, int32_t handle, const nanrecover::Snap& s) {
+    __try {
+        NrClearForcesRaw(bike);
+        // (handle, x, z, heading, y): y is where its ground query starts, so a little above the
+        // body, never under the surface it was on.
+        return g_nrReset(handle, s.pos[0], s.pos[2], s.heading, s.pos[1] + 1.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+static bool NrRescan(uint8_t* bike, nanrecover::Bad* bad) {
+    __try {
+        return nanrecover::Scan(bike, bad);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void NrRecover(const NrFound& f, bool before) {
+    using namespace nanrecover;
+    float t = 0;
+    SafeReadBytes((const char*)(f.bike + kBikeTime), (char*)&t, sizeof(t));
+    Track* tr = NrTrackFor(f.bike, f.handle, t);
+    const uint32_t minAge = tr->MinAgeForNext();
+    const Snap* s = tr->Pick(minAge);
+    const uint32_t n = g_nrResets.load(std::memory_order_relaxed) + 1;
+    const char* what = FieldName(f.bad.field);
+    char where[48] = "";
+    if (f.bad.field >= Field::BodyPos && f.bad.field <= Field::BodyAvel)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, " of body [bike+0x%X]", f.bad.where);
+    else if (f.bad.field >= Field::WheelSpin && f.bad.field <= Field::WheelDeflVel)
+        _snprintf_s(where, sizeof(where), _TRUNCATE, " of wheel %u", f.bad.where);
+    if (!s) {
+        const uint32_t m = g_nrFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLog(m))
+            Log("[nanrecover] bike %p (handle %d) has a non-finite %s%s (%08X) %s the step, "
+                "%.3f s after its spawn, and no finite position to put it back at yet. Left to "
+                "the terrain and shock guards. %u so far.",
+                (void*)f.bike, f.handle, what, where, f.bad.bits, before ? "before" : "after",
+                (double)t, m);
+        if (ShouldLog(m))
+            frostmod::crash::Note("nanrecover: NaN %s%s, no good position to reset to", what, where);
+        return;
+    }
+    const float age = (float)(tr->steps - s->step) * 0.002f;
+    const int rc = NrPlace(f.bike, f.handle, *s);
+    tr->DidReset();
+    uint8_t counter = 0;
+    if (SafeReadBytes((const char*)(f.bike + kBikeResets), (char*)&counter, 1) == 1)
+        tr->PlacedByUs(counter);
+    g_nrResets.store(n, std::memory_order_relaxed);
+    ProtCatch(protection::Kind::PhysicsNan);
+    Bad after;
+    const bool clean = rc == 0 && NrRescan(f.bike, &after);
+    const bool say = ShouldLog(n);
+    if (say)
+        Log("[nanrecover] bike %p (handle %d): non-finite %s%s (%08X) %s the step, %.3f s after "
+            "its spawn. Reset with the game's place-bike to (%.2f, %.2f, %.2f) heading %.1f, "
+            "where it was %.2f s before: %s. %u reset(s) this run, %u for this bike.",
+            (void*)f.bike, f.handle, what, where, f.bad.bits, before ? "before" : "after",
+            (double)t, (double)s->pos[0], (double)s->pos[1], (double)s->pos[2],
+            (double)s->heading, (double)age,
+            rc < 0 ? "place-bike FAULTED" : rc != 0 ? "place-bike did not know the bike"
+            : clean ? "finite again" : "STILL non-finite",
+            n, tr->resets);
+    if (rc < 0) {
+        // Whatever place-bike tripped on, it will trip on again: stop calling it.
+        g_nrLive.store(false, std::memory_order_relaxed);
+        Log("[nanrecover] off for the rest of this session (place-bike faulted). The terrain and "
+            "shock guards still run.");
+    } else if (say && !clean && rc == 0) {
+        Log("[nanrecover] still non-finite after the reset: %s (%08X). It is tried again next "
+            "step, from further back.", FieldName(after.field), after.bits);
+    }
+    // The trail holds 32 notes; a bike that needs a reset every step must not push out what
+    // came before it.
+    if (say || rc < 0)
+        frostmod::crash::Note("nanrecover: NaN %s%s, bike reset to %.0f,%.0f,%.0f (%s, %u so far)",
+                              what, where, (double)s->pos[0], (double)s->pos[1],
+                              (double)s->pos[2], rc < 0 ? "faulted" : clean ? "ok" : "still NaN", n);
+}
+
+static void NrCheck(int32_t slot, bool before) {
+    // The cost, measured on the player's own machine: both checks of the first few thousand
+    // steps are timed and the mean goes in the log once.
+    static unsigned timed = 0;
+    static long long ticks = 0;
+    LARGE_INTEGER a{}, b{};
+    const bool timing = timed < kNrTimedSteps;
+    if (timing) QueryPerformanceCounter(&a);
+    NrFound found[4];
+    bool faulted = false;
+    const int k = NrScan(slot, before, found, 4, &faulted);
+    if (timing) {
+        QueryPerformanceCounter(&b);
+        ticks += b.QuadPart - a.QuadPart;
+        if (++timed == kNrTimedSteps) {
+            LARGE_INTEGER fq{};
+            QueryPerformanceFrequency(&fq);
+            const double ns =
+                fq.QuadPart ? (double)ticks * 1e9 / (double)fq.QuadPart / kNrTimedSteps : 0.0;
+            Log("[nanrecover] the check costs %.0f ns (mean of %u; it runs twice a 2 ms step).",
+                ns, kNrTimedSteps);
+        }
+    }
+    if (faulted) {
+        g_nrLive.store(false, std::memory_order_relaxed);
+        Log("[nanrecover] a read of the bike list faulted - off for the rest of this session.");
+        return;
+    }
+    for (int i = 0; i < k && g_nrLive.load(std::memory_order_relaxed); ++i) NrRecover(found[i], before);
+}
+
+// Before the sim step hook goes in. `fn` is the sim step as found. Every RVA here is beta21e's
+// and is checked byte for byte; one mismatch and nanrecover stays off (the guards still run).
+static bool NrInstall(const uint8_t* fn) {
+    if (g_unloading.load()) return false;
+    if (fn != (const uint8_t*)(g_base + mxb::RVA_SIM_STEP)) {
+        Log("[nanrecover] off: the sim step moved, so this is not the build its offsets are for.");
+        return false;
+    }
+    uint8_t *begin, *end;
+    if (!GetExecRange(g_base, &begin, &end)) { Log("[nanrecover] off: no .text range."); return false; }
+    auto check = [&](uint32_t rva, const char* bytes, int len, const char* what) {
+        const uint8_t* p = (const uint8_t*)(g_base + rva);
+        if (p < begin || p + len > end || memcmp(p, bytes, (size_t)len) != 0) {
+            Log("[nanrecover] off: %s does not match at RVA 0x%x (game updated?). The terrain "
+                "and shock guards still run.", what, rva);
+            return false;
+        }
+        return true;
+    };
+    for (const nanrecover::Check& c : nanrecover::kChecks)
+        if (!check(c.rva, c.bytes, c.len, c.what)) return false;
+    // The bike list and world array, as tyrelog reads them.
+    for (const tyrelog::Check& c : tyrelog::kChecks)
+        if (!check(c.rva, c.bytes, c.len, c.what)) return false;
+    int32_t rel = 0;
+    memcpy(&rel, fn + tyrelog::kSimStepLeaAt + 3, 4);
+    const uint8_t* worlds = fn + tyrelog::kSimStepLeaAt + 7 + rel;
+    auto dos = (const IMAGE_DOS_HEADER*)g_base;
+    auto nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)g_base + dos->e_lfanew);
+    const uint8_t* lo = (const uint8_t*)g_base;
+    const uint8_t* hi = lo + nt->OptionalHeader.SizeOfImage;
+    if (worlds < lo || worlds + 3 * tyrelog::kWorldStride > hi) {
+        Log("[nanrecover] off: the world array the sim step points at is outside the exe.");
+        return false;
+    }
+    g_nrWorlds = worlds;
+    g_nrReset = (nanrecover::ResetFn)(g_base + nanrecover::kRvaReset);
+    return true;
+}
+
 // nantrap= / nantrapmax= straight from the file: the hook goes in before LoadOverlaySettings.
 static void NtReadCfg() {
     char p[MAX_PATH]; OverlaySettingsPath(p, sizeof(p)); if (!p[0]) return;
     FILE* f = nullptr; if (fopen_s(&f, p, "r") || !f) return;
     char line[128];
+    int v = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (!nantrap::ParseCfgLine(line, g_ntCfg)) tyrelog::ParseCfgLine(line, g_tlCfg);
+        if (nantrap::ParseCfgLine(line, g_ntCfg)) continue;
+        if (tyrelog::ParseCfgLine(line, g_tlCfg)) continue;
+        if (sscanf_s(line, "nanrecover=%d", &v) == 1) g_nrOn.store(v != 0);
     }
     fclose(f);
 }
 
+// The sim step hook carries two things: nantrap=1 (off by default) and nanrecover (on by
+// default). Either one puts it in; with both off the step is not touched.
 static void InstallNanTrap(intptr_t delta) {
     NtReadCfg();
-    if (!g_ntCfg.on) return;   // the default: no hook, no handler, nothing
-    if (!g_game->offsets_complete) {
+    bool trap = g_ntCfg.on;
+    bool rec = g_nrOn.load();
+    if (!rec) Log("[nanrecover] off by config (nanrecover=0)");
+    if (!trap && !rec) return;   // no hook, no handler, nothing
+    if (!g_game->offsets_complete || g_game != &GAME_MXB) {
         Log("[nantrap] off for %s - the sim step is MX Bikes' and has no twin here.", g_game->display);
         return;
     }
@@ -8262,10 +10318,27 @@ static void InstallNanTrap(intptr_t delta) {
             fn[0], fn[1], fn[2], fn[3], fn[4]);
         return;
     }
+    // Before the hook: every byte the reset relies on, and the world array it walks.
+    if (rec) rec = NrInstall(fn);
     // Handler first, then the hook: a step must never run armed with nothing to catch it.
-    nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
-    if (!nantrap::Armed()) return;
-    if (InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
+    if (trap) {
+        nantrap::Install([](const char* line) { Log("%s", line); }, g_ntCfg);
+        trap = nantrap::Armed();
+    }
+    if (!trap && !rec) return;
+    if (!InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
+        if (trap) nantrap::Uninstall();
+        return;
+    }
+    if (rec) {
+        g_nrLive.store(true, std::memory_order_release);
+        Log("[nanrecover] ON: after every physics step each bike's bodies, wheels and suspension "
+            "are checked for a value that is not a number. One that is gets the game's own "
+            "reset (place-bike 0x%zx) where it was a moment before, instead of the crash. A "
+            "finite bike is never touched. nanrecover=0 turns it off.",
+            (size_t)nanrecover::kRvaReset);
+    }
+    if (trap) {
         Log("[nantrap] ON (nantrap=1): the first invalid FP op in the sim step is logged and "
             "sent as nan_first_fault, up to %d site(s) this session. The game computes the "
             "same values it does without it.", g_ntCfg.max);
@@ -8683,14 +10756,24 @@ DWORD WINAPI Init(LPVOID) {
             Log("[session] block unavailable - MXB App cannot see this session");
         }
         LoadOverlaySettings();  // restore radar / outline toggles, range, overlay size
+        // Shadows must exist before the game's first bike scan; when the feature is off this
+        // same point removes only folders carrying our marker from an earlier launch.
+        BikeSyncMaterialize();
         // Now that the saved limit is known, put the rider-visibility patch in. Before any
         // session exists, so the playback path it sits in is not running while we write.
         if (g_afOn.load()) AfApply(g_afLimit);
         else Log("[antifreeze] off by config; distant riders will vanish as the game ships");
+        // Same moment, same reason. Off unless MXB App (or the cfg) says aussiemode=1.
+        if (g_auOn.load()) AuApply();
         // Same moment, same reason: the saved setting is known. The flush it guards may already
         // be drawing the loading screen; the unmap call is written before the map call, so a
         // flush in between still pairs the game's own map with the game's own unmap.
         InstallMapGuard();
+        // Same moment: shockguard=0 is known now. One call instruction, in the physics step.
+        InstallShockGuard();
+        // Same moment: their keys are known now. Two detours and two mid-function jumps,
+        // each byte-checked; MinHook holds the game's threads while it writes.
+        InstallSessionGuards();
         // shaders=1 only: the wglGetProcAddress hook, before the game makes its GL context.
         SuInstall();
 
@@ -8823,6 +10906,13 @@ static void PinSelf() {
 static void TdStopThreads(bool canBlock) {
     MsgFeedStop(canBlock);   // no-op in the plugin copy, which never started one
     MdStop(canBlock);
+    // The model index checks g_unloading between files, so shutdown can join it promptly.
+    if (g_rsIndexThread && canBlock) {
+        if (WaitForSingleObject(g_rsIndexThread, 2000) != WAIT_OBJECT_0)
+            Log("[unload] model index thread still running");
+        CloseHandle(g_rsIndexThread);
+        g_rsIndexThread = nullptr;
+    }
     // Init can sit up to 30 s waiting for the scanner; g_unloading already stops it hooking.
     if (g_initThread && canBlock) {
         if (WaitForSingleObject(g_initThread, 2000) != WAIT_OBJECT_0)
@@ -8842,7 +10932,9 @@ static void TdDisableHooks(bool) {
 static void TdRevertPatches(bool) {
     TyreFallbackRevert();   // jumps into a stub that calls this dll
     AfRevert();             // points at our cell, not our code, but the game gets its bytes back
+    AuRevert();             // same shape as antifreeze
     MgRevert();             // two calls into stubs that jump into this dll
+    SgRevert();             // one call into a stub that jumps back into the game
 }
 static void TdRemoveHandlers(bool) {
     nantrap::Uninstall();
@@ -8963,11 +11055,14 @@ __declspec(dllexport) int Startup(char* _szSavePath) {
         Log("[session] %s", SessionInit()
                 ? "plugin block ready for MXB App"
                 : "plugin block unavailable - MXB App cannot name this server");
-        // A rate the game accepts, so it keeps us loaded and goes on delivering the event
-        // callbacks. The telemetry itself is dropped on the floor below.
-        return 3;
+        Log("[gamefeed] %s", FeedInit(HostGame()) ? "Game SDK feed ready for MXB App"
+                                         : "Game SDK feed unavailable");
+        // 50 Hz: the Game SDK feed passes the telemetry on (gamefeed.h). Nothing else in this
+        // copy reads it.
+        return frostmod::gamefeed::kTelemetryRate;
     }
     EnsureInit();
+    Log("[gamefeed] %s", FeedInit(HostGame()) ? "Game SDK feed ready for MXB App" : "Game SDK feed unavailable");
     return 3;
 }
 
@@ -9014,8 +11109,9 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
 // RunTelemetry: our own bike pose. Startup() returned rate 3, so the game calls
 // this and we keep the latest world position (used to identify "me" among the
 // track-position entries).
-__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, float) {
+__declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTime, float _fPos) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.Telemetry(_pData, _iDataSize, _fTime, _fPos);
     if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
@@ -9023,29 +11119,33 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float, flo
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceTrackPosition(_iNumVehicles, _pArray, _iElemSize);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceTrackPosition", _iElemSize);
     RadStoreTrackPositions(_iNumVehicles, _pArray, _iElemSize);
 }
 __declspec(dllexport) void RaceAddEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceAddEntry(_pData, _iDataSize);
     if (g_sessionOnly) return;
     LogCallbackOnce("RaceAddEntry", _iDataSize);
     RadAddEntry(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceRemoveEntry(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.RaceRemoveEntry(_pData, _iDataSize);
     if (g_sessionOnly) return;
     RadRemoveEntry(_pData, _iDataSize);
 }
 // Classification carries laps-done per race number -> the lap-status coloring.
 __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void* _pArray, int _iElemSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
-    if (g_sessionOnly) return;
     // KRP's header has an extra m_iSessionSeries ahead of the count, so both the minimum
     // size and where the count sits are this title's, not MX Bikes'.
     int n = (_pData && _iDataSize >= g_abi->cls_hdr_size)
             ? *(const int*)((const char*)_pData + g_abi->cls_num_entries) : 0;
+    g_feed.RaceClassification(_pData, _iDataSize, _pArray, n, _iElemSize);
+    if (g_sessionOnly) return;
     RadStoreClassification(_pArray, n, _iElemSize);
 }
 // On MX Bikes, EventInit is where the client learns which server it joined. RaceEvent --
@@ -9063,6 +11163,7 @@ __declspec(dllexport) void RaceClassification(void* _pData, int _iDataSize, void
 // a room half the grid cannot compute is a room that quietly splits in two.
 __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.EventInit(_pData, _iDataSize);
     LogCallbackOnce("EventInit", _iDataSize);
     const PluginAbi* abi = g_abi;
     if (!_pData || _iDataSize < abi->ev_size) {
@@ -9114,6 +11215,7 @@ __declspec(dllexport) void EventInit(void* _pData, int _iDataSize) {
 }
 __declspec(dllexport) void EventDeinit() {
     if (g_standDown.load()) return;   // another FrostMod owns this game
+    g_feed.EventDeinit();
     Log("[session] event closed");
     frostmod::crash::Note("event closed");
     {
@@ -9136,6 +11238,7 @@ __declspec(dllexport) void EventDeinit() {
 __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (g_standDown.load()) return;   // another FrostMod owns this game
     LogCallbackOnce("RaceEvent", _iDataSize);
+    g_feed.RaceEvent(_pData, _iDataSize);
     if (!_pData || _iDataSize < (int)sizeof(sdk::RaceEvent)) return;
     const auto* e = (const sdk::RaceEvent*)_pData;
     char track[101] = {0}, name[101] = {0};
@@ -9154,11 +11257,43 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
     if (takeServerName) frostmod::crash::TheContext().SetServer(name);
     frostmod::crash::Note("track now '%s'", track);
 }
-__declspec(dllexport) void RaceSession(void*, int)  { if (g_standDown.load()) return;
+__declspec(dllexport) void RaceSession(void* _pData, int _iDataSize)  { if (g_standDown.load()) return;
+    g_feed.RaceSession(_pData, _iDataSize);
     if (g_sessionOnly) return;
     frostmod::crash::Note("session changed (practice/qualify/race)");
     RadResetRace();
 }
-__declspec(dllexport) void RaceDeinit()             { if (!g_sessionOnly && !g_standDown.load()) RadResetRace(); }
+__declspec(dllexport) void RaceDeinit() {
+    if (g_standDown.load()) return;
+    g_feed.RaceDeinit();
+    if (!g_sessionOnly) RadResetRace();
+}
+
+// The rest of the plugin API, for the Game SDK feed only. Nothing else in FrostMod reads these;
+// each hands its payload to the feed and returns.
+__declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunInit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RunDeinit()  { if (!g_standDown.load()) g_feed.RunDeinit(); }
+__declspec(dllexport) void RunStart()   { if (!g_standDown.load()) g_feed.RunStart(); }
+__declspec(dllexport) void RunStop()    { if (!g_standDown.load()) g_feed.RunStop(); }
+__declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunLap(_pData, _iDataSize);
+}
+__declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RunSplit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceSessionState(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceSessionState(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceLap(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceSplit(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceSplit(_pData, _iDataSize);
+}
+__declspec(dllexport) void RaceCommunication(void* _pData, int _iDataSize) {
+    if (!g_standDown.load()) g_feed.RaceCommunication(_pData, _iDataSize);
+}
 
 } // extern "C"

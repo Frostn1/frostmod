@@ -191,12 +191,124 @@ static void TestRates() {
     CHECK(logged < 25, "an hour of every-frame firing logs %d lines", logged);
 }
 
+static void TestPaths() {
+    // The three branches of 0x22AC50 / 0x22ACC0 that PathOf names, proved against the bytes.
+    // map, no-buffer: both early-outs land on `xor eax,eax; add rsp,0x28; ret` (returns NULL).
+    CHECK(kMapFnBytes[0x0B] == 0x75 && kMapFnBytes[0x0C] == 0x07, "map: jne past the !GlOk exit");
+    CHECK(kMapFnBytes[0x0D] == 0x33 && kMapFnBytes[0x0E] == 0xc0 && kMapFnBytes[0x13] == 0xc3,
+          "map: no-buffer returns NULL");
+    CHECK(kMapFnBytes[0x18] == 0x74 && 0x1A + (int8_t)kMapFnBytes[0x19] == 0x0D,
+          "map: name == 0 takes the same NULL exit");
+    // map, ram: UseMap == 0 jumps to `mov rax, [rcx+0x10]; ...; ret`.
+    CHECK(kMapFnBytes[0x21] == 0x74 && 0x23 + kMapFnBytes[0x22] == 0x61, "map: !UseMap -> ram path");
+    CHECK(kMapFnBytes[0x61] == 0x48 && kMapFnBytes[0x62] == 0x8b && kMapFnBytes[0x63] == 0x41 &&
+          kMapFnBytes[0x64] == kVbRam && kMapFnBytes[0x69] == 0xc3,
+          "map: ram path returns the record's RAM shadow [rcx+0x10]");
+    // unmap, no-buffer: returns 1, no GL call.
+    CHECK(kUnmapFnBytes[0x17] == 0x75 && kUnmapFnBytes[0x19] == 0xb8 && kUnmapFnBytes[0x1A] == 0x01 &&
+          kUnmapFnBytes[0x25] == 0xc3, "unmap: !GlOk returns 1 with no GL call");
+    CHECK(kUnmapFnBytes[0x2A] == 0x74 && 0x2C + (int8_t)kUnmapFnBytes[0x2B] == 0x19,
+          "unmap: name == 0 takes the same return-1 exit");
+    // unmap, ram: UseMap == 0 -> bind and glBufferSubData(GL_ARRAY_BUFFER, 0, n, [rec+0x10]).
+    CHECK(kUnmapFnBytes[0x33] == 0x74 && 0x35 + kUnmapFnBytes[0x34] == 0x4A, "unmap: !UseMap -> ram path");
+    CHECK(kUnmapFnBytes[0x5A] == 0x4c && kUnmapFnBytes[0x5B] == 0x8b && kUnmapFnBytes[0x5C] == 0x4f &&
+          kUnmapFnBytes[0x5D] == kVbRam, "unmap: ram path uploads from [rec+0x10]");
+    CHECK(kUnmapFnBytes[0x55] == 0xe8 &&
+          CallTarget(kBase + kRvaUnmapFn + 0x55, kUnmapFnBytes + 0x55) == kBase + kRvaBindFn,
+          "unmap: ram path binds through 0x2293C0 first, as MgUnmap does");
+
+    // PathOf is that truth table.
+    CHECK(PathOf(1, 1, 7) == Path::GlMap, "gl-map");
+    CHECK(PathOf(1, 0, 7) == Path::Ram, "ram");
+    CHECK(PathOf(0, 1, 7) == Path::NoBuffer && PathOf(0, 0, 7) == Path::NoBuffer, "GlOk off");
+    CHECK(PathOf(1, 1, 0) == Path::NoBuffer && PathOf(1, 0, 0) == Path::NoBuffer, "no GL name");
+    CHECK(PathOf(-1, 2, 3) == Path::GlMap, "any non-zero is true, as cmp ..., 0 reads it");
+    CHECK(std::strcmp(PathName(Path::Ram), "ram path") == 0, "path names");
+
+    // What MgUnmap does with a lent scratch.
+    const Path all[] = {Path::GlMap, Path::Ram, Path::NoBuffer};
+    for (Path m : all) CHECK(UnmapFor(m, Path::NoBuffer) == UnmapAction::Game, "no buffer now: game's no-op unmap");
+    CHECK(UnmapFor(Path::GlMap, Path::GlMap) == UnmapAction::CloseThenUpload, "gl-map: close, upload");
+    CHECK(UnmapFor(Path::Ram, Path::Ram) == UnmapAction::Upload, "ram: upload our copy, never the game's");
+    CHECK(UnmapFor(Path::GlMap, Path::Ram) == UnmapAction::CloseThenUpload, "mapped at the map: still closed");
+    CHECK(UnmapFor(Path::Ram, Path::GlMap) == UnmapAction::CloseThenUpload, "gl-map now: check the mapping");
+    CHECK(UnmapFor(Path::NoBuffer, Path::Ram) == UnmapAction::Upload, "buffer appeared: upload our copy");
+    CHECK(UnmapResult(UnmapAction::Game, 1) == 1, "game's result passed through");
+    CHECK(UnmapResult(UnmapAction::Upload, 1) == 0 && UnmapResult(UnmapAction::CloseThenUpload, 1) == 0,
+          "an upload returns 0, as both of the game's upload paths do");
+    CHECK(UploadBytes(576000, 0) == 0 && UploadBytes(576000, -1) == 0,
+          "an empty batch uploads nothing, like the game's unmap (count * stride = 0)");
+    CHECK(UploadBytes(576000, 1) == 576000 && UploadBytes(576000, 16000) == 576000,
+          "a batch with vertices uploads the whole scratch: the arrays sit at fixed offsets");
+
+    // The 0.49.17 dumps: the junk pointers came from the ram path and none of them is memory.
+    FakeMem empty;
+    for (uintptr_t p : {(uintptr_t)0xA23FE7C0, (uintptr_t)0x9FA80220, (uintptr_t)0x9C330080})
+        CHECK(Classify(p, 576000, empty) == Verdict::NotCommitted, "0.49.17 dump pointer 0x%llx must fail",
+              (unsigned long long)p);
+}
+
+static void TestKinds() {
+    // Every (path, verdict) gets its own counter, inside the table.
+    bool seen[kKinds] = {};
+    const Path paths[] = {Path::GlMap, Path::Ram, Path::NoBuffer};
+    const Verdict verdicts[] = {Verdict::Ok, Verdict::Null, Verdict::NotCommitted, Verdict::NotWritable, Verdict::Forced};
+    for (Path p : paths)
+        for (Verdict v : verdicts) {
+            const int k = KindIndex(p, v);
+            CHECK(k >= 0 && k < kKinds, "kind in range");
+            if (k >= 0 && k < kKinds) { CHECK(!seen[k], "kind %d used twice", k); seen[k] = true; }
+        }
+    CHECK(KindIndex((Path)7, Verdict::Null) == 0 && KindIndex(Path::Ram, (Verdict)9) == 0, "junk stays in range");
+
+    // OB's run: 196608 NULL fires, then one junk pointer on the ram path. With one counter for
+    // everything that last fire was number 196609 and not logged; per kind it is the first.
+    unsigned counts[kKinds] = {};
+    int nullLines = 0;
+    for (int i = 0; i < 196608; ++i)
+        nullLines += ShouldLog(++counts[KindIndex(Path::Ram, Verdict::Null)]) ? 1 : 0;
+    CHECK(nullLines < 25, "a flood of NULLs logs %d lines", nullLines);
+    CHECK(!ShouldLog(196609), "one shared counter would have hidden the junk pointer");
+    CHECK(ShouldLog(++counts[KindIndex(Path::Ram, Verdict::NotCommitted)]), "per kind it is logged");
+}
+
+static void TestWalkerFault() {
+    // The batch table the handler trusts is the one the flush's own lea names.
+    CHECK(RipTarget(kMapWin, kRvaMapWin, 0, 3, 7) == kRvaBatchTable, "lea r13 names the batch table");
+    // The store that crashes is inside the watched range, and so are its two siblings in the
+    // reports (+0x2408C4 texcoords, +0x240904 colours); the loop's count update is not.
+    CHECK(InWalkerStores(0x24085C) && InWalkerStores(0x2408C4) && InWalkerStores(0x240904), "stores watched");
+    CHECK(!InWalkerStores(0x240970) && !InWalkerStores(0x24084F) && !InWalkerStores(0x240B6C), "only the walker");
+    CHECK(kRvaWalkLoLoop + 12 == 0x24085C && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24085C");
+    // The exit we jump to is the walker's own epilogue: xor eax,eax ... pop rsi; ret.
+    CHECK(kWalkExit[0] == 0x33 && kWalkExit[kWalkExitLen - 1] == 0xc3 && kWalkExit[kWalkExitLen - 2] == 0x5e,
+          "epilogue ends pop rsi; ret");
+    // A rebase keeps the cursor's distance into its array, whichever adds already ran.
+    CHECK(Rebase(0x9869F2A0 + 0x30, 0x9869F2A0, 0x20000000) == 0x20000030, "rebase keeps the offset");
+    CHECK(Rebase(0x1000, 0x1000, 0x7FF000000000ull) == 0x7FF000000000ull, "rebase at the base");
+    const uint32_t ok[4] = {0, 192000, 320000, 384000}, bad[4] = {0, 192000, 600000, 384000};
+    CHECK(OffsetsFit(ok, 576000) && !OffsetsFit(bad, 576000) && !OffsetsFit(ok, 0), "offsets fit the scratch");
+    CHECK(OnWalkerFault(false, false, true) == FaultAction::Pass, "not a batch: pass");
+    CHECK(OnWalkerFault(true, false, true) == FaultAction::Move, "game memory: move");
+    CHECK(OnWalkerFault(true, true, true) == FaultAction::Stop, "already ours: stop");
+    CHECK(OnWalkerFault(true, false, false) == FaultAction::Stop, "cannot move: stop");
+    int32_t c = 16012, t = 8006; ClampDraw(&c, &t, 16000);
+    CHECK(c == 16000 && t == 8000, "clamped to the buffer");
+    c = 40; t = 20; ClampDraw(&c, &t, 16000);
+    CHECK(c == 40 && t == 20, "a batch that fits is untouched");
+    c = 9; t = 4; ClampDraw(&c, &t, 7);
+    CHECK(c == 4 && t == 2, "whole quads only");
+}
+
 int main() {
     TestSites();
     TestPatchBytes();
     TestSize();
     TestClassify();
     TestRates();
+    TestPaths();
+    TestKinds();
+    TestWalkerFault();
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("mapguard: all checks passed\n");
     return 0;

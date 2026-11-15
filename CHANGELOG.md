@@ -1,5 +1,102 @@
 # Changelog
 
+## Unreleased
+
+Two more crashes from the beta21e reports, together 21% of what v0.51.0 still sends.
+
+### Fixed
+- **Render crash at +0x24085C, the rest of it.** v0.51.0's pointer check cut it down but it was
+  still 45% of v0.51.0's reports, every one in the quad walker after the check had passed. A
+  write fault on one of the walker's stores now moves that batch onto FrostMod's copy and the
+  store runs again; a walk that runs past a whole buffer is ended there and only whole quads are
+  drawn. Covers the same bug at +0x2408C4 and +0x240904. Off with `mapguard=0`.
+- **Host crash at +0x7A860 / +0x7A8E0 when someone joins your server.** The game asks for the
+  details of a rider who is not in its list, gets nothing written back, and copies two lists of
+  whatever length was on the stack. A miss now comes back with every list empty. Off with
+  `riderinfoguard=0`.
+
+- **Menu crash at +0x255F1F / +0x255EF0 while content loads.** The game builds each smaller
+  mipmap level of a texture in memory it never checks it got. A level with no memory behind it is
+  now skipped instead of written to address 0. Off with `mipmapguard=0`.
+
+### Added
+- **Rider model sync (modelsync=1, off by default).** Remote riders whose rider, helmet or
+  boots model you also have installed are drawn with it, matched by file content under any
+  folder name; everyone else stays stock. Collision, physics and hitboxes are unchanged.
+  IDs come from MXB App's paint sync; `modelsync=1` turns it on.
+- **Bike model sync (modelsync=1, off by default).** Remote riders whose bike model you have
+  in that bike's FrostMod Models library are drawn with it; everyone else stays stock. Physics,
+  collision and hitboxes keep the real bike. IDs come from MXB App's paint sync;
+  `modelsync=1` turns it on.
+- **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
+  installs) now copies what the game's plugin API hands it into a second shared block,
+  `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's
+  track position and the entry list as snapshots, and laps, splits, session changes, riders
+  joining and leaving and race communications in a numbered ring. MXB App reads it for its Game
+  SDK (overlays, extensions, AI tools). It is a copy and nothing more: no decoding, no network,
+  nothing written to the game, and the block is readable by this Windows user only. The layout
+  is `src/gamefeed.h`, pinned by `tests/gamefeed_test.cpp`.
+- The session plugin now asks for telemetry at 50 Hz (it asked for 10 Hz and dropped it).
+- New plugin exports, each handing its payload to the feed and returning: `RunInit`,
+  `RunDeinit`, `RunStart`, `RunStop`, `RunLap`, `RunSplit`, `RaceSessionState`, `RaceLap`,
+  `RaceSplit`, `RaceCommunication`.
+- **What the crash guards caught, for MXB App.** Each kind of crash a guard stops is written once
+  per session to `frostmod-protection.jsonl` beside the log (time, kind, track, server). MXB App
+  reads it for its home card, the note after a session and the Crash protection page. The four
+  guards on the physics NaN count as one crash, and the map guard's empty-batch NULLs (which
+  never crashed) are not counted.
+
+### FrostServer
+- **A rider who leaves is removed from every screen.** The game told clients to drop a leaving
+  rider from the list but not from the track, so a frozen copy stayed and a rejoin made two.
+  FrostServer now runs the game's own rider removal for them. `rejoin_fix: false` turns it off.
+- **The host crash at +0x7A860 is guarded on dedicated servers too.** `crash_guards: false` turns
+  it off.
+- **`GET /frostserver/protection`**: what fair send, the rejoin fix and the guards have done,
+  since start and in total, for MXB Servers and MXB App.
+
+## 2026-11-12 - v0.52.0
+
+Aussie mode: other riders feel as solid as they did in Beta 20. Off by default.
+
+### Added
+- **Aussie mode** (`aussiemode=1`, or the switch in MXB App's Game Integration settings). Beta 21
+  made the spring that holds other riders' collision bodies to them ten times softer, so a contact
+  gives way about three times as far and lasts about three times as long. Aussie mode puts the Beta
+  20 spring back on those bodies. It changes only what your own bike runs into on your screen.
+  Other riders' games, and your own bike's physics, are untouched. Details and measurements are in
+  `docs/aussie-mode.md`.
+
+## 2026-11-03 - v0.51.0
+
+The last four crashes on thomas4f's MXBMRP3 known-crash list are now handled, so FrostMod covers
+every crash on that list.
+
+### Fixed
+- **Crash at +0x45B0 after leaving a session.** A bike index outside the bike list now gets
+  "no names in common" instead of a read off the list. Turn it off with `bikelistguard=0`.
+- **Crash at +0x3B940 at the end of an online race.** A water-wake update after the track freed
+  its list is skipped. Turn it off with `wakeguard=0`.
+- **Crash at +0x1FED9E in menu lists.** A list line that names an item the box does not have is
+  not drawn that frame. Turn it off with `listboxguard=0`.
+- **Crash at +0x2A42F0 on some launches.** The game passed a stack pointer in 32 bits, which
+  breaks when Windows puts the stack above 4 GB. It now passes all 64. Turn it off with `ptr64fix=0`.
+
+## 2026-11-03 - v0.50.0
+
+Three more crash fixes. Together with the trainer and terrain guards already in, FrostMod now handles
+the faults behind about 60% of the crash reports in thomas4f's MXBMRP3 usage survey.
+
+### Fixed
+- **Gate and render crash at +0x24085C.** The quad batch's vertex pointer is now checked on every
+  path the game fills it through, not only `glMapBuffer`. A bad one gets FrostMod's scratch buffer
+  and the frame is drawn. Turn it off with `mapguard=0`.
+- **Rear-shock crash at +0x1A29AE.** A shock curve lookup with a value that is not a number now
+  reads the curve's first entry instead of 8 GB off the table. Turn it off with `shockguard=0`.
+- **A bike whose physics goes NaN.** After every physics step each bike is checked, and one whose
+  values are not numbers is put back with the game's own respawn at where it was about 100 ms
+  earlier. A finite bike is never touched. Turn it off with `nanrecover=0`.
+
 ## 2026-10-25 - v0.49.17
 
 A game crash on supercross tracks is caught instead of closing the game.

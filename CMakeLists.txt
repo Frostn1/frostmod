@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.49.17")
+set(FROSTMOD_VERSION "0.52.0")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -178,6 +178,27 @@ add_test(NAME command_channel COMMAND command_channel_test)
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
 
+# --- Game SDK feed for MXB App (src/gamefeed.h) --------------------------------
+# Raw plugin payloads in a seqlocked block written from two game threads; the layout is a
+# wire contract with the app's Rust reader, so the offsets are pinned here.
+add_executable(gamefeed_test tests/gamefeed_test.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(gamefeed_test PRIVATE Threads::Threads)
+add_test(NAME gamefeed COMMAND gamefeed_test)
+
+# --- per-rider bike model sync -------------------------------------------------
+# Pure naming, hashing and remap rules shared by disk setup and the render-thread hooks.
+add_executable(bikesync_test tests/bikesync_test.cpp)
+add_test(NAME bikesync COMMAND bikesync_test)
+
+# --- rider model sync rules (src/ridersync.h) ---------------------------------
+add_executable(ridersync_test tests/ridersync_test.cpp)
+add_test(NAME ridersync COMMAND ridersync_test)
+
+# --- MXB App rider-look command format (src/riderlooks.h) ----------------------
+add_executable(riderlooks_test tests/riderlooks_test.cpp)
+add_test(NAME riderlooks COMMAND riderlooks_test)
+
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.
 add_executable(masterlist_test tests/masterlist_test.cpp)
@@ -263,6 +284,11 @@ add_test(NAME lean COMMAND lean_test)
 add_executable(antifreeze_test tests/antifreeze_test.cpp)
 add_test(NAME antifreeze COMMAND antifreeze_test)
 
+# --- Aussie-mode patch test ------------------------------------------------------
+# Same shape as antifreeze: one rip-relative load repointed at a cell we own (src/aussie.h).
+add_executable(aussie_test tests/aussie_test.cpp)
+add_test(NAME aussie COMMAND aussie_test)
+
 # --- tyre fallback patch test --------------------------------------------------
 # The guarded span, the three not-found sites in it, and the jump/stub bytes written over
 # them (src/tyrefallback.h). Pure, so it runs on any host.
@@ -276,6 +302,37 @@ add_test(NAME tyrefallback COMMAND tyrefallback_test)
 add_executable(mapguard_test tests/mapguard_test.cpp)
 add_test(NAME mapguard COMMAND mapguard_test)
 
+# --- rear-shock NaN guard test -------------------------------------------------
+# The call repointed, the curve lookup it reaches, and the stub in front of it
+# (src/shockguard.h). On Windows the stub also runs in front of a copy of the game's own
+# function bytes against a fake bike: a NaN gets curve[0], a finite x is untouched.
+add_executable(shockguard_test tests/shockguard_test.cpp)
+add_test(NAME shockguard COMMAND shockguard_test)
+
+# --- session guards test ------------------------------------------------------
+# The four end-of-session / ASLR guards (src/sessionguards.h): the bytes each install checks,
+# the tables and counts they decode, and the two machine-code stubs. On Windows the stubs also
+# run for real: a good list-box line or pointer comes out as the game would make it, a bad one
+# takes the skip path and is counted.
+add_executable(sessionguards_test tests/sessionguards_test.cpp)
+add_test(NAME sessionguards COMMAND sessionguards_test)
+
+# What counts as one caught crash for MXB App, and the line format it reads.
+add_executable(protection_test tests/protection_test.cpp)
+add_test(NAME protection COMMAND protection_test)
+
+# FrostServer's rejoin fix: the departure code's bytes and the owner rule.
+add_executable(serverrejoin_test tests/serverrejoin_test.cpp)
+add_test(NAME serverrejoin COMMAND serverrejoin_test)
+
+# --- NaN bike reset test ---------------------------------------------------------
+# The offsets the per-step check reads and the place-bike call it makes, proved against the
+# install's byte checks (src/nanrecover.h). The check runs against a fake bike: every finite
+# state passes (random, extreme, and the last calm step of four real crashes), every non-finite
+# value in every covered field is caught and named. On Windows the game's own ODE body setters
+# run against the fake bike's bodies.
+add_executable(nanrecover_test tests/nanrecover_test.cpp)
+add_test(NAME nanrecover COMMAND nanrecover_test)
 # --- upgraded material shaders test --------------------------------------------
 # The hash table, the source rewrite, the config keys and the "does a relink keep the game's
 # uniform locations" rule behind shaders=1 (src/shaderup.h). Pure, so it runs on any host.

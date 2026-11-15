@@ -1,4 +1,4 @@
-// mapguard.h - the quad-batch renderer no longer writes through a bad glMapBuffer pointer.
+// mapguard.h - the quad-batch renderer no longer writes through a bad vertex-buffer pointer.
 //
 // THE CRASH, as a player sees it. On a supercross track the game goes to desktop mid-session:
 // an access violation WRITING at mxbikes.exe+0x24085C. Seen on one setup again and again
@@ -6,36 +6,55 @@
 // else so far.
 //
 // WHERE. The game's dynamic quad batcher keeps ten batches of up to 4000 quads (16000
-// vertices). Each flush maps that batch's vertex buffer through 0x22AC50, which orphans it
-// (glBufferData(GL_ARRAY_BUFFER, size, NULL, GL_STREAM_DRAW)) and tail-jumps to
-// glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY). The caller at 0x240A9C adds four fixed offsets
-// to whatever came back - positions, texcoords, colours, normals, 192000 / 128000 / 64000
-// bytes apart - and starts writing. Nothing checks the pointer. The writes end in 0x22ACC0,
-// called at 0x240D1E, which does glUnmapBuffer; the draw follows at 0x238340.
+// vertices). Each flush (0x2409D0) gets a pointer to that batch's vertex data through
+// 0x22AC50, called at 0x240A9C, adds four fixed offsets to it - positions, texcoords,
+// colours, normals - and starts writing. Nothing checks the pointer. The writes end in
+// 0x22ACC0, called at 0x240D1E; the draw follows at 0x238340. The faulting store at
+// 0x24085C (in the batch walker 0x240790) is `mov [r10-0x30], eax` with
+// r10 = batch->positions + 12 * batch->vertexCount + 0x30, i.e. the map result itself on
+// the first quad.
 //
-// WHAT THE DUMPS SAY. In all four +0x24085C dumps the four array pointers sit exactly at
-// their start offsets, so the fault is the first store into a freshly mapped buffer, and the
-// pointer behind them was NOT null: 0x14304790, 0x83E64820, 0x6B8E5830, 0xEF3DEFA0. All
-// below 4 GB, 16-byte aligned, none page aligned - the shape of a stale or truncated heap
-// pointer, not of a driver mapping. So the check below is not just `p != NULL`.
+// 0x22AC50 has three paths, picked by two globals and the record's GL name:
+//   gl-map    kRvaGlOk && name && kRvaUseMap: orphan with glBufferData(NULL) and return
+//             glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY). 0x22ACC0 does glUnmapBuffer.
+//   ram       kRvaGlOk && name && !kRvaUseMap: return the record's own RAM shadow
+//             ([rec+0x10]). 0x22ACC0 binds and uploads that RAM with glBufferSubData.
+//   no-buffer !kRvaGlOk || !name: return NULL. 0x22ACC0 returns 1 and touches nothing.
+//
+// WHAT THE DUMPS SAY. The four earlier dumps and the three 0.49.17 dumps of 2026-10-27 all
+// fault on the first store of a batch (vertexCount 0, worked out from r10/r11/rdx/rcx), at
+// the map result itself: 0x14304790, 0x83E64820, 0x6B8E5830, 0xEF3DEFA0, then 0xA23FE7C0,
+// 0x9FA80220, 0x9C330080. All non-NULL, below 4 GB, 16-byte aligned - a stale or truncated
+// pointer. On 0.49.17 the guard was installed and still did not stand in, so the game was
+// NOT on the gl-map path: it was on the ram path, and the RAM shadow pointer is what went
+// bad. The log only ever showed "NULL" because one rate limit covered every kind of fire,
+// and the NULLs (up to 196k a run) used up the lines before the junk pointer came along.
+// Those NULL fires never crashed: a batch with nothing in it writes nothing (the walker and
+// the item loop both exit before the first store), so every NULL seen must have been an empty
+// batch - inferred, since a full one would fault near address 0 and none ever has.
 //
 // WHAT THIS DOES. Two call instructions are repointed, nothing else: the map call at
 // 0x240A9C and the unmap call at 0x240D1E, each to a 12-byte stub that jumps into FrostMod.
 // The map side calls the game's own 0x22AC50 and looks at the result. A pointer that is
 // committed and writable for the whole buffer is returned untouched - the normal path costs
 // one VirtualQuery. A NULL, an unmapped or a read-only pointer is replaced by a scratch
-// buffer FrostMod owns, of the size the game asked for. On the matching unmap the scratch is
-// uploaded with glBufferSubData (after a real glUnmapBuffer only if GL still thinks the
-// buffer is mapped, since SubData on a mapped buffer is an error) and the game's unmap is
-// skipped. The batch is drawn, from our copy, instead of the game crashing.
+// buffer FrostMod owns, of the size the game asked for, on every path. What the matching
+// unmap does with it depends on the path (UnmapFor below):
+//   gl-map    close the GL mapping if GL still has one, then glBufferSubData our copy.
+//   ram       glBufferSubData our copy (instead of the game's bad RAM pointer).
+//   no-buffer call the game's own unmap, which does nothing here; the writes just land in
+//             our scratch instead of near address 0.
+// The game's unmap is skipped on the first two. Either way the batch is drawn, from our
+// copy, instead of the game crashing. Logging is rate-limited per (path, verdict), so a new
+// kind of fire is always logged even after a flood of another kind.
 //
 // Every other caller of 0x22AC50 / 0x22ACC0 (there are a dozen) is left alone, and
 // glMapBuffer itself is not hooked.
 //
 // WHAT IT DOES NOT FIX. A junk pointer that happens to land in committed, writable memory
 // passes the check, and the game then writes 576000 bytes over whatever lives there. That
-// cannot be told apart from a good mapping without trusting the driver, which is the thing
-// that failed. The real cause is upstream (driver or the GL wrapper in front of it).
+// cannot be told apart from a good pointer without trusting the thing that failed. Why the
+// RAM shadow goes bad is upstream and still open.
 //
 // No Win32 here, so tests/mapguard_test.cpp runs anywhere.
 #pragma once
@@ -59,6 +78,7 @@ constexpr uintptr_t kRvaGlUnmapBuffer   = 0x398F40;
 // The vertex-buffer record 0x22AC50 takes (rcx = batch + 0xA8).
 constexpr size_t kVbCount  = 0x00;   // int, vertices the buffer holds
 constexpr size_t kVbStride = 0x04;   // int, bytes per vertex over all four arrays
+constexpr size_t kVbRam    = 0x10;   // void*, the RAM shadow the ram path hands out
 constexpr size_t kVbGlName = 0x18;   // int, GL buffer name; 0 = no buffer
 
 constexpr uint32_t kGlArrayBuffer = 0x8892;   // GL_ARRAY_BUFFER
@@ -217,7 +237,57 @@ inline Verdict Classify(uintptr_t p, size_t size, Query query, Region* bad = nul
     return a >= end ? Verdict::Ok : Verdict::NotCommitted;
 }
 
-/// mapguardtest=N: pretend every Nth map at this site failed, so the fallback can be driven
+/// ---- which of 0x22AC50's three paths the game is on ----------------------------------
+enum class Path : int { GlMap = 0, Ram, NoBuffer };
+constexpr int kPaths = 3;
+constexpr int kVerdicts = 5;
+
+/// The branch 0x22AC50 / 0x22ACC0 take, from the same three ints they test.
+inline Path PathOf(int32_t glOk, int32_t useMap, int32_t glName) {
+    if (glOk == 0 || glName == 0) return Path::NoBuffer;
+    return useMap != 0 ? Path::GlMap : Path::Ram;
+}
+
+inline const char* PathName(Path p) {
+    switch (p) {
+    case Path::GlMap:    return "gl-map path";
+    case Path::Ram:      return "ram path";
+    case Path::NoBuffer: return "no-buffer path";
+    default:             return "?";
+    }
+}
+
+/// What MgUnmap does with a scratch it lent at the map.
+///   Game            call the game's own 0x22ACC0 (no-buffer: it returns 1, touches no GL).
+///   CloseThenUpload glUnmapBuffer if GL still has the buffer mapped, then glBufferSubData.
+///   Upload          glBufferSubData our copy; the game's unmap would upload its bad pointer.
+/// `atMap` is the path when the scratch was lent, `now` the path at the unmap; they only
+/// differ if a flag flips mid-flush, and then the buffer may be mapped from the map side.
+enum class UnmapAction : int { Game = 0, CloseThenUpload, Upload };
+inline UnmapAction UnmapFor(Path atMap, Path now) {
+    if (now == Path::NoBuffer) return UnmapAction::Game;
+    if (now == Path::GlMap || atMap == Path::GlMap) return UnmapAction::CloseThenUpload;
+    return UnmapAction::Upload;
+}
+
+/// The value 0x22ACC0 would have returned on the path we stood in for (0 = uploaded).
+inline int UnmapResult(UnmapAction a, int gameResult) { return a == UnmapAction::Game ? gameResult : 0; }
+
+/// Bytes MgUnmap uploads from a scratch of `lent` bytes when the flush says it wrote `count`
+/// vertices. An empty batch wrote nothing, and the game's own unmap uploads count * stride =
+/// 0 bytes for it, so neither do we; the NULL fires (up to 196k a run) are exactly those.
+/// Anything else goes up whole: the four arrays sit at fixed offsets across all of it.
+inline size_t UploadBytes(size_t lent, int count) { return count > 0 ? lent : 0; }
+
+/// One rate-limit counter per (path, verdict): a flood of one kind must not hide another.
+inline int KindIndex(Path p, Verdict v) {
+    const int pi = (int)p, vi = (int)v;
+    if (pi < 0 || pi >= kPaths || vi < 0 || vi >= kVerdicts) return 0;
+    return pi * kVerdicts + vi;
+}
+constexpr int kKinds = kPaths * kVerdicts;
+
+// mapguardtest=N: pretend every Nth map at this site failed, so the fallback can be driven
 /// in game on a machine where nothing is wrong. `n` counts maps from 1.
 inline bool ForceThis(uint64_t n, int every) { return every > 0 && n > 0 && n % (uint64_t)every == 0; }
 
@@ -227,5 +297,92 @@ inline bool ShouldLog(uint64_t n) { return n > 0 && (n <= 3 || (n & (n - 1)) == 
 
 // Scratch buffers kept, one per vertex-buffer record. The quad batcher has ten.
 constexpr int kMaxSlots = 16;
+
+// ---- the second line: a store that faults anyway ------------------------------------
+// v0.51.0 still crashed at +0x24085C (449 of its 1003 beta21e reports, 2026-11-12), every one
+// after the map check above had passed the pointer, and every one in the tree walker
+// 0x240790 (via 0x2409A9 / 0x240B23), never in the flat loop. So the pointer the map handed
+// back was good when checked and bad by the first store, or the store is not where the check
+// looked; the reports carry no registers to say which. Rather than guess, the walker's own
+// stores are caught: a write fault on one of them moves the batch onto FrostMod's scratch
+// and the same store runs again there.
+//
+// The walker's quad loop (0x240850 .. 0x24096D) keeps four write cursors, one per array:
+//   r10 positions  (batch+0x80, map result + [batch+0xC8])
+//   r11 texcoords  (batch+0x88, + [batch+0xD8])
+//   rdx colours    (batch+0x90, + [batch+0xD0])
+//   rcx normals    (batch+0x98, + [batch+0xF8])
+// and rsi is the batch. Each recursion level reloads the cursors from the batch's four
+// pointers, so rewriting those four and the live frame's four registers moves every write
+// still to come. A cursor keeps its distance from its array's base, whichever adds of the
+// quad have already run, so the move is a rebase: new = cursor - oldBase + newBase.
+constexpr uintptr_t kRvaWalker     = 0x240790;   // void walk(batch, node, frustum)
+constexpr uintptr_t kRvaWalkLoLoop = 0x240850;   // first instruction of the quad loop
+constexpr uintptr_t kRvaWalkHiLoop = 0x240970;   // `add [rsi+0x78], 4`, after the last store
+constexpr uintptr_t kRvaWalkExit   = 0x2409B3;   // xor eax,eax; restore rdi/rbx/rbp; pop rsi; ret
+constexpr uintptr_t kRvaBatchTable = 0x5815A0;   // ten batch pointers (the flush's lea r13)
+constexpr int       kBatches       = 10;
+constexpr size_t    kBatchArrays   = 0x80;       // four pointers: pos, tex, col, nor
+constexpr size_t    kBatchVb       = 0xA8;       // the vertex-buffer record 0x22AC50 takes
+constexpr size_t    kBatchCount    = 0x78;       // vertices written this flush
+constexpr size_t    kBatchTris     = 0xA0;       // triangles (2 per quad); 0 = no draw
+constexpr size_t    kArrayOffs[4]  = {0xC8, 0xD8, 0xD0, 0xF8};   // dword offsets into the buffer
+
+// 0x240850 .. 0x24085F: the loop head through the first store, and the epilogue we jump to.
+constexpr size_t  kWalkHeadLen = 16;
+constexpr uint8_t kWalkHead[kWalkHeadLen] = {
+    0x41, 0x8b, 0x41, 0x04,               // mov eax, [r9+4]
+    0x49, 0x83, 0xc2, 0x30,               // add r10, 0x30
+    0x49, 0x83, 0xc3, 0x20,               // add r11, 0x20
+    0x41, 0x89, 0x42, 0xd0,               // mov [r10-0x30], eax   <- +0x24085C
+};
+constexpr size_t  kWalkExitLen = 23;
+constexpr uint8_t kWalkExit[kWalkExitLen] = {
+    0x33, 0xc0, 0x48, 0x8b, 0x7c, 0x24, 0x30, 0x48, 0x8b, 0x5c, 0x24, 0x38,
+    0x48, 0x8b, 0x6c, 0x24, 0x40, 0x48, 0x83, 0xc4, 0x20, 0x5e, 0xc3,
+};
+
+/// The fault is one of the walker's stores (rip as an RVA).
+inline bool InWalkerStores(uintptr_t ripRva) {
+    return ripRva >= kRvaWalkLoLoop && ripRva < kRvaWalkHiLoop;
+}
+
+/// Where a cursor goes when its array moves from `oldBase` to `newBase`.
+inline uint64_t Rebase(uint64_t cursor, uint64_t oldBase, uint64_t newBase) {
+    return cursor - oldBase + newBase;
+}
+
+/// Whether a scratch of `cap` bytes holds the buffer as the batch lays it out: every array
+/// offset inside it. A record whose offsets point past its own size is not one we move.
+inline bool OffsetsFit(const uint32_t offs[4], size_t cap) {
+    if (cap == 0) return false;
+    for (int k = 0; k < 4; ++k)
+        if ((size_t)offs[k] >= cap) return false;
+    return true;
+}
+
+/// What the fault handler does.
+///   Move  the batch is on the game's memory: move it onto our scratch and run the store again
+///   Stop  it is already on our scratch (so the walk ran off the end of a whole buffer), or
+///         it cannot be moved: leave this walker frame through its own epilogue; the frames
+///         above fault in turn and leave the same way, and the draw takes only whole quads
+///   Pass  not ours: the batch is not one of the ten, or the guard is not installed
+enum class FaultAction : int { Pass = 0, Move, Stop };
+inline FaultAction OnWalkerFault(bool knownBatch, bool onScratch, bool canMove) {
+    if (!knownBatch) return FaultAction::Pass;
+    if (onScratch || !canMove) return FaultAction::Stop;
+    return FaultAction::Move;
+}
+
+/// After a Stop the batch may say it wrote more than the buffer holds. The draw is clamped to
+/// the vertices that fit (whole quads) and two triangles per quad.
+inline void ClampDraw(int32_t* count, int32_t* tris, int32_t capVerts) {
+    if (capVerts < 0) capVerts = 0;
+    capVerts -= capVerts % 4;
+    if (*count > capVerts) *count = capVerts;
+    if (*count < 0) *count = 0;
+    if (*tris > *count / 2) *tris = *count / 2;
+    if (*tris < 0) *tris = 0;
+}
 
 }  // namespace mapguard

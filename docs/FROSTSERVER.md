@@ -140,6 +140,29 @@ put your `maps` list in a `.bak`.
   That one makes a distant rider visible but smoothed. This one is the better fix,
   because the rider's position stays accurate.
 
+## Riders who leave are removed from every screen
+
+When a rider leaves, the game tells every client to drop them from the rider list but not
+from the track. Their bike stays frozen where they left it, on every screen, until each player
+leaves the server themselves. If they rejoin, there are two of them.
+
+The game has a function that does remove a rider properly. It frees the server's record and
+tells every client to free theirs. It is just never called when someone leaves. `rejoin_fix`
+calls it for each bike the leaving client owned, right after the game's own departure code has
+run. That is the same pair of effects as the game's own removal, and it is what native
+mxbserver does on a disconnect.
+
+`rejoin_fix: true` is the default. Set it to `false` to leave departures exactly as PiBoSo
+ships them.
+
+## Crash guards
+
+The game's code for handling a joining client runs on a dedicated server too. One of FrostMod's
+crash fixes applies there: the host crash at `+0x7A860`, where the game asks for a rider who is
+not in its list, gets no answer written, and copies two lists of whatever length was left on
+the stack. FrostServer answers such a request with empty lists instead. `crash_guards: false`
+turns it off.
+
 ## Styled announcements
 
 Every message a dedicated server sends in chat arrives in the same colour on every
@@ -289,6 +312,21 @@ configured line is. Body cap 4 KB.
 ```json
 { "seq": 13 }
 ```
+
+### `GET /frostserver/protection`
+
+What this server's fixes have done, for MXB Servers and MXB App. `session` counts since the
+server started, `total` since FrostServer first ran in this folder (`since`, unix seconds).
+`on` is whether the fix is active on this server.
+
+```json
+{"frostserver":"0.52.0","startedAt":1794535445,"since":1794100000,"fixes":[
+  {"id":"fair-send","name":"Distant riders kept visible","on":true,"session":412,"total":90311,"unit":"riders kept drawn"},
+  {"id":"rejoin","name":"Riders who left removed from every screen","on":true,"session":3,"total":118,"unit":"departures cleaned up"},
+  {"id":"rider-info","name":"Host crash when someone joins (+0x7A860)","on":true,"session":0,"total":2,"unit":"crashes stopped"}]}
+```
+
+Lifetime totals live in `frostserver-protection.json` beside the log.
 
 ### `GET /health`
 

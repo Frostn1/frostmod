@@ -20,6 +20,10 @@
 #include <string>
 #include <vector>
 
+#ifndef FROSTMOD_SRC
+#define FROSTMOD_SRC "src"
+#endif
+
 static int g_failures = 0;
 
 #define CHECK(cond, ...)                                                        \
@@ -171,27 +175,33 @@ static void TestInventory() {
     CHECK(!Has(fm, "MH_Uninitialize("),
           "no MH_Uninitialize: a thread inside a detour still calls through its trampoline");
 
-    // Hand-written code patches: the antifreeze displacement, the tyre-fallback span and the
-    // map-guard calls. Each VirtualProtect is one of these three (apply, verify-revert, revert) -
-    // a new one is a new patch that needs a revert in TdRevertPatches.
-    CHECK(Count(fm, "VirtualProtect(") == 14,
-          "VirtualProtect is called %d times (14 known: antifreeze 6, tyre fallback 4, map guard 4); a new code "
+    // Hand-written code patches: the antifreeze displacement, the Aussie-mode spring sites, the tyre-fallback
+    // span, the map-guard calls and the shock-guard call. Each VirtualProtect is one of these (apply,
+    // verify-revert, revert) - a new one is a new patch that needs a revert in TdRevertPatches.
+    CHECK(Count(fm, "VirtualProtect(") == 21,
+          "VirtualProtect is called %d times (21 known: antifreeze 6, aussie 3, tyre fallback 4, "
+          "map guard 4, shock guard 4); a new code "
           "patch must be reverted in TdRevertPatches - then update this count", Count(fm, "VirtualProtect("));
     const std::string patches = Body(fm, "static void TdRevertPatches(");
     CHECK(Has(patches, "TyreFallbackRevert()"), "teardown reverts the tyre fallback span");
     CHECK(Has(patches, "AfRevert()"), "teardown reverts the antifreeze displacement");
+    CHECK(Has(patches, "AuRevert()"), "teardown reverts the Aussie-mode spring sites");
     CHECK(Has(patches, "MgRevert()"), "teardown reverts the map-guard calls");
+    CHECK(Has(patches, "SgRevert()"), "teardown reverts the shock-guard call");
 
     // Threads: each kept in a handle and stopped (and joined when it may block) first.
-    CHECK(Count(fm, "CreateThread(") == 3,
-          "CreateThread is called %d times (3 known: servermsg poll, memdiag report, Init); a new "
+    CHECK(Count(fm, "CreateThread(") == 4,
+          "CreateThread is called %d times (4 known: servermsg poll, memdiag report, Init, model "
+          "index); a new "
           "thread must be stopped in TdStopThreads - then update this count", Count(fm, "CreateThread("));
     CHECK(Has(fm, "g_msgThread = CreateThread("), "servermsg thread kept in a handle");
     CHECK(Has(fm, "g_mdThread = CreateThread("), "memdiag thread kept in a handle");
     CHECK(Has(fm, "g_initThread = CreateThread("), "init thread kept in a handle");
+    CHECK(Has(fm, "g_rsIndexThread = CreateThread("), "model index thread kept in a handle");
     const std::string threads = Body(fm, "static void TdStopThreads(");
-    CHECK(Has(threads, "MsgFeedStop(") && Has(threads, "MdStop(") && Has(threads, "g_initThread"),
-          "teardown stops all three threads");
+    CHECK(Has(threads, "MsgFeedStop(") && Has(threads, "MdStop(") &&
+          Has(threads, "g_rsIndexThread") && Has(threads, "g_initThread"),
+          "teardown stops all four threads");
     CHECK(Has(Body(fm, "static DWORD WINAPI MdThread("), "g_mdQuit"), "memdiag thread has a way out");
 
     // Exception handlers: removed, last.

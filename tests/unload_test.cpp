@@ -156,11 +156,17 @@ static bool Has(const std::string& s, const char* needle) { return s.find(needle
 
 static void TestInventory() {
     const std::string dir = FROSTMOD_SRC;
-    const std::string fm = ReadFile(dir + "/frostmod.cpp");
+    // The crash guards and the hook helper are shared with frostmod_fixes.dlo (src/guards.cpp,
+    // src/hookutil.cpp) and are part of frostmod.dll, so the inventory covers all three files.
+    const std::string fmMain = ReadFile(dir + "/frostmod.cpp");
+    const std::string gd = ReadFile(dir + "/guards.cpp");
+    const std::string hu = ReadFile(dir + "/hookutil.cpp");
+    CHECK(!gd.empty() && !hu.empty(), "guards.cpp and hookutil.cpp readable under %s", dir.c_str());
+    const std::string fm = fmMain + "\n" + gd + "\n" + hu;
     const std::string cr = ReadFile(dir + "/crashreport.cpp");
     const std::string nt = ReadFile(dir + "/nantrap.cpp");
-    CHECK(!fm.empty() && !cr.empty() && !nt.empty(), "sources readable under %s", dir.c_str());
-    if (fm.empty()) return;
+    CHECK(!fmMain.empty() && !cr.empty() && !nt.empty(), "sources readable under %s", dir.c_str());
+    if (fmMain.empty()) return;
 
     // MinHook: exactly InstallHook() and the server-filter loop-top. Both refuse once unloading,
     // and MH_DisableHook(MH_ALL_HOOKS) at teardown covers every hook either made.
@@ -183,11 +189,11 @@ static void TestInventory() {
           "map guard 4, shock guard 4); a new code "
           "patch must be reverted in TdRevertPatches - then update this count", Count(fm, "VirtualProtect("));
     const std::string patches = Body(fm, "static void TdRevertPatches(");
-    CHECK(Has(patches, "TyreFallbackRevert()"), "teardown reverts the tyre fallback span");
+    CHECK(Has(patches, "guards::RevertTyreFallback()"), "teardown reverts the tyre fallback span");
     CHECK(Has(patches, "AfRevert()"), "teardown reverts the antifreeze displacement");
     CHECK(Has(patches, "AuRevert()"), "teardown reverts the Aussie-mode spring sites");
-    CHECK(Has(patches, "MgRevert()"), "teardown reverts the map-guard calls");
-    CHECK(Has(patches, "SgRevert()"), "teardown reverts the shock-guard call");
+    CHECK(Has(patches, "guards::RevertMapGuard()"), "teardown reverts the map-guard calls");
+    CHECK(Has(patches, "guards::RevertShockGuard()"), "teardown reverts the shock-guard call");
 
     // Threads: each kept in a handle and stopped (and joined when it may block) first.
     CHECK(Count(fm, "CreateThread(") == 4,
@@ -219,6 +225,23 @@ static void TestInventory() {
     CHECK(Has(Body(fm, "static void PinSelf()"), "GET_MODULE_HANDLE_EX_FLAG_PIN"), "PinSelf pins");
 }
 
+// frostmod_fixes.dlo carries the same guards, so it owes the same teardown: every hook off and
+// every code patch put back before the game frees it. It also must not take full FrostMod's
+// per-process name, or a full FrostMod loaded after it would stand down.
+static void TestFixesInventory() {
+    const std::string fx = ReadFile(std::string(FROSTMOD_SRC) + "/fixes.cpp");
+    CHECK(!fx.empty(), "fixes.cpp readable");
+    if (fx.empty()) return;
+    const std::string td = Body(fx, "void Teardown()");
+    CHECK(Has(td, "MH_DisableHook(MH_ALL_HOOKS)"), "fixes teardown disables every hook");
+    CHECK(Has(td, "guards::RevertTyreFallback()"), "fixes teardown reverts the tyre fallback span");
+    CHECK(Has(td, "guards::RevertMapGuard()"), "fixes teardown reverts the map-guard calls");
+    CHECK(Has(td, "guards::RevertShockGuard()"), "fixes teardown reverts the shock-guard call");
+    CHECK(Has(Body(fx, "__declspec(dllexport) void Shutdown()"), "Teardown()"), "fixes Shutdown runs it");
+    CHECK(!Has(fx, "CreateMutex"), "fixes never creates FrostMod's per-process name");
+    CHECK(!Has(fx, "MH_Uninitialize("), "fixes keeps trampolines alive");
+}
+
 int main() {
     TestOrder();
     TestOnce();
@@ -227,6 +250,7 @@ int main() {
     TestRejects();
     TestDetach();
     TestInventory();
+    TestFixesInventory();
     if (g_failures) {
         std::printf("unload_test: %d failure(s)\n", g_failures);
         return 1;

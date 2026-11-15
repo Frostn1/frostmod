@@ -43,6 +43,9 @@ void InstallSessionGuards();
 void Tick();
 
 bool NanRecoverInstall(const uint8_t* sim_step);
+const uint8_t* ResolveSimStep(intptr_t delta, const char* log_tag);
+bool InstallSimStepHook(const uint8_t* sim_step, void* detour, void** original);
+bool InstallNanRecoverHook(intptr_t delta);
 void NanRecoverCheck(int32_t slot, bool before);
 void NanRecoverSetLive(bool live);
 bool NanRecoverLive();

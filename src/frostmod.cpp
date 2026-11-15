@@ -75,6 +75,7 @@
 #include "sessionguards.h" // four end-of-session / ASLR crashes, each sent down the game's own empty path
 #include "nanrecover.h"   // a bike whose physics state goes NaN is put back with the game's own reset
 #include "guards.h"      // shared crash-guard installers, hooks, state and periodic logs
+#include "hookutil.h"    // shared hook/scanner primitives used by both plugins
 #include "unload.h"       // Shutdown/unload: threads, hooks, patches, handlers - in that order
 #include "hotkey.h"       // menukey=: the key that opens the FrostMod menu (F8 by default)
 #include "ridersync.h"    // content-addressed rider, helmet and boots model sync
@@ -166,6 +167,16 @@ static void SessionClear() {
 }
 #include "cmdchannel.h" // MXB App command files: which one is new, and what it says
 #include "version.h"    // FROSTMOD_VERSION
+
+using hookutil::AllocNear;
+using hookutil::GetExecRange;
+using hookutil::InstallHook;
+using hookutil::MatchAt;
+using hookutil::PatternScan;
+using hookutil::SafeReadBytes;
+using hookutil::SafeReadInt;
+using hookutil::SafeCopyStr;
+using hookutil::WaitForScanner;
 
 // ---------------------------------------------------------------------------
 // logging -> <dll folder>\frostmod.log (+ OutputDebugString). Next to the dll,
@@ -482,33 +493,6 @@ struct ScanCall { void* a0{}; void* a1{}; void* a2{}; void* a3{}; std::string di
 std::mutex g_scansMutex;
 std::vector<ScanCall> g_scans;
 
-// SEH-guarded raw copy into a POD buffer (no C++ objects here, so the compiler
-// allows __try/__except in this function).
-static bool SafeCopyStr(const void* p, char* out, size_t cap) {
-    __try {
-        const char* s = reinterpret_cast<const char*>(p);
-        size_t n = 0;
-        while (n + 1 < cap && s[n]) { out[n] = s[n]; ++n; }
-        out[n] = '\0';
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// SEH-guarded int read (POD, so __try is allowed here).
-static int SafeReadInt(const int* p) {
-    __try { return *p; } __except (EXCEPTION_EXECUTE_HANDLER) { return -0x7FFF; }
-}
-
-// SEH-guarded byte copy up to cap; returns bytes read (stops on the first fault).
-static size_t SafeReadBytes(const char* p, char* out, size_t cap) {
-    size_t n = 0;
-    __try { while (n < cap) { out[n] = p[n]; ++n; } }
-    __except (EXCEPTION_EXECUTE_HANDLER) { /* stop at n */ }
-    return n;
-}
-
 // Read a NUL-terminated string from a (possibly bogus) pointer, safely.
 std::string SafeStr(void* p) {
     if (!p) return "<null>";
@@ -666,7 +650,6 @@ int __cdecl hkFindNext(intptr_t h, _finddata64i32_t* fd) {
         if (r != 0 || !t_rf || RfPass(fd)) return r;
     }
 }
-bool InstallHook(void* target, void* detour, void** original, const char* name);   // fwd
 // The find hooks go in only once there is a list, so a player who never uses race mode
 // runs the game's CRT untouched.
 void RaceFilterEnsureHooks() {
@@ -924,8 +907,6 @@ size_t BlobHeadBytes() {
 
 // forward decls (defined later near setup) - AOB scan helpers the filter uses to
 // self-locate its hook site across game builds.
-bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end);
-uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* mask);
 
 // ---------------------------------------------------------------------------
 // SERVER FILTER - hide spam/"ghost" servers from the browser.
@@ -4407,25 +4388,6 @@ static uintptr_t         g_afSite    = 0;        // VA of the instruction we rew
 static uint8_t           g_afOrig[antifreeze::kSiteLen] = {0};
 static bool              g_afPatched = false;
 
-// An 8-byte cell the instruction can actually name. Its operand is a signed 32-bit offset
-// from itself, so a cell more than ~2 GB away cannot be addressed at all, and VirtualAlloc
-// left to choose will happily return a page far outside that. So walk outward from the site
-// one allocation granule at a time and take the first slot that is free.
-static void* AllocNear(uintptr_t site, size_t size, DWORD protect) {
-    SYSTEM_INFO si{}; GetSystemInfo(&si);
-    const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
-    const uintptr_t limit = 0x70000000ull;                 // stay well inside rel32 reach
-    for (uintptr_t d = gran; d < limit; d += gran) {
-        for (int up = 0; up < 2; ++up) {
-            if (!up && site < d) continue;                  // would underflow past zero
-            uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
-            if (!a) continue;
-            void* p = VirtualAlloc((void*)a, size, MEM_RESERVE | MEM_COMMIT, protect);
-            if (p) return p;
-        }
-    }
-    return nullptr;
-}
 static double* AfAllocCellNear(uintptr_t site) {
     return (double*)AllocNear(site, sizeof(double), PAGE_READWRITE);
 }
@@ -6970,167 +6932,6 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
 // executable sections for the pattern and use whatever we find. All of this is
 // logged, so the console tells you plainly whether offsets.h fits your build.
 // ---------------------------------------------------------------------------
-bool MatchAt(const uint8_t* p, const char* pat, const char* mask) {
-    for (; *mask; ++mask, ++p, ++pat)
-        if (*mask == 'x' && (uint8_t)*pat != *p) return false;
-    return true;
-}
-
-// bounds of the module's executable bytes, from its PE section headers
-bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end) {
-    auto dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    uintptr_t lo = ~(uintptr_t)0, hi = 0;
-    auto sec = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            uintptr_t s = base + sec->VirtualAddress;
-            uintptr_t e = s + sec->Misc.VirtualSize;
-            if (s < lo) lo = s;
-            if (e > hi) hi = e;
-        }
-    }
-    if (hi <= lo) return false;
-    *begin = (uint8_t*)lo; *end = (uint8_t*)hi;
-    return true;
-}
-
-uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* mask) {
-    size_t len = strlen(mask);                       // mask has no embedded NULs
-    if (len == 0 || (size_t)(end - begin) < len) return nullptr;
-    for (uint8_t* p = begin; p <= end - len; ++p)
-        if (MatchAt(p, pat, mask)) return p;
-    return nullptr;
-}
-
-// Resolve the scanner by signature. Returns its address (0 if unresolvable) and
-// sets *outDelta to how far it moved from the offsets.h RVA (0 == offsets fit).
-uintptr_t ResolveScanner(intptr_t* outDelta) {
-    *outDelta = 0;
-    uint8_t* expected = (uint8_t*)(g_base + g_game->scan_folder);
-    size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
-
-    uint8_t *b, *e;
-    bool haveRange = GetExecRange(g_base, &b, &e);
-
-    // A title with no derived offsets has no RVA to check against: `base + 0` is the PE
-    // header, and "verifying" or hooking it would be a wild write. Signature only - and
-    // the RVA it finds is the first constant of that title's port, so it is logged loudly.
-    if (!g_game->content_derived()) {
-        uint8_t* found = haveRange
-            ? PatternScan(b, e, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK) : nullptr;
-        if (!found) {
-            Log("[sig] %s: no offsets derived for this title and the scanner signature is "
-                "not in .text (yet). Content hooks stay off.", g_game->display);
-            return 0;
-        }
-        Log("[sig] %s: scanner found at RVA 0x%zx by signature. This title has no derived "
-            "offsets - RECORD THIS RVA (see tasks/kart-racing-pro-port.md).",
-            g_game->display, (size_t)((uintptr_t)found - g_base));
-        return (uintptr_t)found;
-    }
-
-    // only read the raw RVA if it actually lies inside an executable section
-    bool rvaInRange = haveRange && expected >= b && expected + sigLen <= e;
-    if (rvaInRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
-        Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
-            (size_t)g_game->scan_folder);
-        return (uintptr_t)expected;
-    }
-    if (!haveRange) {
-        Log("[sig] WARNING: can't read module sections to validate; using the raw RVA "
-            "0x%zx anyway (may be wrong).", (size_t)g_game->scan_folder);
-        return (uintptr_t)expected;
-    }
-    Log("[sig] WARNING: bytes at scanner RVA 0x%zx do NOT match the signature - "
-        "offsets.h looks stale for this mxbikes build. Scanning .text...",
-        (size_t)g_game->scan_folder);
-    uint8_t* found = PatternScan(b, e, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK);
-    if (!found) {
-        Log("[sig] ERROR: scanner signature not found in .text. The reload can't work on "
-            "this build until offsets.h/SIG_SCAN_FOLDER are updated. Skipping content hooks.");
-        return 0;
-    }
-    *outDelta = (intptr_t)((uintptr_t)found - (g_base + g_game->scan_folder));
-    Log("[sig] scanner RELOCATED: found at RVA 0x%zx (delta %+lld from offsets.h).",
-        (size_t)((uintptr_t)found - g_base), (long long)*outDelta);
-    return (uintptr_t)found;
-}
-
-// If we inject EARLY (to get hooked before the game's one-time startup mods
-// scan), the scanner's code may not be decrypted yet - SteamStub unpacks .text
-// in place during early execution. The game can't run its scan until that code
-// exists, so we spin until the signature appears, then hook: that lands our hook
-// after unpack but (hopefully) before the game itself calls the scanner.
-uintptr_t WaitForScanner(intptr_t* outDelta, DWORD timeoutMs) {
-    *outDelta = 0;
-
-    // Nothing to wait AT when the title has no derived RVA: sweep .text for the signature
-    // until SteamStub has decrypted the code it lives in. A sweep is a few milliseconds, so
-    // poll it slowly rather than spinning. The scanner prologue is byte-identical between
-    // MX Bikes and GP Bikes, which is the reason to expect it to match a third title too -
-    // and if it doesn't, that is itself the answer, logged below.
-    if (!g_game->content_derived()) {
-        DWORD start = GetTickCount();
-        bool announced = false;
-        for (;;) {
-            uint8_t *b, *e;
-            if (GetExecRange(g_base, &b, &e))
-                if (uint8_t* found = PatternScan(b, e, mxb::SIG_SCAN_FOLDER,
-                                                 mxb::SIG_SCAN_FOLDER_MASK)) {
-                    Log("[sig] %s: scanner found at RVA 0x%zx by signature (after %lums). "
-                        "This title has no derived offsets - RECORD THIS RVA; the [stack] "
-                        "lines that follow carry the rest (tasks/kart-racing-pro-port.md).",
-                        g_game->display, (size_t)((uintptr_t)found - g_base),
-                        (unsigned long)(GetTickCount() - start));
-                    return (uintptr_t)found;
-                }
-            if (GetTickCount() - start > timeoutMs) break;
-            if (!announced) {
-                Log("[sig] %s: no derived offsets - sweeping .text for the scanner signature "
-                    "(waiting for the code to decrypt)...", g_game->display);
-                announced = true;
-            }
-            Sleep(100);
-        }
-        Log("[sig] %s: the scanner signature never appeared in .text. Content hooks stay off, "
-            "so the capture that would derive this title's offsets has nothing to hook - its "
-            "scanner prologue must differ. Nothing else is affected.", g_game->display);
-        return 0;
-    }
-
-    uint8_t* expected = (uint8_t*)(g_base + g_game->scan_folder);
-    size_t   sigLen   = strlen(mxb::SIG_SCAN_FOLDER_MASK);
-    DWORD    start    = GetTickCount();
-    bool     announced = false;
-
-    for (;;) {
-        uint8_t *b, *e;
-        bool haveRange = GetExecRange(g_base, &b, &e);
-        bool inRange = haveRange && expected >= b && expected + sigLen <= e;
-        if (inRange && MatchAt(expected, mxb::SIG_SCAN_FOLDER, mxb::SIG_SCAN_FOLDER_MASK)) {
-            if (announced)
-                Log("[sig] scanner code decrypted after %lums; hooking now (before the scan, we hope).",
-                    (unsigned long)(GetTickCount() - start));
-            else
-                Log("[sig] scanner signature VERIFIED at RVA 0x%zx - offsets.h fits this build.",
-                    (size_t)g_game->scan_folder);
-            return (uintptr_t)expected;
-        }
-        if (GetTickCount() - start > timeoutMs) break;
-        if (!announced) {
-            Log("[sig] game code not decrypted yet (SteamStub); waiting to install content hooks...");
-            announced = true;
-        }
-        Sleep(2);
-    }
-    // Timed out waiting on the exact RVA - fall back to a one-shot full resolve
-    // (handles a relocated/updated build, or reports that it's truly absent).
-    return ResolveScanner(outDelta);
-}
-
 // ---------------------------------------------------------------------------
 // Stage A (opt-in --bikecap): OBSERVE the bike APPLY loader to RE the in-garage
 // bike switcher.
@@ -7697,23 +7498,6 @@ void PollCommandFiles() {
 // ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
-bool InstallHook(void* target, void* detour, void** original, const char* name) {
-    if (g_unloading.load()) {
-        Log("[hook] %s not hooked: the plugin is unloading", name);
-        return false;
-    }
-    if (MH_CreateHook(target, detour, original) != MH_OK) {
-        Log("[hook] FAILED to create hook for %s @ %p", name, target);
-        return false;
-    }
-    if (MH_EnableHook(target) != MH_OK) {
-        Log("[hook] FAILED to enable hook for %s @ %p", name, target);
-        return false;
-    }
-    Log("[hook] %s hooked @ %p", name, target);
-    return true;
-}
-
 // ---- model-sync byte checks (the crash guards own their copies in guards.cpp) ---------
 /// The bytes at `rva` are `want`, inside .text. beta21e only: every guard below refuses
 /// rather than looking elsewhere.
@@ -8226,28 +8010,8 @@ static void InstallNanTrap(intptr_t delta) {
         Log("[nantrap] off for %s - the sim step is MX Bikes' and has no twin here.", g_game->display);
         return;
     }
-    uint8_t *begin, *end;
-    if (!GetExecRange(g_base, &begin, &end)) {
-        Log("[nantrap] off: can't read the module's sections to place it.");
-        return;
-    }
-    uint8_t* fn = (uint8_t*)(g_base + mxb::RVA_SIM_STEP + delta);
-    if (fn < begin || fn >= end || !MatchAt(fn, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK)) {
-        uint8_t* found = PatternScan(begin, end, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK);
-        if (!found) {
-            Log("[nantrap] off: the sim step's bytes are not in this build's .text (game "
-                "updated?). Re-derive RVA_SIM_STEP before turning it on again.");
-            return;
-        }
-        Log("[nantrap] sim step RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
-            (size_t)(found - g_base), (size_t)mxb::RVA_SIM_STEP);
-        fn = found;
-    }
-    if (mxb::LooksDetoured(fn)) {
-        Log("[nantrap] off: the sim step is already hooked (%02X %02X %02X %02X %02X).",
-            fn[0], fn[1], fn[2], fn[3], fn[4]);
-        return;
-    }
+    const uint8_t* fn = guards::ResolveSimStep(delta, "nantrap");
+    if (!fn) return;
     // Before the hook: every byte the reset relies on, and the world array it walks.
     if (rec) rec = guards::NanRecoverInstall(fn);
     // Handler first, then the hook: a step must never run armed with nothing to catch it.
@@ -8256,7 +8020,7 @@ static void InstallNanTrap(intptr_t delta) {
         trap = nantrap::Armed();
     }
     if (!trap && !rec) return;
-    if (!InstallHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep, "simStep(0x1be3a0)")) {
+    if (!guards::InstallSimStepHook(fn, (void*)&hkSimStep, (void**)&g_origSimStep)) {
         if (trap) nantrap::Uninstall();
         return;
     }
@@ -8300,6 +8064,9 @@ DWORD WINAPI Init(LPVOID) {
 
     LogHostGame();
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));  // the game exe
+    hookutil::SetLog(&Log);
+    hookutil::SetUnloadingFlag(&g_unloading);
+    hookutil::SetGameContext(g_base, g_game);
     Log("[init] %s - module base = %p", g_game->display, (void*)g_base);
     if (!g_game->offsets_complete)
         Log("[init] NOTE: %s for %s. The server browser filter and anything else needing "

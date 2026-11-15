@@ -20,8 +20,18 @@
 #include "tyrelog.h"
 #include "crashreport.h"
 #include "protection.h"
+#include "hookutil.h"
 
 namespace guards {
+
+using hookutil::AllocNear;
+using hookutil::GetExecRange;
+using hookutil::InstallHook;
+using hookutil::MatchAt;
+using hookutil::PatternScan;
+using hookutil::SafeReadBytes;
+using hookutil::SafeReadInt;
+using hookutil::SafeCopyStr;
 
 std::atomic<bool> mapguard_on{true};
 std::atomic<int> mapguard_test_every{0};
@@ -47,84 +57,6 @@ std::atomic<bool> g_nrLive{false};
 
 static void ProtCatch(protection::Kind kind) {
     if (g_host.protection_catch) g_host.protection_catch(kind);
-}
-
-static int SafeReadInt(const int* p) {
-    __try { return *p; } __except (EXCEPTION_EXECUTE_HANDLER) { return -0x7FFF; }
-}
-
-static size_t SafeReadBytes(const char* p, char* out, size_t cap) {
-    size_t n = 0;
-    __try { while (n < cap) { out[n] = p[n]; ++n; } }
-    __except (EXCEPTION_EXECUTE_HANDLER) { /* stop at n */ }
-    return n;
-}
-
-static bool MatchAt(const uint8_t* p, const char* pat, const char* mask) {
-    for (; *mask; ++mask, ++p, ++pat)
-        if (*mask == 'x' && (uint8_t)*pat != *p) return false;
-    return true;
-}
-
-static bool GetExecRange(uintptr_t base, uint8_t** begin, uint8_t** end) {
-    auto dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    uintptr_t lo = ~(uintptr_t)0, hi = 0;
-    auto sec = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            uintptr_t s = base + sec->VirtualAddress;
-            uintptr_t e = s + sec->Misc.VirtualSize;
-            if (s < lo) lo = s;
-            if (e > hi) hi = e;
-        }
-    }
-    if (hi <= lo) return false;
-    *begin = (uint8_t*)lo; *end = (uint8_t*)hi;
-    return true;
-}
-
-static uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* mask) {
-    size_t len = strlen(mask);                       // mask has no embedded NULs
-    if (len == 0 || (size_t)(end - begin) < len) return nullptr;
-    for (uint8_t* p = begin; p <= end - len; ++p)
-        if (MatchAt(p, pat, mask)) return p;
-    return nullptr;
-}
-
-static void* AllocNear(uintptr_t site, size_t size, DWORD protect) {
-    SYSTEM_INFO si{}; GetSystemInfo(&si);
-    const uintptr_t gran  = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
-    const uintptr_t limit = 0x70000000ull;                 // stay well inside rel32 reach
-    for (uintptr_t d = gran; d < limit; d += gran) {
-        for (int up = 0; up < 2; ++up) {
-            if (!up && site < d) continue;                  // would underflow past zero
-            uintptr_t a = (up ? site + d : site - d) & ~(uintptr_t)(gran - 1);
-            if (!a) continue;
-            void* p = VirtualAlloc((void*)a, size, MEM_RESERVE | MEM_COMMIT, protect);
-            if (p) return p;
-        }
-    }
-    return nullptr;
-}
-
-static bool InstallHook(void* target, void* detour, void** original, const char* name) {
-    if (g_unloading.load()) {
-        Log("[hook] %s not hooked: the plugin is unloading", name);
-        return false;
-    }
-    if (MH_CreateHook(target, detour, original) != MH_OK) {
-        Log("[hook] FAILED to create hook for %s @ %p", name, target);
-        return false;
-    }
-    if (MH_EnableHook(target) != MH_OK) {
-        Log("[hook] FAILED to enable hook for %s @ %p", name, target);
-        return false;
-    }
-    Log("[hook] %s hooked @ %p", name, target);
-    return true;
 }
 
 // ===========================================================================
@@ -1677,6 +1609,44 @@ static bool NrInstall(const uint8_t* fn) {
     return true;
 }
 
+using SimStepFn = int32_t (*)(int32_t, float);
+static SimStepFn g_origNanRecoverStep = nullptr;
+
+static int32_t hkNanRecoverStep(int32_t slot, float dt) {
+    const bool live = g_nrLive.load(std::memory_order_relaxed);
+    if (live) NrCheck(slot, true);
+    const int32_t rc = g_origNanRecoverStep(slot, dt);
+    if (live) NrCheck(slot, false);
+    return rc;
+}
+
+static const uint8_t* ResolveSimStepImpl(intptr_t delta, const char* tag) {
+    uint8_t *begin = nullptr, *end = nullptr;
+    if (!GetExecRange(g_base, &begin, &end)) {
+        Log("[%s] off: can't read the module's sections to place it.", tag);
+        return nullptr;
+    }
+    uint8_t* fn = reinterpret_cast<uint8_t*>(g_base + mxb::RVA_SIM_STEP + delta);
+    if (fn < begin || fn >= end || !MatchAt(fn, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK)) {
+        uint8_t* found = PatternScan(begin, end, mxb::SIG_SIM_STEP, mxb::SIG_SIM_STEP_MASK);
+        if (!found) {
+            Log("[%s] off: the sim step's bytes are not in this build's .text (game "
+                "updated?). Re-derive RVA_SIM_STEP before turning it on again.", tag);
+            return nullptr;
+        }
+        Log("[%s] sim step RELOCATED: found at RVA 0x%zx (offsets.h says 0x%zx).",
+            tag, static_cast<size_t>(reinterpret_cast<uintptr_t>(found) - g_base),
+            static_cast<size_t>(mxb::RVA_SIM_STEP));
+        fn = found;
+    }
+    if (mxb::LooksDetoured(fn)) {
+        Log("[%s] off: the sim step is already hooked (%02X %02X %02X %02X %02X).",
+            tag, fn[0], fn[1], fn[2], fn[3], fn[4]);
+        return nullptr;
+    }
+    return fn;
+}
+
 // Verify, decode, hook. MX Bikes only: both the RVA and the signature are mxbikes.exe's.
 static void InstallGhsGuard(intptr_t delta) {
     if (!g_game->offsets_complete) {
@@ -1747,7 +1717,6 @@ void Configure(const Host& host) {
     g_base = host.game_base;
     g_sigDelta = host.sig_delta;
     g_game = host.game ? host.game : &GAME_MXB;
-    g_unloading.store(false);
 }
 
 void SetUnloading(bool unloading) { g_unloading.store(unloading); }
@@ -1766,6 +1735,30 @@ void Tick() {
 }
 
 bool NanRecoverInstall(const uint8_t* sim_step) { return NrInstall(sim_step); }
+const uint8_t* ResolveSimStep(intptr_t delta, const char* log_tag) {
+    return ResolveSimStepImpl(delta, log_tag ? log_tag : "nanrecover");
+}
+bool InstallSimStepHook(const uint8_t* sim_step, void* detour, void** original) {
+    return sim_step && InstallHook(const_cast<uint8_t*>(sim_step), detour, original,
+                                   "simStep(0x1be3a0)");
+}
+bool InstallNanRecoverHook(intptr_t delta) {
+    if (!nanrecover_on.load()) {
+        Log("[nanrecover] off by config (nanrecover=0)");
+        return false;
+    }
+    const uint8_t* fn = ResolveSimStepImpl(delta, "nanrecover");
+    if (!fn || !NrInstall(fn) ||
+        !InstallSimStepHook(fn, reinterpret_cast<void*>(&hkNanRecoverStep),
+                            reinterpret_cast<void**>(&g_origNanRecoverStep))) return false;
+    g_nrLive.store(true, std::memory_order_release);
+    Log("[nanrecover] ON: after every physics step each bike's bodies, wheels and suspension "
+        "are checked for a value that is not a number. One that is gets the game's own "
+        "reset (place-bike 0x%zx) where it was a moment before, instead of the crash. A "
+        "finite bike is never touched. nanrecover=0 turns it off.",
+        static_cast<size_t>(nanrecover::kRvaReset));
+    return true;
+}
 void NanRecoverCheck(int32_t slot, bool before) { NrCheck(slot, before); }
 void NanRecoverSetLive(bool live) { g_nrLive.store(live, std::memory_order_release); }
 bool NanRecoverLive() { return g_nrLive.load(std::memory_order_relaxed); }

@@ -1,0 +1,55 @@
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+
+struct GameOffsets;
+namespace protection { enum class Kind : int; }
+
+namespace guards {
+
+using LogFn = void (*)(const char*, ...);
+using ProtectionCatchFn = void (*)(protection::Kind);
+
+struct Host {
+    LogFn log = nullptr;
+    uintptr_t game_base = 0;
+    intptr_t sig_delta = 0;
+    const GameOffsets* game = nullptr;
+    ProtectionCatchFn protection_catch = nullptr;
+};
+
+extern std::atomic<bool> mapguard_on;
+extern std::atomic<int> mapguard_test_every;
+extern std::atomic<bool> shockguard_on;
+extern std::atomic<bool> bikelistguard_on;
+extern std::atomic<bool> wakeguard_on;
+extern std::atomic<bool> listboxguard_on;
+extern std::atomic<bool> ptr64fix_on;
+extern std::atomic<bool> riderinfoguard_on;
+extern std::atomic<bool> mipmapguard_on;
+extern std::atomic<bool> nanrecover_on;
+
+void Configure(const Host& host);
+void SetUnloading(bool unloading);
+
+void InstallGhsGuard();
+void InstallTerrainGuard();
+void InstallTrainerGuard();
+void InstallTyreFallback();
+void InstallMapGuard();
+void InstallShockGuard();
+void InstallSessionGuards();
+void Tick();
+
+bool NanRecoverInstall(const uint8_t* sim_step);
+void NanRecoverCheck(int32_t slot, bool before);
+void NanRecoverSetLive(bool live);
+bool NanRecoverLive();
+unsigned TerrainGuardedCount();
+
+void RevertTyreFallback();
+void RevertMapGuard();
+void RevertShockGuard();
+
+}  // namespace guards

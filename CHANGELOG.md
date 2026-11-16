@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- frostmod.log now records session changes (practice, warmup, race...) and riders the game
+  removes, so a rider disappearing at the race start shows up in the log.
+
 ## 2026-11-14 - v0.53.0
 
 Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by

@@ -200,6 +200,8 @@ add_test(NAME command_channel COMMAND command_channel_test)
 # runs in CI rather than only on a machine with the game on it.
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
+add_executable(sessionlog_test tests/sessionlog_test.cpp)
+add_test(NAME sessionlog COMMAND sessionlog_test)
 
 # --- Game SDK feed for MXB App (src/gamefeed.h) --------------------------------
 # Raw plugin payloads in a seqlocked block written from two game threads; the layout is a

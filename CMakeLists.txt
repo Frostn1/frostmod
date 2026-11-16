@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.52.0")
+set(FROSTMOD_VERSION "0.52.1")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -177,6 +177,8 @@ add_test(NAME command_channel COMMAND command_channel_test)
 # runs in CI rather than only on a machine with the game on it.
 add_executable(session_test tests/session_test.cpp)
 add_test(NAME session COMMAND session_test)
+add_executable(sessionlog_test tests/sessionlog_test.cpp)
+add_test(NAME sessionlog COMMAND sessionlog_test)
 
 # --- master list handed to MXB App (src/masterlist.h) -------------------------
 # The addresses the game's browser received, so the app finds servers during a session.

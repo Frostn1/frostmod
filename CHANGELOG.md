@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-16 - v0.52.1
+
+- frostmod.log now records session changes (practice/race) and riders the game removes, to diagnose riders vanishing at the race start.
+
 ## 2026-11-12 - v0.52.0
 
 Aussie mode: other riders feel as solid as they did in Beta 20. Off by default.

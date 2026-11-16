@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 2026-11-14 - v0.53.0
 
-Two more crashes from the beta21e reports, together 21% of what v0.51.0 still sends.
+Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by
+default), upgraded material shading (off by default), FrostServer's rejoin fix, and FrostMod
+Fixes, a standalone crash-fix plugin (`frostmod_fixes.dlo` / `FrostModFixes.zip`).
 
 ### Fixed
 - **Render crash at +0x24085C, the rest of it.** v0.51.0's pointer check cut it down but it was
@@ -14,7 +16,6 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
   details of a rider who is not in its list, gets nothing written back, and copies two lists of
   whatever length was on the stack. A miss now comes back with every list empty. Off with
   `riderinfoguard=0`.
-
 - **Menu crash at +0x255F1F / +0x255EF0 while content loads.** The game builds each smaller
   mipmap level of a texture in memory it never checks it got. A level with no memory behind it is
   now skipped instead of written to address 0. Off with `mipmapguard=0`.
@@ -32,6 +33,12 @@ Two more crashes from the beta21e reports, together 21% of what v0.51.0 still se
   in that bike's FrostMod Models library are drawn with it; everyone else stays stock. Physics,
   collision and hitboxes keep the real bike. IDs come from MXB App's paint sync;
   `modelsync=1` turns it on.
+- **Upgraded material shading (shaders=1, off by default).** FrostMod rewrites the lighting in
+  the game's own material shaders as they load: a sharper specular highlight on shiny materials,
+  Fresnel on reflections, renormalised normal maps and softer shadow edges. Only shaders it
+  recognises by hash are changed; one that fails to compile gets the game's own back. `S` in the
+  F8 menu turns it on or off, `Ctrl+Shift+S` switches between upgraded and original while you
+  ride. Keys are in `docs/USAGE.md`.
 - **Game SDK feed for MXB App.** The plugin copy of FrostMod (the session plugin MXB App
   installs) now copies what the game's plugin API hands it into a second shared block,
   `Local\FrostModGameFeed`: telemetry, the event and session, the timing screen, every bike's

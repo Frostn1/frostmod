@@ -3,7 +3,8 @@
 ## 2026-11-14 - v0.53.0
 
 Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by
-default), upgraded material shading (off by default), and FrostServer's rejoin fix.
+default), upgraded material shading (off by default), FrostServer's rejoin fix, and FrostMod
+Fixes, a standalone crash-fix plugin (`frostmod_fixes.dlo` / `FrostModFixes.zip`).
 
 ### Fixed
 - **Render crash at +0x24085C, the rest of it.** v0.51.0's pointer check cut it down but it was
@@ -20,6 +21,10 @@ default), upgraded material shading (off by default), and FrostServer's rejoin f
   now skipped instead of written to address 0. Off with `mipmapguard=0`.
 
 ### Added
+- **FrostMod Fixes (`frostmod_fixes.dlo`, `FrostModFixes.zip`).** FrostMod's crash guards as their
+  own plugin, built from the same code: no overlay, network, MXB App or account. Drop it into
+  `MX Bikes\plugins`. It stays off next to full FrostMod and leaves a crash to MXBFix when
+  MXBFix's fix for it is on. See the README for what it covers.
 - **Rider model sync (modelsync=1, off by default).** Remote riders whose rider, helmet or
   boots model you also have installed are drawn with it, matched by file content under any
   folder name; everyone else stays stock. Collision, physics and hitboxes are unchanged.

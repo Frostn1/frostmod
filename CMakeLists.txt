@@ -46,6 +46,7 @@ function(frostmod_version_rc out_var filetype original_filename description)
 endfunction()
 
 frostmod_version_rc(FROSTMOD_DLL_RC VFT_DLL "frostmod.dll" "FrostMod in-game overlay / mod loader for PiBoSo sims")
+frostmod_version_rc(FROSTMOD_FIXES_DLL_RC VFT_DLL "frostmod_fixes.dlo" "FrostMod Fixes - crash guards only for MX Bikes")
 frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for PiBoSo sims")
 frostmod_version_rc(FROSTSERVER_DLL_RC VFT_DLL "frostserver.dlo" "FrostServer - dedicated-server map/link API for MX Bikes")
 frostmod_version_rc(FROSTSERVER_EXE_RC VFT_APP "frostserver.exe" "FrostServer standalone - map/link API for MX Bikes")
@@ -92,11 +93,21 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- the mod DLL ---------------------------------------------------------------
-add_library(frostmod SHARED src/frostmod.cpp src/serverfilter.cpp src/crashreport.cpp src/nantrap.cpp ${FROSTMOD_DLL_RC})
+add_library(frostmod SHARED src/frostmod.cpp src/guards.cpp src/hookutil.cpp src/serverfilter.cpp src/crashreport.cpp src/nantrap.cpp ${FROSTMOD_DLL_RC})
 target_link_libraries(frostmod PRIVATE minhook gdi32 user32 opengl32 winhttp)
 # Be explicit about MinHook's headers in case the target doesn't export them.
 target_include_directories(frostmod PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")
+
+option(FROSTMOD_FIXES "Build frostmod_fixes.dlo (crash guards only)" ON)
+if(FROSTMOD_FIXES)
+    add_library(frostmod_fixes SHARED
+        src/fixes.cpp src/guards.cpp src/hookutil.cpp src/crashreport.cpp
+        ${FROSTMOD_FIXES_DLL_RC})
+    target_link_libraries(frostmod_fixes PRIVATE minhook user32 opengl32)
+    target_include_directories(frostmod_fixes PRIVATE "${minhook_SOURCE_DIR}/include")
+    set_target_properties(frostmod_fixes PROPERTIES OUTPUT_NAME "frostmod_fixes" PREFIX "")
+endif()
 
 # --- the frostmod launcher / monitor exe --------------------------------------
 # This is the app you actually run. It injects frostmod.dll, then STAYS OPEN as a
@@ -159,6 +170,18 @@ add_test(NAME offsets COMMAND offsets_test)
 # constants, same as above.
 add_executable(pluginsdk_test tests/pluginsdk_test.cpp)
 add_test(NAME pluginsdk COMMAND pluginsdk_test)
+
+# FrostMod Fixes' load/overlap decisions are deliberately pure so CI can prove them
+# without loading a plugin or touching a game install.
+add_executable(fixesguard_test tests/fixesguard_test.cpp)
+add_test(NAME fixesguard COMMAND fixesguard_test)
+
+if(WIN32 AND FROSTMOD_FIXES)
+    add_executable(fixesexports_test tests/fixesexports_test.cpp)
+    add_dependencies(fixesexports_test frostmod_fixes)
+    add_test(NAME fixesexports COMMAND fixesexports_test
+             "$<TARGET_FILE_DIR:frostmod_fixes>/frostmod_fixes.dlo")
+endif()
 
 # --- command channel test ------------------------------------------------------
 # The MXB App command channel is read on an event *and* on a poll — the poll being all
@@ -483,6 +506,11 @@ endif()
 set_target_properties(frostmod frostmod_app frostserver frostserver_app mxbcoach PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(FROSTMOD_FIXES)
+    set_target_properties(frostmod_fixes PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 
 # --- optional Authenticode signing (AV false-positive hardening) --------------
 # Unsigned binaries are the single biggest AV-ML red flag; a signed binary that
@@ -511,7 +539,11 @@ if(FROSTMOD_SIGN)
     else()
         message(FATAL_ERROR "FROSTMOD_SIGN=ON but neither FROSTMOD_SIGN_PFX nor FROSTMOD_SIGN_SHA1 is set.")
     endif()
-    foreach(_frostmod_target frostmod frostmod_app frostserver frostserver_app mxbcoach)
+    set(_frostmod_sign_targets frostmod frostmod_app frostserver frostserver_app mxbcoach)
+    if(FROSTMOD_FIXES)
+        list(APPEND _frostmod_sign_targets frostmod_fixes)
+    endif()
+    foreach(_frostmod_target IN LISTS _frostmod_sign_targets)
         add_custom_command(TARGET ${_frostmod_target} POST_BUILD
             COMMAND "${FROSTMOD_SIGNTOOL}" sign /fd SHA256 ${_frostmod_sign_id}
                     /tr "${FROSTMOD_SIGN_TIMESTAMP_URL}" /td SHA256
@@ -532,6 +564,15 @@ add_custom_command(TARGET frostmod POST_BUILD
             "$<TARGET_FILE:frostmod>" "$<TARGET_FILE_DIR:frostmod>/frostmod.dlo"
     VERBATIM
     COMMENT "Copying frostmod.dll -> frostmod.dlo (PiBoSo plugin)")
+
+if(FROSTMOD_FIXES)
+    add_custom_command(TARGET frostmod_fixes POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:frostmod_fixes>"
+                "$<TARGET_FILE_DIR:frostmod_fixes>/frostmod_fixes.dlo"
+        VERBATIM
+        COMMENT "Copying frostmod_fixes.dll -> frostmod_fixes.dlo (PiBoSo plugin)")
+endif()
 
 # frostserver.dlo - the server-side plugin artifact (byte-for-byte copy of the
 # frostserver.dll, same as frostmod.dlo). Runs LAST so it inherits any signature.

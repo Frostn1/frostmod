@@ -89,6 +89,53 @@ injector needed. Run `frostmod.exe --install-plugin` to copy it there for you.
 In plugin mode the in-game overlay renders through the game's sanctioned `Draw()`
 callback. See [docs/PLUGIN.md](docs/PLUGIN.md).
 
+## FrostMod Fixes (crash guards only)
+
+`frostmod_fixes.dlo` is the crash-guard part of FrostMod as a separate MX Bikes
+plugin. It is for people who want the crash fixes without the overlay, network,
+MXB App or an account. Download `FrostModFixes.zip`, then copy
+`frostmod_fixes.dlo` into `MX Bikes\plugins`.
+
+All guards are on by default. An optional `frostmod_fixes.cfg` beside the plugin
+can turn individual guards off with `key=0`. The keys are `mapguard`,
+`shockguard`, `bikelistguard`, `wakeguard`, `listboxguard`, `ptr64fix`,
+`riderinfoguard`, `mipmapguard` and `nanrecover`. The trainer, tyre-fallback,
+GHS and terrain guards have no off key. `frostmod_fixes.log`, also beside the
+plugin, is rewritten each game start.
+
+Do not install it alongside full FrostMod. If `frostmod.dlo` is in the same
+plugins folder, or full FrostMod is already running in the game, FrostMod Fixes
+installs nothing and records the reason in its log. MXB App users already have
+the guards through full FrostMod and do not need this plugin.
+
+If `mxbfix.dlo` is in the same plugins folder, FrostMod Fixes reads MXBFix's
+`mxbfix.ini`. While the matching MXBFix fix is enabled, it leaves these five
+guards to MXBFix: mapguard (`gate-vertex-pointer`), terrain
+(`ground-nan-guard`), shockguard (`suspension-nan-guard`), GHS
+(`trainer-cleanup-reset`) and trainer (`trainer-series-lookup`). Every other
+FrostMod guard stays on. Set the matching MXBFix key to `0` to use FrostMod's
+guard instead.
+
+In FrostMod 0.51.0 + 0.52.0 reports on the current game build, from 1,321
+reports by 523 riders between 2026-11-03 and 2026-11-15, these were the main
+crashes the guards address:
+
+- Quad-batch vertex writes while riding, mostly for riders using ReShade:
+  45.2% (`+0x24085C` 43.3%, `+0x2408C4` 1.0%, `+0x240904` 0.9%) - `mapguard`.
+- Rider info read while someone joins your server mid-handshake (menus, loading):
+  7.9% (`+0x7A860` 6.9%, `+0x7A8E0` 1.0%) - `riderinfoguard`.
+- A menu texture loaded without memory: 4.7% (`+0x255F1F` 3.2%,
+  `+0x255EF0` 1.5%) - `mipmapguard`.
+- A bad string passed by the game to `msvcr90.dll+0x36EDE`: 4.0%, partly
+  covered by the trainer guard and tyre fallback. Part of this crash is still open.
+- Rarer crashes from older reports: terrain NaN (`+0x1F1923`), GHS
+  (`+0x11D753`), shock NaN (`+0x1A29AE`), the physics NaN reset, bike list
+  (`+0x45B0`), wake (`+0x3B940`), list box (`+0x1FED9E`) and ptr64 (`+0x2A42F0`).
+
+The first three account for 57.8% of the crashes we see in those reports. The
+GPU-driver crashes (16.7%) and crashes in other plugins or overlays (5.3%) are
+outside what any game-side guard can fix. Together, they are about 22% of reports.
+
 
 ## FrostServer (dedicated servers)
 

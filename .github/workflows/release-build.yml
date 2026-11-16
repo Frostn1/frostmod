@@ -89,15 +89,15 @@ jobs:
           ./scripts/sign-windows.ps1 `
             "$bin/frostmod.exe" "$bin/frostmod.dll" `
             "$bin/frostserver.exe" "$bin/frostserver.dll" `
-            "$bin/mxbcoach.dll"
-          foreach ($name in 'frostmod','frostserver','mxbcoach') {
+            "$bin/mxbcoach.dll" "$bin/frostmod_fixes.dll"
+          foreach ($name in 'frostmod','frostserver','mxbcoach','frostmod_fixes') {
             Copy-Item "$bin/$name.dll" "$bin/$name.dlo" -Force
           }
           # Every PE that ships must now verify.
           $signtool = $env:ARTIFACT_SIGNING_SIGNTOOL
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
                          'frostserver.exe','frostserver.dll','frostserver.dlo',
-                         'mxbcoach.dlo') {
+                         'mxbcoach.dlo','frostmod_fixes.dlo') {
             $verification = & $signtool verify /pa /tw /v "$bin/$f" 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f has no valid timestamped Authenticode signature"; exit 1 }
             $signature = Get-AuthenticodeSignature "$bin/$f"
@@ -120,7 +120,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
                          'frostserver.exe','frostserver.dll','frostserver.dlo',
-                         'mxbcoach.dlo') {
+                         'mxbcoach.dlo','frostmod_fixes.dlo') {
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
             Copy-Item "$bin/$f" dist/
           }
@@ -205,6 +205,61 @@ jobs:
           Write-Host "--- Release.zip contents ---"
           Get-ChildItem $stage | Select-Object Name, Length
 
+      - name: Package FrostModFixes.zip
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          $stage = 'staging/FrostModFixes'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/frostmod_fixes.dlo $stage
+
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
+                 else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
+          $readme = @(
+            "FrostMod Fixes $tag - FrostMod's crash guards only for MX Bikes"
+            "https://github.com/Frostn1/frostmod"
+            ""
+            "WHAT IT IS"
+            "  FrostMod's crash guards and nothing else: no overlay, no network, no"
+            "  MXB App and no account."
+            ""
+            "INSTALL"
+            "  Copy frostmod_fixes.dlo into MX Bikes\plugins."
+            ""
+            "OPTIONAL CONFIG"
+            "  Put frostmod_fixes.cfg beside the plugin. Set a key to 0 to turn that"
+            "  guard off: mapguard, shockguard, bikelistguard, wakeguard, listboxguard,"
+            "  ptr64fix, riderinfoguard, mipmapguard, nanrecover."
+            ""
+            "LOG"
+            "  frostmod_fixes.log is written beside the plugin and replaced each game start."
+            ""
+            "DO NOT DOUBLE-LOAD"
+            "  If you use full FrostMod or MXB App, you already have these guards. Do not"
+            "  install both. If frostmod.dlo is in the same plugins folder, FrostMod"
+            "  Fixes installs nothing and says so in its log."
+            ""
+            "WITH MXBFIX"
+            "  If mxbfix.dlo is in the same plugins folder, the five guards for crashes"
+            "  MXBFix also fixes stay off while MXBFix's fix is on (one fix per crash)."
+            "  frostmod_fixes.log names each one."
+            ""
+          )
+          $readme += if ($env:SIGNED -eq 'true') { @(
+            "NOTE: frostmod_fixes.dlo is code-signed. FrostMod is open source; see the"
+            "project page to build it yourself."
+          ) } else { @(
+            "NOTE: frostmod_fixes.dlo is not code-signed, so your antivirus may warn about"
+            "it. FrostMod is open source; see the project page to build it yourself."
+          ) }
+          $readme = $readme -join "`r`n"
+          Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
+
+          Compress-Archive -Path "$stage/*" -DestinationPath dist/FrostModFixes.zip -Force
+          Write-Host "--- FrostModFixes.zip contents ---"
+          Get-ChildItem $stage | Select-Object Name, Length
+
       # Server-admin bundle: the plugin (.dlo) + the standalone tester (.exe) +
       # a short README. frostserver writes its own frostserver.yaml next to the
       # plugin on first run, so no config is bundled.
@@ -267,7 +322,7 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}" `
             dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
             dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip `
-            dist/mxbcoach.dlo --clobber
+            dist/mxbcoach.dlo dist/frostmod_fixes.dlo dist/FrostModFixes.zip --clobber
 
       # Mirror the same release (same tag, title, notes, assets) to the public release-only
       # Frostn1/frostmod-releases, so this source repo can go private while every client keeps
@@ -298,7 +353,8 @@ jobs:
           }
           $assets = 'frostmod.exe','frostmod.dll','frostmod.dlo','Release.zip',
                     'frostserver.exe','frostserver.dll','frostserver.dlo','FrostServer.zip',
-                    'mxbcoach.dlo' | ForEach-Object { "dist/$_" }
+                    'mxbcoach.dlo','frostmod_fixes.dlo','FrostModFixes.zip' |
+                    ForEach-Object { "dist/$_" }
           gh release view $env:TAG --repo $env:MIRROR --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -ne 0) {
             $notesFile = Join-Path $env:RUNNER_TEMP 'mirror-notes.md'

@@ -333,6 +333,21 @@ add_test(NAME serverrejoin COMMAND serverrejoin_test)
 # run against the fake bike's bodies.
 add_executable(nanrecover_test tests/nanrecover_test.cpp)
 add_test(NAME nanrecover COMMAND nanrecover_test)
+# --- upgraded material shaders test --------------------------------------------
+# The hash table, the source rewrite, the config keys and the "does a relink keep the game's
+# uniform locations" rule behind shaders=1 (src/shaderup.h). Pure, so it runs on any host.
+add_executable(shaderup_test tests/shaderup_test.cpp)
+add_test(NAME shaderup COMMAND shaderup_test)
+
+# --- shaderlab (offline, opt-in) -------------------------------------------------
+# Compiles and links every game shader, original and upgraded, in a hidden legacy GL context,
+# replays the live A/B relink and renders comparison sheets (tools/shaderlab). Needs a GPU and
+# the game's exe, so it is not built by default and never runs in CI.
+option(FROSTMOD_SHADERLAB "Build tools/shaderlab (needs a GPU to run)" OFF)
+if(FROSTMOD_SHADERLAB AND WIN32)
+    add_executable(shaderlab tools/shaderlab/shaderlab.cpp)
+    target_link_libraries(shaderlab PRIVATE opengl32 gdi32 user32)
+endif()
 
 # --- unload teardown test ------------------------------------------------------
 # The game FreeLibrary()s the plugin after Shutdown(); nothing may point into it after that.

@@ -54,6 +54,7 @@
 #include "masterlist.h"
 #include "serverfilter.h"
 #include "session.h"
+#include "sessionlog.h"
 #include "gamefeed.h"  // the Game SDK feed MXB App reads (raw plugin payloads)
 #include "changefree.h" // bike change: free the old own-vehicle record
 #include "refreshgate.h" // content refresh kinds, and the pages a refresh waits out
@@ -4284,6 +4285,7 @@ static RadRider g_radRiders[64];             // from RaceTrackPosition
 struct RadEntry { int raceNum; int numLaps; char name[24]; };
 static int      g_radNEntries = 0;
 static RadEntry g_radEntries[64];            // from RaceAddEntry / RaceClassification
+static std::uint32_t g_radRemoveCount = 0;
 
 static int RadFindEntry(int raceNum) {       // caller holds g_radMutex
     for (int i = 0; i < g_radNEntries; ++i)
@@ -4348,8 +4350,13 @@ static void RadRemoveEntry(const void* d, int size) {
     std::lock_guard<std::mutex> lk(g_radMutex);
     int i = RadFindEntry(raceNum);
     if (i >= 0) g_radEntries[i] = g_radEntries[--g_radNEntries];
-    if (i >= 0) frostmod::crash::Note("rider #%d left (%d in the session)",
-                                      raceNum, g_radNEntries);
+    if (i >= 0) {
+        frostmod::crash::Note("rider #%d left (%d in the session)",
+                              raceNum, g_radNEntries);
+        if (sessionlog::ShouldLogRemove(++g_radRemoveCount))
+            Log("[session] rider #%d removed by the game (%d left on the list)",
+                raceNum, g_radNEntries);
+    }
 }
 // GP Bikes and Kart Racing Pro carry an m_fBestSpeed that MX Bikes does not, so both the
 // element size and where m_iNumLaps sits inside it are per-title (see pluginsdk.h). Read
@@ -4370,6 +4377,7 @@ static void RadStoreClassification(const void* arr, int n, int elem) {
 static void RadResetRace() {
     std::lock_guard<std::mutex> lk(g_radMutex);
     g_radN = 0; g_radNEntries = 0; g_radHaveMe = false;
+    g_radRemoveCount = 0;
 }
 
 // ---- rider visibility: widening the remote-rider playback gap -----------------
@@ -9418,7 +9426,17 @@ __declspec(dllexport) void RaceEvent(void* _pData, int _iDataSize) {
 __declspec(dllexport) void RaceSession(void* _pData, int _iDataSize)  { if (g_standDown.load()) return;
     g_feed.RaceSession(_pData, _iDataSize);
     if (g_sessionOnly) return;
-    frostmod::crash::Note("session changed (practice/qualify/race)");
+    int session = -1, state = -1;
+    sessionlog::ReadSession(_pData, _iDataSize, &session, &state);
+    const char* name = sessionlog::SessionName(session);
+    frostmod::crash::Note("session changed to %s (%d), state %d", name, session, state);
+    int riders = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_radMutex);
+        riders = g_radNEntries;
+    }
+    Log("[session] session now %s (%d), state %d, %d rider(s) on the list before the reset",
+        name, session, state, riders);
     RadResetRace();
 }
 __declspec(dllexport) void RaceDeinit() {
@@ -9442,7 +9460,17 @@ __declspec(dllexport) void RunSplit(void* _pData, int _iDataSize) {
     if (!g_standDown.load()) g_feed.RunSplit(_pData, _iDataSize);
 }
 __declspec(dllexport) void RaceSessionState(void* _pData, int _iDataSize) {
-    if (!g_standDown.load()) g_feed.RaceSessionState(_pData, _iDataSize);
+    if (g_standDown.load()) return;
+    g_feed.RaceSessionState(_pData, _iDataSize);
+    if (g_sessionOnly) return;
+    int session = -1, state = -1;
+    if (!sessionlog::ReadSession(_pData, _iDataSize, &session, &state)) return;
+    static int lastSession = INT_MIN;
+    static int lastState = INT_MIN;
+    if (session == lastSession && state == lastState) return;
+    lastSession = session;
+    lastState = state;
+    Log("[session] state now %d (session %s)", state, sessionlog::SessionName(session));
 }
 __declspec(dllexport) void RaceLap(void* _pData, int _iDataSize) {
     if (!g_standDown.load()) g_feed.RaceLap(_pData, _iDataSize);

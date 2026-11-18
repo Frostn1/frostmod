@@ -30,6 +30,7 @@
 #include <dinput.h>
 #include <xinput.h>
 #include <MinHook.h>
+#include <intrin.h>
 
 #include <cstdio>
 #include <atomic>
@@ -58,6 +59,7 @@
 #include "offsets.h"
 #include "others.h"
 #include "lean.h"
+#include "riderbones.h"
 #include "stance.h"
 #include "version.h"
 
@@ -2221,6 +2223,126 @@ void PollStance(float time, float pos, bool crashed) {
     if (!g_stance.update(ok, down, crashed)) return;
     const auto p = stance::EventPayload(time, pos, g_stance.state());
     g_rec.record(coachrec::STANCE, p.data(), uint32_t(p.size()));
+}
+
+// ---------------------------------------------------------------------------------------
+// The rider's pose as the game drew it (riderbones.h). Draw captures the skeleton, on the
+// thread that draws the frame it was just computed for, into g_rb_last; the telemetry worker
+// writes it beside each sample. The two only meet under g_rb_mu, for a copy, and Draw never
+// waits for it.
+
+/// A read of the game's memory with a fault turned into "no". Nothing here to unwind.
+bool RbCopy(void* dst, const void* src, size_t n) {
+    __try {
+        std::memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+struct GameMem {
+    bool read(uintptr_t addr, void* out, size_t n) const {
+        return addr >= 0x10000 && RbCopy(out, reinterpret_cast<const void*>(addr), n);
+    }
+};
+
+std::atomic<bool>    g_rb_want{false};  // a stint is recording: Draw captures
+int                  g_rb_build = -1;   // Draw's: -1 not checked yet, 0 another build, 1 beta21e
+std::string          g_rb_build_why;    // Draw's
+std::mutex           g_rb_mu;           // g_rb_last, g_rb_last_why, g_rb_last_ms
+riderbones::Snapshot g_rb_last;         // the newest capture; frame 0 = none this stint
+std::string          g_rb_last_why;
+uint64_t             g_rb_last_ms = 0;
+// The worker's, under g_mu.
+riderbones::Snapshot g_rb_cur;            // its copy of the newest capture
+std::string          g_rb_cur_why;
+uint64_t             g_rb_cur_ms = 0;
+riderbones::Snapshot g_rb_skel;           // what the stint's last RIDER_SKELETON said
+bool                 g_rb_skel_written = false;
+std::vector<uint8_t> g_rb_pick;
+uint32_t             g_rb_written_frame = 0;
+std::string          g_rb_said;           // the state last logged
+
+// A capture older than this is the game not drawing (paused, alt-tabbed): no RIDER_BONES.
+constexpr uint64_t kRbStaleMs = 250;
+
+/// Draw's part: one frame of the skeleton, or why there isn't one.
+void CaptureBones() {
+    if (!g_rb_want.load(std::memory_order_relaxed)) return;
+    static riderbones::Snapshot snap;  // Draw's own; kept so its vectors keep their room
+    static uint32_t             frames = 0;
+    const GameMem               mem;
+    // The exe's base out of the PEB (x64: gs:[0x60], ImageBaseAddress at +0x10), as
+    // coachterrain does: no loader lock on the game's thread.
+    const uintptr_t base = *reinterpret_cast<const uintptr_t*>(__readgsqword(0x60) + 0x10);
+    std::string     why;
+    if (g_rb_build < 0) g_rb_build = riderbones::BuildMatches(mem, base, g_rb_build_why) ? 1 : 0;
+    snap.stamp = riderbones::Stamp(mem, base);
+    if (g_rb_build == 1) {
+        riderbones::Capture(mem, base, snap, why);
+    } else {
+        snap.status = riderbones::UNKNOWN_BUILD;
+        snap.names.clear();
+        snap.parent.clear();
+        snap.rel.clear();
+        why = g_rb_build_why;
+    }
+    if (++frames == 0) ++frames;  // never 0, which means "none yet"
+    snap.frame = frames;
+    std::unique_lock<std::mutex> lock(g_rb_mu, std::try_to_lock);
+    if (!lock.owns_lock()) return;  // the worker is copying the last one; this frame is skipped
+    g_rb_last     = snap;
+    g_rb_last_why = std::move(why);
+    g_rb_last_ms  = GetTickCount64();
+}
+
+/// A new stint: nothing written yet, and Draw starts capturing for it.
+void BonesStint(bool recording) {
+    {
+        std::lock_guard<std::mutex> lock(g_rb_mu);
+        g_rb_last.frame = 0;
+    }
+    g_rb_cur.frame       = 0;
+    g_rb_skel_written    = false;
+    g_rb_written_frame   = 0;
+    g_rb_said.clear();
+    g_rb_want.store(recording);
+}
+
+/// The worker's part, with each sample: RIDER_SKELETON when it is new, then RIDER_BONES.
+void PollBones(float time, float pos) {
+    if (!g_rec.recording()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_rb_mu);
+        if (!g_rb_last.frame) return;  // Draw hasn't run since the stint opened
+        if (g_rb_last.frame != g_rb_cur.frame) {
+            g_rb_cur     = g_rb_last;
+            g_rb_cur_why = g_rb_last_why;
+            g_rb_cur_ms  = g_rb_last_ms;
+        }
+    }
+    const riderbones::Snapshot& s = g_rb_cur;
+    const std::string state = s.status == riderbones::OK ? "recording " + std::to_string(s.names.size()) + " nodes"
+                                                         : (s.status == riderbones::UNKNOWN_BUILD ? "off: " : "not found: ") + g_rb_cur_why;
+    if (state != g_rb_said) {
+        Log("bones", state);
+        g_rb_said = state;
+    }
+    // The first word of the stint, whatever it is; after that only a skeleton that is newly
+    // known or different. A frame that goes missing mid-stint does not take it back.
+    const bool ok = s.status == riderbones::OK;
+    if (!g_rb_skel_written || (ok && (g_rb_skel.status != riderbones::OK || !riderbones::SameSkeleton(s, g_rb_skel)))) {
+        g_rb_pick = ok ? riderbones::Pick(s.names) : std::vector<uint8_t>{};
+        const std::vector<uint8_t> p = riderbones::SkeletonPayload(s, g_rb_pick);
+        g_rec.record(coachrec::RIDER_SKELETON, p.data(), uint32_t(p.size()));
+        g_rb_skel         = s;
+        g_rb_skel_written = true;
+    }
+    if (!ok || GetTickCount64() - g_rb_cur_ms > kRbStaleMs) return;
+    const std::vector<uint8_t> p = riderbones::BonesPayload(time, pos, s, g_rb_pick, s.frame == g_rb_written_frame);
+    g_rec.record(coachrec::RIDER_BONES, p.data(), uint32_t(p.size()));
+    g_rb_written_frame = s.frame;
 }
 
 // Everyone already in the event, at the top of a stint.
@@ -4468,11 +4590,13 @@ __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_stance_conf = stance::CONF_NONE;
-    if (g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str())) {
+    const bool recording = g_rec.on_run_init(_pData, _iDataSize, Stamp().c_str());
+    if (recording) {
         SetupStance();
         g_others.on_stint();
         WriteRoster();
     }
+    BonesStint(recording);
     const int session = coachcue::ReadSession(_pData, _iDataSize);
     g_practice        = coachcue::Practice(g_event.type, session);
     g_cues.set_practice(g_practice);
@@ -4504,6 +4628,7 @@ __declspec(dllexport) void RunDeinit() {
     g_live_on.store(false);
     std::lock_guard<std::mutex> lock(g_mu);
     g_rec.on_run_end();
+    BonesStint(false);
     CutsOnStintEnd();
     g_cues.set_practice(false);
     StopVoice();
@@ -4655,6 +4780,7 @@ LiveIn RunTelemetryLocked(void* _pData, int _iDataSize, float _fTime, float _fPo
     }
     PollStance(_fTime, _fPos, crashed);
     PollLean(_fTime, _fPos);
+    PollBones(_fTime, _fPos);
     CheckLink(false);
     MaybeReloadHudSettings();
     // Only does anything while a sheet is missing: see coachcue::ShouldLook.
@@ -4900,6 +5026,11 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad, i
                                 void** _ppString) {
     const uint64_t t0 = PerfNow();
     g_tid_draw.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // The rider's skeleton for this frame, before anything here can wait (riderbones.h).
+    try {
+        CaptureBones();
+    } catch (...) {
+    }
     // Without the swap hook (the line off), the frame is measured here instead.
     if (!g_gl_ok) PerfFrame(t0);
     // How often the game calls Draw, measured here, on Draw's own thread. It is what MXBMRP3's FPS

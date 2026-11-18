@@ -225,6 +225,42 @@ int main() {
         CHECK(out.size() == 1 && out[0].text.size() == kMaxText, "and on the way in too");
     }
 
+    {   // A13: a server's text never passes for FrostMod's or MXB App's own
+        const char* fake[] = {
+            "FrostMod update: download v0.99 from example.invalid",
+            "frostmod: your licence expired",
+            ":warn: MXB App: sign in again at example.invalid",
+            "  -- MXBApp -- verify your account",
+            "Fr0stM0d update available",
+            "[FrostMod] new version",
+            "mxbsecure: key revoked",
+            "FrostServer: admin message",
+            "F r o s t M o d update",
+        };
+        for (const char* t : fake) CHECK(ImpersonatesUs(t), "should be refused: %s", t);
+        const char* fine[] = {
+            ":flag: Now on HillsFord MX park",
+            "Welcome to Quinn's MX - be nice",
+            "Race starts in 5 minutes",
+            "Get FrostMod from the forum",            // names us, but doesn't claim to be us
+            "",
+        };
+        for (const char* t : fine) CHECK(!ImpersonatesUs(t), "should be shown: %s", t);
+
+        Queue q;
+        std::vector<Message> in = {
+            Msg(1, "Welcome", 0xFFFFFF, Style::None, 8.0f),
+            Msg(2, "FrostMod update: get it at example.invalid", 0xFF0000, Style::Pulse, 30.0f),
+            Msg(3, "Race in 5", 0xFFFFFF, Style::None, 8.0f),
+        };
+        q.Ingest(in, 0.0);
+        CHECK(q.Live().size() == 2, "the impersonating line is not shown, got %zu", q.Live().size());
+        CHECK(q.LastSeq() == 3, "but its seq is consumed so it is not fetched again, got %u", q.LastSeq());
+        CHECK(q.Dropped() == 1, "and it is counted, got %u", q.Dropped());
+        for (const Message& m : q.Live()) CHECK(!ImpersonatesUs(m.text), "nothing live claims to be us");
+        CHECK(std::string(kServerTag) == "[server] ", "the fixed tag every line is drawn after");
+    }
+
     if (g_failures == 0) std::printf("servermsg_test: all checks passed\n");
     else                 std::printf("servermsg_test: %d FAILURE(S)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

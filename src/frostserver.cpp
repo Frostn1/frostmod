@@ -47,6 +47,8 @@
 
 #include "fairsend.h"   // the promotion rule, and the game's candidate-list layout
 #include "servermsg.h"  // the announcement model + feed JSON, shared with FrostMod
+#include "httpmux.h"    // the HTTP front: non-blocking, per-connection deadlines
+#include "announceauth.h" // the announce token: minimum length, constant-time, backoff
 #include "version.h"
 
 #pragma comment(lib, "ws2_32.lib")   // harmless duplicate of the CMake link
@@ -235,7 +237,7 @@ const char* kDefaultConfig =
     "  #   every: 300\n"
     "\n"
     "announce_session: false   # also say a line whenever the track changes\n"
-    "announce_token: ''        # set a password here to allow live announcements over HTTP:\n"
+    "announce_token: ''        # a password of 24+ characters allows live announcements:\n"
     "                          #   POST /frostserver/announce  with header\n"
     "                          #   Authorization: Bearer <this>  and a JSON body\n"
     "                          #   {\"text\":\"...\",\"color\":\"FF3B00\",\"style\":\"pulse\"}\n"
@@ -366,6 +368,13 @@ void LoadConfig() {
         else Log("[config] ignoring unknown key: %s", key.c_str());
     }
     fclose(f);
+
+    if (!c.announceToken.empty() && !announceauth::TokenUsable(c.announceToken)) {
+        Log("[config] announce_token is %zu characters; it needs at least %zu. Live "
+            "announcements stay OFF until it is longer.", c.announceToken.size(),
+            announceauth::kMinToken);
+        c.announceToken.clear();
+    }
 
     // An entry with no text would publish an empty line; drop it here rather than on every tick.
     for (size_t i = c.announce.size(); i-- > 0; )
@@ -592,7 +601,10 @@ std::string HeaderValue(const std::string& req, const char* name) {
 // through exactly the same clamps as a line configured in the file.
 constexpr size_t kMaxBody = 4096;
 
-void HandleAnnounce(SOCKET c, std::string& req) {
+// Wrong-token backoff per address. Touched only by the server thread.
+announceauth::FailGate g_announceFails;
+
+void HandleAnnounce(SOCKET c, std::string& req, uint32_t peerIp) {
     std::string token;
     { std::lock_guard<std::mutex> lk(g_cfgMutex); token = g_cfg.announceToken; }
     if (token.empty()) {
@@ -600,11 +612,19 @@ void HandleAnnounce(SOCKET c, std::string& req) {
         SendResponse(c, "404 Not Found", "text/plain", "not found");
         return;
     }
-    if (HeaderValue(req, "authorization") != ("Bearer " + token)) {
+    const uint64_t now = GetTickCount64();
+    if (g_announceFails.Blocked(peerIp, now)) {
+        SendResponse(c, "429 Too Many Requests", "text/plain", "too many wrong tokens; wait");
+        return;
+    }
+    const std::string got = announceauth::BearerToken(HeaderValue(req, "authorization"));
+    if (!announceauth::TokenMatches(got, token)) {
+        g_announceFails.Fail(peerIp, now);
         SendResponse(c, "401 Unauthorized", "text/plain", "bad or missing bearer token");
         Log("[announce] rejected a push: wrong token");
         return;
     }
+    g_announceFails.Ok(peerIp);
 
     size_t hend = req.find("\r\n\r\n");
     if (hend == std::string::npos) {
@@ -616,15 +636,8 @@ void HandleAnnounce(SOCKET c, std::string& req) {
         SendResponse(c, "413 Payload Too Large", "text/plain", "body too large");
         return;
     }
-    // The body may not have arrived with the headers; read on until we have what was
-    // declared, and stop at the cap whatever the sender claims.
-    std::string body = req.substr(hend + 4);
-    char more[1024];
-    while (body.size() < declared && body.size() < kMaxBody) {
-        int n = recv(c, more, sizeof(more), 0);
-        if (n <= 0) break;
-        body.append(more, (size_t)n);
-    }
+    // httpmux only hands over a request once the declared body is all here.
+    std::string body = req.substr(hend + 4, declared);
 
     servermsg::Message m;
     if (!servermsg::ParseMessageObject(body, m)) {
@@ -638,12 +651,10 @@ void HandleAnnounce(SOCKET c, std::string& req) {
     SendResponse(c, "200 OK", "application/json", "{\"seq\":" + std::to_string(seq) + "}");
 }
 
-void HandleConnection(SOCKET c) {
-    char buf[4096];
-    int len = recv(c, buf, sizeof(buf) - 1, 0);
-    if (len <= 0) return;
-    buf[len] = 0;
-    std::string req(buf, (size_t)len);
+// One complete request, already read by httpmux (which owns every recv and every deadline).
+void HandleConnection(SOCKET c, std::string& req, uint32_t peerIp) {
+    const char* buf = req.c_str();
+    const int   len = (int)req.size();
 
     const bool isGet  = _strnicmp(buf, "GET ",  4) == 0;
     const bool isPost = _strnicmp(buf, "POST ", 5) == 0;
@@ -654,7 +665,7 @@ void HandleConnection(SOCKET c) {
     std::string path = ParsePath(buf, len);
 
     if (isPost) {
-        if (path == "/frostserver/announce") HandleAnnounce(c, req);
+        if (path == "/frostserver/announce") HandleAnnounce(c, req, peerIp);
         else SendResponse(c, "404 Not Found", "text/plain", "not found");
         return;
     }
@@ -670,6 +681,13 @@ void HandleConnection(SOCKET c) {
         SendResponse(c, "200 OK", "text/plain", "ok");
     else
         SendResponse(c, "404 Not Found", "text/plain", "not found");
+}
+
+// Never let a bad request take down the listener. Its own function: __try cannot sit in one
+// that unwinds C++ objects.
+void HandleGuarded(SOCKET c, std::string& req, uint32_t peerIp) {
+    __try { HandleConnection(c, req, peerIp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[http] request handler faulted - caught."); }
 }
 
 void HttpServerLoop(int port) {
@@ -704,28 +722,12 @@ void HttpServerLoop(int port) {
 
     Log("[http] listening on 0.0.0.0:%d  (GET /frostserver/info, /frostserver/maps, "
         "/frostserver/messages, /health; POST /frostserver/announce)", port);
-    while (g_httpRunning.load()) {
-        // A timeout rather than a blocking accept, so due announcements go out whether or
-        // not anybody happens to call. One thread still, as before.
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(g_listenSock, &rfds);
-        timeval tv{1, 0};
-        const int ready = select(0, &rfds, nullptr, nullptr, &tv);
-        if (!g_httpRunning.load()) break;
-        ScheduleTick();
-        if (ready <= 0) continue;
-
-        SOCKET c = accept(g_listenSock, nullptr, nullptr);
-        if (c == INVALID_SOCKET) {
-            if (!g_httpRunning.load()) break;    // closed by StopHttpServer
-            continue;
-        }
-        // Never let a bad request take down the listener.
-        __try { HandleConnection(c); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[http] request handler faulted - caught."); }
-        closesocket(c);
-    }
+    // One thread, many connections: a client that connects and goes quiet is dropped after
+    // httpmux::kRequestMs and holds nobody else up meanwhile, and due announcements go out on
+    // every pass whatever the clients are doing (security report A10).
+    httpmux::Serve(g_listenSock, g_httpRunning,
+                   [](SOCKET c, std::string& req, uint32_t ip) { HandleGuarded(c, req, ip); },
+                   [] { ScheduleTick(); });
     SOCKET s = g_listenSock; g_listenSock = INVALID_SOCKET;
     if (s != INVALID_SOCKET) closesocket(s);
     WSACleanup();

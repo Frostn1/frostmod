@@ -61,6 +61,7 @@
 #include <set>
 #include "version.h"    // FROSTMOD_VERSION
 #include "offsets.h"    // GameOffsets / ALL_GAMES (which titles --game accepts)
+#include "updatetrust.h" // --update: https on GitHub's hosts only, Creste LLC signature before the swap
 
 // Where updates come from (public GitHub Releases). Asked in order: the public release-only
 // mirror Frostn1/frostmod-releases (same tags, same assets) first, then this source repo, which
@@ -416,6 +417,12 @@ static std::string FindAssetUrl(const std::string& j, const char* fileName) {
 // Download `url` (HTTPS, follows redirects - GitHub asset URLs 302 to a CDN) to a
 // file. Returns true only if it wrote a non-empty file with HTTP 200.
 static bool DownloadToFile(const std::string& url, const std::string& outPath) {
+    // The URL comes from the release JSON: anything but https on GitHub's release hosts is
+    // refused before a connection is made.
+    if (!updatetrust::IsTrustedAssetUrl(url)) {
+        printf("[!] refusing to download from %s (not https on a GitHub release host).\n", url.c_str());
+        return false;
+    }
     wchar_t wurl[2048] = {0};
     MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, wurl, 2047);
     URL_COMPONENTS uc; ZeroMemory(&uc, sizeof(uc)); uc.dwStructSize = sizeof(uc);
@@ -423,6 +430,7 @@ static bool DownloadToFile(const std::string& url, const std::string& outPath) {
     uc.lpszHostName = host; uc.dwHostNameLength = 255;
     uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 1599;
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return false;
+    if (uc.nScheme != INTERNET_SCHEME_HTTPS) return false;
 
     bool ok = false;
     HINTERNET hSes = WinHttpOpen(L"FrostMod-Updater", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -430,7 +438,7 @@ static bool DownloadToFile(const std::string& url, const std::string& outPath) {
     if (hSes) {
         WinHttpSetTimeouts(hSes, 5000, 5000, 30000, 30000);
         if (HINTERNET hCon = WinHttpConnect(hSes, host, uc.nPort, 0)) {
-            DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+            const DWORD flags = WINHTTP_FLAG_SECURE;   // https only, checked above
             if (HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path, nullptr,
                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags)) {
                 const wchar_t* ua = L"User-Agent: FrostMod\r\n";
@@ -504,7 +512,20 @@ static int DoUpdate() {
     printf("[*] downloading frostmod.exe ...\n");
     if (!DownloadToFile(exeUrl, exeNew)) { printf("[!] exe download failed.\n"); DeleteFileA(dllNew.c_str()); return 1; }
 
-    // Both are downloaded + verified non-empty. Swap: dll first, then the running exe.
+    // Nothing is swapped in, let alone launched, unless Windows verifies both files as signed
+    // by Creste LLC: the same check release-build.yml makes before it attaches them.
+    for (const std::string* p : {&dllNew, &exeNew}) {
+        wchar_t wp[MAX_PATH * 2] = {0};   // the paths are ANSI (ExeDir), so convert as ANSI
+        MultiByteToWideChar(CP_ACP, 0, p->c_str(), -1, wp, (int)(sizeof(wp) / sizeof(wp[0])) - 1);
+        if (!updatetrust::SignedBy(wp)) {
+            printf("[!] %s is not signed by Creste LLC - not installing it. Nothing changed.\n"
+                   "    Get the release by hand from:  %s\n", p->c_str(), FROSTMOD_RELEASES_URL);
+            DeleteFileA(exeNew.c_str()); DeleteFileA(dllNew.c_str());
+            return 1;
+        }
+    }
+
+    // Both are downloaded and verified. Swap: dll first, then the running exe.
     const std::string dll = dir + "frostmod.dll";
     if (!MoveFileExA(dllNew.c_str(), dll.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         printf("[!] couldn't replace frostmod.dll (err %lu). Nothing changed. Manual: %s\n",

@@ -222,8 +222,9 @@ that is not on the list is left exactly as you typed it, so `2:30` stays `2:30`.
 
 ### Live announcements
 
-Set `announce_token` to a password and you can send one right now, from anywhere that can
-reach the server:
+Set `announce_token` to a password of at least 24 characters and you can send one right now,
+from anywhere that can reach the server. A shorter token leaves the endpoint off (the log says
+so), and an address that sends a few wrong tokens gets `429` for a growing while:
 
 ```
 curl -X POST http://<server-ip>:54210/frostserver/announce \

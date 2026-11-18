@@ -5359,10 +5359,16 @@ static DWORD WINAPI MsgFeedThread(LPVOID) {
             Log("[servermsg] feed found on this server (seq %u).", head);
         }
         if (msgs.empty()) continue;
+        uint32_t droppedBefore = 0, droppedAfter = 0;
         {
             std::lock_guard<std::mutex> lk(g_msgMutex);
+            droppedBefore = g_msgQueue.Dropped();
             g_msgQueue.Ingest(msgs, MsgNowSec());
+            droppedAfter = g_msgQueue.Dropped();
         }
+        if (droppedAfter != droppedBefore)
+            Log("[servermsg] refused %u announcement(s) that claimed to be FrostMod or MXB App",
+                droppedAfter - droppedBefore);
         Log("[servermsg] %zu new announcement(s), newest seq %u", msgs.size(), head);
     }
     return 0;
@@ -5435,8 +5441,17 @@ static void DrawMessagesGL(int w, int lh, float pxPerDesign) {
         const servermsg::Rgba lead = servermsg::ColorAt(m, 0, cells, now);
         if (lead.a <= 0.01f) continue;
 
+        // Every line opens with the fixed "[server] " tag in its own colour, whatever the
+        // server sent: the feed is plain HTTP from the joined server, so its text must never
+        // read as FrostMod's own overlay. Lines that claim to be FrostMod or MXB App never get
+        // this far (servermsg::ImpersonatesUs, applied in Queue::Ingest).
+        const char*  tag    = servermsg::kServerTag;
+        const size_t tagLen = std::strlen(tag);
+        float tagWide = 0.0f;
+        for (size_t k = 0; k < tagLen; ++k) tagWide += (float)g_charW[(unsigned char)tag[k]] / pxPerDesign;
+
         // A backing strip, so a pale colour still reads over a pale track.
-        float wide = 0.0f;
+        float wide = tagWide;
         for (const auto& sp : spans) {
             if (sp.icon) { wide += iconPx + 3.0f; continue; }
             for (unsigned char ch : sp.text) wide += (float)g_charW[ch] / pxPerDesign;
@@ -5446,8 +5461,15 @@ static void DrawMessagesGL(int w, int lh, float pxPerDesign) {
         glColor4f(0.03f, 0.04f, 0.07f, 0.55f * lead.a);
         FillRect(x0 - 6, y - 4, x0 + (int)wide + 8, y + lh - 4);
 
+        const uint32_t tagRgb = servermsg::kServerTagRgb;
+        glColor4f(((tagRgb >> 16) & 0xFF) / 255.0f, ((tagRgb >> 8) & 0xFF) / 255.0f,
+                  (tagRgb & 0xFF) / 255.0f, lead.a);
+        glRasterPos2f((float)x0, (float)y);
+        glListBase(g_fontBase);
+        glCallLists((GLsizei)tagLen, GL_UNSIGNED_BYTE, tag);
+
         const bool perCell = (m.style == servermsg::Style::Rainbow);
-        float x = (float)x0;
+        float x = (float)x0 + tagWide;
         int   cell = 0;
         for (const auto& sp : spans) {
             if (sp.icon) {

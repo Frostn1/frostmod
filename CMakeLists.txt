@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.52.1")
+set(FROSTMOD_VERSION "0.52.2")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -106,7 +106,7 @@ set_target_properties(frostmod PROPERTIES OUTPUT_NAME "frostmod" PREFIX "")
 add_executable(frostmod_app src/launcher.cpp ${FROSTMOD_EXE_RC})
 # shell32: SHGetFolderPath; advapi32: the HKCU Run-key (auto-start); user32: ShowWindow;
 # winhttp: the GitHub update check/download.
-target_link_libraries(frostmod_app PRIVATE shell32 advapi32 user32 winhttp)
+target_link_libraries(frostmod_app PRIVATE shell32 advapi32 user32 winhttp wintrust crypt32)
 set_target_properties(frostmod_app PROPERTIES OUTPUT_NAME "frostmod")
 
 # --- frostserver (dedicated-server companion) ---------------------------------
@@ -341,6 +341,26 @@ add_test(NAME fairsend COMMAND fairsend_test)
 # it - in two processes that never compile together, so the round trip is proved here.
 add_executable(servermsg_test tests/servermsg_test.cpp)
 add_test(NAME servermsg COMMAND servermsg_test)
+
+# --- FrostServer HTTP front and announce token (security report A10, A13) -------
+# httpmux.h serves every connection from one select() set with a deadline each, so an idle
+# client cannot freeze the API or the schedule; the test drives it over loopback sockets.
+# announceauth.h is the token's minimum length, constant-time compare and per-address backoff.
+if(WIN32)
+    add_executable(httpmux_test tests/httpmux_test.cpp)
+    target_link_libraries(httpmux_test PRIVATE ws2_32)
+    add_test(NAME httpmux COMMAND httpmux_test)
+endif()
+add_executable(announceauth_test tests/announceauth_test.cpp)
+add_test(NAME announceauth COMMAND announceauth_test)
+
+# --- frostmod.exe --update trust (security report A13) ----------------------------
+# https on GitHub's release hosts only, and a Creste LLC Authenticode signature before the swap.
+if(WIN32)
+    add_executable(updatetrust_test tests/updatetrust_test.cpp)
+    target_link_libraries(updatetrust_test PRIVATE wintrust crypt32)
+    add_test(NAME updatetrust COMMAND updatetrust_test)
+endif()
 
 # --- coach other riders test ---------------------------------------------------
 # Who else is in the event, where their bikes are and their lap times, as the recorder

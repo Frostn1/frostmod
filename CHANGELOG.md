@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-18 - v0.52.2
+
+Security fixes only, on top of v0.52.1.
+
+- FrostServer's API no longer freezes when a client connects and sends nothing.
+- `frostmod.exe --update` only downloads over https from GitHub's release hosts, and only installs files Windows verifies as signed by Creste LLC.
+- Server announcements are tagged as the server's own and the announce token rules are stricter.
+
 ## 2026-11-16 - v0.52.1
 
 - frostmod.log now records session changes (practice/race) and riders the game removes, to diagnose riders vanishing at the race start.

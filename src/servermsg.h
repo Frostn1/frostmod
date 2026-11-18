@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -417,6 +418,43 @@ inline bool ParseFeedJson(const std::string& doc, std::vector<Message>& out, uin
 }
 
 // ---------------------------------------------------------------------------
+// server text is never ours
+// ---------------------------------------------------------------------------
+// Every announcement is drawn after this fixed tag, in kServerTagRgb, whatever the server
+// asked for. The feed is plain HTTP from whichever server the player joined, so its text is the
+// server operator's (or anyone on the path's), and must never pass for FrostMod's own overlay.
+constexpr const char* kServerTag    = "[server] ";
+constexpr uint32_t    kServerTagRgb = 0x9AA3B2u;
+
+// True when the text, past any icons, spaces and punctuation, opens with one of our own names:
+// "FrostMod update: ...", ":warn: MXB App: ...". Those are dropped rather than shown, because
+// a line that claims to come from FrostMod or MXB App is the phishing case and nothing else.
+inline bool ImpersonatesUs(const std::string& text) {
+    std::string lead;
+    for (const Span& sp : Tokenise(text)) {
+        if (sp.icon) continue;
+        lead += sp.text;
+        if (lead.size() > 64) break;
+    }
+    std::string norm;   // lower case, letters and digits only: "M.X.B  App" is still "mxbapp"
+    for (unsigned char c : lead) {
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) norm += (char)c;
+        if (norm.size() >= 16) break;
+    }
+    // Look-alike digits for the obvious letters, so "Fr0stM0d" is caught too.
+    for (char& c : norm) {
+        if (c == '0') c = 'o';
+        else if (c == '1') c = 'l';
+        else if (c == '5') c = 's';
+    }
+    static const char* const kOurs[] = {"frostmod", "frostserver", "mxbapp", "mxbsecure"};
+    for (const char* name : kOurs)
+        if (norm.compare(0, std::strlen(name), name) == 0) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // the client's queue
 // ---------------------------------------------------------------------------
 class Queue {
@@ -426,10 +464,11 @@ class Queue {
     void Ingest(const std::vector<Message>& in, double nowSec) {
         for (const Message& m : in) {
             if (m.seq <= lastSeq_) continue;
+            lastSeq_ = m.seq;                      // seen, even when it is not shown
+            if (ImpersonatesUs(m.text)) { ++dropped_; continue; }
             Message copy = m;
             copy.shownAt = nowSec;
             live_.push_back(copy);
-            lastSeq_ = m.seq;
         }
         if (live_.size() > kMaxLive)
             live_.erase(live_.begin(), live_.begin() + (live_.size() - kMaxLive));
@@ -448,13 +487,16 @@ class Queue {
     const std::vector<Message>& Live() const { return live_; }
     uint32_t LastSeq() const { return lastSeq_; }
     bool     Empty()   const { return live_.empty(); }
+    // Lines refused by ImpersonatesUs since the last Reset, for the log.
+    uint32_t Dropped() const { return dropped_; }
 
     // A new server means a new sequence; keeping the old one would swallow its first messages.
-    void Reset() { live_.clear(); lastSeq_ = 0; }
+    void Reset() { live_.clear(); lastSeq_ = 0; dropped_ = 0; }
 
   private:
     std::vector<Message> live_;
     uint32_t             lastSeq_ = 0;
+    uint32_t             dropped_ = 0;
 };
 
 } // namespace servermsg

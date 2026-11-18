@@ -23,12 +23,18 @@ jobs:
   build:
     runs-on: windows-latest
     # The environment is what the Azure federated credential trusts: the OIDC subject is
-    # repo:Frostn1/frostmod:environment:code-signing whatever tag is being released. No
-    # protection rules; it only names the job. Setup: docs/signing/SETUP.md in Frostn1/mxb-app.
+    # repo:Frostn1/frostmod:environment:code-signing whatever tag is being released, so the
+    # environment's deployment policy is what limits signing: only refs matching `v*` tags or
+    # the `main` branch may run this job (repo Settings -> Environments -> code-signing). A
+    # workflow_dispatch from any other branch is refused before it starts.
+    # Setup: docs/signing/SETUP.md in Frostn1/mxb-app.
     environment: code-signing
     permissions:
       contents: write    # upload assets onto the release
       id-token: write    # OIDC login for code signing (.github/actions/artifact-signing)
+    # The release tag reaches the scripts as an environment variable, never pasted into them.
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +46,7 @@ jobs:
         if: github.event_name == 'release'
         shell: pwsh
         run: |
-          $tag = "${{ github.event.release.tag_name }}" -replace '^v','' -replace '[-+].*$',''
+          $tag = $env:RELEASE_TAG -replace '^v','' -replace '[-+].*$',''
           $ver = (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value
           Write-Host "release tag -> $tag ; version.h -> $ver"
           if ($tag -ne $ver) {
@@ -164,7 +170,7 @@ jobs:
           Set-Content -Path "$stage/frostmod_serverfilter.yaml" -Value $yaml -NoNewline -Encoding utf8
 
           # --- README --------------------------------------------------------------
-          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { $env:RELEASE_TAG }
                  else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
           $readme = @(
             "FrostMod $tag - in-game overlay / mod loader for MX Bikes"
@@ -217,7 +223,7 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item dist/frostserver.dlo, dist/frostserver.exe $stage
 
-          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { '${{ github.event.release.tag_name }}' }
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'release') { $env:RELEASE_TAG }
                  else { 'v' + (Select-String -Path src/version.h -Pattern '#define FROSTMOD_VERSION "([^"]+)"').Matches[0].Groups[1].Value }
           $readme = @(
             "FrostServer $tag - dedicated-server map/link API for MX Bikes"
@@ -264,7 +270,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" `
+          gh release upload $env:RELEASE_TAG `
             dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
             dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip `
             dist/mxbcoach.dlo --clobber

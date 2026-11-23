@@ -565,23 +565,23 @@ constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 // the bike chooser (0x91570) keeps its filtered view INSIDE the state array (+4 slots,
 // filled by 0x8EF20) with its own count 0x4C2F18; see RVA_BIKE_CHOOSER_N.
 constexpr RLStep kReloadSteps[] = {
-    {0,0,0,0,0x2460,"tracks"}, {0,0,0,0,0x1CE00,"tyres"},
-    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790,"rider cfgs"},
-    {0,0,0,0,0x3100,"bikes"}, {0,0,0,0,0x3FA0,"series"}, {0,0,0,0,0x171D0,"paints data.ini"},
-    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320,"bike paints"},
-    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950,"fonts"},
-    {0,0,0,0,0x17F80,"helmets"},
-    {1,0xF48620,0xF3DB64,0x109E090,0x18360,"helmet paints"},
-    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0,"goggles"},
-    {1,0xF4EE00,0x109DE90,0xF48610,0x19060,"helmet cams"},
-    {0,0,0,0,0x1BDD0,"rider models"},
-    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330,"suits"},
-    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10,"rider fonts"},
-    {0,0,0,0,0x1B420,"animations"}, {0,0,0,0,0x19DA0,"boots"},
-    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110,"boot paints"},
-    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770,"gloves"},
-    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140,"protections"},
-    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450,"protection paints"},
+    {0,0,0,0,0x2460,"tracks"}, {0,0,0,0,0x1CCD0,"tyres"},
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B660,"rider cfgs"},
+    {0,0,0,0,0x3100,"bikes"}, {0,0,0,0,0x3FA0,"series"}, {0,0,0,0,0x170A0,"paints data.ini"},
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x171F0,"bike paints"},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17820,"fonts"},
+    {0,0,0,0,0x17E50,"helmets"},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18230,"helmet paints"},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x18890,"goggles"},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x18F30,"helmet cams"},
+    {0,0,0,0,0x1BCA0,"rider models"},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19200,"suits"},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1ACE0,"rider fonts"},
+    {0,0,0,0,0x1B2F0,"animations"}, {0,0,0,0,0x19C70,"boots"},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x19FE0,"boot paints"},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A640,"gloves"},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C010,"protections"},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C320,"protection paints"},
 };
 constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
 
@@ -606,7 +606,7 @@ constexpr uintptr_t kPaintReloadRvas[] = {0x171F0, 0x19200, 0x1A640, 0x19FE0, 0x
 // boots (+ paints), protections (+ paints), and the bike paints (same pass). Model lists
 // are SC rows that come before the paint rows indexing into them in the table.
 constexpr uintptr_t kGearReloadRvas[] = {0x17E50, 0x18230, 0x18890, 0x18F30, 0x1BCA0, 0x19200,
-                                         0x19DA0, 0x1A110, 0x1A770, 0x1C140, 0x1C450, 0x17320};
+                                         0x19C70, 0x19FE0, 0x1A640, 0x1C010, 0x1C320, 0x171F0};
 // Tracks only: nothing else in the table reads the track list (STEP MAP above).
 constexpr uintptr_t kTrackReloadRvas[] = {0x2460};
 // Bikes and what is derived from them: the bike list, the series (one per bike category),
@@ -788,7 +788,7 @@ namespace gpb {
 //   .pdata range 0xfb650-0xfcfb7.
 // Carries MX's warning too: it re-inits Steam/input/sound and transitions to the UI, so
 // calling it mid-game is a soft restart to the menu.
-constexpr uintptr_t RVA_CONTENT_INIT = 0xfb590;
+constexpr uintptr_t RVA_CONTENT_INIT = 0xfb650;
 
 // Generic VFS directory walker (out_status, dir, ext, out_buf); GP twin of
 // mxb::RVA_SCAN_FOLDER. Pinned two independent ways that agree exactly:
@@ -797,7 +797,7 @@ constexpr uintptr_t RVA_CONTENT_INIT = 0xfb590;
 //   2. In MX it sits 4 .pdata entries before the "%s*.pkz" wrapper; GP's wrapper is
 //      0x18f53b, minus 4 entries lands here.
 // It also has 3 call sites (0x16020b, 0x237421, 0x2bee1d), matching MX's 3.
-constexpr uintptr_t RVA_SCAN_FOLDER = 0x18eb90;
+constexpr uintptr_t RVA_SCAN_FOLDER = 0x18f150;
 
 // ---- surgical reload: the content-load section of GP's boot init --------------
 // The contiguous run of loader calls at 0xfb95a..0xfb9b3 inside RVA_CONTENT_INIT.

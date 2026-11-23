@@ -198,7 +198,7 @@ static void TestLive() {
     // rip-relative loads land, so the bytes run unmodified.
     const size_t oneOff = kRvaOne - kRvaCurveFn, nnOff = kRvaNinetyNine - kRvaCurveFn;
     const size_t span = ((oneOff > nnOff ? oneOff : nnOff) + 0x1000) & ~(size_t)0xFFF;
-    uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, span + 0x1000, MEM_RESERVE | MEM_COMMIT,
+    uint8_t* mem = (uint8_t*)VirtualAlloc(nullptr, span + 0x2000, MEM_RESERVE | MEM_COMMIT,
                                           PAGE_EXECUTE_READWRITE);
     CHECK(mem != nullptr, "VirtualAlloc for the function copy");
     if (!mem) return;
@@ -207,6 +207,24 @@ static void TestLive() {
     std::memcpy(mem + oneOff, &one, 4);
     std::memcpy(mem + nnOff, &nn, 4);
     uint8_t* stub = mem + span;   // its own page, as AllocNear gives the DLL
+    // beta21f's lookup has a frame (push rbx; sub rsp, 0x30; xmm6 saved at +0x93), so a fault
+    // inside the copy only unwinds back to CallSafe's __except with unwind data, as the game's
+    // .pdata gives it. Two entries, the second chained to the first, like the game's.
+    struct Rf { uint32_t begin, end, unwind; };
+    uint8_t* uw = mem + span + 0x1000;
+    Rf* rf = (Rf*)uw;
+    uint8_t* u1 = uw + 0x40;   // prolog 6: push rbx @2, sub rsp,0x30 @6
+    const uint8_t u1b[] = {0x01, 0x06, 0x02, 0x00, 0x06, 0x52, 0x02, 0x30};
+    std::memcpy(u1, u1b, sizeof(u1b));
+    uint8_t* u2 = uw + 0x60;   // chained: movaps [rsp+0x20], xmm6 @0x93 (5 bytes)
+    const uint8_t u2b[] = {0x21, 0x05, 0x02, 0x00, 0x05, 0x68, 0x02, 0x00};
+    std::memcpy(u2, u2b, sizeof(u2b));
+    Rf* chain = (Rf*)(u2 + sizeof(u2b));
+    *chain = {0, 0x93, (uint32_t)(u1 - mem)};
+    rf[0] = {0, 0x93, (uint32_t)(u1 - mem)};
+    rf[1] = {0x93, (uint32_t)kFnLen, (uint32_t)(u2 - mem)};
+    const bool tableOk = RtlAddFunctionTable((PRUNTIME_FUNCTION)rf, 2, (DWORD64)(uintptr_t)mem) != FALSE;
+    CHECK(tableOk, "unwind data for the function copy");
     std::memset(stub, 0xCC, kPageBytes);
     std::memset(stub + kCountOff, 0, kPageBytes - kCountOff);
     BuildStub(stub, (uintptr_t)stub, (uint64_t)(uintptr_t)mem);
@@ -246,11 +264,13 @@ static void TestLive() {
         CallSafe(game, bike, nan, &faulted);
         CHECK(faulted, "unguarded NaN faults, as at +0x1A29AE (beta21e) / +0x1E5C8C (beta21f)");
     }
+    if (tableOk) RtlDeleteFunctionTable((PRUNTIME_FUNCTION)rf);
     VirtualFree(mem, 0, MEM_RELEASE);
 }
 #endif
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     TestSite();
     TestFunction();
     TestStub();

@@ -31,7 +31,7 @@ namespace tyrefallback {
 // RVAs in mxbikes.exe (image base 0x140000000).
 constexpr uintptr_t kRvaSpan     = 0xE8C06;   // first loop's `cmp [tyreCount], ebx`
 constexpr size_t    kSpanLen     = 0x85;      // up to the join at 0xE8D6B
-constexpr uintptr_t kRvaJoin     = kRvaSpan + kSpanLen;   // 0xE8D6B: index in ebp from here
+constexpr uintptr_t kRvaJoin     = kRvaSpan + kSpanLen;   // 0xE8C8B (beta21e 0xE8D6B): index in ebp from here
 constexpr uintptr_t kRvaTyreCount = 0x109DECC;  // int, entries in the tyre table
 constexpr uintptr_t kRvaTyreTable = 0xF48618;   // pointer to the table
 constexpr size_t    kTyreStride   = 0x608;      // entry size; the name is at +0

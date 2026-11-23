@@ -67,8 +67,8 @@ constexpr uint8_t kSiteBytes[kSiteLen] = {
 
 // The displacement those bytes carry, and where it lands. Kept as a constant so a test can
 // prove our arithmetic against the real encoding rather than restating it.
-constexpr int32_t   kOrigDisp    = 0x000a94bc;
-constexpr uintptr_t kRvaOrigConst = kRvaNextIp + (uintptr_t)kOrigDisp;   // 0x353D90
+constexpr int32_t   kOrigDisp    = 0x000a92bc;
+constexpr uintptr_t kRvaOrigConst = kRvaNextIp + (uintptr_t)kOrigDisp;   // 0x353DD0 (beta21e 0x353D90)
 
 // The value compiled in, in seconds. Two snapshots further apart than this and the rider
 // stops being drawn.

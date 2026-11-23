@@ -158,7 +158,13 @@ static void TestPtr64() {
     CHECK(kSite[8] == 0x8b && kSite[9] == 0x08, "0x127111: mov ecx, [rax] - 32 bits, no REX.W");
     CHECK(kSite[0] == 0x48 && kSite[1] == 0x8d && Disp32(kSite + 4) == kSlot, "lea rax, [rsp+0x2D8]");
     CHECK(kSite[kCallInSite] == 0xe8 &&
-          kRvaSite + kCallInSite + 5 + Disp32(kSite + kCallInSite + 1) == kRvaCallee, "call 0x2A42F0");
+          kRvaSite + kCallInSite + 5 + Disp32(kSite + kCallInSite + 1) == kRvaCallee21e, "call 0x2A42F0");
+    // beta21f: job 864 does the 64-bit load itself and calls the same callee, moved.
+    CHECK(kFixedSite[8] == 0x48 && kFixedSite[9] == 0x8b && kFixedSite[10] == 0x09, "mov rcx, [rcx] - 64 bits");
+    CHECK(Disp32(kFixedSite + 4) == kSlot, "lea rcx, [rsp+0x2D8]");
+    CHECK(kFixedSite[11] == 0xe8 && kRvaFixedSite + 11 + 5 + Disp32(kFixedSite + 12) == kRvaCallee,
+          "beta21f's job calls 0x2A4530");
+    CHECK(kFixedJob == 864, "job 863 became 864");
     CHECK(kRvaSite + kCallInSite == kRvaBack, "the stub returns to the call");
     CHECK(kCallee[0] == 0x8b && kCallee[1] == 0x11, "0x2A42F0: mov edx, [rcx] - it is a pointer");
     // The dispatcher spills all of rdx, and [rsp+0x2D8] is that spill.
@@ -318,7 +324,8 @@ static void TestRiderInfo() {
     CHECK(kCaller[0] == 0xff && kCaller[1] == 0x15 && kCaller[6] == 0x8b, "call [dispatcher]; mov eax, [count]");
     CHECK(Disp32(kCaller + 9) == (int32_t)(0x160 + kList1Count), "list 1 count is struct +0x2EFC (rsp+0x305C)");
     CHECK(kList2Count + 4 + kListRoom * 0x64 <= kOutBytes && kList1Count < kList2Count, "the lists lie inside the struct");
-    CHECK(kRvaFault == 0x7A860 && kRvaFault2 == 0x7A8E0, "sites");
+    CHECK(kRvaFault == 0x7A810 && kRvaFault2 == 0x7A890, "sites (beta21e: 0x7A860, 0x7A8E0)");
+    CHECK(kJob == 0x27A, "job 633 became 634 in beta21f");
     CHECK(ShouldClear(1, (void*)1) && !ShouldClear(0, (void*)1) && !ShouldClear(1, nullptr), "clear only a miss");
 }
 
@@ -328,7 +335,7 @@ static void TestMipmap() {
     CHECK(kColumn[2] == 0x48 && kColumn[3] == 0x8b && kColumn[4] == 0xfa, "column: rdi = dst");
     CHECK(kRow[2] == 0x48 && kRow[3] == 0x8b && kRow[4] == 0xfa, "row: rdi = dst");
     CHECK(kBox[17] == 0x41 && kBox[18] == 0x8b && kBox[19] == 0xc0, "box: eax = w");
-    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x255F50, "faults inside the box filter");
+    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x256190, "faults inside the box filter");
     uint8_t a = 0, b = 0;
     CHECK(Admit(&a, &b) && !Admit(nullptr, &b) && !Admit(&a, nullptr), "NULL either side is refused");
 }

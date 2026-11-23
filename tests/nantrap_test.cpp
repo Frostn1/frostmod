@@ -233,9 +233,10 @@ static void report() {
 }
 
 static void discarded() {
-    // The bytes at 0x1AD83D in beta21e, as five player reports captured them after the bar.
-    static const uint8_t kAt[] = {0xF3, 0x0F, 0x5E, 0x81, 0xF8, 0x39, 0x02, 0x00,
-                                  0x0F, 0x2F, 0xC1, 0x76, 0x03, 0x0F, 0x28, 0xC1, 0x0F};
+    // The bytes at 0x1AD8DD in beta21f (0x1AD83D in beta21e, where five player reports
+    // captured them after the bar, with [rcx+0x239F8]; beta21f reads [rcx+0x24530]).
+    static const uint8_t kAt[] = {0xF3, 0x0F, 0x5E, 0x81, 0x30, 0x45, 0x02, 0x00,
+                                  0x0F, 0x2F, 0xC1, 0x76, 0x03, 0x0F, 0x28, 0xC1, 0xF2};
     CHECK(IsDiscarded(kAt, sizeof(kAt)), "the discarded 0/0 matches");
     CHECK(!IsDiscarded(kAt, 15), "too few bytes");
     CHECK(!IsDiscarded(nullptr, 16), "null");

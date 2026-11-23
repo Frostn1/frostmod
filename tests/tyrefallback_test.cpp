@@ -28,7 +28,7 @@ static int32_t Rel32(const uint8_t* p) {
 
 int main() {
     // --- the span ---------------------------------------------------------------------
-    CHECK(kRvaJoin == 0xE8D6B, "join is 0xE8D6B");
+    CHECK(kRvaJoin == 0xE8C8B, "join is 0xE8C8B");
     CHECK(SpanMatches(kSpanBytes), "span matches itself");
     CHECK(!SpanMatches(nullptr), "null never matches");
     uint8_t bad[kSpanLen];
@@ -52,18 +52,18 @@ int main() {
               "site %d's jmp lands on the join", i);
     }
     // The loops' rip-relative operands decode to the globals we read.
-    // cmp [rip+d], ebx at 0xE8CE6 (6 bytes) -> tyre count
+    // cmp [rip+d], ebx at 0xE8C06 (6 bytes) -> tyre count
     CHECK(kRvaSpan + 6 + Rel32(kSpanBytes + 2) == kRvaTyreCount, "count global");
-    // add rcx, [rip+d] at 0xE8D02 (7 bytes) -> tyre table
-    CHECK(0xE8D02 + 7 + Rel32(kSpanBytes + (0xE8D02 - kRvaSpan) + 3) == kRvaTyreTable,
+    // add rcx, [rip+d] at 0xE8C22 (7 bytes) -> tyre table
+    CHECK(0xE8C22 + 7 + Rel32(kSpanBytes + (0xE8C22 - kRvaSpan) + 3) == kRvaTyreTable,
           "table global");
-    // lea rdx, [rip+d] at 0xE8D33 (7 bytes) -> picked tyre name
-    CHECK(0xE8D33 + 7 + Rel32(kSpanBytes + (0xE8D33 - kRvaSpan) + 3) == kRvaPickedTyre,
+    // lea rdx, [rip+d] at 0xE8C53 (7 bytes) -> picked tyre name
+    CHECK(0xE8C53 + 7 + Rel32(kSpanBytes + (0xE8C53 - kRvaSpan) + 3) == kRvaPickedTyre,
           "picked-tyre global");
     // imul rcx, rcx, 0x608 in both loops
-    CHECK(Rel32(kSpanBytes + (0xE8CFB - kRvaSpan) + 3) == (int32_t)kTyreStride, "stride");
+    CHECK(Rel32(kSpanBytes + (0xE8C1B - kRvaSpan) + 3) == (int32_t)kTyreStride, "stride");
     // lea rdx, [rsp+0x640] in the first loop
-    CHECK(Rel32(kSpanBytes + (0xE8CF3 - kRvaSpan) + 4) == (int32_t)kCfgTyreSlot, "cfg slot");
+    CHECK(Rel32(kSpanBytes + (0xE8C13 - kRvaSpan) + 4) == (int32_t)kCfgTyreSlot, "cfg slot");
 
     // --- the pick ---------------------------------------------------------------------
     CHECK(PickIndex(5, (int)0xE67A2C53) == 0, "junk replaced");

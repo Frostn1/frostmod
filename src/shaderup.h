@@ -412,12 +412,12 @@ struct UType {
 inline bool UniformType(unsigned t, UType* out) {
     static const UType k[] = {
         {0x1406, 1, false, false},  {0x8B50, 2, false, false}, {0x8B51, 3, false, false},
-        {0x8A22, 4, false, false},  {0x1404, 1, true, false},  {0x8B53, 2, true, false},
-        {0x8A24, 3, true, false},   {0x8B55, 4, true, false},  {0x8B56, 1, true, false},
-        {0x8A27, 2, true, false},   {0x8B58, 3, true, false},  {0x8B59, 4, true, false},
-        {0x8A2A, 4, false, true},   {0x8B5B, 9, false, true},  {0x8B5C, 16, false, true},
-        {0x8A2D, 1, true, false},   {0x8B5E, 1, true, false},  {0x8B5F, 1, true, false},
-        {0x8A30, 1, true, false},   {0x8B61, 1, true, false},  {0x8B62, 1, true, false},
+        {0x8B52, 4, false, false},  {0x1404, 1, true, false},  {0x8B53, 2, true, false},
+        {0x8B54, 3, true, false},   {0x8B55, 4, true, false},  {0x8B56, 1, true, false},
+        {0x8B57, 2, true, false},   {0x8B58, 3, true, false},  {0x8B59, 4, true, false},
+        {0x8B5A, 4, false, true},   {0x8B5B, 9, false, true},  {0x8B5C, 16, false, true},
+        {0x8B5D, 1, true, false},   {0x8B5E, 1, true, false},  {0x8B5F, 1, true, false},
+        {0x8B60, 1, true, false},   {0x8B61, 1, true, false},  {0x8B62, 1, true, false},
     };
     for (const UType& u : k)
         if (u.type == t) { if (out) *out = u; return true; }

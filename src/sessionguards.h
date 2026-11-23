@@ -325,6 +325,7 @@ constexpr uintptr_t kRvaSite   = 0x127109;   // hooked here
 constexpr uintptr_t kRvaBack   = 0x127113;   // the call
 constexpr uintptr_t kRvaCallee = 0x2A4530;
 constexpr uintptr_t kRvaFault  = 0x2A4530;
+constexpr uintptr_t kRvaCallee21e = 0x2A42F0;   // where kSite's call lands: kSite is beta21e's
 constexpr int       kJob       = 863;
 constexpr int32_t   kSlot      = 0x2D8;      // rdx's home, from the job's frame
 

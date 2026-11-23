@@ -277,9 +277,9 @@ static void TestWalkerFault() {
     CHECK(RipTarget(kMapWin, kRvaMapWin, 0, 3, 7) == kRvaBatchTable, "lea r13 names the batch table");
     // The store that crashes is inside the watched range, and so are its two siblings in the
     // reports (+0x2408C4 texcoords, +0x240904 colours); the loop's count update is not.
-    CHECK(InWalkerStores(0x24085C) && InWalkerStores(0x2408C4) && InWalkerStores(0x240904), "stores watched");
-    CHECK(!InWalkerStores(0x240970) && !InWalkerStores(0x24084F) && !InWalkerStores(0x240B6C), "only the walker");
-    CHECK(kRvaWalkLoLoop + 12 == 0x24085C && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24085C");
+    CHECK(InWalkerStores(0x240A9C) && InWalkerStores(0x240B04) && InWalkerStores(0x240B44), "stores watched");
+    CHECK(!InWalkerStores(0x240BB0) && !InWalkerStores(0x240A8F) && !InWalkerStores(0x240DAC), "only the walker");
+    CHECK(kRvaWalkLoLoop + 12 == 0x240A9C && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24085C");
     // The exit we jump to is the walker's own epilogue: xor eax,eax ... pop rsi; ret.
     CHECK(kWalkExit[0] == 0x33 && kWalkExit[kWalkExitLen - 1] == 0xc3 && kWalkExit[kWalkExitLen - 2] == 0x5e,
           "epilogue ends pop rsi; ret");

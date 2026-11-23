@@ -1018,7 +1018,7 @@ static bool BusCall(BusFn bus, uint32_t cmd) {
 
 /// The bus as the game itself reaches it: read the slot and check it lands in .text.
 static BusFn ResolveBus() {
-    uintptr_t slot = g_base + mxb::RVA_CMD_BUS_PTR + g_sigDelta;
+    uintptr_t slot = g_base + mxb::RVA_CMD_BUS_PTR;
     void* cur = nullptr;
     if (SafeReadBytes((const char*)slot, (char*)&cur, sizeof(cur)) != sizeof(cur) || !cur) return nullptr;
     uint8_t *b = nullptr, *e = nullptr;
@@ -1050,7 +1050,16 @@ static bool ResetServerBrowser(const char* why, bool clearPort) {
             why, g_game->display);
         return false;
     }
-    int* state = (int*)(g_base + mxb::RVA_WORLD_STATE + g_sigDelta);
+    // .data globals do not move with the code: a build whose code drifted from the one these
+    // offsets were read off (g_sigDelta != 0) may have moved them too, and this function
+    // writes. Not knowing is a refusal, never a write at a guessed address.
+    if (g_sigDelta != 0) {
+        Log("[world] reset (%s) REFUSED: this build's code moved by 0x%zx from the one the offsets "
+            "are for, so its .data layout is unverified - nothing was touched.",
+            why, (size_t)g_sigDelta);
+        return false;
+    }
+    int* state = (int*)(g_base + mxb::RVA_WORLD_STATE);
     const int was = SafeReadInt(state);
     if (was < 0 || was > mxb::WORLD_STATE_MAX) {
         Log("[world] reset (%s) REFUSED: state @ RVA 0x%zx reads %d, which is not a state this "
@@ -1071,7 +1080,7 @@ static bool ResetServerBrowser(const char* why, bool clearPort) {
 
     // The port global sits outside the block the teardown zeroes, so it survives unless we
     // say otherwise. 0 reaches bind() unchecked and means "any".
-    int* port = (int*)(g_base + mxb::RVA_WORLD_PORT + g_sigDelta);
+    int* port = (int*)(g_base + mxb::RVA_WORLD_PORT);
     const int wasPort = SafeReadInt(port);
     const bool portCleared = clearPort && SafeWriteInt(port, 0);
 
@@ -1116,7 +1125,7 @@ static void WorldWatch() {
     static bool awaitingVerdict = false;  // a reset happened; the next login is the answer
     static bool verdictPortToo  = false;  // ...and whether that reset took the port as well
 
-    const int now = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_STATE + g_sigDelta));
+    const int now = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_STATE));
     if (now < 0 || now > mxb::WORLD_STATE_MAX) { prev = -1; return; }  // wrong offset: stay out
 
     if (now == mxb::WORLD_STATE_MAX) {
@@ -1137,7 +1146,7 @@ static void WorldWatch() {
         // register that is zero on the path where no datagram arrived - which is the path this
         // bug takes. A tick that happened to process some other traffic can leave it nonzero,
         // and then we simply sit this timeout out and catch the next one five seconds later.
-        const int reason = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_REASON + g_sigDelta));
+        const int reason = SafeReadInt((const int*)(g_base + mxb::RVA_WORLD_REASON));
         if (reason == 0) {
             const worldwatch::Decision d = worldwatch::OnTimeout(w, GetTickCount64());
             switch (d.action) {
@@ -7578,9 +7587,9 @@ static void LogDescStrings(void* desc) {
 
 // Enumerate the in-game bike array: index -> entry+0x00 / entry+0x4C0 names.
 static void LogBikeArray() {
-    int count = SafeReadInt(reinterpret_cast<const int*>(g_base + mxb::RVA_BIKE_COUNT + g_sigDelta));
+    int count = SafeReadInt(reinterpret_cast<const int*>(g_base + mxb::RVA_BIKE_COUNT));
     uintptr_t arr = 0;
-    SafeReadBytes(reinterpret_cast<const char*>(g_base + mxb::RVA_BIKE_LIST + g_sigDelta),
+    SafeReadBytes(reinterpret_cast<const char*>(g_base + mxb::RVA_BIKE_LIST),
                   reinterpret_cast<char*>(&arr), sizeof(arr));
     Log("[bikecap] bike array: count=%d ptr=%p stride=0x%x", count, (void*)arr, mxb::BIKE_STRIDE);
     if (!arr || count <= 0 || count > 100000) return;

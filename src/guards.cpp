@@ -938,7 +938,7 @@ static void InstallShockGuardImpl() {
         Log("[shock] guard not applied: VirtualProtect failed (%lu)", GetLastError());
         return;
     }
-    // Only the rel32 changes, and it is 4-byte aligned in this build (0x1A2E80), so the physics
+    // Only the rel32 changes, and it is 4-byte aligned in this build (0x1A2EF4), so the physics
     // thread sees the old call or the new one, never half of each.
     if (((site + 1) & 3) == 0) InterlockedExchange((volatile LONG*)(site + 1), (LONG)rel);
     else                       memcpy((void*)(site + 1), &rel, sizeof(rel));

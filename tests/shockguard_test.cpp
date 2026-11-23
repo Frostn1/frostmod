@@ -55,21 +55,24 @@ static uintptr_t RipTarget(const uint8_t* insn, uintptr_t rva, size_t at, size_t
     return (uintptr_t)((int64_t)(rva + len) + Disp(insn + at));
 }
 
-// Where 0x1A2970's two constants live (comiss x, [1.0f]; mulss x, [99.0f]).
-static constexpr size_t kOneAt = 0x14, kNinetyNineAt = 0x1D;
-static constexpr uintptr_t kRvaOne = 0x353808, kRvaNinetyNine = 0x329370;
+// Where 0x1E5BE0's two constants live (comiss x, [1.0f]; mulss x, [99.0f]).
+static constexpr size_t kOneAt = 0x45, kNinetyNineAt = 0x4E;
+static constexpr uintptr_t kRvaOne = 0x353848, kRvaNinetyNine = 0x32AB34;
 
 static void TestSite() {
-    CHECK(kCallInWin == 31 && kCallInWin + kCallLen == kWinLen, "the call is the window's last 5 bytes");
+    CHECK(kCallInWin == 38 && kCallInWin + kCallLen == kWinLen, "the call is the window's last 5 bytes");
     CHECK(CallTarget(kBase + kRvaCall, kWin + kCallInWin) == kBase + kRvaCurveFn,
-          "the call at +0x1A2E7F must reach 0x1A2970");
-    // The arguments: rcx = rbx (the bike), xmm1 = (float)(1.0 - length / stroke).
-    CHECK(kWin[0] == 0xf2 && kWin[1] == 0x45 && kWin[3] == 0x5e && kWin[4] == 0xe9, "divsd xmm13, xmm9");
-    CHECK(kWin[14] == 0x48 && kWin[15] == 0x8b && kWin[16] == 0xcb, "mov rcx, rbx");
-    CHECK(kWin[27] == 0xf2 && kWin[29] == 0x5a && kWin[30] == 0xc8, "cvtsd2ss xmm1, xmm0");
-    // The two loads the length and stroke come from.
-    CHECK(Disp(kLenLoad + 5) == (int32_t)kBikeShockLen && kLenLoad[4] == 0xab, "xmm13 = [rbx+0x5CC8]");
-    CHECK(Disp(kStrokeLoad + 5) == (int32_t)kBikeStroke && kStrokeLoad[4] == 0x8b, "xmm9 = [rbx+0x5180]");
+          "the call at +0x1A2EF3 must reach 0x1E5BE0");
+    // The arguments: rcx = rbx (the bike), xmm1 = (float)(1.0 - length / stroke), r8 = 0.
+    CHECK(kWin[0] == 0xf2 && kWin[1] == 0x44 && kWin[3] == 0x5e && kWin[4] == 0xab &&
+              Disp(kWin + 5) == (int32_t)kBikeStroke, "divsd xmm13, [rbx+stroke]");
+    CHECK(kWin[18] == 0x45 && kWin[19] == 0x33 && kWin[20] == 0xc0, "xor r8d, r8d: no out pointer");
+    CHECK(kWin[26] == 0x48 && kWin[27] == 0x8b && kWin[28] == 0xcb, "mov rcx, rbx");
+    CHECK(kWin[34] == 0xf2 && kWin[36] == 0x5a && kWin[37] == 0xc8, "cvtsd2ss xmm1, xmm0");
+    // The loads the length and stroke come from.
+    CHECK(Disp(kLenLoad + 5) == (int32_t)kBikeShockLen && kLenLoad[4] == 0xab, "xmm13 = [rbx+0x67F8]");
+    CHECK(std::memcmp(kStrokeLoad, kWin, kLoadLen) == 0 && kRvaStrokeLoad == kRvaWin,
+          "the stroke is read by the window's divide");
     // A call rel32 we would write must decode back to the stub.
     int32_t rel = 0;
     const uintptr_t stub = kBase + kRvaCall - 0x10000000;
@@ -83,33 +86,40 @@ static void TestSite() {
 }
 
 static void TestFunction() {
-    // x <= 0 -> curve[0]: xorps xmm0; movaps xmm3, xmm1; comiss xmm0, xmm3; jb +9;
-    // movss xmm0, [rcx+0x4FE8]; ret
-    CHECK(kFnBytes[3] == 0x0f && kFnBytes[4] == 0x28 && kFnBytes[5] == 0xd9, "x arrives in xmm1");
-    CHECK(kFnBytes[6] == 0x0f && kFnBytes[7] == 0x2f && kFnBytes[8] == 0xc3 && kFnBytes[9] == 0x72,
-          "comiss 0, x ; jb");
-    CHECK(Disp(kFnBytes + 15) == (int32_t)kBikeCurve && kFnBytes[19] == 0xc3, "x <= 0 returns [rcx+0x4FE8]");
+    // push rbx; sub rsp, 0x30; xorps xmm0; mov rbx, r8; comiss xmm0, xmm1; jb;
+    // x <= 0 -> movss xmm0, [rcx+0x566C] (curve[0]); out only when r8 != 0
+    CHECK(kFnBytes[0] == 0x40 && kFnBytes[1] == 0x53, "push rbx (saved)");
+    CHECK(kFnBytes[9] == 0x49 && kFnBytes[10] == 0x8b && kFnBytes[11] == 0xd8, "mov rbx, r8: the out pointer");
+    CHECK(kFnBytes[12] == 0x0f && kFnBytes[13] == 0x2f && kFnBytes[14] == 0xc1 && kFnBytes[15] == 0x72,
+          "comiss 0, x (x in xmm1) ; jb");
+    CHECK(kFnBytes[17] == 0xf3 && kFnBytes[20] == 0x81 && Disp(kFnBytes + 21) == (int32_t)kBikeCurve,
+          "x <= 0 returns [rcx+0x566C]");
+    CHECK(kFnBytes[25] == 0x48 && kFnBytes[26] == 0x85 && kFnBytes[27] == 0xdb, "test rbx, rbx: no out, no write");
     // x >= 1 -> curve[99]
     CHECK(kFnBytes[kOneAt] == 0x0f && kFnBytes[kOneAt + 1] == 0x2f && kFnBytes[kOneAt + 7] == 0x73,
           "comiss x, [1.0f] ; jae");
     CHECK(RipTarget(kFnBytes + kOneAt, kRvaCurveFn + kOneAt, 3, 7) == kRvaOne, "the 1.0f constant");
     CHECK(RipTarget(kFnBytes + kNinetyNineAt, kRvaCurveFn + kNinetyNineAt, 4, 8) == kRvaNinetyNine,
           "the 99.0f constant");
-    CHECK(Disp(kFnBytes + 50) == (int32_t)kBikeCurveLast && kFnBytes[54] == 0xc3, "x >= 1 returns [rcx+0x5174]");
-    CHECK(kBikeCurveLast == kBikeCurve + 4 * (kCurveEntries - 1), "0x5174 is curve[99]");
-    // i = cvttss2si(x * 99); the read that faults is curve[i] at 0x1A29AE.
-    CHECK(kFnBytes[37] == 0xf3 && kFnBytes[38] == 0x0f && kFnBytes[39] == 0x2c && kFnBytes[40] == 0xd3,
-          "cvttss2si edx, xmm3");
+    CHECK(kFnBytes[0x5F] == 0xf3 && Disp(kFnBytes + 0x63) == (int32_t)kBikeCurveLast,
+          "x >= 1 returns [rcx+0x5C9C]");
+    CHECK(kBikeCurveLast == kBikeCurve + kCurveStride * (kCurveEntries - 1), "0x5C9C is curve[99]");
+    // i = cvttss2si(x * 99); cmp edx, 99; the read that faults is curve[i] at 0x1E5C8C.
+    CHECK(kFnBytes[0x56] == 0xf3 && kFnBytes[0x57] == 0x0f && kFnBytes[0x58] == 0x2c && kFnBytes[0x59] == 0xd1,
+          "cvttss2si edx, xmm1");
+    CHECK(kFnBytes[0x5A] == 0x83 && kFnBytes[0x5B] == 0xfa && kFnBytes[0x5C] == 0x63, "cmp edx, 99");
     const size_t fault = kRvaFault - kRvaCurveFn;
-    CHECK(fault == 62, "0x1A29AE is byte 62");
-    CHECK(kFnBytes[fault] == 0xf3 && kFnBytes[fault + 2] == 0x10 && kFnBytes[fault + 3] == 0x94 &&
-              Disp(kFnBytes + fault + 5) == (int32_t)kBikeCurve,
-          "0x1A29AE: movss xmm2, [rcx + rax*4 + 0x4FE8]");
+    CHECK(fault == 0xAC, "0x1E5C8C is byte 0xAC");
+    CHECK(kFnBytes[fault] == 0xf3 && kFnBytes[fault + 2] == 0x10 && kFnBytes[fault + 3] == 0x84 &&
+              kFnBytes[fault + 4] == 0xc1 && Disp(kFnBytes + fault + 5) == (int32_t)kBikeCurve,
+          "0x1E5C8C: movss xmm0, [rcx + rax*8 + 0x566C]");
     CHECK(kFnBytes[kFnLen - 1] == 0xc3, "ends on its last ret");
-    // It writes xmm0-3, eax/rax and edx and nothing else, which is what the caller trusts and
-    // what the stub may clobber: every ModRM `reg` it writes is 0-3, no REX.R anywhere.
-    for (size_t i = 0; i < kFnLen; ++i)
-        CHECK(!(kFnBytes[i] == 0x44 || kFnBytes[i] == 0x4C), "no REX.R (xmm8+/r8+) at byte %zu", i);
+    // xmm6 is saved before it is used and restored on the way out; xmm4/xmm5, which the caller
+    // keeps live, are never named (no ModRM reg field 4/5 on an SSE op with 0x0F prefix pair
+    // is checked by hand here: the only SSE writes are to xmm0, xmm1, xmm3 and the saved xmm6).
+    CHECK(kFnBytes[0x93] == 0x0f && kFnBytes[0x94] == 0x29 && kFnBytes[0x95] == 0x74, "movaps [rsp+0x20], xmm6");
+    CHECK(kFnBytes[kFnLen - 11] == 0x0f && kFnBytes[kFnLen - 10] == 0x28 && kFnBytes[kFnLen - 9] == 0x74,
+          "movaps xmm6, [rsp+0x20] before the ret");
 }
 
 static void TestStub() {
@@ -132,7 +142,7 @@ static void TestStub() {
     CHECK(s[kStoreAt] == 0x48 && s[kStoreAt + 1] == 0x89 && s[kStoreAt + 2] == 0x0D, "mov [rip+d], rcx");
     CHECK(at + kStoreEnd + Disp(s + kStoreAt + 3) == at + kBikeOff, "store hits the bike cell");
     // mov rax, fn ; jmp rax
-    CHECK(s[kGameAt] == 0x48 && s[kGameAt + 1] == 0xB8 && Imm64(s + kGameAt + 2) == fn, "mov rax, 0x1A2970");
+    CHECK(s[kGameAt] == 0x48 && s[kGameAt + 1] == 0xB8 && Imm64(s + kGameAt + 2) == fn, "mov rax, 0x1E5BE0");
     CHECK(s[kGameAt + 10] == 0xFF && s[kGameAt + 11] == 0xE0 && kGameAt + 12 == kStubLen, "jmp rax");
     // Registers it writes: xmm1 (ucomiss/xorps reg field 1), rax, and memory of its own.
     // Nothing in xmm4/xmm5, which the caller keeps live across the call.
@@ -150,12 +160,14 @@ static void TestModel() {
         CHECK(IndexFor(x, true) == IndexFor(x, false), "finite x %g is untouched", (double)x);
     CHECK(IndexFor(0.5f, false) == 49, "0.5 reads curve[49]");
 
-    // OB's report, 2026-10-28: AV reading 0xFFFFFFFFD5CC5068 at +0x1A29AE. With i = INT_MIN
-    // that is bike + 0x4FE8 - 2^33, for a bike at 0x1D5CC0080.
+    // OB's report, 2026-10-28 (beta21e): AV reading 0xFFFFFFFFD5CC5068 at +0x1A29AE. With
+    // i = INT_MIN that was bike + 0x4FE8 - 2^33 (4-byte entries), for a bike at 0x1D5CC0080.
     const uint64_t bike = 0x1D5CC0080ull;
-    const uint64_t read = bike + kBikeCurve + (uint64_t)((int64_t)INT32_MIN * 4);
-    CHECK(read == 0xFFFFFFFFD5CC5068ull, "OB's fault address is curve[INT_MIN] (got %llx)",
-          (unsigned long long)read);
+    CHECK(bike + 0x4FE8 + (uint64_t)((int64_t)INT32_MIN * 4) == 0xFFFFFFFFD5CC5068ull,
+          "OB's fault address is curve[INT_MIN] on beta21e");
+    // beta21f's 16-byte entries put the same NaN 32 GB below the curve.
+    const uint64_t read = bike + kBikeCurve + (uint64_t)((int64_t)INT32_MIN * (int64_t)kCurveStride);
+    CHECK(read == bike + kBikeCurve - (1ull << 35), "beta21f: curve[INT_MIN] is 2^35 below");
 }
 
 static void TestRates() {
@@ -168,12 +180,12 @@ static void TestRates() {
 
 #ifdef _WIN32
 // ---- the stub, run for real in front of the game's own bytes --------------------------
-using CurveFn = float (*)(const void* bike, float x);
+using CurveFn = float (*)(const void* bike, float x, void* out);
 
 static float CallSafe(CurveFn f, const void* bike, float x, bool* faulted) {
     *faulted = false;
     __try {
-        return f(bike, x);
+        return f(bike, x, nullptr);
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
         *faulted = true;
@@ -201,10 +213,10 @@ static void TestLive() {
     FlushInstructionCache(GetCurrentProcess(), mem, span + 0x1000);
 
     // A bike with a recognisable curve: curve[i] = 1000 + i.
-    static uint8_t bike[0x6000];
+    static uint8_t bike[0x7000];
     for (int i = 0; i < kCurveEntries; ++i) {
         const float v = 1000.0f + (float)i;
-        std::memcpy(bike + kBikeCurve + 4 * i, &v, 4);
+        std::memcpy(bike + kBikeCurve + kCurveStride * i, &v, 4);
     }
     const CurveFn game = (CurveFn)(void*)mem, guarded = (CurveFn)(void*)stub;
     const volatile uint32_t* count = (const volatile uint32_t*)(stub + kCountOff);
@@ -229,10 +241,10 @@ static void TestLive() {
     // And the crash, as shipped: the same NaN into the game's own bytes reads 8 GB below the
     // curve. Only checked when that address is not mapped, which it should never be.
     MEMORY_BASIC_INFORMATION mbi{};
-    const uintptr_t target = (uintptr_t)bike + kBikeCurve + (uintptr_t)((int64_t)INT32_MIN * 4);
+    const uintptr_t target = (uintptr_t)bike + kBikeCurve + (uintptr_t)((int64_t)INT32_MIN * (int64_t)kCurveStride);
     if (!VirtualQuery((const void*)target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
         CallSafe(game, bike, nan, &faulted);
-        CHECK(faulted, "unguarded NaN faults, as at +0x1A29AE");
+        CHECK(faulted, "unguarded NaN faults, as at +0x1A29AE (beta21e) / +0x1E5C8C (beta21f)");
     }
     VirtualFree(mem, 0, MEM_RELEASE);
 }

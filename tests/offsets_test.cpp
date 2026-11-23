@@ -27,26 +27,26 @@ static int g_failures = 0;
         }                                                                       \
     } while (0)
 
-// The MX table as it shipped, transcribed from fcn.1400ef210. Duplicated here on purpose:
+// The MX table as beta21f ships it, transcribed from its boot init fcn.1400ef130 (beta21e: 0x1400ef210). Duplicated here on purpose:
 // the point is to notice when someone edits the real one, so this copy must be independent.
 static const RLStep kMxExpected[] = {
-    {0,0,0,0,0x2460}, {0,0,0,0,0x1CE00},
-    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790},
-    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x171D0},
-    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320},
-    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950},
-    {0,0,0,0,0x17F80},
-    {1,0xF48620,0xF3DB64,0x109E090,0x18360},
-    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0},
-    {1,0xF4EE00,0x109DE90,0xF48610,0x19060},
-    {0,0,0,0,0x1BDD0},
-    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330},
-    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10},
-    {0,0,0,0,0x1B420}, {0,0,0,0,0x19DA0},
-    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110},
-    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770},
-    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140},
-    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450},
+    {0,0,0,0,0x2460}, {0,0,0,0,0x1CCD0},
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B660},
+    {0,0,0,0,0x3100}, {0,0,0,0,0x3FA0}, {0,0,0,0,0x170A0},
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x171F0},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17820},
+    {0,0,0,0,0x17E50},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18230},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x18890},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x18F30},
+    {0,0,0,0,0x1BCA0},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19200},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1ACE0},
+    {0,0,0,0,0x1B2F0}, {0,0,0,0,0x19C70},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x19FE0},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A640},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C010},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C320},
 };
 static const int kMxExpectedCount = (int)(sizeof(kMxExpected) / sizeof(kMxExpected[0]));
 
@@ -63,7 +63,7 @@ static void mx_table_is_unchanged() {
     for (int i = 0; i < kMxExpectedCount; ++i)
         CHECK(same(mxb::kReloadSteps[i], kMxExpected[i]), "MX step %d differs", i);
 
-    CHECK(mxb::RVA_RELOAD_STR == 0x3333EB, "MX reload_str moved");
+    CHECK(mxb::RVA_RELOAD_STR == 0x33342B, "MX reload_str moved");
     CHECK(mxb::RVA_RELOAD_MODS == 0xE54B44, "MX reload_mods moved");
 }
 
@@ -443,7 +443,7 @@ static void world_session_constants_agree() {
     CHECK(mxb::RVA_WORLD_STATE  == 0x3D7900, "world state moved");
     CHECK(mxb::RVA_WORLD_REASON == 0x3D7E6C, "world reason moved");
     CHECK(mxb::RVA_WORLD_PORT   == 0x3D78F0, "world port moved");
-    CHECK(mxb::CMD_WORLD_CLOSE  == 0x386,    "the teardown bus command moved");
+    CHECK(mxb::CMD_WORLD_CLOSE  == 0x387,    "the teardown bus command moved");
 
     // The three live in the same block the teardown zeroes — except the port, which is the
     // whole reason the reset has to clear it separately.

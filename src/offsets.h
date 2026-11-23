@@ -47,19 +47,19 @@ namespace mxb {
 //   WARNING: it also re-inits Steam/input/sound and transitions to the UI, so
 //   calling it wholesale mid-game is heavy (a soft restart to the menu). Used as
 //   the reload target for now; the surgical per-category loaders are safer (TODO).
-constexpr uintptr_t RVA_CONTENT_INIT  = 0xef210;   // fcn.1400ef210
+constexpr uintptr_t RVA_CONTENT_INIT  = 0xef130;   // fcn.1400ef210
 
 // fcn.140158be0 : generic VFS directory walker (out_status, dir, ext, out_buf).
 //   Reads the filesystem live (findfirst + fopen each .pkz). We hook it only to
 //   observe the boot scans ([capture]); it is NOT a reload target.
-constexpr uintptr_t RVA_SCAN_FOLDER   = 0x158be0;
+constexpr uintptr_t RVA_SCAN_FOLDER   = 0x158570;
 
 // Reference-only RVAs kept for the opt-in --probe-mount diagnostic (see frostmod.cpp).
 // These were part of the abandoned "mount the new .pkz" reload approach; the probe
 // still uses them to observe how the game opens archives. NOT used by the reload.
-constexpr uintptr_t RVA_REGISTRY_RESET = 0x159340;  // fcn.140159340 (restrict registry)
-constexpr uintptr_t RVA_MOUNT_ONE_PKZ  = 0x15a9e0;  // fcn.14015a9e0 (6-arg .pkz iterator)
-constexpr uintptr_t RVA_VFS_LOOKUP     = 0x157920;  // fcn.140157920
+constexpr uintptr_t RVA_REGISTRY_RESET = 0x158CD0;  // fcn.140159340 (restrict registry)
+constexpr uintptr_t RVA_MOUNT_ONE_PKZ  = 0x15a370;  // fcn.14015a9e0 (6-arg .pkz iterator)
+constexpr uintptr_t RVA_VFS_LOOKUP     = 0x1572B0;  // fcn.140157920
 constexpr uintptr_t RVA_REG_BASE       = 0x396760;  // RegEntry* (0x20c each)
 constexpr uintptr_t RVA_REG_COUNT      = 0x396754;  // int32 count
 
@@ -90,7 +90,7 @@ constexpr int TRK_RESOLVER_NAME = 0x33C;
 // the name config (folder + entry+0x33C) and call 0xBB510 - setting the index alone
 // won't survive. HEAVY (disk I/O + heap + UI) -> game thread only, from menu context.
 constexpr uintptr_t RVA_TRK_LOAD_ENTER  = 0xBB510; // fcn.1400BB510: load track + enter session
-constexpr uintptr_t RVA_TRK_DATA_LOADER = 0x5A20;  // fcn.140005A20(ecx=index): data loader it calls
+constexpr uintptr_t RVA_TRK_DATA_LOADER = 0x58F0;  // fcn.140005A20(ecx=index): data loader it calls
 constexpr uintptr_t RVA_TRK_SEL_INDEX   = 0x4CA3D4;// int32 selected index (re-derived from name cfg)
 constexpr uintptr_t RVA_TRK_SESSION_CFG = 0xE4B540;// name cfg: +0x00 folder, +0x20 2nd name
 
@@ -111,7 +111,7 @@ constexpr int       BIKE_CFGNAME    = 0x4C0;     // string in bikes\<name>\<name
 //   the descriptor (rdx), builds "%sbikes\%s\%s.cfg", loads the machine. Mirrors the
 //   track loader's re-derive-by-name shape, but selection travels through the passed
 //   descriptor (no fixed session-cfg global like tracks' 0xE4B540). Callers 0xE5632/0xE57A0.
-constexpr uintptr_t RVA_BIKE_APPLY  = 0xE4550;
+constexpr uintptr_t RVA_BIKE_APPLY  = 0xE4560;
 // AOB for the apply prologue (offset-drift resilience; the E8 rel32 is wildcarded):
 //   40 53 56 57 41 57 B8 C8 20 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B 05
 constexpr char SIG_BIKE_APPLY[] =
@@ -146,10 +146,10 @@ constexpr char SIG_SCAN_FOLDER_MASK[] = "xxxxxxxxxxxxxxxxxxxx";
 //     (filled on JOIN, msg 0x385 -> RVA_SB_CONNECT_TARGET; flag = password/lock bit)
 
 // ---- transport (UDP, ws2_32) ----
-constexpr uintptr_t RVA_NET_RECVFROM_W   = 0x284B10; // recvfrom wrapper(sock rcx, buf rdx, len r8)
-constexpr uintptr_t RVA_NET_SENDTO_W     = 0x284BD0; // sendto wrapper
-constexpr uintptr_t RVA_NET_RESOLVE_HOST = 0x2854E0; // host:port -> getaddrinfo
-constexpr uintptr_t RVA_NET_DISPATCH     = 0x284450; // recv + per-peer dispatch
+constexpr uintptr_t RVA_NET_RECVFROM_W   = 0x284D30; // recvfrom wrapper(sock rcx, buf rdx, len r8)
+constexpr uintptr_t RVA_NET_SENDTO_W     = 0x284DF0; // sendto wrapper
+constexpr uintptr_t RVA_NET_RESOLVE_HOST = 0x285700; // host:port -> getaddrinfo
+constexpr uintptr_t RVA_NET_DISPATCH     = 0x284670; // recv + per-peer dispatch
 constexpr uintptr_t RVA_NET_PEER_BASE    = 0x3993B0; // peer/conn table base (stride 0x5B4)
 constexpr uintptr_t RVA_NET_PEER_COUNT   = 0x3993AC; // peer count (cap 10)
 
@@ -158,16 +158,16 @@ constexpr uintptr_t RVA_NET_PEER_COUNT   = 0x3993AC; // peer count (cap 10)
 // as TEXT into the blob at 0x9E3AE0. Hooking 0x2A10E0 (clean prologue + AOB) and
 // editing that blob before the browser parses it lets us drop spam servers with
 // no code cave. Blob is records via read_str (NUL/\n) + read_u32.
-constexpr uintptr_t RVA_MP_MSG_HANDLER   = 0x2A10E0; // client opcode handler; HOSTED = server-list reply
-constexpr uintptr_t RVA_MP_REFRESH_DRV   = 0x2A6890; // sends GETLIST to masters, 3000ms refresh timer
-constexpr uintptr_t RVA_MP_ENDPOINT_ADD  = 0x2A8330; // append MASTER endpoint (not game servers), cap 10
+constexpr uintptr_t RVA_MP_MSG_HANDLER   = 0x2A1320; // client opcode handler; HOSTED = server-list reply
+constexpr uintptr_t RVA_MP_REFRESH_DRV   = 0x2A6AD0; // sends GETLIST to masters, 3000ms refresh timer
+constexpr uintptr_t RVA_MP_ENDPOINT_ADD  = 0x2A8570; // append MASTER endpoint (not game servers), cap 10
 constexpr uintptr_t RVA_MP_ENDPOINT_BASE = 0x597560; // master endpoint array (stride 0x28, cap 10)
 constexpr uintptr_t RVA_MP_ENDPOINT_CNT  = 0x3D8014; // master endpoint count
 constexpr uintptr_t RVA_MP_LIST_BLOB     = 0x9E3AE0; // HOSTED payload text buffer (written by 0x2A10E0)
 constexpr uintptr_t RVA_MP_STATE         = 0x9D7AA4; // 0 idle /1 requesting /2 connected /3 list-complete
-constexpr uintptr_t RVA_MP_READ_INIT     = 0x2835A0; // reader: init
-constexpr uintptr_t RVA_MP_READ_U32      = 0x283490; // reader: read_u32
-constexpr uintptr_t RVA_MP_READ_STR      = 0x283800; // reader: read_str (inline NUL/\n-terminated)
+constexpr uintptr_t RVA_MP_READ_INIT     = 0x2837C0; // reader: init
+constexpr uintptr_t RVA_MP_READ_U32      = 0x2836B0; // reader: read_u32
+constexpr uintptr_t RVA_MP_READ_STR      = 0x283A20; // reader: read_str (inline NUL/\n-terminated)
 
 // ---- world session: the browser's own master login (RE'd 2026-09-16) ---------
 // What actually prints "connection timeout". One global state machine drives the in-game
@@ -196,7 +196,7 @@ constexpr uintptr_t RVA_WORLD_REASON = 0x3D7E6C; // 0 = nothing came back, 1 = t
 // a dword by the setter at 0x2A66E0). It lives OUTSIDE the 0x5D8 block 0x386 zeroes, so a
 // teardown alone rebinds the same port; 0 reaches bind() unchecked and means "any".
 constexpr uintptr_t RVA_WORLD_PORT   = 0x3D78F0;
-constexpr int       CMD_WORLD_CLOSE  = 0x386;    // bus cmd: LOGOUT, close, free, zero
+constexpr int       CMD_WORLD_CLOSE  = 0x387;    // bus cmd: LOGOUT, close, free, zero
 constexpr int       WORLD_STATE_MAX  = 4;        // a read above this means the offset is wrong
 
 // ---- server browser UI state (.data) ----
@@ -237,8 +237,8 @@ constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // connect OUTPUT/state (s
 // 0x140E53DE0, step over, dump 16B @ 0xE53DE0 (now the packed addr). That settles the
 // input format. Until then direct connect is PREVIEW-only (parses + logs, no dispatch).
 constexpr uintptr_t RVA_CMD_BUS_PTR   = 0x566C48; // [0x140566C48] engine command-bus fn-ptr
-constexpr int       CMD_JOIN          = 0x389;    // bus cmd id that initiates the connect
-constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0FE7;  // the `call [bus]` inside the JOIN handler
+constexpr int       CMD_JOIN          = 0x38A;    // bus cmd id that initiates the connect
+constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0F07;  // the `call [bus]` inside the JOIN handler
 constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is omitted
 
 // ---- the GHS handle pool: a crash we can actually stop (beta21e, 2026-09-16) ----
@@ -285,7 +285,7 @@ constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is 
 // (LEA_DISP_OFF/LEA_END_OFF below), so the guard can only ever point at the pool this
 // function really uses. RVA_GHS_TABLE is kept for the disassembler, and to check the
 // decode landed where beta21e has it.
-constexpr uintptr_t RVA_GHS_CLOSE      = 0x11D730;   // close(handle): the faulting fn
+constexpr uintptr_t RVA_GHS_CLOSE      = 0x11D6B0;   // close(handle): the faulting fn
 constexpr uintptr_t RVA_GHS_TABLE      = 0xE4B380;   // the ten slots (beta21e)
 constexpr int       GHS_SLOTS          = 10;         // `cmp ecx,9` after the 1-based dec
 constexpr size_t    GHS_LEA_DISP_OFF   = 0x1B;       // disp32 of the `lea` into the fn
@@ -318,8 +318,8 @@ constexpr char SIG_GHS_CLOSE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxx????";
 // loader has one caller and the saver has one, both reachable only from track load, session
 // teardown and the trainer UI. Neither writes a checksum and neither has a length that depends
 // on the bytes we touch, so a record can be corrected in flight.
-constexpr uintptr_t RVA_GHS_LOAD = 0x11DAB0;  // int(pool, path, tag, ver, dest, size) -> 0 ok
-constexpr uintptr_t RVA_GHS_SAVE = 0x11DE10;  // int(pool, path, tag, ver, buf,  size)
+constexpr uintptr_t RVA_GHS_LOAD = 0x11DA30;  // int(pool, path, tag, ver, dest, size) -> 0 ok
+constexpr uintptr_t RVA_GHS_SAVE = 0x11DD90;  // int(pool, path, tag, ver, buf,  size)
 // 16 bytes, stopping one short of the security cookie's RIP-relative displacement so nothing
 // in the signature moves between builds. `40 55 57 41 54 41 55 41 56` is the three-push
 // prologue the detour replaces.
@@ -376,8 +376,8 @@ constexpr char SIG_GHS_SAVE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // arg3 is the out-pointer: the prologue homes r8 to [rsp+0x18] and the success path writes
 // [rax], [rax+4], [rax+8] through it. arg5 is read at [rsp+0x170], which is entry [rsp+0x28]
 // once the `push rbx` and `sub rsp,0x140` are accounted for.
-constexpr uintptr_t RVA_TERRAIN_SAMPLE = 0x1F1720;  // the bilinear height sample
-constexpr uintptr_t RVA_TERRAIN_FAULT  = 0x1F1923;  // the corner read that faults, for the log
+constexpr uintptr_t RVA_TERRAIN_SAMPLE = 0x1F1960;  // the bilinear height sample
+constexpr uintptr_t RVA_TERRAIN_FAULT  = 0x1F1B63;  // the corner read that faults, for the log
 constexpr size_t    OFF_TERRAIN_GRID   = 0x750;     // qword: the 16-bit height grid, or null
 constexpr size_t    OFF_TERRAIN_WIDTH  = 0x740;     // dword
 constexpr size_t    OFF_TERRAIN_HEIGHT = 0x744;     // dword
@@ -394,8 +394,8 @@ constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // of 0x1F1720. A NaN faults at 0x1F1EFC (a player's dump, 2026-09-27). 0x1F5AC0 calls it
 // first and bails on 1, so guarding this covers that caller's own grid read too.
 // Map: game/terrain.c.
-constexpr uintptr_t RVA_TERRAIN_SAMPLE2 = 0x1F1D10;
-constexpr uintptr_t RVA_TERRAIN_FAULT2  = 0x1F1EFC;
+constexpr uintptr_t RVA_TERRAIN_SAMPLE2 = 0x1F1F50;
+constexpr uintptr_t RVA_TERRAIN_FAULT2  = 0x1F213C;
 // 38 fixed bytes, no RIP-relative operand. Unique in beta21e's .text.
 constexpr char SIG_TERRAIN_SAMPLE2[] =
     "\x4C\x89\x44\x24\x18\x41\x57\x48\x81\xEC\xC0\x00\x00\x00\x48\x83\xB9\x50\x07"
@@ -470,19 +470,19 @@ inline bool LooksDetoured(const uint8_t* p) {
 // -> jmp 0x0ACE68 at 0x0AB9D3. We mirror it by hooking the LOOP TOP (0x0AB960) and
 // jmp'ing to 0x0ACE68 for spam rows, so the cells are never written = the row never
 // appears. (Hooking 0x0ABAB6/hide-empty was too LATE - the row was already committed.)
-constexpr uintptr_t RVA_SB_LAN_CMD        = 0x0AB530; // clear+build+populate (LAN)
-constexpr uintptr_t RVA_SB_WORLD_CMD      = 0x0AA260; // string dispatch (world)
-constexpr uintptr_t RVA_SB_POPULATE_LOOP  = 0x0AB960; // per-server loop TOP - our hook site
-constexpr uintptr_t RVA_SB_ROW_CREATE     = 0x0ABA03; // first setCellText (row is committed here)
-constexpr uintptr_t RVA_SB_ROW_SKIP_TGT   = 0x0ACE68; // jump here to SKIP a row (row never created)
-constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABAB6; // game's hide-empty cmp (AFTER row create; unused now)
-constexpr uintptr_t RVA_SB_BUILD_CLEAR    = 0x0AB59C; // ListBegin + zero counts + ListClear
+constexpr uintptr_t RVA_SB_LAN_CMD        = 0x0AB4F0; // clear+build+populate (LAN)
+constexpr uintptr_t RVA_SB_WORLD_CMD      = 0x0AA220; // string dispatch (world)
+constexpr uintptr_t RVA_SB_POPULATE_LOOP  = 0x0AB920; // per-server loop TOP - our hook site
+constexpr uintptr_t RVA_SB_ROW_CREATE     = 0x0AB9C3; // first setCellText (row is committed here)
+constexpr uintptr_t RVA_SB_ROW_SKIP_TGT   = 0x0ACE28; // jump here to SKIP a row (row never created)
+constexpr uintptr_t RVA_SB_HIDE_EMPTY_BR  = 0x0ABA76; // game's hide-empty cmp (AFTER row create; unused now)
+constexpr uintptr_t RVA_SB_BUILD_CLEAR    = 0x0AB55C; // ListBegin + zero counts + ListClear
 
 // bytes at the loop top 0x0AB960: cmp byte [rip+disp32], r12b. We verify the 3-byte
 // opcode+modrm (44 38 25); the disp32 that follows is RIP-relative and build-specific,
 // so it is intentionally NOT part of the check.
 constexpr unsigned char SB_POPULATE_LOOP_BYTES[] = {0x44, 0x38, 0x25};
-constexpr uintptr_t RVA_SB_REFRESHLIST    = 0x0AB6A8; // ID_REFRESHLIST branch (LAN)
+constexpr uintptr_t RVA_SB_REFRESHLIST    = 0x0AB668; // ID_REFRESHLIST branch (LAN)
 
 // SB_Entry (working copy) field offsets. Confirmed from the populate loop disasm
 // AND the runtime read-only dump ([srv.hex]):
@@ -565,30 +565,30 @@ constexpr char SIG_MP_MSG_HANDLER_MASK[] = "xxxxxxxxxxxxxx????xxxxxxxxxxx";
 // the bike chooser (0x91570) keeps its filtered view INSIDE the state array (+4 slots,
 // filled by 0x8EF20) with its own count 0x4C2F18; see RVA_BIKE_CHOOSER_N.
 constexpr RLStep kReloadSteps[] = {
-    {0,0,0,0,0x2460,"tracks"}, {0,0,0,0,0x1CE00,"tyres"},
-    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B790,"rider cfgs"},
-    {0,0,0,0,0x3100,"bikes"}, {0,0,0,0,0x3FA0,"series"}, {0,0,0,0,0x171D0,"paints data.ini"},
-    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x17320,"bike paints"},
-    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17950,"fonts"},
-    {0,0,0,0,0x17F80,"helmets"},
-    {1,0xF48620,0xF3DB64,0x109E090,0x18360,"helmet paints"},
-    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x189C0,"goggles"},
-    {1,0xF4EE00,0x109DE90,0xF48610,0x19060,"helmet cams"},
-    {0,0,0,0,0x1BDD0,"rider models"},
-    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19330,"suits"},
-    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1AE10,"rider fonts"},
-    {0,0,0,0,0x1B420,"animations"}, {0,0,0,0,0x19DA0,"boots"},
-    {1,0xF48660,0xF4EDE0,0xF432A0,0x1A110,"boot paints"},
-    {1,0xF3DC58,0xF432B4,0xF48208,0x1A770,"gloves"},
-    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C140,"protections"},
-    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C450,"protection paints"},
+    {0,0,0,0,0x2460,"tracks"}, {0,0,0,0,0x1CCD0,"tyres"},
+    {1,0xF3DC80,0x109DEC4,0xF3DC48,0x1B660,"rider cfgs"},
+    {0,0,0,0,0x3100,"bikes"}, {0,0,0,0,0x3FA0,"series"}, {0,0,0,0,0x170A0,"paints data.ini"},
+    {1,0x109DE88,0xF3DC40,0xF4EDF8,0x171F0,"bike paints"},
+    {1,0xF3DB9C,0xF3DC9C,0xF4EDA0,0x17820,"fonts"},
+    {0,0,0,0,0x17E50,"helmets"},
+    {1,0xF48620,0xF3DB64,0x109E090,0x18230,"helmet paints"},
+    {1,0x10A30F4,0xF4EDDC,0xF3DC28,0x18890,"goggles"},
+    {1,0xF4EE00,0x109DE90,0xF48610,0x18F30,"helmet cams"},
+    {0,0,0,0,0x1BCA0,"rider models"},
+    {1,0xF3DB50,0x109DEA8,0xF3DC90,0x19200,"suits"},
+    {1,0x109DEA4,0xF3DC8C,0xF48658,0x1ACE0,"rider fonts"},
+    {0,0,0,0,0x1B2F0,"animations"}, {0,0,0,0,0x19C70,"boots"},
+    {1,0xF48660,0xF4EDE0,0xF432A0,0x19FE0,"boot paints"},
+    {1,0xF3DC58,0xF432B4,0xF48208,0x1A640,"gloves"},
+    {1,0x106BB28,0x109DEB0,0xF432A8,0x1C010,"protections"},
+    {1,0xF432C0,0xF48608,0xF4EDD0,0x1C320,"protection paints"},
 };
 constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadSteps[0]));
 
 // The two operands the DIR steps pass. `RELOAD_STR` is the empty string the game hands
 // its loaders for "the game dir" (cwd); `RELOAD_MODS` is the mods-folder path global,
 // scanned only when non-empty — exactly the `cmp byte ptr [mods], 0 / je` the game does.
-constexpr uintptr_t RVA_RELOAD_STR  = 0x3333EB;
+constexpr uintptr_t RVA_RELOAD_STR  = 0x33342B;
 constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 
 // ---- live paints (add-only) -------------------------------------------------
@@ -598,21 +598,21 @@ constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 // paint that arrives after the bike was built stays stock until something re-applies it.
 // That is what RefreshPaints does, after the paints row (0x17320) of the reload has run.
 // Removing a paint is NOT covered: paint_apply with "" is a no-op, not a revert.
-constexpr uintptr_t RVA_PAINTS_LOADER = 0x17320;   // the DIR row in kReloadSteps
+constexpr uintptr_t RVA_PAINTS_LOADER = 0x171F0;   // the DIR row in kReloadSteps
 // Every paint list's loader - bike, suit, gloves, boots, helmet, goggles - each a DIR row of
 // kReloadSteps. A paint-only refresh replays just these rows (RequestPaintRefresh).
-constexpr uintptr_t kPaintReloadRvas[] = {0x17320, 0x19330, 0x1A770, 0x1A110, 0x18360, 0x189C0};
+constexpr uintptr_t kPaintReloadRvas[] = {0x171F0, 0x19200, 0x1A640, 0x19FE0, 0x18230, 0x18890};
 // Rider gear: helmets (+ paints, goggles), helmet cams, rider models (+ suits, gloves),
 // boots (+ paints), protections (+ paints), and the bike paints (same pass). Model lists
 // are SC rows that come before the paint rows indexing into them in the table.
-constexpr uintptr_t kGearReloadRvas[] = {0x17F80, 0x18360, 0x189C0, 0x19060, 0x1BDD0, 0x19330,
-                                         0x19DA0, 0x1A110, 0x1A770, 0x1C140, 0x1C450, 0x17320};
+constexpr uintptr_t kGearReloadRvas[] = {0x17E50, 0x18230, 0x18890, 0x18F30, 0x1BCA0, 0x19200,
+                                         0x19C70, 0x19FE0, 0x1A640, 0x1C010, 0x1C320, 0x171F0};
 // Tracks only: nothing else in the table reads the track list (STEP MAP above).
 constexpr uintptr_t kTrackReloadRvas[] = {0x2460};
 // Bikes and what is derived from them: the bike list, the series (one per bike category),
 // and the bike paints, whose entries hold bike indexes the re-sorted list invalidates.
 // Tyres stay: series reads them, but a bikes refresh leaves them as they are.
-constexpr uintptr_t kBikeReloadRvas[] = {0x3100, 0x3FA0, 0x17320};
+constexpr uintptr_t kBikeReloadRvas[] = {0x3100, 0x3FA0, 0x171F0};
 constexpr uintptr_t RVA_BIKES_LOADER = 0x3100;
 // Per-bike state, 8 bytes per bike: +0 u8 "available" (memset 0 then set 1 by the caching
 // pass, 0x634BB / 0x63C5B; cleared on a failed load, 0x69EEF), +4 i32 slot (= own index
@@ -624,14 +624,14 @@ constexpr int       BIKE_STATE_STRIDE = 8;
 // [0, this) of the state slots as bike indexes and _stricmps each bike's name - the
 // 0x9259F crash. Only 0x8EF20 rebuilds it (from 0x91706 / 0x9232E); 0 is an empty chooser.
 constexpr uintptr_t RVA_BIKE_CHOOSER_N = 0x4C2F18;
-constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DC50;   // (int bike_idx, char* name, int* handle)
+constexpr uintptr_t RVA_PAINT_APPLY   = 0x4DB40;   // (int bike_idx, char* name, int* handle)
 // Per-rider visual bike model sync (beta21e). These builders take a rider-gfx block at
 // vehicle+0x274. 0x4D8C0's callers are 0x5D930 (vehicle create), 0x5F386 (rider re-load
 // 0x5E570), and 0x6F1CC; the last passes some other block and must pass through unchanged.
-constexpr uintptr_t RVA_BIKE_BUILD = 0x4D8C0; // (void* gfxBlock, int bikeIdx, ...), 19 args
-constexpr uintptr_t RVA_BIKE_BUILD_DEFERRED = 0x45020; // (void* block, int bikeIdx, ...), 21 args
-constexpr uintptr_t RVA_BIKE_PAINT_LOOKUP = 0x455C0; // stand clone: (block, bikeIdx, paint, out)
-constexpr uintptr_t RVA_BIKE_GFX_LOAD = 0x48170; // int(bikeIdx, mode), skipped if entry+0x5D0 != 0
+constexpr uintptr_t RVA_BIKE_BUILD = 0x4D7B0; // (void* gfxBlock, int bikeIdx, ...), 19 args
+constexpr uintptr_t RVA_BIKE_BUILD_DEFERRED = 0x44F10; // (void* block, int bikeIdx, ...), 21 args
+constexpr uintptr_t RVA_BIKE_PAINT_LOOKUP = 0x454B0; // stand clone: (block, bikeIdx, paint, out)
+constexpr uintptr_t RVA_BIKE_GFX_LOAD = 0x48060; // int(bikeIdx, mode), skipped if entry+0x5D0 != 0
 constexpr int       BIKE_GFX_STATE = 0x5D0; // int in bike entry: 0 = gfx not loaded
 constexpr uintptr_t RVA_PAINT_TABLE   = 0xF4EDF8;  // qword: pointer to the paints table
 constexpr uintptr_t RVA_PAINT_COUNT   = 0x109DE88; // int32 paints count
@@ -644,8 +644,8 @@ constexpr int       VEHICLE_MAX       = 50;
 constexpr int       VEHICLE_STRIDE    = 0x5B24;    // +0x00 live
 // Vehicle-record fields session end's per-vehicle teardown (0x71D50) touches; the bike-change
 // cleanup runs that teardown on the old own-vehicle record. Map: game/rider_gfx.c.
-constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4E0D0;   // int(void* rec+0x274): every gfx object
-constexpr uintptr_t RVA_VEHICLE_SUBFREE  = 0x4FE70;   // void(void* rec+0x4EEC)
+constexpr uintptr_t RVA_VEHICLE_GFX_FREE = 0x4DFC0;   // int(void* rec+0x274): every gfx object
+constexpr uintptr_t RVA_VEHICLE_SUBFREE  = 0x4FD60;   // void(void* rec+0x4EEC)
 constexpr uintptr_t RVA_BIKE_PAINTS_ARG  = 0x109DE94; // the int bus 0xCF takes first
 constexpr uintptr_t RVA_LOAD_REQUESTS    = 0xE5A6A0;  // 100 x 0x40: +0 live, +4 conn id, +0x30 vehicle+1
 constexpr int       LOAD_REQUEST_MAX     = 100;
@@ -661,7 +661,7 @@ constexpr int       VEH_HANDLE        = 0x5B0C;    // int handle: the cloned "st
 // with the same .pnt path (bus 0x9E at 0x4CEE1, 0x4CF55 x2, 0x4CF7A/0x4CF86/0x4CF97).
 constexpr int       VEH_GFX           = 0x274;
 // Rider/bike gfx builder: 21 args; rider model a6, helmet a7, boots a13.
-constexpr uintptr_t RVA_RIDER_GFX_BUILD = 0x4CE00;
+constexpr uintptr_t RVA_RIDER_GFX_BUILD = 0x4CCF0;
 constexpr int       VEH_GFX_PAINTED[] = { 0x00, 0x10, 0x14, 0x50, 0x60, 0x70 };
 
 // Rider gear. The same builder (0x4CE00) paints three more objects of the rider-gfx block,
@@ -699,10 +699,10 @@ constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char
 // ---- rider rebuild (EXPERIMENTAL) --------------------------------------------
 // Tear one remote rider down the way session end does (0x71D50, per vehicle) and build
 // them again with vehicle create, so models and paints are all looked up afresh.
-constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CAE0;  // int(int conn_id, int flag)
-constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E570;  // int(int conn_id): the CHANGEINFO rebuild
+constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CA30;  // int(int conn_id, int flag)
+constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E520;  // int(int conn_id): the CHANGEINFO rebuild
 // Rider parts of the rider-gfx block, as the game's teardown 0x44950 drops them.
-constexpr uintptr_t RVA_ATTACH_DROP  = 0x37C60;   // void(int a, int b): drop attachment (a, b)
+constexpr uintptr_t RVA_ATTACH_DROP  = 0x37B50;   // void(int a, int b): drop attachment (a, b)
 constexpr int GFX_BUILT              = 0x1D0;     // rider objects built -> builder only repaints
 constexpr int GFX_RIDER_ATTACH_A     = 0x374;     // attachments of the rider body (+0x1D4)
 constexpr int GFX_RIDER_ATTACH_B     = 0x378;
@@ -717,7 +717,7 @@ constexpr uintptr_t RVA_NOTICE_WRAP  = 0xE627D8;   // next slot once the ring is
 constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
 
 // ---- mid-session change (F8 -> 0) - map: net/change.c ---------------------------------------
-constexpr uint32_t  CMD_CHANGE_REQUEST = 0x365;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
+constexpr uint32_t  CMD_CHANGE_REQUEST = 0x366;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
 constexpr uintptr_t RVA_NET_EVENT_PTR  = 0x9CB8B0; // client net-event callback (0x120890)
 constexpr int       NET_EVENT_CHANGEANSWER = 4;    // raised by CHANGEANSWER with the rej code
 constexpr uintptr_t RVA_IDENTITY_LEN   = 0x598D74; // i32: the identity the server last accepted
@@ -738,7 +738,7 @@ constexpr int       PAGE_STACK_STRIDE  = 0x254;
 constexpr int       PAGE_STACK_MAX     = 4;
 constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
 constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
-constexpr uintptr_t RVA_RIDER_LINK     = 0x62A10;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})
+constexpr uintptr_t RVA_RIDER_LINK     = 0x629A0;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})
 constexpr uintptr_t RVA_RACE_ENTRY_COUNT = 0x5121D8;
 constexpr uintptr_t RVA_RACE_ENTRY_KEY   = 0x5122A4; // first entry's race number; slot at +0xC
 constexpr int       RACE_ENTRY_STRIDE    = 0x178;

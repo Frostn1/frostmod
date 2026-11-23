@@ -50,7 +50,7 @@ int main() {
 
     // And it lands on the shared 0.3 constant. This is the number that must NOT be
     // overwritten in place - 37 unrelated sites read the same eight bytes.
-    CHECK(kRvaOrigConst == 0x353D90, "original target RVA 0x%llx", (unsigned long long)kRvaOrigConst);
+    CHECK(kRvaOrigConst == 0x353DD0, "original target RVA 0x%llx", (unsigned long long)kRvaOrigConst);
 
     // --- CurrentTarget decodes what the bytes say ------------------------------------
     CHECK(CurrentTarget(kBase + kRvaSite, kSiteBytes) == kBase + kRvaOrigConst,

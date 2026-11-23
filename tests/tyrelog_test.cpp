@@ -103,29 +103,29 @@ static void checks() {
         CHECK(same == 1, "check %X listed once", c.rva);
     }
     const Check* k;
-    k = find(0x1A5A41); CHECK(k && disp32(*k, 3) == kWheelStride, "wheel stride");
-    k = find(0x1A5BE3); CHECK(k && disp32(*k, 5) == kWheelSpin, "spin offset");
-    k = find(0x1A5C47); CHECK(k && disp32(*k, 5) == kWheelRadius, "radius offset");
-    // lea rdi, [w+0x12214] is the sample's y; x is 4 before it.
-    k = find(0x1A5BFB); CHECK(k && disp32(*k, 4) == kWheelSample0 + 4, "sample 0 offset");
-    k = find(0x1A6117); CHECK(k && disp32(*k, 5) == kWheelGap, "gap offset");
-    k = find(0x1A6123); CHECK(k && disp32(*k, 3) == kWheelHit, "hit offset");
-    k = find(0x1AFC70); CHECK(k && disp32(*k, 3) == kBikeChassis, "chassis body offset");
-    k = find(0x2AC8B0); CHECK(k && disp32(*k, 3) == kBodyPos, "body pos");
-    k = find(0x2AC8E0); CHECK(k && disp32(*k, 3) == kBodyLvel, "body lvel");
-    k = find(0x2AC8F0); CHECK(k && disp32(*k, 3) == kBodyAvel, "body avel");
-    k = find(0x1AEB24); CHECK(k && (uint8_t)k->bytes[5] == kBikeTime, "bike time");
-    k = find(0x1ADA4B); CHECK(k && (uint8_t)k->bytes[2] == kBikeActive, "bike active");
+    k = find(0x1A5AE1); CHECK(k && disp32(*k, 3) == kWheelStride, "wheel stride");
+    k = find(0x1A5C83); CHECK(k && disp32(*k, 5) == kWheelSpin, "spin offset");
+    k = find(0x1A5CE7); CHECK(k && disp32(*k, 5) == kWheelRadius, "radius offset");
+    // lea rdi, [w+0x12D4C] is the sample's y; x is 4 before it.
+    k = find(0x1A5C9B); CHECK(k && disp32(*k, 4) == kWheelSample0 + 4, "sample 0 offset");
+    k = find(0x1A61B7); CHECK(k && disp32(*k, 5) == kWheelGap, "gap offset");
+    k = find(0x1A61C3); CHECK(k && disp32(*k, 3) == kWheelHit, "hit offset");
+    k = find(0x1AFD20); CHECK(k && disp32(*k, 3) == kBikeChassis, "chassis body offset");
+    k = find(0x2ACAE0); CHECK(k && disp32(*k, 3) == kBodyPos, "body pos");
+    k = find(0x2ACB10); CHECK(k && disp32(*k, 3) == kBodyLvel, "body lvel");
+    k = find(0x2ACB20); CHECK(k && disp32(*k, 3) == kBodyAvel, "body avel");
+    k = find(0x1AEBD4); CHECK(k && (uint8_t)k->bytes[5] == kBikeTime, "bike time");
+    k = find(0x1ADAEB); CHECK(k && (uint8_t)k->bytes[2] == kBikeActive, "bike active");
     k = find(0x1BE3DC); CHECK(k && disp32(*k, 3) == kWorldStride, "world stride");
     k = find(0x1BE657); CHECK(k && (uint8_t)k->bytes[3] == kWorldBikeList, "bike list");
     k = find(0x1BF0DD); CHECK(k && (uint8_t)k->bytes[3] == kWorldBikeList, "bikes created in that list");
     k = find(0x1BF1BC); CHECK(k && (uint8_t)k->bytes[9] == kWorldBikeList, "handles resolve into it");
     k = find(0x1BF13C); CHECK(k && (uint8_t)k->bytes[1] == 0x07 && kBikeHandle == 0, "handle at +0");
-    k = find(0x21F6E); CHECK(k && (uint8_t)k->bytes[2] == kVehicleBikeHandle, "vehicle +4");
+    k = find(0x21E5E); CHECK(k && (uint8_t)k->bytes[2] == kVehicleBikeHandle, "vehicle +4");
     // The vehicle records are the ones FrostMod already indexes by RVA_OWN_VEHICLE.
-    k = find(0x21E66); CHECK(k && disp32(*k, 3) == (uint32_t)mxb::VEHICLE_STRIDE, "vehicle stride");
-    k = find(0x21E75);
-    CHECK(k && 0x21E75 + 7 + (int32_t)disp32(*k, 3) == mxb::RVA_VEHICLES, "vehicle records RVA");
+    k = find(0x21D56); CHECK(k && disp32(*k, 3) == (uint32_t)mxb::VEHICLE_STRIDE, "vehicle stride");
+    k = find(0x21D65);
+    CHECK(k && 0x21D65 + 7 + (int32_t)disp32(*k, 3) == mxb::RVA_VEHICLES, "vehicle records RVA");
     // The lea the world array comes from sits where the live code reads it: sim step + 0x2B.
     k = find(0x1BE3CB);
     CHECK(k && k->rva == mxb::RVA_SIM_STEP + kSimStepLeaAt, "world lea at sim step + 0x2B");

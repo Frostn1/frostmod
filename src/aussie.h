@@ -65,6 +65,21 @@ constexpr uintptr_t kRvaYd       = 0x167187;
 constexpr size_t    kYdLen       = 5;
 constexpr uint8_t   kYdBytes[kYdLen] = { 0xf3, 0x41, 0x0f, 0x59, 0xc2 };
 
+// ---- beta21f: the game does this itself ------------------------------------------------------
+// beta21f rebuilt this stepper (0x166470) with separate horizontal and vertical stiffness:
+//     0x166B28  mulss xmm6, [rip -> 0x353FC8]   ; 200.0: horizontal k = 200 x mass
+//     0x166B30  mulss xmm7, [rip -> 0x353E90]   ;  20.0: vertical   k =  20 x mass
+// and both dampers are computed from their own k. That is the Beta 20 spring this mode puts
+// back, so on beta21f there is nothing to patch. The three sites above are beta21e's.
+constexpr uintptr_t kRvaStock21f     = 0x166B28;
+constexpr size_t    kStock21fLen     = 16;
+constexpr uint8_t   kStock21fBytes[kStock21fLen] = {
+    0xf3, 0x0f, 0x59, 0x35, 0x98, 0xd4, 0x1e, 0x00,    // mulss xmm6, [rip + 0x1ED498]
+    0xf3, 0x0f, 0x59, 0x3d, 0x58, 0xd3, 0x1e, 0x00,    // mulss xmm7, [rip + 0x1ED358]
+};
+constexpr uintptr_t kRvaStock21fH    = 0x353FC8;   // 200.0f
+constexpr uintptr_t kRvaStock21fV    = 0x353E90;   //  20.0f
+
 // ---- the numbers -----------------------------------------------------------------------------
 constexpr float kStockK      = 20.0f;          // Beta 21: k = 20 x mass, all axes
 constexpr float kAussieK     = 200.0f;         // Beta 20: k = 200 x mass ...
@@ -96,6 +111,20 @@ inline int32_t Get32(const uint8_t* p) {
 
 inline bool Matches(const uint8_t* at, const uint8_t* want, size_t n) {
     return at && std::memcmp(at, want, n) == 0;
+}
+
+/// Whether the image at `base` already runs the Beta 20 spring (beta21f and later): the two
+/// stiffness loads, and the constants they read are 200 and 20. `base` must be readable.
+inline bool StockHasBeta20Springs(uintptr_t base) {
+    if (!base) return false;
+    const uint8_t* at = reinterpret_cast<const uint8_t*>(base + kRvaStock21f);
+    if (!Matches(at, kStock21fBytes, kStock21fLen)) return false;
+    if (base + kRvaStock21f + 8 + (uintptr_t)(intptr_t)Get32(at + 4) != base + kRvaStock21fH) return false;
+    if (base + kRvaStock21f + 16 + (uintptr_t)(intptr_t)Get32(at + 12) != base + kRvaStock21fV) return false;
+    float h = 0, v = 0;
+    std::memcpy(&h, reinterpret_cast<const void*>(base + kRvaStock21fH), 4);
+    std::memcpy(&v, reinterpret_cast<const void*>(base + kRvaStock21fV), 4);
+    return h == kAussieK && v == kStockK;
 }
 
 /// Everything that is written, worked out without touching a process: the page contents and the

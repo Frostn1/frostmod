@@ -51,7 +51,7 @@ namespace antifreeze {
 //     comisd xmm8, qword ptr [rip + disp32]
 // encoded 66 44 0f 2f 05 <disp32>: nine bytes, the displacement in the last four, and
 // rip-relative displacements count from the END of the instruction.
-constexpr uintptr_t kRvaSite     = 0x2AA8CB;          // the comisd
+constexpr uintptr_t kRvaSite     = 0x2AAB0B;          // the comisd
 constexpr size_t    kSiteLen     = 9;
 constexpr size_t    kDispOffset  = 5;                 // within the instruction
 constexpr uintptr_t kRvaNextIp   = kRvaSite + kSiteLen;
@@ -62,13 +62,13 @@ constexpr uintptr_t kRvaNextIp   = kRvaSite + kSiteLen;
 // there now. Offsets move with every build (see offsets.h) and this one is unusually
 // dangerous to get wrong, because a bad displacement here is a wild read on every frame.
 constexpr uint8_t kSiteBytes[kSiteLen] = {
-    0x66, 0x44, 0x0f, 0x2f, 0x05, 0xbc, 0x94, 0x0a, 0x00
+    0x66, 0x44, 0x0f, 0x2f, 0x05, 0xbc, 0x92, 0x0a, 0x00
 };
 
 // The displacement those bytes carry, and where it lands. Kept as a constant so a test can
 // prove our arithmetic against the real encoding rather than restating it.
-constexpr int32_t   kOrigDisp    = 0x000a94bc;
-constexpr uintptr_t kRvaOrigConst = kRvaNextIp + (uintptr_t)kOrigDisp;   // 0x353D90
+constexpr int32_t   kOrigDisp    = 0x000a92bc;
+constexpr uintptr_t kRvaOrigConst = kRvaNextIp + (uintptr_t)kOrigDisp;   // 0x353DD0 (beta21e 0x353D90)
 
 // The value compiled in, in seconds. Two snapshots further apart than this and the rider
 // stops being drawn.

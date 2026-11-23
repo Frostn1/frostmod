@@ -139,8 +139,8 @@ inline bool Admit(int32_t bike, int32_t bikeCount, bool bikeList,
 // =====================================================================================
 namespace wake {
 
-constexpr uintptr_t kRvaFn    = 0x3B8E0;
-constexpr uintptr_t kRvaFault = 0x3B940;
+constexpr uintptr_t kRvaFn    = 0x3B7D0;
+constexpr uintptr_t kRvaFault = 0x3B830;
 constexpr int       kSlots    = 400;
 constexpr size_t    kSlotBytes = 0x58;
 
@@ -148,15 +148,15 @@ constexpr size_t    kSlotBytes = 0x58;
 constexpr size_t  kHeadLen = 18;
 constexpr uint8_t kHead[kHeadLen] = {
     0x48, 0x83, 0xec, 0x58,                            // sub rsp, 0x58
-    0x48, 0x8b, 0x0d, 0xed, 0xa3, 0xe4, 0x00,          // 0x3B8E4 mov rcx, [wake list]
-    0x48, 0x8b, 0x15, 0xc6, 0x30, 0xe5, 0x00,          // 0x3B8EB mov rdx, [wake vertices]
+    0x48, 0x8b, 0x0d, 0xfd, 0xa4, 0xe4, 0x00,          // 0x3B8E4 mov rcx, [wake list]
+    0x48, 0x8b, 0x15, 0xd6, 0x31, 0xe5, 0x00,          // 0x3B8EB mov rdx, [wake vertices]
 };
 constexpr size_t kListAt = 4, kVertsAt = 11;
 // 0x3B924: mov [live count], r11d (r11d = 0), the store the guard repeats.
-constexpr uintptr_t kRvaCountStore = 0x3B924;
-constexpr uint8_t   kCountStore[7] = {0x44, 0x89, 0x1d, 0xfd, 0xf0, 0xe7, 0x00};
+constexpr uintptr_t kRvaCountStore = 0x3B814;
+constexpr uint8_t   kCountStore[7] = {0x44, 0x89, 0x1d, 0x0d, 0xf2, 0xe7, 0x00};
 // 0x3B937 .. 0x3B94A: 400 slots, and the read that faults.
-constexpr uintptr_t kRvaLoop = 0x3B937;
+constexpr uintptr_t kRvaLoop = 0x3B827;
 constexpr size_t    kLoopLen = 19;
 constexpr uint8_t   kLoop[kLoopLen] = {
     0x41, 0xb9, 0x90, 0x01, 0x00, 0x00,                // mov r9d, 400
@@ -200,11 +200,11 @@ inline bool Admit(const void* list, const void* verts) { return list && verts; }
 // =====================================================================================
 namespace listbox {
 
-constexpr uintptr_t kRvaDraw  = 0x1FEC90;
-constexpr uintptr_t kRvaSite  = 0x1FED8C;   // hooked here
-constexpr uintptr_t kRvaBack  = 0x1FEDA2;   // the instruction after the two reads
-constexpr uintptr_t kRvaSkip  = 0x1FEE30;   // inc edi: the next line, nothing drawn
-constexpr uintptr_t kRvaFault = 0x1FED9E;
+constexpr uintptr_t kRvaDraw  = 0x1FEED0;
+constexpr uintptr_t kRvaSite  = 0x1FEFCC;   // hooked here
+constexpr uintptr_t kRvaBack  = 0x1FEFE2;   // the instruction after the two reads
+constexpr uintptr_t kRvaSkip  = 0x1FF070;   // inc edi: the next line, nothing drawn
+constexpr uintptr_t kRvaFault = 0x1FEFDE;
 
 constexpr int32_t kTextUsed  = 0x4C4;
 constexpr int32_t kItemCount = 0x4C8;
@@ -212,7 +212,7 @@ constexpr int32_t kOffs      = 0x4F0;
 constexpr int32_t kLines     = 0x500;
 
 // 0x1FED74 .. 0x1FEDA2: the loop head (rows left, scroll position) and the two reads.
-constexpr uintptr_t kRvaWin = 0x1FED74;
+constexpr uintptr_t kRvaWin = 0x1FEFB4;
 constexpr size_t    kWinLen = 46;
 constexpr uint8_t   kWin[kWinLen] = {
     0x3b, 0xb3, 0xd0, 0x03, 0x00, 0x00,                // cmp esi, [rbx+0x3D0] (rows)
@@ -227,12 +227,12 @@ constexpr uint8_t   kWin[kWinLen] = {
 constexpr size_t kSiteInWin = kRvaSite - kRvaWin;      // 24
 constexpr size_t kSkipJlAt  = 18;                       // the jl to kRvaSkip
 // 0x1FEE2E .. 0x1FEE3C: the end of a drawn line (inc esi) and the skip target (inc edi ...).
-constexpr uintptr_t kRvaTail = 0x1FEE2E;
+constexpr uintptr_t kRvaTail = 0x1FF06E;
 constexpr uint8_t   kTail[14] = {0xff, 0xc6, 0xff, 0xc7, 0x48, 0x83, 0xc5, 0x04,
                                  0x3b, 0xbb, 0xf8, 0x04, 0x00, 0x00};
 // 0x1FD100 .. 0x1FD121: the add, which proves the two bounds: offs[count] = used, and the
 // arrays it writes.
-constexpr uintptr_t kRvaAdd = 0x1FD100;
+constexpr uintptr_t kRvaAdd = 0x1FD340;
 constexpr size_t    kAddLen = 33;
 constexpr uint8_t   kAdd[kAddLen] = {
     0x48, 0x63, 0x93, 0xc8, 0x04, 0x00, 0x00,          // movsxd rdx, [rbx+0x4C8] (count)
@@ -323,8 +323,9 @@ namespace ptr64 {
 
 constexpr uintptr_t kRvaSite   = 0x127109;   // hooked here
 constexpr uintptr_t kRvaBack   = 0x127113;   // the call
-constexpr uintptr_t kRvaCallee = 0x2A42F0;
-constexpr uintptr_t kRvaFault  = 0x2A42F0;
+constexpr uintptr_t kRvaCallee = 0x2A4530;
+constexpr uintptr_t kRvaFault  = 0x2A4530;
+constexpr uintptr_t kRvaCallee21e = 0x2A42F0;   // where kSite's call lands: kSite is beta21e's
 constexpr int       kJob       = 863;
 constexpr int32_t   kSlot      = 0x2D8;      // rdx's home, from the job's frame
 
@@ -340,7 +341,7 @@ constexpr size_t kCallInSite = 10;
 constexpr uint8_t kCallee[7] = {0x8b, 0x11, 0xb8, 0x08, 0x00, 0x00, 0x00};   // mov edx,[rcx]; mov eax,8
 // 0x120CC0 .. 0x120CE5: the dispatcher's prologue. rdx goes to [entry rsp + 0x10]; 8 pushes and
 // sub rsp, 0x288 later that is [rsp + 0x2D8].
-constexpr uintptr_t kRvaDispatch = 0x120CC0;
+constexpr uintptr_t kRvaDispatch = 0x120C40;
 constexpr size_t    kDispatchLen = 37;
 constexpr uint8_t   kDispatch[kDispatchLen] = {
     0x48, 0x8b, 0xc4,                                  // mov rax, rsp
@@ -351,8 +352,24 @@ constexpr uint8_t   kDispatch[kDispatchLen] = {
     0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,   // 8 pushes
     0x48, 0x81, 0xec, 0x88, 0x02, 0x00, 0x00,          // sub rsp, 0x288
 };
-// The jump table the dispatcher indexes (`mov eax, [r9 + rax*4 + 0x1280B0]`, r9 = image base).
-constexpr uintptr_t kRvaJumpTable = 0x1280B0;
+// The jump table the dispatcher indexes (`mov eax, [r9 + rax*4 + 0x128048]`, r9 = image base).
+constexpr uintptr_t kRvaJumpTable = 0x128048;
+
+// beta21f fixed this in the game. The job is now 864 (a job was inserted below it) and it loads
+// the whole pointer itself:
+//   0x127099  lea rcx, [rsp+0x2D8]
+//   0x1270A1  mov rcx, [rcx]                     ; 48 8B 09 - 64 bits
+//   0x1270A4  call 0x2A4530
+// When the table sends job 864 to exactly that, there is nothing to fix and nothing is patched.
+// kRvaSite/kSite above stay the beta21e shape, so a build that still has the bug is recognised.
+constexpr uintptr_t kRvaFixedSite = 0x127099;
+constexpr int       kFixedJob     = 864;
+constexpr size_t    kFixedLen     = 16;
+constexpr uint8_t   kFixedSite[kFixedLen] = {
+    0x48, 0x8d, 0x8c, 0x24, 0xd8, 0x02, 0x00, 0x00,    // lea rcx, [rsp+0x2D8]
+    0x48, 0x8b, 0x09,                                  // mov rcx, [rcx]   <- 64 bits
+    0xe8, 0x87, 0xd4, 0x17, 0x00,                      // call 0x2A4530
+};
 
 // The stub page.
 constexpr size_t kCountOff  = 0x40;   // uint32, calls whose pointer had a top half
@@ -419,14 +436,14 @@ inline bool StockWouldTruncate(uint64_t slot) { return (slot >> 32) != 0; }
 // =====================================================================================
 namespace riderinfo {
 
-constexpr uintptr_t kRvaFn      = 0x1B44C0;   // int job633(int id, void* out)
-constexpr uintptr_t kRvaFill    = 0x19A7A0;   // the fill a found rider gets; returns 0
-constexpr uintptr_t kRvaCase    = 0x1251B3;   // the dispatcher's case for job 0x279
-constexpr uintptr_t kRvaCaller  = 0x7A80B;    // the call in the host's connection handler
-constexpr uintptr_t kRvaFault   = 0x7A860;
-constexpr uintptr_t kRvaFault2  = 0x7A8E0;
-constexpr uintptr_t kRvaJumpTable = 0x1280B0; // the dispatcher's table (image-relative i32s)
-constexpr int       kJob        = 0x279;
+constexpr uintptr_t kRvaFn      = 0x1B44F0;   // int job633(int id, void* out)
+constexpr uintptr_t kRvaFill    = 0x19A810;   // the fill a found rider gets; returns 0
+constexpr uintptr_t kRvaCase    = 0x12514A;   // the dispatcher's case for job 0x279
+constexpr uintptr_t kRvaCaller  = 0x7A7BB;    // the call in the host's connection handler
+constexpr uintptr_t kRvaFault   = 0x7A810;
+constexpr uintptr_t kRvaFault2  = 0x7A890;
+constexpr uintptr_t kRvaJumpTable = 0x128048; // the dispatcher's table (image-relative i32s)
+constexpr int       kJob        = 0x27A;      // 0x279 in beta21e: beta21f inserted a job below it
 constexpr size_t    kOutBytes   = 0x4E84;     // last store of 0x19A7A0 is [r8+0x4E80]
 constexpr size_t    kList1Count = 0x2EFC, kList2Count = 0x3928;
 constexpr int       kListRoom   = 25;
@@ -436,26 +453,26 @@ constexpr size_t  kFnLen = 0x39;
 constexpr uint8_t kFn[kFnLen] = {
     0x40, 0x53, 0x48, 0x83, 0xec, 0x20,               // push rbx; sub rsp, 0x20
     0x48, 0x8b, 0xda, 0x8b, 0xd1,                     // rbx = out; edx = id
-    0x48, 0x8b, 0x0d, 0xf6, 0x56, 0x3c, 0x00,         // mov rcx, [rider list]
-    0xe8, 0x99, 0x7d, 0xfa, 0xff,                     // call 0x15C270 (find)
+    0x48, 0x8b, 0x0d, 0xc6, 0x56, 0x3c, 0x00,         // mov rcx, [rider list]
+    0xe8, 0xC9, 0x77, 0xfa, 0xff,                     // call 0x15C270 (find)
     0x48, 0x85, 0xc0, 0x75, 0x0b,                     // test rax, rax; jne found
     0xb8, 0x01, 0x00, 0x00, 0x00,                     // mov eax, 1      <- miss, out untouched
     0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3,
     0x4c, 0x8b, 0xc3, 0x33, 0xd2, 0x48, 0x8b, 0xc8,   // r8 = out; edx = 0; rcx = rider
     0x48, 0x83, 0xc4, 0x20, 0x5b,
-    0xe9, 0xa7, 0x62, 0xfe, 0xff,                     // jmp 0x19A7A0 (fill)
+    0xe9, 0xe7, 0x62, 0xfe, 0xff,                     // jmp 0x19A7A0 (fill)
 };
 constexpr size_t kTailJmpAt = 0x34;
 // The case: rdx = args; ecx = id; rdx = out; call 0x1B44C0.
 constexpr size_t  kCaseLen = 0x13;
 constexpr uint8_t kCase[kCaseLen] = {
     0x48, 0x8d, 0x94, 0x24, 0xd8, 0x02, 0x00, 0x00, 0x8b, 0x0a, 0x48, 0x8b, 0x52, 0x08,
-    0xe8, 0xfa, 0xf2, 0x08, 0x00,
+    0xe8, 0x93, 0xf3, 0x08, 0x00,
 };
 // The caller that crashes: the dispatcher call, then the first count load.
 constexpr size_t  kCallerLen = 13;
 constexpr uint8_t kCaller[kCallerLen] = {
-    0xff, 0x15, 0x37, 0xc4, 0x4e, 0x00, 0x8b, 0x84, 0x24, 0x5c, 0x30, 0x00, 0x00,
+    0xff, 0x15, 0x87, 0xc4, 0x4e, 0x00, 0x8b, 0x84, 0x24, 0x5c, 0x30, 0x00, 0x00,
 };
 
 /// What the detour does after the game's lookup: zero the struct on a miss.
@@ -486,11 +503,11 @@ inline bool ShouldClear(int rc, const void* out) { return rc != 0 && out != null
 // =====================================================================================
 namespace mipmap {
 
-constexpr uintptr_t kRvaBox    = 0x255EA0;   // int box(src, dst, w, h, bpp)
-constexpr uintptr_t kRvaColumn = 0x255DC0;   // the same for a 1-wide level
-constexpr uintptr_t kRvaRow    = 0x255E30;   // the same for a 1-high level
-constexpr uintptr_t kRvaFaultWrite = 0x255F1F;
-constexpr uintptr_t kRvaFaultRead  = 0x255EF0;
+constexpr uintptr_t kRvaBox    = 0x2560E0;   // int box(src, dst, w, h, bpp)
+constexpr uintptr_t kRvaColumn = 0x256000;   // the same for a 1-wide level
+constexpr uintptr_t kRvaRow    = 0x256070;   // the same for a 1-high level
+constexpr uintptr_t kRvaFaultWrite = 0x25615F;
+constexpr uintptr_t kRvaFaultRead  = 0x256130;
 constexpr int       kDone = 0;               // what all three return
 
 constexpr size_t  kHeadLen = 0x18;

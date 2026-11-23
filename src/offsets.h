@@ -196,7 +196,7 @@ constexpr uintptr_t RVA_WORLD_REASON = 0x3D7E6C; // 0 = nothing came back, 1 = t
 // a dword by the setter at 0x2A66E0). It lives OUTSIDE the 0x5D8 block 0x386 zeroes, so a
 // teardown alone rebinds the same port; 0 reaches bind() unchecked and means "any".
 constexpr uintptr_t RVA_WORLD_PORT   = 0x3D78F0;
-constexpr int       CMD_WORLD_CLOSE  = 0x386;    // bus cmd: LOGOUT, close, free, zero
+constexpr int       CMD_WORLD_CLOSE  = 0x387;    // bus cmd: LOGOUT, close, free, zero
 constexpr int       WORLD_STATE_MAX  = 4;        // a read above this means the offset is wrong
 
 // ---- server browser UI state (.data) ----
@@ -237,7 +237,7 @@ constexpr uintptr_t RVA_SB_CONNECT_TARGET = 0xE53DE0; // connect OUTPUT/state (s
 // 0x140E53DE0, step over, dump 16B @ 0xE53DE0 (now the packed addr). That settles the
 // input format. Until then direct connect is PREVIEW-only (parses + logs, no dispatch).
 constexpr uintptr_t RVA_CMD_BUS_PTR   = 0x566C48; // [0x140566C48] engine command-bus fn-ptr
-constexpr int       CMD_JOIN          = 0x389;    // bus cmd id that initiates the connect
+constexpr int       CMD_JOIN          = 0x38A;    // bus cmd id that initiates the connect
 constexpr uintptr_t RVA_JOIN_DISPATCH = 0xF0F07;  // the `call [bus]` inside the JOIN handler
 constexpr uint16_t  MXB_DEFAULT_PORT  = 54200;    // 0xD3B8; used when :port is omitted
 
@@ -717,7 +717,7 @@ constexpr uintptr_t RVA_NOTICE_WRAP  = 0xE627D8;   // next slot once the ring is
 constexpr uintptr_t RVA_NOTICE_SEQ   = 0xE627DC;   // running sequence number
 
 // ---- mid-session change (F8 -> 0) - map: net/change.c ---------------------------------------
-constexpr uint32_t  CMD_CHANGE_REQUEST = 0x365;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
+constexpr uint32_t  CMD_CHANGE_REQUEST = 0x366;    // bus(0x365, blob*, len) -> CHANGEREQUEST 0x0F
 constexpr uintptr_t RVA_NET_EVENT_PTR  = 0x9CB8B0; // client net-event callback (0x120890)
 constexpr int       NET_EVENT_CHANGEANSWER = 4;    // raised by CHANGEANSWER with the rej code
 constexpr uintptr_t RVA_IDENTITY_LEN   = 0x598D74; // i32: the identity the server last accepted

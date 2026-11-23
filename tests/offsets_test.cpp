@@ -443,7 +443,7 @@ static void world_session_constants_agree() {
     CHECK(mxb::RVA_WORLD_STATE  == 0x3D7900, "world state moved");
     CHECK(mxb::RVA_WORLD_REASON == 0x3D7E6C, "world reason moved");
     CHECK(mxb::RVA_WORLD_PORT   == 0x3D78F0, "world port moved");
-    CHECK(mxb::CMD_WORLD_CLOSE  == 0x386,    "the teardown bus command moved");
+    CHECK(mxb::CMD_WORLD_CLOSE  == 0x387,    "the teardown bus command moved");
 
     // The three live in the same block the teardown zeroes — except the port, which is the
     // whole reason the reset has to clear it separately.

@@ -351,8 +351,24 @@ constexpr uint8_t   kDispatch[kDispatchLen] = {
     0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,   // 8 pushes
     0x48, 0x81, 0xec, 0x88, 0x02, 0x00, 0x00,          // sub rsp, 0x288
 };
-// The jump table the dispatcher indexes (`mov eax, [r9 + rax*4 + 0x1280B0]`, r9 = image base).
-constexpr uintptr_t kRvaJumpTable = 0x1280B0;
+// The jump table the dispatcher indexes (`mov eax, [r9 + rax*4 + 0x128048]`, r9 = image base).
+constexpr uintptr_t kRvaJumpTable = 0x128048;
+
+// beta21f fixed this in the game. The job is now 864 (a job was inserted below it) and it loads
+// the whole pointer itself:
+//   0x127099  lea rcx, [rsp+0x2D8]
+//   0x1270A1  mov rcx, [rcx]                     ; 48 8B 09 - 64 bits
+//   0x1270A4  call 0x2A4530
+// When the table sends job 864 to exactly that, there is nothing to fix and nothing is patched.
+// kRvaSite/kSite above stay the beta21e shape, so a build that still has the bug is recognised.
+constexpr uintptr_t kRvaFixedSite = 0x127099;
+constexpr int       kFixedJob     = 864;
+constexpr size_t    kFixedLen     = 16;
+constexpr uint8_t   kFixedSite[kFixedLen] = {
+    0x48, 0x8d, 0x8c, 0x24, 0xd8, 0x02, 0x00, 0x00,    // lea rcx, [rsp+0x2D8]
+    0x48, 0x8b, 0x09,                                  // mov rcx, [rcx]   <- 64 bits
+    0xe8, 0x87, 0xd4, 0x17, 0x00,                      // call 0x2A4530
+};
 
 // The stub page.
 constexpr size_t kCountOff  = 0x40;   // uint32, calls whose pointer had a top half
@@ -420,13 +436,13 @@ inline bool StockWouldTruncate(uint64_t slot) { return (slot >> 32) != 0; }
 namespace riderinfo {
 
 constexpr uintptr_t kRvaFn      = 0x1B44F0;   // int job633(int id, void* out)
-constexpr uintptr_t kRvaFill    = 0x19A7A0;   // the fill a found rider gets; returns 0
-constexpr uintptr_t kRvaCase    = 0x1251B3;   // the dispatcher's case for job 0x279
-constexpr uintptr_t kRvaCaller  = 0x7A80B;    // the call in the host's connection handler
-constexpr uintptr_t kRvaFault   = 0x7A860;
-constexpr uintptr_t kRvaFault2  = 0x7A8E0;
-constexpr uintptr_t kRvaJumpTable = 0x1280B0; // the dispatcher's table (image-relative i32s)
-constexpr int       kJob        = 0x279;
+constexpr uintptr_t kRvaFill    = 0x19A810;   // the fill a found rider gets; returns 0
+constexpr uintptr_t kRvaCase    = 0x12514A;   // the dispatcher's case for job 0x279
+constexpr uintptr_t kRvaCaller  = 0x7A7BB;    // the call in the host's connection handler
+constexpr uintptr_t kRvaFault   = 0x7A810;
+constexpr uintptr_t kRvaFault2  = 0x7A890;
+constexpr uintptr_t kRvaJumpTable = 0x128048; // the dispatcher's table (image-relative i32s)
+constexpr int       kJob        = 0x27A;      // 0x279 in beta21e: beta21f inserted a job below it
 constexpr size_t    kOutBytes   = 0x4E84;     // last store of 0x19A7A0 is [r8+0x4E80]
 constexpr size_t    kList1Count = 0x2EFC, kList2Count = 0x3928;
 constexpr int       kListRoom   = 25;
@@ -450,7 +466,7 @@ constexpr size_t kTailJmpAt = 0x34;
 constexpr size_t  kCaseLen = 0x13;
 constexpr uint8_t kCase[kCaseLen] = {
     0x48, 0x8d, 0x94, 0x24, 0xd8, 0x02, 0x00, 0x00, 0x8b, 0x0a, 0x48, 0x8b, 0x52, 0x08,
-    0xe8, 0xfa, 0xf2, 0x08, 0x00,
+    0xe8, 0x93, 0xf3, 0x08, 0x00,
 };
 // The caller that crashes: the dispatcher call, then the first count load.
 constexpr size_t  kCallerLen = 13;

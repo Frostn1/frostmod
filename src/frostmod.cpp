@@ -4608,7 +4608,7 @@ static void VehTearDown(int i) {
             VehBus(0x239, rd(mxb::VEH_ID), 0);
             VehFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
         } else if (rd(mxb::VEH_ENTITY_ON) != 0) {
-            VehBus(0x285, rd(mxb::VEH_ENTITY), 0);
+            VehBus(0x286, rd(mxb::VEH_ENTITY), 0);   // 0x285 in beta21e
             VehFree(g_base + mxb::RVA_VEHICLE_SUBFREE, (void*)(v + mxb::VEH_SUB));
         }
     }
@@ -4617,7 +4617,7 @@ static void VehTearDown(int i) {
         VehBus(0xCF, SafeReadInt((const int*)(g_base + mxb::RVA_BIKE_PAINTS_ARG)), rd(mxb::VEH_50BC));
     }
     if (kind <= 3) {
-        VehBus(0x27A, rd(mxb::VEH_5838), 0);
+        VehBus(0x27B, rd(mxb::VEH_5838), 0);   // 0x27A in beta21e
         VehBus(0x5C, rd(mxb::VEH_HANDLE), 0);
         VehFree(g_base + mxb::RVA_VEHICLE_GFX_FREE, (void*)(v + mxb::VEH_GFX));
     }

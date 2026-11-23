@@ -1155,6 +1155,18 @@ static void InstallPtr64Fix() {
     if (!SsgMxbOnly("ptr64")) return;
     if (!ptr64fix_on.load()) { Log("[ptr64] fix off by config (ptr64fix=0)"); return; }
     if (g_p64Tramp || g_unloading.load()) return;
+    {
+        uint8_t *fb, *fe;
+        const uint8_t* fixedEntry = (const uint8_t*)(g_base + kRvaJumpTable + 4 * kFixedJob);
+        if (SsgCodeIs(kRvaFixedSite, kFixedSite, kFixedLen) && GetExecRange(g_base, &fb, &fe) &&
+            fixedEntry >= fb && fixedEntry + 4 <= fe &&
+            (uint32_t)sessionguards::Disp32(fixedEntry) == (uint32_t)kRvaFixedSite) {
+            Log("[ptr64] not needed: this build loads job %d's pointer in 64 bits itself (fixed by "
+                "the game in beta21f, at +0x%llX). Nothing patched.", kFixedJob,
+                (unsigned long long)kRvaFixedSite);
+            return;
+        }
+    }
     bool ok = SsgCodeIs(kRvaSite, kSite, kSiteLen) && SsgCodeIs(kRvaCallee, kCallee, sizeof(kCallee)) &&
               SsgCodeIs(kRvaDispatch, kDispatch, kDispatchLen);
     // And the dispatcher's table sends job 863 here.

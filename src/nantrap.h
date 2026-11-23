@@ -57,6 +57,8 @@ inline bool IsTrapCode(uint32_t code) { return code == kStatusInvalid || code ==
 /// and both compares take the "keep" branch on a NaN, so the NaN never leaves the block. With
 /// the default one report a session, this site used the report up in every capture we had
 /// from it (5 of 32 by 2026-10-14), and the trap turned off before the real NaN.
+/// beta21f grew the object: the same block is 0x1AD8D5..0x1AD913 with [obj+2453C] /
+/// [obj+24530], [obj+24534] and [obj+2E0]; the bytes below are beta21f's.
 /// Matched by the bytes from rip on (divss, comiss, jbe, movaps), so a build that moved it
 /// still matches and one that changed it does not.
 inline constexpr uint8_t kDiscardedDivide[] = {0xF3, 0x0F, 0x5E, 0x81, 0x30, 0x45, 0x02, 0x00,

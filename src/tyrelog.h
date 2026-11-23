@@ -60,14 +60,14 @@ namespace tyrelog {
 // ---- layout --------------------------------------------------------------------------------
 inline constexpr int kWheels = 2;              // 0x1ADDBD mov r12d, 2: the wheel loop's bound
 inline constexpr size_t kWheelStride  = 0xE310;
-inline constexpr size_t kWheelSpin    = 0x12208;
-inline constexpr size_t kWheelRadius  = 0x121D8;
-inline constexpr size_t kWheelSample0 = 0x12210;
-inline constexpr size_t kWheelGap     = 0x140A0;
-inline constexpr size_t kWheelHit     = 0x127B8;
+inline constexpr size_t kWheelSpin    = 0x12D40;   // beta21e 0x12208: beta21f moved the wheels by 0xB38
+inline constexpr size_t kWheelRadius  = 0x12D10;
+inline constexpr size_t kWheelSample0 = 0x12D48;
+inline constexpr size_t kWheelGap     = 0x14BD8;
+inline constexpr size_t kWheelHit     = 0x132F0;
 inline constexpr size_t kBikeActive   = 0x38;
 inline constexpr size_t kBikeTime     = 0x40;
-inline constexpr size_t kBikeChassis  = 0x430;
+inline constexpr size_t kBikeChassis  = 0x440;    // beta21e 0x430
 inline constexpr size_t kBodyPos  = 0xC0;
 inline constexpr size_t kBodyLvel = 0x110;
 inline constexpr size_t kBodyAvel = 0x120;
@@ -91,13 +91,13 @@ struct Check {
     const char* what;
 };
 inline constexpr Check kChecks[] = {
-    {0x1A5A41, "\x48\x69\xED\x10\xE3\x00\x00", 7, "wheel stride 0xE310"},
-    {0x1A5BE3, "\xF2\x0F\x10\x84\x2E\x08\x22\x01\x00", 9, "spin [w+0x12208]"},
-    {0x1A5C47, "\xF2\x0F\x11\x94\x2E\xD8\x21\x01\x00", 9, "radius [w+0x121D8]"},
-    {0x1A5BFB, "\x48\x8D\xBC\x2E\x14\x22\x01\x00", 8, "sample 0 [w+0x12214]"},
-    {0x1A6117, "\xF2\x0F\x11\x84\x2E\xA0\x40\x01\x00", 9, "ground gap [w+0x140A0]"},
-    {0x1A6123, "\x89\x9C\x2E\xB8\x27\x01\x00", 7, "hit [w+0x127B8]"},
-    {0x1AFC70, "\x48\x8B\x8E\x30\x04\x00\x00", 7, "chassis body [bike+0x430]"},
+    {0x1A5AE1, "\x48\x69\xED\x10\xE3\x00\x00", 7, "wheel stride 0xE310"},
+    {0x1A5C83, "\xF2\x0F\x10\x84\x2E\x40\x2D\x01\x00", 9, "spin [w+0x12D40]"},
+    {0x1A5CE7, "\xF2\x0F\x11\x94\x2E\x10\x2D\x01\x00", 9, "radius [w+0x12D10]"},
+    {0x1A5C9B, "\x48\x8D\xBC\x2E\x4C\x2D\x01\x00", 8, "sample 0 [w+0x12D4C]"},
+    {0x1A61B7, "\xF2\x0F\x11\x84\x2E\xD8\x4B\x01\x00", 9, "ground gap [w+0x14BD8]"},
+    {0x1A61C3, "\x89\x9C\x2E\xF0\x32\x01\x00", 7, "hit [w+0x132F0]"},
+    {0x1AFD20, "\x48\x8B\x8E\x40\x04\x00\x00", 7, "chassis body [bike+0x440]"},
     {0x2ACAE0, "\x48\x8D\x81\xC0\x00\x00\x00", 7, "body pos +0xC0"},
     {0x2ACB10, "\x48\x8D\x81\x10\x01\x00\x00", 7, "body lvel +0x110"},
     {0x2ACB20, "\x48\x8D\x81\x20\x01\x00\x00", 7, "body avel +0x120"},

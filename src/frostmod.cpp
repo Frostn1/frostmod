@@ -4517,6 +4517,12 @@ static bool AuApply() {
         return false;
     }
     if (!g_base) { Log("[aussie] not applied: no module base"); return false; }
+    if (aussie::StockHasBeta20Springs(g_base)) {
+        Log("[aussie] not needed: this build (beta21f or later) already puts other riders' "
+            "collision bodies on the Beta 20 spring (k %.0f x mass, vertical %.0f x mass). "
+            "Nothing patched.", aussie::kAussieK, aussie::kStockK);
+        return false;
+    }
 
     const uint8_t* k  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaK);
     const uint8_t* y  = reinterpret_cast<const uint8_t*>(g_base + aussie::kRvaY);

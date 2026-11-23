@@ -699,7 +699,7 @@ constexpr uint32_t CMD_APPLY_PAINT = 0x9E;   // bus(0x9E, int handle, const char
 // ---- rider rebuild (EXPERIMENTAL) --------------------------------------------
 // Tear one remote rider down the way session end does (0x71D50, per vehicle) and build
 // them again with vehicle create, so models and paints are all looked up afresh.
-constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CAE0;  // int(int conn_id, int flag)
+constexpr uintptr_t RVA_VEHICLE_CREATE = 0x5CA30;  // int(int conn_id, int flag)
 constexpr uintptr_t RVA_RIDER_RELOAD   = 0x5E520;  // int(int conn_id): the CHANGEINFO rebuild
 // Rider parts of the rider-gfx block, as the game's teardown 0x44950 drops them.
 constexpr uintptr_t RVA_ATTACH_DROP  = 0x37B50;   // void(int a, int b): drop attachment (a, b)

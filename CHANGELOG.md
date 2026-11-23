@@ -1,35 +1,34 @@
 # Changelog
 
-## Unreleased
+## 2026-11-23 - v0.53.0
 
-### Changed
+Runs on MX Bikes beta21f (beta21e is no longer supported). Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by
+default), upgraded material shading (off by default), FrostServer's rejoin fix, and FrostMod
+Fixes, a standalone crash-fix plugin (`frostmod_fixes.dlo` / `FrostModFixes.zip`).
+
+### MX Bikes beta21f
+#### Changed
 - MX Bikes beta21f: every address FrostMod uses was moved to the new build. Code moved by
   different amounts in different places, the bike physics struct grew (shock, fork, bodies and
   wheels all sit further in), and the game's command ids from 0x24E up went up by one (join,
-  leave, change request, two vehicle teardown jobs). beta21e is no longer supported.
+  leave, change request, two vehicle teardown jobs).
 - The shock guard follows the rebuilt shock curve lookup (now 0x1E5BE0, 16-byte entries). beta21f
   still turns a NaN into a wild index there, so the guard stays.
 - The trainer guard stays: beta21f's loader still uses the series lookup's result unchecked.
 
-### Fixed
+#### Fixed
 - `.data` globals (world state, port, command bus, bike list) no longer take the code drift
   delta. On a build whose code moved, the server browser reset now refuses instead of writing.
 
-### Removed
+#### Removed
 - The 32-bit pointer fix (+0x2A42F0) stands down on beta21f: the game loads that pointer in 64
   bits itself now. The log says so.
 - Aussie mode stands down on beta21f: the game's own collision bodies already use the Beta 20
   spring (200 x mass horizontal, 20 x mass vertical). The log says so.
 
-### Added
+#### Added
 - frostmod.log now records session changes (practice, warmup, race...) and riders the game
   removes, so a rider disappearing at the race start shows up in the log.
-
-## 2026-11-14 - v0.53.0
-
-Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by
-default), upgraded material shading (off by default), FrostServer's rejoin fix, and FrostMod
-Fixes, a standalone crash-fix plugin (`frostmod_fixes.dlo` / `FrostModFixes.zip`).
 
 ### Fixed
 - **Render crash at +0x24085C, the rest of it.** v0.51.0's pointer check cut it down but it was

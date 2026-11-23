@@ -135,7 +135,7 @@ uint8_t* PatternScan(uint8_t* begin, uint8_t* end, const char* pat, const char* 
 void* AllocNear(uintptr_t site, size_t size, unsigned long protect) {
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
-    const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x0FED0;
     constexpr uintptr_t limit = 0x70000000ull;
     for (uintptr_t d = gran; d < limit; d += gran) {
         for (int up = 0; up < 2; ++up) {

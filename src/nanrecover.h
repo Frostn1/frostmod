@@ -58,7 +58,7 @@ namespace nanrecover {
 // ---- the game, mxbikes.exe beta21e (image base 0x140000000) -------------------------------
 /// place-bike: int (int handle, float x, float z, float headingDeg, float y). 0 placed, 1 no
 /// such bike. The bus job 0x25A's handler (kRvaJob) is a straight call into it.
-constexpr uintptr_t kRvaReset = 0x197060;
+constexpr uintptr_t kRvaReset = 0x197070;
 constexpr uintptr_t kRvaJob   = 0x124A9A;
 using ResetFn = int32_t (*)(int32_t handle, float x, float z, float headingDeg, float y);
 
@@ -114,8 +114,8 @@ struct Check {
 inline constexpr Check kChecks[] = {
     // place-bike: its prologue through the handle lookup, then the suspension reset before it
     // reads the fork and shock, the body placements, and the reset counter.
-    {0x197060, "\x41\x54\x48\x81\xEC\x40\x0C\x00\x00", 9, "place-bike prologue"},
-    {0x1970A2, "\xE8\xF9\x80\x02\x00\x4C\x8B\xE0", 8, "handle -> bike (0x1BF1A0)"},
+    {0x197070, "\x41\x54\x48\x81\xEC\x40\x0C\x00\x00", 9, "place-bike prologue"},
+    {0x1970B2, "\xE8\xE9\x80\x02\x00\x4C\x8B\xE0", 8, "handle -> bike (0x1BF1A0)"},
     {0x197123, "\xE8\xD8\xF3\xFF\xFF", 5, "suspension reset (0x196500) first"},
     {0x197153, "\xF2\x41\x0F\x10\x84\x24\x78\x4C\x00\x00", 10, "fork [bike+0x4C78]"},
     {0x197181, "\xF2\x41\x0F\x10\x8C\x24\xC8\x5C\x00\x00", 10, "shock [bike+0x5CC8]"},
@@ -143,13 +143,13 @@ inline constexpr Check kChecks[] = {
     {0x195DAC, "\x48\x8B\x8F\xC0\x23\x02\x00", 7, "wheel 1 body [bike+0x223C0]"},
     {0x195A0B, "\x48\x8B\x8F\x80\x34\x02\x00", 7, "rider body [bike+0x23480]"},
     // ODE's dxBody
-    {0x2AC7AA, "\xF3\x0F\x11\x89\xC0\x00\x00\x00", 8, "dBodySetPosition +0xC0"},
-    {0x2AC8C0, "\x48\x8D\x81\xD0\x00\x00\x00", 7, "dBodyGetRotation +0xD0"},
-    {0x2AC8D0, "\x48\x8D\x81\x00\x01\x00\x00", 7, "dBodyGetQuaternion +0x100"},
-    {0x2AC870, "\xF3\x0F\x11\x89\x10\x01\x00\x00", 8, "dBodySetLinearVel +0x110"},
-    {0x2AC890, "\xF3\x0F\x11\x89\x20\x01\x00\x00", 8, "dBodySetAngularVel +0x120"},
-    {0x2AC990, "\xF3\x0F\x58\x89\x30\x01\x00\x00", 8, "dBodyAddForce +0x130"},
-    {0x2AC9D0, "\xF3\x0F\x58\x89\x40\x01\x00\x00", 8, "dBodyAddTorque +0x140"},
+    {0x2AC9DA, "\xF3\x0F\x11\x89\xC0\x00\x00\x00", 8, "dBodySetPosition +0xC0"},
+    {0x2ACAF0, "\x48\x8D\x81\xD0\x00\x00\x00", 7, "dBodyGetRotation +0xD0"},
+    {0x2ACB00, "\x48\x8D\x81\x00\x01\x00\x00", 7, "dBodyGetQuaternion +0x100"},
+    {0x2ACAA0, "\xF3\x0F\x11\x89\x10\x01\x00\x00", 8, "dBodySetLinearVel +0x110"},
+    {0x2ACAC0, "\xF3\x0F\x11\x89\x20\x01\x00\x00", 8, "dBodySetAngularVel +0x120"},
+    {0x2ACBC0, "\xF3\x0F\x58\x89\x30\x01\x00\x00", 8, "dBodyAddForce +0x130"},
+    {0x2ACC00, "\xF3\x0F\x58\x89\x40\x01\x00\x00", 8, "dBodyAddTorque +0x140"},
 };
 
 // ---- the check -------------------------------------------------------------------------------

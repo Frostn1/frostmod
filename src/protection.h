@@ -44,6 +44,7 @@ enum class Kind : int {
     StackPointer,     // +0x2A42F0
     RiderInfo,        // +0x7A860, +0x7A8E0
     MipMemory,        // +0x255F1F, +0x255EF0
+    EventSettings,    // +0x715F3
     Count
 };
 constexpr int kKinds = (int)Kind::Count;
@@ -65,6 +66,7 @@ inline const KindInfo& Info(Kind k) {
         {"stack-pointer", "mxbikes.exe+0x2A42F0", "pointer cut to 32 bits at launch"},
         {"rider-info",    "mxbikes.exe+0x7A860",  "someone joined your server mid-handshake"},
         {"menu-image",    "mxbikes.exe+0x255F1F", "texture loaded without the memory for it"},
+        {"event-settings", "mxbikes.exe+0x715F3", "menu read the event settings after the event closed"},
     };
     const int i = (int)k;
     return t[i >= 0 && i < kKinds ? i : 0];

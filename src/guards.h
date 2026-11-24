@@ -28,6 +28,7 @@ extern std::atomic<bool> listboxguard_on;
 extern std::atomic<bool> ptr64fix_on;
 extern std::atomic<bool> riderinfoguard_on;
 extern std::atomic<bool> mipmapguard_on;
+extern std::atomic<bool> eventcfgguard_on;
 extern std::atomic<bool> nanrecover_on;
 
 void Configure(const Host& host);

@@ -99,6 +99,33 @@ int main() {
     CHECK(s[12] == 0x53 && s[52] == 0x5B, "rbx saved and restored");
     CHECK(s[53] == 0x89 && s[54] == 0xC5, "mov ebp, eax");
     CHECK(s[11] == 0x9C && s[55] == 0x9D, "flags saved and restored");
+    CHECK(s[23] == 0x45 && s[24] == 0x89 && s[25] == 0xE0, "bike list: r8d = r12d");
+
+    // --- the trainer loader -------------------------------------------------------------
+    {
+        namespace tl = tyrefallback::trainerload;
+        CHECK(tl::SpanMatches(tl::kSpanBytes) && !tl::SpanMatches(nullptr), "trainer span matches itself");
+        for (int i = 0; i < kSiteCount; ++i) {
+            const uintptr_t off = tl::kRvaSites[i] - tl::kRvaSpan;
+            CHECK(off + kSiteLen <= tl::kSpanLen, "trainer site %d inside span", i);
+            CHECK(std::memcmp(tl::kSpanBytes + off, tl::kSiteBytes, kSiteLen) == 0, "trainer site %d is mov ebx,[rsp+0xB8]", i);
+            // Each is followed by `mov [rsp+0xB4], ebx`: the stub's return lands on it.
+            const uint8_t storeB4[7] = {0x89, 0x9c, 0x24, 0xb4, 0x00, 0x00, 0x00};
+            CHECK(std::memcmp(tl::kSpanBytes + off + kSiteLen, storeB4, 7) == 0, "trainer site %d then stores ebx", i);
+        }
+        // The two loops read the same tyre count and table as the bike list.
+        CHECK(0x1FD60 + 6 + Rel32(tl::kSpanBytes + (0x1FD60 - tl::kRvaSpan) + 2) == kRvaTyreCount, "trainer count global");
+        CHECK(0x1FD85 + 7 + Rel32(tl::kSpanBytes + (0x1FD85 - tl::kRvaSpan) + 3) == kRvaTyreTable, "trainer table global");
+        CHECK(0x1FDDE + 7 + Rel32(tl::kSpanBytes + (0x1FDDE - tl::kRvaSpan) + 3) == kRvaTyreTable, "trainer table global 2");
+        // [r15+0x70] is the trainer's tyre the second loop compares.
+        CHECK(tl::kSpanBytes[(0x1FDD3 - tl::kRvaSpan) + 3] == tl::kRecTyre, "lea rdx, [r15+0x70]");
+        uint8_t t[128];
+        std::memset(t, 0xCC, sizeof(t));
+        const size_t m = BuildStub(t, 1, fn, base + tl::kRvaSites[1] + kSiteLen, Arg3::R15, Dest::Ebx);
+        CHECK(m == kStubLen && t[m] == 0xCC, "trainer stub length %zu", m);
+        CHECK(t[23] == 0x4D && t[24] == 0x89 && t[25] == 0xF8, "trainer: r8 = r15");
+        CHECK(t[52] == 0x5B && t[53] == 0x89 && t[54] == 0xC3, "trainer: rbx restored, then mov ebx, eax");
+    }
 
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("tyrefallback: all checks passed\n");

@@ -12,6 +12,7 @@
 //   +0x2A42F0  stack pointer passed through 32 bits (job 863)       ptr64fix=0
 //   +0x7A860   host copies a rider's lists that were never filled    riderinfoguard=0
 //   +0x255F1F  mipmap level built from a NULL allocation             mipmapguard=0
+//   +0x715F3   event settings read with no event set                 eventcfgguard=0
 //
 // No Win32 here, so tests/sessionguards_test.cpp runs anywhere.
 #pragma once
@@ -528,5 +529,101 @@ constexpr uint8_t kRow[kHeadLen] = {
 inline bool Admit(const void* src, const void* dst) { return src != nullptr && dst != nullptr; }
 
 }  // namespace mipmap
+
+// =====================================================================================
+// +0x715F3  -  EVENT SETTINGS READ WITH NO EVENT SET
+//
+// 0x5AA80 is `settings* f(int which)`: the settings block for the current event type. It reads
+// the event type from [0x14050FEC0] and returns one of four 0x18-byte blocks in .data
+// (0x3E7100, +0x18, +0x30, +0x48): type 1 and 4 get the first, type 2 picks by `which` (or the
+// current index at [0x14051CCA0] when `which` < 0). Any other type, 0 included, falls to
+//   0x5AB31  xor  eax, eax                       ; return NULL
+// None of its eight callers (0x612F7, 0x62315, 0x661F4, 0x672AF, 0x6732C, 0x6735E, 0x67C89,
+// 0x715E3) tests the result. The one in the reports is the menu at 0x715E3:
+//   0x715E3  call 0x5AA80
+//   0x715F3  mov  ecx, [rax]                     ; <- the fault, reading 0
+//            movss xmm0, [rax+0x10] / [rax+0x14] ; then posts them as bus job 0x39B
+// It is reached from the menu right after an event closes (the trails show "event closed"
+// seconds before), when the event type has already gone back to 0. 32 reports from 29 riders
+// on beta21e (as +0x71643), and it is still there in beta21f.
+//
+// WHAT THIS DOES. The NULL exit is hooked (MinHook, 0x5AB31, which holds the game's threads
+// while it writes) to a stub that returns FrostMod's own 0x18-byte block, zeroed each time:
+// the same values the game's four blocks hold before anything fills them. A caller then reads
+// zeros instead of address 0. A real event type takes the game's path untouched. The stub
+// touches rax, rcx and the flags, all of which the game's own exit writes too.
+// =====================================================================================
+namespace eventcfg {
+
+constexpr uintptr_t kRvaFn    = 0x5AA80;
+constexpr uintptr_t kRvaSite  = 0x5AB31;   // xor eax, eax: the NULL exit (hooked here)
+constexpr uintptr_t kRvaBack  = 0x5AB37;   // xor rcx, rsp: after the two instructions we redo
+constexpr uintptr_t kRvaFault = 0x715F3;   // the read in the reports
+constexpr uintptr_t kRvaCall  = 0x715E3;   // its call
+constexpr size_t    kBlockBytes = 0x18;
+
+// The whole function and its seven-entry jump table, 0x5AA80 .. 0x5AB5F.
+constexpr size_t  kFnLen = 224;
+constexpr uint8_t kFn[kFnLen] = {
+    0x48, 0x83, 0xec, 0x18, 0x48, 0x8b, 0x05, 0x15, 0x7e, 0x33, 0x00, 0x48, 0x33, 0xc4, 0x48, 0x89,
+    0x04, 0x24, 0x8b, 0x05, 0x28, 0x54, 0x4b, 0x00, 0x83, 0xf8, 0x01, 0x74, 0x2f, 0x83, 0xf8, 0x02,
+    0x0f, 0x85, 0x86, 0x00, 0x00, 0x00, 0x85, 0xc9, 0x0f, 0x48, 0x0d, 0xf1, 0x21, 0x4c, 0x00, 0xff,
+    0xc9, 0x83, 0xf9, 0x06, 0x77, 0x16, 0x48, 0x8d, 0x15, 0x43, 0x55, 0xfa, 0xff, 0x48, 0x63, 0xc1,
+    0x8b, 0x8c, 0x82, 0x44, 0xab, 0x05, 0x00, 0x48, 0x03, 0xca, 0xff, 0xe1, 0x48, 0x8d, 0x05, 0x2d,
+    0xc6, 0x38, 0x00, 0x48, 0x8b, 0x0c, 0x24, 0x48, 0x33, 0xcc, 0xe8, 0xc1, 0x05, 0x25, 0x00, 0x48,
+    0x83, 0xc4, 0x18, 0xc3, 0x48, 0x8d, 0x05, 0x2d, 0xc6, 0x38, 0x00, 0x48, 0x8b, 0x0c, 0x24, 0x48,
+    0x33, 0xcc, 0xe8, 0xa9, 0x05, 0x25, 0x00, 0x48, 0x83, 0xc4, 0x18, 0xc3, 0x48, 0x8d, 0x05, 0x2d,
+    0xc6, 0x38, 0x00, 0x48, 0x8b, 0x0c, 0x24, 0x48, 0x33, 0xcc, 0xe8, 0x91, 0x05, 0x25, 0x00, 0x48,
+    0x83, 0xc4, 0x18, 0xc3, 0x48, 0x8d, 0x05, 0x2d, 0xc6, 0x38, 0x00, 0x48, 0x8b, 0x0c, 0x24, 0x48,
+    0x33, 0xcc, 0xe8, 0x79, 0x05, 0x25, 0x00, 0x48, 0x83, 0xc4, 0x18, 0xc3, 0x83, 0xf8, 0x04, 0x74,
+    0x9b, 0x33, 0xc0, 0x48, 0x8b, 0x0c, 0x24, 0x48, 0x33, 0xcc, 0xe8, 0x61, 0x05, 0x25, 0x00, 0x48,
+    0x83, 0xc4, 0x18, 0xc3, 0xcc, 0xaa, 0x05, 0x00, 0xe4, 0xaa, 0x05, 0x00, 0xe4, 0xaa, 0x05, 0x00,
+    0xe4, 0xaa, 0x05, 0x00, 0xfc, 0xaa, 0x05, 0x00, 0x14, 0xab, 0x05, 0x00, 0x14, 0xab, 0x05, 0x00,
+};
+constexpr size_t kModeLoadAt = 0x12;     // mov eax, [rip+d] (6 bytes): the event type
+constexpr size_t kSiteInFn   = kRvaSite - kRvaFn;   // 0xB1
+
+// The call in the reports and the read after it, 0x715E0 .. 0x715FA.
+constexpr uintptr_t kRvaCallWin = 0x715E0;
+constexpr size_t    kCallWinLen = 27;
+constexpr uint8_t   kCallWin[kCallWinLen] = {
+    0x83, 0xc9, 0xff,                          // or ecx, -1
+    0xe8, 0x98, 0x94, 0xfe, 0xff,              // call 0x5AA80
+    0x8b, 0x15, 0xda, 0x27, 0xde, 0x00,        // mov edx, [rip+d]
+    0xbd, 0x01, 0x00, 0x00, 0x00,              // mov ebp, 1
+    0x8b, 0x08,                                // mov ecx, [rax]   <- +0x715F3
+    0x45, 0x33, 0xc9,                          // xor r9d, r9d
+    0x44, 0x8b, 0xc5,                          // mov r8d, ebp
+};
+
+// The stub page: code, the counter, and the block handed out.
+constexpr size_t kCountOff  = 0x60;   // uint32, NULL exits turned into the block
+constexpr size_t kBlockOff  = 0x80;   // kBlockBytes, zeroed by the stub on every use
+constexpr size_t kPageBytes = 0xC0;
+constexpr size_t kStubLen   = 45;
+
+/// The stub (runs at `stubVa`): count, rax = the block, zero it, redo the game's
+/// `mov rcx, [rsp]` (the second instruction MinHook's jump covers), and go back to
+/// `xor rcx, rsp` at `backVa`.
+inline size_t BuildStub(uint8_t* s, uintptr_t stubVa, uint64_t backVa) {
+    size_t o = 0;
+    auto b = [&](uint8_t x) { s[o++] = x; };
+    auto d32 = [&](int32_t v) { for (int i = 0; i < 4; ++i) b((uint8_t)((uint32_t)v >> (8 * i))); };
+    auto q64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) b((uint8_t)(v >> (8 * i))); };
+    auto rip = [&](size_t end, size_t target) {
+        d32((int32_t)((int64_t)(stubVa + target) - (int64_t)(stubVa + end)));
+    };
+    b(0xf0); b(0xff); b(0x05); rip(o + 4, kCountOff);       // lock inc dword [count]
+    b(0x48); b(0x8d); b(0x05); rip(o + 4, kBlockOff);       // lea rax, [block]
+    b(0x31); b(0xc9);                                       // xor ecx, ecx
+    b(0x48); b(0x89); b(0x08);                              // mov [rax], rcx
+    b(0x48); b(0x89); b(0x48); b(0x08);                     // mov [rax+8], rcx
+    b(0x48); b(0x89); b(0x48); b(0x10);                     // mov [rax+0x10], rcx
+    b(0x48); b(0x8b); b(0x0c); b(0x24);                     // mov rcx, [rsp]
+    b(0xff); b(0x25); d32(0); q64(backVa);                  // jmp [rip] -> back
+    return o;
+}
+
+}  // namespace eventcfg
 
 }  // namespace sessionguards

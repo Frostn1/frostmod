@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-24 - v0.53.1
+
+Two crash fixes for MX Bikes beta21f, from the crash reports since the update.
+
+Most of the "new" crashes players see on beta21f come from FrostMod 0.52.x: its addresses are
+beta21e's, so on beta21f the shock, render-batch, list-box and wake guards and nanrecover
+switch themselves off and those crashes come back (+0x1E5C8C, +0x240A9C). 0.53.0 already has
+them on again. Update FrostMod (MXB App 0.20.12 or later ships 0.53.x).
+
+### Fixed
+- **Menu crash at +0x715F3 after an event closes.** The menu asks the game for the current
+  event's settings when the event type has already gone back to "none", gets NULL, and reads
+  it. The game's own getter (+0x5AA80) now hands back an empty settings block in that case,
+  the same zeros the game's blocks hold before an event fills them. 32 reports from 29 riders
+  on beta21e (as +0x71643) and still there on beta21f. Off with `eventcfgguard=0`.
+- **Track-load crash at msvcr90+0x36EDE from a trainer whose tyre isn't loaded.** Loading a
+  trainer, the game looks its tyre (or the bike's own tyre) up in the tyre list; when it isn't
+  there, the index comes from an uninitialised stack slot and goes to sprintf as a string. Same
+  bug as the bike-list one the tyre fallback already covers, so the same fix: the first loaded
+  tyre is used and the log names the trainer and the missing tyre. 22 reports from 16 riders on
+  beta21e (under +0x1FFF6), one on beta21f with 0.53.0.
+
 ## 2026-11-23 - v0.53.0
 
 Runs on MX Bikes beta21f (beta21e is no longer supported). Three more crash fixes, the Game SDK feed for MXB App, rider and bike model sync (off by

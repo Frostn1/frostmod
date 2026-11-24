@@ -4729,6 +4729,7 @@ static void SaveOverlaySettings() {
     if (!guards::ptr64fix_on.load()) fprintf(f, "ptr64fix=0\n");
     if (!guards::riderinfoguard_on.load()) fprintf(f, "riderinfoguard=0\n");
     if (!guards::mipmapguard_on.load()) fprintf(f, "mipmapguard=0\n");
+    if (!guards::eventcfgguard_on.load()) fprintf(f, "eventcfgguard=0\n");
     if (!guards::nanrecover_on.load()) fprintf(f, "nanrecover=0\n");
     fputs(shaderup::CfgLines(g_suCfg).c_str(), f);
     if (frostmod::hotkey::Unpack(g_suKey.load()) != SuDefaultKey()) {
@@ -4780,6 +4781,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) guards::ptr64fix_on.store(v != 0);
         else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) guards::riderinfoguard_on.store(v != 0);
         else if (sscanf_s(line, "mipmapguard=%d", &v) == 1) guards::mipmapguard_on.store(v != 0);
+        else if (sscanf_s(line, "eventcfgguard=%d", &v) == 1) guards::eventcfgguard_on.store(v != 0);
         // Only kept for the next save: whether the reset went in was decided at load.
         else if (sscanf_s(line, "nanrecover=%d", &v) == 1) guards::nanrecover_on.store(v != 0);
         // shaders=, shaderbump=, ..., grade=. Read here once; whether the hooks go in is

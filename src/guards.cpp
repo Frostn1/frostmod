@@ -42,6 +42,7 @@ std::atomic<bool> listboxguard_on{true};
 std::atomic<bool> ptr64fix_on{true};
 std::atomic<bool> riderinfoguard_on{true};
 std::atomic<bool> mipmapguard_on{true};
+std::atomic<bool> eventcfgguard_on{true};
 std::atomic<bool> nanrecover_on{true};
 
 namespace {
@@ -292,7 +293,9 @@ static uintptr_t g_tyreSpan = 0;   // VA of the patched span, 0 = not patched
 
 // Put the game's own bytes back. Called from Shutdown(): the game unloads the plugin at exit,
 // and a jump into a stub that calls into an unloaded dll would be a crash of our own making.
+static void TrainerTyreRevert();
 static void TyreFallbackRevert() {
+    TrainerTyreRevert();
     if (!g_tyreSpan) return;
     DWORD prot = 0;
     if (!VirtualProtect((void*)g_tyreSpan, tyrefallback::kSpanLen, PAGE_EXECUTE_READWRITE, &prot))
@@ -340,12 +343,104 @@ static int TyreFallbackPick(int site, const uint8_t* gameRsp, int bikeIndex) {
     return pick;
 }
 
+// ---- the same three exits in the trainer loader (tyrefallback.h, namespace trainer) --------
+static std::atomic<unsigned> g_trnTyreFallbacks{0};
+static uintptr_t g_trnTyreSpan = 0;   // VA of the patched span, 0 = not patched
+
+static void TrainerTyreRevert() {
+    if (!g_trnTyreSpan) return;
+    using namespace tyrefallback;
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)g_trnTyreSpan, trainerload::kSpanLen, PAGE_EXECUTE_READWRITE, &prot))
+        return;
+    memcpy((void*)g_trnTyreSpan, trainerload::kSpanBytes, trainerload::kSpanLen);
+    VirtualProtect((void*)g_trnTyreSpan, trainerload::kSpanLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)g_trnTyreSpan, trainerload::kSpanLen);
+    g_trnTyreSpan = 0;
+}
+
+// Same contract as TyreFallbackPick; the third argument is the loader's r15 (the trainer).
+static int TrainerTyrePick(int site, const uint8_t* gameRsp, const uint8_t* rec) {
+    using namespace tyrefallback;
+    const int gameValue = SafeReadInt((const int*)(gameRsp + kJunkSlot));
+    const int count     = SafeReadInt((const int*)(g_base + kRvaTyreCount));
+    uint8_t* table = nullptr;
+    SafeReadBytes((const char*)(g_base + kRvaTyreTable), (char*)&table, sizeof(table));
+    const int pick = table ? PickIndex(count, gameValue) : gameValue;
+
+    const unsigned n = g_trnTyreFallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 20) return pick;
+
+    char bike[64] = "?", want[64] = "?", used[64] = "?";
+    if (rec) SafeCopyStr(rec + trainerload::kRecBike, bike, sizeof(bike));
+    if (site == kCfgTyreMissing) SafeCopyStr(gameRsp + trainerload::kCfgTyreSlot, want, sizeof(want));
+    else if (site == kPickedTyreMissing && rec) SafeCopyStr(rec + trainerload::kRecTyre, want, sizeof(want));
+
+    if (count <= 0 || !table) {
+        Log("[tyres] trainer for %s: no tyres are loaded at all, so there is no tyre to fall "
+            "back on (game's own value kept).", bike);
+        return pick;
+    }
+    SafeCopyStr(table + (size_t)pick * kTyreStride, used, sizeof(used));
+    Log("[tyres] trainer for %s names tyre '%s', which isn't loaded; using '%s' instead of "
+        "crashing at msvcr90+0x36EDE (from mxbikes.exe+0x%llX). %u so far.", bike, want, used,
+        (unsigned long long)trainerload::kRvaCall, n);
+    frostmod::crash::Note("trainer tyre fallback for %s (%u so far)", bike, n);
+    ProtCatch(protection::Kind::BadText);
+    return pick;
+}
+
+static void InstallTrainerTyreFallback() {
+    using namespace tyrefallback;
+    if (g_trnTyreSpan) return;
+    const uintptr_t span = g_base + trainerload::kRvaSpan;
+    uint8_t *tb, *te;
+    if (!GetExecRange(g_base, &tb, &te) || (uint8_t*)span < tb ||
+        (uint8_t*)span + trainerload::kSpanLen > te || !trainerload::SpanMatches((const uint8_t*)span)) {
+        Log("[tyres] trainer fallback not applied: the bytes at +0x%llX are not the trainer's "
+            "tyre lookup we expect (game updated?). Nothing patched.",
+            (unsigned long long)trainerload::kRvaSpan);
+        return;
+    }
+    uint8_t* stubs = (uint8_t*)AllocNear(span, kSiteCount * 0x60, PAGE_EXECUTE_READWRITE);
+    if (!stubs) { Log("[tyres] trainer fallback not applied: no free page within reach"); return; }
+    uint8_t patch[kSiteCount][kSiteLen];
+    for (int i = 0; i < kSiteCount; ++i) {
+        uint8_t* stub = stubs + i * 0x60;
+        const uintptr_t site = g_base + trainerload::kRvaSites[i];
+        // Back to the instruction after the mov: the game's own path from there on.
+        BuildStub(stub, i, (uint64_t)&TrainerTyrePick, (uint64_t)(site + kSiteLen), Arg3::R15,
+                  Dest::Ebx);
+        if (!BuildSitePatch(site, (uintptr_t)stub, patch[i])) {
+            VirtualFree(stubs, 0, MEM_RELEASE);
+            Log("[tyres] trainer fallback not applied: stub out of rel32 reach");
+            return;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), stubs, kSiteCount * 0x60);
+    DWORD prot = 0;
+    if (!VirtualProtect((void*)span, trainerload::kSpanLen, PAGE_EXECUTE_READWRITE, &prot)) {
+        VirtualFree(stubs, 0, MEM_RELEASE);
+        Log("[tyres] trainer fallback not applied: VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    for (int i = 0; i < kSiteCount; ++i)
+        memcpy((void*)(g_base + trainerload::kRvaSites[i]), patch[i], kSiteLen);
+    VirtualProtect((void*)span, trainerload::kSpanLen, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), (void*)span, trainerload::kSpanLen);
+    g_trnTyreSpan = span;
+    Log("[tyres] trainer fallback live: a trainer naming a tyre that isn't loaded gets the "
+        "first loaded tyre instead of crashing the track load (+0x%llX).",
+        (unsigned long long)trainerload::kRvaSpan);
+}
+
 static void InstallTyreFallback(intptr_t delta) {
     using namespace tyrefallback;
     if (g_game != &GAME_MXB) {
         Log("[tyres] fallback off for %s - the offsets are MX Bikes' only.", g_game->display);
         return;
     }
+    InstallTrainerTyreFallback();   // its own exact-bytes check; independent of the bike list's
     const uintptr_t span = g_base + kRvaSpan + delta;
     uint8_t *tb, *te;
     if (!GetExecRange(g_base, &tb, &te) || (uint8_t*)span < tb || (uint8_t*)span + kSpanLen > te ||
@@ -1296,6 +1391,41 @@ static void InstallMipmapGuard() {
         "written to address 0 (the crash at +0x%llX).", (unsigned long long)kRvaFaultWrite);
 }
 
+// ---- +0x715F3: event settings with no event --------------------------------------------
+static uint8_t*        g_ecStub   = nullptr;   // kept after unload: a thread may be on its way through
+static void*           g_ecTramp  = nullptr;   // MinHook's; unused, the stub jumps back itself
+static uint32_t        g_ecLogged = 0;
+static const int32_t*  g_ecMode   = nullptr;   // the event type the getter reads
+
+static void InstallEventCfgGuard() {
+    using namespace sessionguards::eventcfg;
+    if (!SsgMxbOnly("eventcfg")) return;
+    if (!eventcfgguard_on.load()) { Log("[eventcfg] guard off by config (eventcfgguard=0)"); return; }
+    if (g_ecTramp || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaFn, kFn, kFnLen) || !SsgCodeIs(kRvaCallWin, kCallWin, kCallWinLen)) {
+        Log("[eventcfg] guard not applied: the bytes at +0x%llX are not the event-settings "
+            "getter we expect (game updated?). Nothing patched.", (unsigned long long)kRvaFn);
+        return;
+    }
+    g_ecMode = (const int32_t*)SsgCell((const uint8_t*)(g_base + kRvaFn + kModeLoadAt),
+                                       kRvaFn + kModeLoadAt, 2, 6, sizeof(int32_t));
+    const uintptr_t site = g_base + kRvaSite;
+    if (!g_ecStub) g_ecStub = (uint8_t*)AllocNear(site, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_ecStub) { Log("[eventcfg] guard not applied: no page for the stub"); return; }
+    memset(g_ecStub, 0xCC, kPageBytes);
+    memset(g_ecStub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(g_ecStub, (uintptr_t)g_ecStub, (uint64_t)(g_base + kRvaBack));
+    FlushInstructionCache(GetCurrentProcess(), g_ecStub, kPageBytes);
+    g_ecLogged = 0;
+    if (!InstallHook((void*)site, g_ecStub, &g_ecTramp, "eventCfgNull(0x5ab31)")) {
+        g_ecTramp = nullptr;
+        return;
+    }
+    Log("[eventcfg] guard on: event settings asked for with no event set get an empty block "
+        "instead of NULL (getter +0x%llX, the crash at +0x%llX).",
+        (unsigned long long)kRvaFn, (unsigned long long)kRvaFault);
+}
+
 /// A stub's counter crossed a line the rate limit allows (or is the first).
 static bool SsgDue(const uint8_t* page, size_t off, uint32_t* logged, uint32_t* now) {
     if (!page) return false;
@@ -1333,6 +1463,15 @@ static void SessionGuardsTick() {
             "so far.", (unsigned long long)p, (unsigned long long)(uint32_t)p, n);
         if (n == 1) frostmod::crash::Note("job 863 pointer above 4 GB, passed whole");
     }
+    if (g_ecStub && *(volatile const uint32_t*)(g_ecStub + sessionguards::eventcfg::kCountOff) != g_ecLogged)
+        ProtCatch(protection::Kind::EventSettings);
+    if (SsgDue(g_ecStub, sessionguards::eventcfg::kCountOff, &g_ecLogged, &n)) {
+        const int mode = g_ecMode ? SafeReadInt(g_ecMode) : -1;
+        Log("[eventcfg] the menu asked for the event settings with no event set (event type %d): "
+            "it got an empty block instead of NULL - the crash at mxbikes.exe+0x715F3. %u so far.",
+            mode, n);
+        frostmod::crash::Note("event settings asked for with no event (%u so far)", n);
+    }
 }
 
 static void InstallSessionGuardsImpl() {
@@ -1342,6 +1481,7 @@ static void InstallSessionGuardsImpl() {
     InstallPtr64Fix();
     InstallRiderInfoGuard();
     InstallMipmapGuard();
+    InstallEventCfgGuard();
 }
 
 // ===========================================================================

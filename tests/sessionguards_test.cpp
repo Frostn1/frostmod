@@ -216,6 +216,47 @@ static uint8_t* ExecPage() {
     return (uint8_t*)VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 }
 
+static void TestEventCfgLive() {
+    using namespace eventcfg;
+    uint8_t* mem = ExecPage();
+    CHECK(mem != nullptr, "VirtualAlloc");
+    if (!mem) return;
+    std::memset(mem, 0xCC, 0x1000);
+    // A thunk that stands in for the getter's NULL exit: its frame (sub rsp, 0x18) with the
+    // cookie at [rsp], then into the stub. "back" checks rcx came back as the cookie (what the
+    // game's `xor rcx, rsp` expects) and returns rax, or 0 when rcx was wrong.
+    uint8_t* stub = mem + 0x800;
+    uint8_t* t = mem;
+    size_t o = 0;
+    auto b = [&](uint8_t x) { t[o++] = x; };
+    b(0x48); b(0x83); b(0xec); b(0x18);                          // sub rsp, 0x18
+    b(0x48); b(0xc7); b(0x04); b(0x24); b(0x34); b(0x12); b(0x00); b(0x00);   // mov qword [rsp], 0x1234
+    b(0x48); b(0xb8);                                            // mov rax, stub
+    for (int i = 0; i < 8; ++i) b((uint8_t)((uint64_t)(uintptr_t)stub >> (8 * i)));
+    b(0xff); b(0xe0);                                            // jmp rax
+    const size_t backAt = o;
+    b(0x48); b(0x81); b(0xf9); b(0x34); b(0x12); b(0x00); b(0x00);   // cmp rcx, 0x1234
+    b(0x75); b(0x05);                                            // jne bad
+    b(0x48); b(0x83); b(0xc4); b(0x18); b(0xc3);                 // add rsp, 0x18; ret
+    b(0x31); b(0xc0);                                            // bad: xor eax, eax
+    b(0x48); b(0x83); b(0xc4); b(0x18); b(0xc3);
+    std::memset(stub + kCountOff, 0, kPageBytes - kCountOff);
+    BuildStub(stub, (uintptr_t)stub, (uint64_t)(uintptr_t)(t + backAt));
+    FlushInstructionCache(GetCurrentProcess(), mem, 0x1000);
+
+    using Thunk = uint8_t* (*)();
+    const Thunk run = (Thunk)(void*)t;
+    std::memset(stub + kBlockOff, 0xAB, kBlockBytes);   // dirty, as a caller might leave it
+    uint8_t* got = run();
+    CHECK(got == stub + kBlockOff, "returns FrostMod's block, not NULL");
+    bool zero = got != nullptr;
+    for (size_t i = 0; zero && i < kBlockBytes; ++i) zero = got[i] == 0;
+    CHECK(zero, "and it reads as zeros");
+    CHECK(*(volatile uint32_t*)(stub + kCountOff) == 1, "counted once");
+    CHECK(run() == stub + kBlockOff && *(volatile uint32_t*)(stub + kCountOff) == 2, "again");
+    VirtualFree(mem, 0, MEM_RELEASE);
+}
+
 static void TestListBoxLive() {
     using namespace listbox;
     uint8_t* mem = ExecPage();
@@ -340,7 +381,38 @@ static void TestMipmap() {
     CHECK(Admit(&a, &b) && !Admit(nullptr, &b) && !Admit(&a, nullptr), "NULL either side is refused");
 }
 
+static void TestEventCfg() {
+    using namespace sessionguards::eventcfg;
+    // The NULL exit is `xor eax,eax; mov rcx,[rsp]; xor rcx,rsp`: MinHook covers the first two,
+    // the stub redoes the second and comes back on the third.
+    const uint8_t exitBytes[9] = {0x33, 0xc0, 0x48, 0x8b, 0x0c, 0x24, 0x48, 0x33, 0xcc};
+    CHECK(std::memcmp(kFn + kSiteInFn, exitBytes, 9) == 0, "NULL exit bytes");
+    CHECK(kRvaBack == kRvaSite + 6, "back after the two instructions");
+    // The exit is reached only from `cmp eax, 4; je` failing (0x5AB2C .. 0x5AB30).
+    CHECK(kFn[kSiteInFn - 5] == 0x83 && kFn[kSiteInFn - 3] == 0x04 && kFn[kSiteInFn - 2] == 0x74, "cmp eax,4; je");
+    // The event type load decodes to 0x50FEC0.
+    CHECK(sessionguards::RipTarget(kFn + kModeLoadAt, kRvaFn + kModeLoadAt, 2, 6) == 0x50FEC0, "event type global");
+    // The call in the reports targets the getter, and the fault is the read right after.
+    CHECK(kCallWin[3] == 0xe8 && kRvaCallWin + 3 + 5 + sessionguards::Disp32(kCallWin + 4) == kRvaFn, "call 0x5AA80");
+    CHECK(kRvaCallWin + 19 == kRvaFault && kCallWin[19] == 0x8b && kCallWin[20] == 0x08, "mov ecx, [rax] at the fault");
+    // Stub.
+    uint8_t s[kPageBytes];
+    std::memset(s, 0xCC, sizeof(s));
+    const uintptr_t va = 0x7FF600010000ull;
+    const uint64_t back = 0x7FF6A0000000ull + kRvaBack;
+    const size_t n = BuildStub(s, va, back);
+    CHECK(n == kStubLen && n <= kCountOff && s[n] == 0xCC, "stub length %zu", n);
+    CHECK(s[0] == 0xf0 && va + 7 + sessionguards::Disp32(s + 3) == va + kCountOff, "lock inc [count]");
+    CHECK(s[7] == 0x48 && s[9] == 0x05 && va + 14 + sessionguards::Disp32(s + 10) == va + kBlockOff, "lea rax, [block]");
+    CHECK(kBlockOff + kBlockBytes <= kPageBytes && kBlockOff >= kCountOff + 4, "block inside page");
+    CHECK(s[27] == 0x48 && s[28] == 0x8b && s[29] == 0x0c && s[30] == 0x24, "mov rcx, [rsp]");
+    uint64_t got = 0;
+    std::memcpy(&got, s + n - 8, 8);
+    CHECK(s[n - 14] == 0xff && s[n - 13] == 0x25 && got == back, "jmp back");
+}
+
 int main() {
+    TestEventCfg();
     TestBikeList();
     TestWake();
     TestListBox();
@@ -349,6 +421,7 @@ int main() {
     TestMipmap();
     TestRates();
 #ifdef _WIN32
+    TestEventCfgLive();
     TestListBoxLive();
     TestPtr64Live();
 #endif

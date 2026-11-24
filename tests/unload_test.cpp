@@ -182,10 +182,11 @@ static void TestInventory() {
           "no MH_Uninitialize: a thread inside a detour still calls through its trampoline");
 
     // Hand-written code patches: the antifreeze displacement, the Aussie-mode spring sites, the tyre-fallback
-    // span, the map-guard calls and the shock-guard call. Each VirtualProtect is one of these (apply,
+    // spans (bike list and trainer), the map-guard calls and the shock-guard call. Each VirtualProtect is one of these (apply,
     // verify-revert, revert) - a new one is a new patch that needs a revert in TdRevertPatches.
-    CHECK(Count(fm, "VirtualProtect(") == 21,
-          "VirtualProtect is called %d times (21 known: antifreeze 6, aussie 3, tyre fallback 4, "
+    CHECK(Count(fm, "VirtualProtect(") == 25,
+          "VirtualProtect is called %d times (25 known: antifreeze 6, aussie 3, tyre fallback 4, "
+          "trainer tyre fallback 4, "
           "map guard 4, shock guard 4); a new code "
           "patch must be reverted in TdRevertPatches - then update this count", Count(fm, "VirtualProtect("));
     const std::string patches = Body(fm, "static void TdRevertPatches(");

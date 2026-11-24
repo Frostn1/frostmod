@@ -49,6 +49,7 @@
 #include "fairsend.h"   // the promotion rule, and the game's candidate-list layout
 #include "serverrejoin.h"  // a rider who leaves is taken off everybody's screen
 #include "sessionguards.h" // the host-side crash at +0x7A860 (riderinfo), shared with FrostMod
+#include "setupguard.h"    // beta21f: "Cheat - Bike Setup" on every joiner
 #include "servermsg.h"  // the announcement model + feed JSON, shared with FrostMod
 #include "httpmux.h"    // the HTTP front: non-blocking, per-connection deadlines
 #include "announceauth.h" // the announce token: minimum length, constant-time, backoff
@@ -190,6 +191,8 @@ struct Config {
     // The crash guards FrostMod has that also apply to a server (the host's connection
     // handler, +0x7A860). See sessionguards.h, riderinfo.
     bool        crashGuards   = true;
+    // beta21f bans every joiner for "Cheat - Bike Setup". See setupguard.h.
+    bool        setupGuard    = true;
     // Styled announcements. These do not travel as chat - FrostMod fetches them and draws
     // them itself, so a rider without it is unaffected and still sees ordinary server chat.
     std::vector<Announce> announce;              // timed lines from this file
@@ -226,6 +229,8 @@ const char* kDefaultConfig =
     "rejoin_fix: true     # set false to leave departures exactly as PiBoSo ships them\n"
     "crash_guards: true   # FrostMod's server-side crash fixes (a join the game cannot\n"
     "                     # find crashed the host at +0x7A860)\n"
+    "setup_guard: true    # beta21f bans every joiner for \"Cheat - Bike Setup\"; this lets\n"
+    "                     # a valid setup through and still bans a real setup cheat\n"
     "\n"
     "# For each track this server runs, the mxb-mods.com page to download it.\n"
     "# The KEY must be the track name EXACTLY as FrostServer logs it - watch\n"
@@ -375,6 +380,7 @@ void LoadConfig() {
         else if (key == "port") { int p = atoi(stripComment(val).c_str()); if (p > 0 && p < 65536) c.port = p; }
         else if (key == "name") c.name = unquote(stripComment(val));
         else if (key == "rejoin_fix") { std::string v = lower(stripComment(val)); c.rejoinFix = !(v == "false" || v == "0" || v == "no"); }
+        else if (key == "setup_guard") { std::string v = lower(stripComment(val)); c.setupGuard = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "crash_guards") { std::string v = lower(stripComment(val)); c.crashGuards = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "fair_send") { std::string v = lower(stripComment(val)); c.fairSend = !(v == "false" || v == "0" || v == "no"); }
         else if (key == "fair_send_ticks") {
@@ -1019,6 +1025,93 @@ static void StartCrashGuards() {
         "(the crash at +0x%llX)", (unsigned long long)kRvaFault);
 }
 
+// ---- beta21f setup ban (setupguard.h) ----------------------------------------------------
+using ValidateFn = int (*)(const uint8_t* def, const uint8_t* setup);
+using SetupJobFn = int (*)(int world, const uint8_t* setup);
+static ValidateFn g_validateOrig = nullptr;
+static SetupJobFn g_setupJobOrig = nullptr;
+static thread_local bool t_validatorRan = false;
+static std::atomic<unsigned long long> g_setupPassed{0}, g_setupKept{0};
+
+static void LogSetupFailures(const setupguard::Failure* f, size_t n, const char* verdict) {
+    char line[1024];
+    int at = _snprintf_s(line, sizeof(line), _TRUNCATE, "[setup] the game rejected a setup (%s):", verdict);
+    for (size_t i = 0; i < n && i < 12 && at > 0 && at < (int)sizeof(line) - 80; ++i) {
+        const auto& fd = setupguard::kFields[f[i].field];
+        const int w = f[i].gear >= 0
+            ? _snprintf_s(line + at, sizeof(line) - at, _TRUNCATE, " gear%d(+0x%X)=%d max %d",
+                          f[i].gear, fd.setup + 4 * f[i].gear, f[i].value, f[i].limit)
+            : _snprintf_s(line + at, sizeof(line) - at, _TRUNCATE, " %s(+0x%X)=%d max %d [def+0x%X]",
+                          fd.name, fd.setup, f[i].value, f[i].limit, fd.limit);
+        if (w > 0) at += w;
+    }
+    Log("%s", line);
+}
+
+static size_t EvaluateSafely(const uint8_t* def, const uint8_t* setup, setupguard::Failure* f, size_t cap,
+                             bool* readOk) {
+    __try { *readOk = true; return setupguard::Evaluate(def, setup, f, cap); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *readOk = false; return 0; }
+}
+
+static int GuardValidate(const uint8_t* def, const uint8_t* setup) {
+    t_validatorRan = true;
+    const int rc = g_validateOrig(def, setup);
+    if (rc == 0 || !def || !setup) return rc;
+    setupguard::Failure f[48];
+    bool readOk = false;
+    size_t n = EvaluateSafely(def, setup, f, 48, &readOk);
+    if (!readOk) { Log("[setup] could not read the setup or the bike; the game's ban stands"); return rc; }
+    if (n > 48) n = 48;
+    if (setupguard::OnlyBroken(f, n)) {
+        const unsigned long long k = g_setupPassed.fetch_add(1) + 1;
+        if (k <= 20 || (k & (k - 1)) == 0) LogSetupFailures(f, n, "a beta21f mistake, let through");
+        return 0;
+    }
+    const unsigned long long k = g_setupKept.fetch_add(1) + 1;
+    if (k <= 50 || (k & (k - 1)) == 0)
+        LogSetupFailures(f, n, n ? "out of range, the game's ban stands" : "no field out of range by our table");
+    return rc;
+}
+
+static int GuardSetupJob(int world, const uint8_t* setup) {
+    t_validatorRan = false;
+    const int rc = g_setupJobOrig(world, setup);
+    if (rc != 0 && !t_validatorRan)
+        Log("[setup] no bike found for world %d, so the game bans this rider for Bike Setup without "
+            "looking at the setup", world);
+    return rc;
+}
+
+static void StartSetupGuard() {
+    bool on;
+    { std::lock_guard<std::mutex> lk(g_cfgMutex); on = g_cfg.setupGuard; }
+    if (!on) { Log("[setup] off by config; the beta21f setup check runs as PiBoSo ships it"); return; }
+    const uintptr_t base = MxbBase("setup");
+    if (!base) return;
+    using namespace setupguard;
+    if (!CodeIs(base, kRvaValidator, kValidator, kValidatorLen) ||
+        !CodeIs(base, kRvaSetupJob, kSetupJob, kSetupJobLen)) {
+        Log("[setup] not applied: the setup check is not beta21f's (another game build)");
+        return;
+    }
+    if (!MinHookReady()) { Log("[setup] not applied: MinHook init failed"); return; }
+    void* v = reinterpret_cast<void*>(base + kRvaValidator);
+    void* j = reinterpret_cast<void*>(base + kRvaSetupJob);
+    if (MH_CreateHook(v, reinterpret_cast<void*>(&GuardValidate), reinterpret_cast<void**>(&g_validateOrig)) != MH_OK ||
+        MH_CreateHook(j, reinterpret_cast<void*>(&GuardSetupJob), reinterpret_cast<void**>(&g_setupJobOrig)) != MH_OK ||
+        MH_EnableHook(v) != MH_OK || MH_EnableHook(j) != MH_OK) {
+        MH_DisableHook(v);
+        MH_DisableHook(j);
+        Log("[setup] not applied: could not hook +0x%llX / +0x%llX", (unsigned long long)kRvaValidator,
+            (unsigned long long)kRvaSetupJob);
+        return;
+    }
+    Log("[setup] on: a setup the game rejects is re-checked field by field and logged; only beta21f's "
+        "known mistakes are let through (hooks at +0x%llX, +0x%llX)", (unsigned long long)kRvaValidator,
+        (unsigned long long)kRvaSetupJob);
+}
+
 constexpr uintptr_t kRvaWriterInit = 0x2837B0;   // writer_init(w, buf, cap)
 constexpr uintptr_t kRvaBuilderCallRet = 0x29D6D0;  // the instruction after the builder's call
 
@@ -1097,6 +1190,7 @@ static void StartFairSend() {
 static void StartFairSend() {}   // the standalone exe is not inside a game
 static void StartRejoinFix() {}
 static void StartCrashGuards() {}
+static void StartSetupGuard() {}
 #endif
 
 void FrostServerInit() {
@@ -1109,6 +1203,7 @@ void FrostServerInit() {
     StartFairSend();
     StartRejoinFix();
     StartCrashGuards();
+    StartSetupGuard();
     // fair_send counts thirty times a second; its lifetime total is saved once a minute.
     std::thread([] {
         for (;;) { std::this_thread::sleep_for(std::chrono::seconds(60)); SaveProtection(); }

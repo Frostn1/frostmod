@@ -355,6 +355,8 @@ add_test(NAME protection COMMAND protection_test)
 # FrostServer's rejoin fix: the departure code's bytes and the owner rule.
 add_executable(serverrejoin_test tests/serverrejoin_test.cpp)
 add_test(NAME serverrejoin COMMAND serverrejoin_test)
+add_executable(setupguard_test tests/setupguard_test.cpp)
+add_test(NAME setupguard COMMAND setupguard_test)
 
 # --- NaN bike reset test ---------------------------------------------------------
 # The offsets the per-step check reads and the place-bike call it makes, proved against the

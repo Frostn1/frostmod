@@ -21,6 +21,7 @@
 #include "crashreport.h"
 #include "protection.h"
 #include "hookutil.h"
+#include "lookupguard.h"
 
 namespace guards {
 
@@ -43,6 +44,8 @@ std::atomic<bool> ptr64fix_on{true};
 std::atomic<bool> riderinfoguard_on{true};
 std::atomic<bool> mipmapguard_on{true};
 std::atomic<bool> eventcfgguard_on{true};
+std::atomic<bool> lookupguard_on{true};
+std::atomic<bool> animguard_on{true};
 std::atomic<bool> nanrecover_on{true};
 
 namespace {
@@ -1474,6 +1477,145 @@ static void SessionGuardsTick() {
     }
 }
 
+// ===========================================================================
+// LOOKUP GUARD  -  empty lookups, a NaN animation phase and two NULL objects (lookupguard.h)
+//
+// 45 "nothing found" exits whose index is clamped to the list (lookupguard=0), the animation
+// sampler behind +0x2686C0 (animguard=0), and two NULL reads given the game's own skip and
+// failure paths (lookupguard=0). Each site's bytes are checked before anything is written; a
+// site that does not match is left alone and the rest still go in. Hand-written patches like
+// the tyre fallback's, reverted at unload; the stubs only jump back into the game, so the page
+// is kept after unload for a thread that may be on its way through.
+// ===========================================================================
+static uint8_t*  g_lgPage = nullptr;
+static bool      g_lgOn[lookupguard::kSlots] = {};
+static uint32_t  g_lgLogged[lookupguard::kSlots] = {};
+
+/// Write `len` bytes of `patch` over the game at `rva` (or put `orig` back). One site.
+static bool LgWrite(uint32_t rva, const uint8_t* bytes, size_t len) {
+    DWORD prot = 0;
+    void* p = (void*)(g_base + rva);
+    if (!VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, &prot)) return false;
+    memcpy(p, bytes, len);
+    VirtualProtect(p, len, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), p, len);
+    return true;
+}
+
+static void LookupGuardRevert() {
+    using namespace lookupguard;
+    for (size_t i = 0; i < kSlots; ++i) {
+        if (!g_lgOn[i]) continue;
+        if (i < kClampCount) LgWrite(kClamps[i].rva, kClamps[i].bytes, kClamps[i].len);
+        else if (i == kAnimSlot) LgWrite(kAnimSite, kAnimWinBytes + (kAnimSite - kAnimWin), kAnimLen);
+        else if (i == kNull1Slot) LgWrite(kNull1Site, kNull1Bytes, kNull1Len);
+        else if (i == kNull2Slot) LgWrite(kNull2Site, kNull2Bytes, kNull2Len);
+        g_lgOn[i] = false;
+    }
+}
+
+static void InstallLookupGuard() {
+    using namespace lookupguard;
+    if (!SsgMxbOnly("lookup")) return;
+    const bool lookups = lookupguard_on.load(), anim = animguard_on.load();
+    if (!lookups) Log("[lookup] guard off by config (lookupguard=0)");
+    if (!anim) Log("[anim] guard off by config (animguard=0)");
+    if ((!lookups && !anim) || g_unloading.load()) return;
+    for (size_t i = 0; i < kSlots; ++i) if (g_lgOn[i]) return;   // already in
+    auto* dos = (IMAGE_DOS_HEADER*)g_base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
+    const uint32_t image = nt->OptionalHeader.SizeOfImage;
+    if (!g_lgPage) g_lgPage = (uint8_t*)AllocNear(g_base + 0x150000, kPageBytes, PAGE_EXECUTE_READWRITE);
+    if (!g_lgPage) { Log("[lookup] guard not applied: no page for the stubs"); return; }
+    memset(g_lgPage, 0xCC, kCountBase);
+    memset(g_lgPage + kCountBase, 0, kPageBytes - kCountBase);
+    memset(g_lgLogged, 0, sizeof(g_lgLogged));
+    auto counter = [&](size_t slot) { return (uint64_t)(uintptr_t)(g_lgPage + kCountBase + 4 * slot); };
+    auto stub = [&](size_t slot) { return g_lgPage + slot * kSlot; };
+    auto place = [&](size_t slot, uint32_t rva, size_t len) {
+        uint8_t patch[16];
+        if (!BuildSitePatch(g_base + rva, (uintptr_t)stub(slot), len, patch)) return false;
+        if (!LgWrite(rva, patch, len)) return false;
+        g_lgOn[slot] = true;
+        return true;
+    };
+    unsigned clamps = 0, missed = 0;
+    if (lookups) {
+        for (size_t i = 0; i < kClampCount; ++i) {
+            const ClampSite& c = kClamps[i];
+            bool ok = SsgCodeIs(c.rva, c.bytes, c.len) && c.count + 4 <= image;
+            if (ok && c.cmpRva) {
+                const uint8_t* cmp = (const uint8_t*)(g_base + c.cmpRva);
+                ok = SsgCodeIs(c.cmpRva, cmp, c.cmpLen) &&
+                     sessionguards::RipTarget(cmp, c.cmpRva, c.cmpLen - 4, c.cmpLen) == c.count;
+            }
+            if (!ok) { ++missed; continue; }
+            BuildClamp(stub(i), (uintptr_t)stub(i), g_base, c, counter(i));
+            if (place(i, c.rva, c.len)) ++clamps; else ++missed;
+        }
+        FlushInstructionCache(GetCurrentProcess(), g_lgPage, kCountBase);
+        if (SsgCodeIs(kNull1Site, kNull1Bytes, kNull1Len) && SsgCodeIs(kNull1CallRva, kNull1Call, sizeof(kNull1Call))) {
+            BuildNull1(stub(kNull1Slot), (uintptr_t)stub(kNull1Slot), g_base, counter(kNull1Slot));
+            FlushInstructionCache(GetCurrentProcess(), stub(kNull1Slot), kSlot);
+            place(kNull1Slot, kNull1Site, kNull1Len);
+        }
+        if (SsgCodeIs(kNull2Site, kNull2Bytes, kNull2Len) && SsgCodeIs(kNull2LoadRva, kNull2Load, sizeof(kNull2Load))) {
+            BuildNull2(stub(kNull2Slot), (uintptr_t)stub(kNull2Slot), g_base, counter(kNull2Slot));
+            FlushInstructionCache(GetCurrentProcess(), stub(kNull2Slot), kSlot);
+            place(kNull2Slot, kNull2Site, kNull2Len);
+        }
+        if (clamps)
+            Log("[lookup] guard on: %u name lookup(s) that find nothing now use the list's first entry "
+                "instead of an index the game never set (the .roc track lookup at +0x62E66, tyres, "
+                "series, bikes)%s.", clamps, missed ? "" : "; every site matched");
+        if (missed)
+            Log("[lookup] %u lookup site(s) are not the bytes we expect (game updated?) and were left "
+                "alone.", missed);
+        Log("[lookup] NULL checks: race-start item +0x2544A3 %s, interface call +0x290371 %s.",
+            g_lgOn[kNull1Slot] ? "on" : "not applied", g_lgOn[kNull2Slot] ? "on" : "not applied");
+    }
+    if (anim) {
+        if (SsgCodeIs(kAnimWin, kAnimWinBytes, kAnimWinLen)) {
+            BuildAnim(stub(kAnimSlot), (uintptr_t)stub(kAnimSlot), g_base, counter(kAnimSlot));
+            FlushInstructionCache(GetCurrentProcess(), stub(kAnimSlot), kSlot);
+            if (place(kAnimSlot, kAnimSite, kAnimLen))
+                Log("[anim] guard on: an animation channel with a NaN phase is sampled at its first "
+                    "key instead of key INT_MIN (at +0x%X, the crash at +0x%X).", kAnimSite, kAnimFault);
+        } else {
+            Log("[anim] guard not applied: the bytes at +0x%X are not the animation sampler we "
+                "expect (game updated?). Nothing patched.", kAnimWin);
+        }
+    }
+}
+
+static void LookupGuardTick() {
+    using namespace lookupguard;
+    if (!g_lgPage) return;
+    for (size_t i = 0; i < kSlots; ++i) {
+        uint32_t n = 0;
+        if (!SsgDue(g_lgPage, kCountBase + 4 * i, &g_lgLogged[i], &n)) continue;
+        if (i < kClampCount) {
+            ProtCatch(protection::Kind::BadText);
+            Log("[lookup] a %s lookup at +0x%X found no match and its index was never set: used "
+                "the first %s instead. %u so far.", ListName(kClamps[i].stride), kClamps[i].rva,
+                ListName(kClamps[i].stride), n);
+            frostmod::crash::Note("empty %s lookup at +0x%X (%u so far)", ListName(kClamps[i].stride),
+                                  kClamps[i].rva, n);
+        } else if (i == kAnimSlot) {
+            ProtCatch(protection::Kind::PhysicsNan);
+            Log("[anim] an animation channel had a NaN phase: sampled at its first key and the phase "
+                "set to 0, instead of the crash at mxbikes.exe+0x%X. %u so far.", kAnimFault, n);
+            frostmod::crash::Note("NaN animation phase reset (%u so far)", n);
+        } else {
+            ProtCatch(protection::Kind::NullObject);
+            const uint32_t site = i == kNull1Slot ? kNull1Site : kNull2Site;
+            Log("[lookup] a NULL object at +0x%X took the game's own %s path instead of being read. "
+                "%u so far.", site, i == kNull1Slot ? "skip-this-item" : "failure", n);
+            frostmod::crash::Note("NULL object skipped at +0x%X (%u so far)", site, n);
+        }
+    }
+}
+
 static void InstallSessionGuardsImpl() {
     InstallBikeListGuard();
     InstallWakeGuard();
@@ -1482,6 +1624,7 @@ static void InstallSessionGuardsImpl() {
     InstallRiderInfoGuard();
     InstallMipmapGuard();
     InstallEventCfgGuard();
+    InstallLookupGuard();
 }
 
 // ===========================================================================
@@ -1884,6 +2027,7 @@ void InstallSessionGuards() { InstallSessionGuardsImpl(); }
 void Tick() {
     ShockGuardTick();
     SessionGuardsTick();
+    LookupGuardTick();
 }
 
 bool NanRecoverInstall(const uint8_t* sim_step) { return NrInstall(sim_step); }
@@ -1917,6 +2061,7 @@ bool NanRecoverLive() { return g_nrLive.load(std::memory_order_relaxed); }
 unsigned TerrainGuardedCount() { return g_terrainGuarded.load(std::memory_order_relaxed); }
 
 void RevertTyreFallback() { TyreFallbackRevert(); }
+void RevertLookupGuard() { LookupGuardRevert(); }
 void RevertMapGuard() { MgRevert(); }
 void RevertShockGuard() { SgRevert(); }
 

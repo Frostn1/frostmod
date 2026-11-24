@@ -15,7 +15,7 @@
 // THE GUARD. A detour on the validator. When the game's own validator rejects a setup, this
 // re-runs the same 36 comparisons, logs every one that failed with its value and limit, and
 // decides from that:
-//   - every failing field is one the beta21f build gets wrong (kBroken)  -> the setup passes;
+//   - every failing field is one the beta21f build gets wrong (IsBroken) -> the setup passes;
 //   - anything else fails                                                 -> the game's 1 stands.
 // So a real out-of-range setup is still caught. A detour on the setup job notes when the bike
 // lookup itself fails, which the game also turns into this ban.
@@ -108,10 +108,6 @@ constexpr Field kFields[] = {
 constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
 constexpr size_t kSetupBytes = 0xD8;
 
-// Fields beta21f gets wrong, by index into kFields. Filled in from the live diagnosis; a setup
-// that fails only these passes, anything else keeps the game's verdict.
-constexpr bool IsBroken(size_t /*field*/) { return false; }
-
 inline int32_t I32(const uint8_t* p, size_t off) { int32_t v; std::memcpy(&v, p + off, 4); return v; }
 
 struct Failure {
@@ -120,6 +116,27 @@ struct Failure {
     int32_t value;
     int32_t limit;
 };
+
+// WHAT BETA21F GETS WRONG (live, ride rig 2026-11-24, 21f dedicated server, OEM KTM 250 SX-F):
+// the only comparison that fails is setup+0x98, the rear tyre size, against def+0x217B0, the
+// number of rear tyre sizes. The client's own copy of the same bike lists 2 ("OEM MX IS
+// 110/90-19 1", ...); the server's lists 0. Front (setup+0x94 / def+0x134A0) is 1 on the client
+// and 0 on the server too. The size list is built from the bike's tyre compounds
+// (+0x193880), and on the dedicated server that list comes out empty, so every rider who picks
+// any size but the first is "cheating". With setup+0x98 = 0 there is no ban.
+//
+// So exactly this is let through: a tyre-size field (front or rear) failing against a server
+// list that is EMPTY. The server has nothing to check the index against; the index is only
+// stored (+0x199A34 / +0x199A42) into lists that live inside the bike record. A size index
+// above a list the server did build, or any other field out of range, keeps the game's ban.
+constexpr uint16_t kFrontSize = 0x94, kRearSize = 0x98;
+constexpr int32_t  kMaxSizeIndex = 0x159;   // per-wheel list capacity (0x15A entries of 0xA8)
+
+inline bool IsBroken(const Failure& f) {
+    const Field& fd = kFields[f.field];
+    return (fd.setup == kFrontSize || fd.setup == kRearSize) && fd.kind == Kind::Max &&
+           f.limit == 0 && f.value >= 0 && f.value <= kMaxSizeIndex;
+}
 
 /// Re-runs every comparison the validator makes; fills up to `cap` failures, returns the count.
 /// Tyre fields are only read when their compound index passed its own check (the game reads
@@ -159,7 +176,7 @@ inline size_t Evaluate(const uint8_t* def, const uint8_t* setup, Failure* out, s
 /// True when every failure is one the build gets wrong (and there was at least one).
 inline bool OnlyBroken(const Failure* f, size_t n) {
     if (n == 0) return false;
-    for (size_t i = 0; i < n; ++i) if (!IsBroken(f[i].field)) return false;
+    for (size_t i = 0; i < n; ++i) if (!IsBroken(f[i])) return false;
     return true;
 }
 

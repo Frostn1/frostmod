@@ -163,6 +163,27 @@ not in its list, gets no answer written, and copies two lists of whatever length
 the stack. FrostServer answers such a request with empty lists instead. `crash_guards: false`
 turns it off.
 
+## Riders banned for "Cheat - Bike Setup" (beta21f)
+
+On a beta21f dedicated server every rider who joins is banned within seconds, with
+`Ban (Cheat - Bike Setup)` in the server log. The client's game build, bike and saved setups
+make no difference, and a beta21e server does not do it.
+
+When a rider's setup arrives, the server checks every setting against the steps the bike
+allows. On beta21f the server's list of tyre sizes for the rider's bike comes out empty, so any
+tyre size but the first is out of range and the rider is banned as a cheater. The OEM KTM's
+rear tyre, for example, offers two sizes on the rider's screen and none on the server.
+
+`setup_guard` re-checks a setup the game rejects, field by field, and logs what failed. It lets
+the setup through only when every failure is a tyre size checked against an empty size list on
+the server. Any other setting out of range, or a tyre size past a list the server did build,
+still gets the game's ban. It only switches on when the game's code matches beta21f exactly; on
+any other build it logs that it was not applied and changes nothing.
+
+`setup_guard: true` is the default. Set it to `false` to run the setup check exactly as PiBoSo
+ships it. FrostMod has the same fix for players who host from the game (`setupguard=0` turns
+it off there).
+
 ## Styled announcements
 
 Every message a dedicated server sends in chat arrives in the same colour on every

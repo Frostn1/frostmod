@@ -77,6 +77,7 @@ void ResetConfigDefaults() {
     guards::listboxguard_on.store(true);
     guards::ptr64fix_on.store(true);
     guards::riderinfoguard_on.store(true);
+    guards::setupguard_on.store(true);
     guards::mipmapguard_on.store(true);
     guards::eventcfgguard_on.store(true);
     guards::lookupguard_on.store(true);
@@ -101,6 +102,7 @@ void ReadConfig() {
         else if (sscanf_s(line, "listboxguard=%d", &value) == 1) guards::listboxguard_on.store(value != 0);
         else if (sscanf_s(line, "ptr64fix=%d", &value) == 1) guards::ptr64fix_on.store(value != 0);
         else if (sscanf_s(line, "riderinfoguard=%d", &value) == 1) guards::riderinfoguard_on.store(value != 0);
+        else if (sscanf_s(line, "setupguard=%d", &value) == 1) guards::setupguard_on.store(value != 0);
         else if (sscanf_s(line, "mipmapguard=%d", &value) == 1) guards::mipmapguard_on.store(value != 0);
         else if (sscanf_s(line, "eventcfgguard=%d", &value) == 1) guards::eventcfgguard_on.store(value != 0);
         else if (sscanf_s(line, "lookupguard=%d", &value) == 1) guards::lookupguard_on.store(value != 0);

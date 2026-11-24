@@ -99,7 +99,7 @@ MXB App or an account. Download `FrostModFixes.zip`, then copy
 All guards are on by default. An optional `frostmod_fixes.cfg` beside the plugin
 can turn individual guards off with `key=0`. The keys are `mapguard`,
 `shockguard`, `bikelistguard`, `wakeguard`, `listboxguard`, `ptr64fix`,
-`riderinfoguard`, `mipmapguard`, `eventcfgguard`, `lookupguard`, `animguard` and `nanrecover`. The trainer, tyre-fallback,
+`riderinfoguard`, `mipmapguard`, `eventcfgguard`, `lookupguard`, `animguard`, `setupguard` and `nanrecover`. The trainer, tyre-fallback,
 GHS and terrain guards have no off key. `frostmod_fixes.log`, also beside the
 plugin, is rewritten each game start.
 

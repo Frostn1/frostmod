@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-24 - v0.53.3
+
+A fix for the beta21f "Banned Cheating" on every server.
+
+### Fixed
+- **Every rider banned for "Cheat - Bike Setup" on a beta21f server.** When a rider's setup
+  arrives, the server checks each setting against the steps the bike allows. On beta21f the
+  server's list of tyre sizes for the bike comes out empty, so any tyre size but the first is
+  out of range and the rider is banned as a cheater ("Banned Cheating (-1)"). FrostServer now
+  re-checks a setup the game rejects and lets it through only when every failure is a tyre size
+  against an empty list. Any other setting out of range still gets the game's ban. FrostMod does
+  the same when you host from the game. Off with `setup_guard: false` (FrostServer) or
+  `setupguard=0` (FrostMod). Only active on beta21f.
+
 ## 2026-11-24 - v0.53.2
 
 More crash fixes for MX Bikes beta21f, from the crash reports.

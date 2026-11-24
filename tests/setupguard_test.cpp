@@ -42,7 +42,7 @@ int main() {
     CHECK(n >= 1 && kFields[f[0].field].setup == 0x54 && f[0].value == 6 && f[0].limit == 5, "f54 first");
     CHECK(n >= 2 && kFields[f[1].field].kind == Kind::Gears && f[1].gear == 2 && f[1].value == 9, "gear 2");
     CHECK(n >= 3 && kFields[f[2].field].setup == 0xC0 && f[2].value == -1, "negative fC0");
-    CHECK(!OnlyBroken(f, n), "nothing is known broken yet, so a real out-of-range setup keeps its ban");
+    CHECK(!OnlyBroken(f, n), "a real out-of-range setup keeps its ban");
     CHECK(!OnlyBroken(f, 0), "no failures is not 'only broken'");
 
     // A bad compound index: its own field fails and the tyre range behind it is not read.
@@ -50,6 +50,34 @@ int main() {
     Put(s2, 0x8C, 1000000);
     n = Evaluate(def.data(), s2.data(), f, 48);
     CHECK(n == 1 && kFields[f[0].field].setup == 0x8C, "compound index out of range, tyre not read");
+
+    // The beta21f case: the server built no tyre sizes, the rider picked the second rear size.
+    std::vector<uint8_t> d3 = def, s3(kSetupBytes, 0);
+    Put(d3, 0x134A0, 0);                 // front sizes: none on the server
+    Put(d3, 0x217B0, 0);                 // rear sizes: none on the server
+    Put(s3, kRearSize, 1);
+    n = Evaluate(d3.data(), s3.data(), f, 48);
+    CHECK(n == 1 && kFields[f[0].field].setup == kRearSize && f[0].limit == 0, "rear size vs empty list");
+    CHECK(OnlyBroken(f, n), "the beta21f empty-list failure is let through");
+    Put(s3, kFrontSize, 1);
+    n = Evaluate(d3.data(), s3.data(), f, 48);
+    CHECK(n == 2 && OnlyBroken(f, n), "front and rear against empty lists");
+    // ...but not together with a real out-of-range field,
+    Put(s3, 0x54, 6);
+    n = Evaluate(d3.data(), s3.data(), f, 48);
+    CHECK(n == 3 && !OnlyBroken(f, n), "a real cheat next to it keeps the ban");
+    // ...not when the server did build the list,
+    std::vector<uint8_t> s4(kSetupBytes, 0);
+    Put(s4, kRearSize, 9);
+    n = Evaluate(def.data(), s4.data(), f, 48);
+    CHECK(n == 1 && !OnlyBroken(f, n), "size past a list the server built keeps the ban");
+    // ...and not for a negative or absurd index.
+    Put(s4, kRearSize, -1);
+    n = Evaluate(d3.data(), s4.data(), f, 48);
+    CHECK(n == 1 && !OnlyBroken(f, n), "negative size index keeps the ban");
+    Put(s4, kRearSize, 100000);
+    n = Evaluate(d3.data(), s4.data(), f, 48);
+    CHECK(n == 1 && !OnlyBroken(f, n), "absurd size index keeps the ban");
 
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("setupguard: all checks passed\n");

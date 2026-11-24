@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-11-24 - v0.53.2
+
+More crash fixes for MX Bikes beta21f, from the crash reports.
+
+### Fixed
+- **Name lookups that find nothing (msvcr90+0x36EDE and others).** The game finds tracks,
+  tyres, bikes and series by name with one loop pattern. When nothing matches, it uses an index
+  it never set. 45 of those exits now check the index against the list they just walked and use
+  the first entry when it is out of range. A valid index is never changed. The biggest one is the
+  menu after an online event whose track is not installed (the `.roc` path, 35 reports from 31
+  riders on beta21e). Also covers the second trainer loader's tyre and the bike-list entry's tyre.
+  Off with `lookupguard=0`.
+- **Crash at +0x2686C0 with a NaN animation phase.** The rider's animation sampler turned a NaN
+  phase into key INT_MIN. The NaN was in render-side animation state, not the bike's physics, so
+  nanrecover had nothing to reset. A NaN phase now reads as 0 and the key stays inside the
+  channel. Off with `animguard=0`.
+- **Two NULL objects.** +0x2544A3 (an item at race start the game could not find) now takes the
+  game's own skip-this-item path. +0x290371 (an interface that is not there) now takes the
+  function's own failure return. Off with `lookupguard=0`.
+
 ## 2026-11-24 - v0.53.1
 
 Two crash fixes for MX Bikes beta21f, from the crash reports since the update.

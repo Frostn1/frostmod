@@ -79,6 +79,8 @@ void ResetConfigDefaults() {
     guards::riderinfoguard_on.store(true);
     guards::mipmapguard_on.store(true);
     guards::eventcfgguard_on.store(true);
+    guards::lookupguard_on.store(true);
+    guards::animguard_on.store(true);
     guards::nanrecover_on.store(true);
 }
 
@@ -101,6 +103,8 @@ void ReadConfig() {
         else if (sscanf_s(line, "riderinfoguard=%d", &value) == 1) guards::riderinfoguard_on.store(value != 0);
         else if (sscanf_s(line, "mipmapguard=%d", &value) == 1) guards::mipmapguard_on.store(value != 0);
         else if (sscanf_s(line, "eventcfgguard=%d", &value) == 1) guards::eventcfgguard_on.store(value != 0);
+        else if (sscanf_s(line, "lookupguard=%d", &value) == 1) guards::lookupguard_on.store(value != 0);
+        else if (sscanf_s(line, "animguard=%d", &value) == 1) guards::animguard_on.store(value != 0);
         else if (sscanf_s(line, "nanrecover=%d", &value) == 1) guards::nanrecover_on.store(value != 0);
     }
     std::fclose(file);
@@ -221,6 +225,7 @@ void Teardown() {
     if (status != MH_OK && status != MH_ERROR_NOT_INITIALIZED)
         Log("[unload] MH_DisableHook(all) failed: %s", MH_StatusToString(status));
     guards::RevertTyreFallback();
+    guards::RevertLookupGuard();
     guards::RevertMapGuard();
     guards::RevertShockGuard();
 }

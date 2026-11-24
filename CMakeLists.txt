@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.53.1")
+set(FROSTMOD_VERSION "0.53.2")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -319,6 +319,12 @@ add_test(NAME aussie COMMAND aussie_test)
 # them (src/tyrefallback.h). Pure, so it runs on any host.
 add_executable(tyrefallback_test tests/tyrefallback_test.cpp)
 add_test(NAME tyrefallback COMMAND tyrefallback_test)
+
+# --- lookup guard test ----------------------------------------------------------
+# The 45 clamped "nothing found" exits, the animation and NULL stubs (src/lookupguard.h); on
+# Windows the clamp and animation stubs run on an executable page.
+add_executable(lookupguard_test tests/lookupguard_test.cpp)
+add_test(NAME lookupguard COMMAND lookupguard_test)
 
 # --- quad-batch map guard test -------------------------------------------------
 # The two call sites rewritten, the map/unmap functions they reach, the GL pointers and flags

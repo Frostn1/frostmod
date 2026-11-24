@@ -29,6 +29,8 @@ extern std::atomic<bool> ptr64fix_on;
 extern std::atomic<bool> riderinfoguard_on;
 extern std::atomic<bool> mipmapguard_on;
 extern std::atomic<bool> eventcfgguard_on;
+extern std::atomic<bool> lookupguard_on;
+extern std::atomic<bool> animguard_on;
 extern std::atomic<bool> nanrecover_on;
 
 void Configure(const Host& host);
@@ -53,6 +55,7 @@ bool NanRecoverLive();
 unsigned TerrainGuardedCount();
 
 void RevertTyreFallback();
+void RevertLookupGuard();
 void RevertMapGuard();
 void RevertShockGuard();
 

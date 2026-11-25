@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-11-24 - v0.54.0
+
+The Game Integration panel waits for the pause screen, its text shows on track again, and Pip
+rides along.
+
+### Fixed
+- **The Game Integration panel drew while riding.** The corner pill ("Game Integration -
+  F8"), the F8 menu and every panel opened from it now show only on the Esc screen. While
+  riding nothing of it draws, not even its frame, and the menu key does nothing (press Esc
+  first). Offline the game's own pause tells it; online the simulation keeps running behind
+  the Esc menu, so FrostMod reads the game's page stack and two UI globals beside it (found on
+  beta21f). A panel left open closes when riding starts, so a digit pressed on the bike can
+  never run a menu row.
+- **On track the panel was an empty dark box.** A plugin draws text with the fonts it
+  registers, and FrostMod registered none, so on track (where the game draws the panel for
+  it) every line was dropped and only the boxes showed. FrostMod now registers a font
+  (written to `plugins/frostmod_data/frostmod.fnt` at start), and the pill text is a lighter
+  blue that reads on the dark box.
+
+### Added
+- **Pip rides along.** MXB App's pet, the little chick with goggles, now sits in a corner of
+  the screen on track: it runs at the bike's speed, gasps in the air, is scared on a long
+  flight or a crash, cheers a landing and falls asleep when the bike stands still. MXB App's
+  pet switch turns it on or off (`pet=` in `frostmod_radar.cfg`: 0 off, 1 bottom right, 2
+  bottom left, 3 top right). F8 > P on the Esc screen moves it round the corners or hides it.
+
 ## 2026-11-24 - v0.53.3
 
 A fix for the beta21f "Banned Cheating" on every server.

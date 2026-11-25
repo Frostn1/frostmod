@@ -736,6 +736,12 @@ constexpr uintptr_t RVA_PAGE_LAYER     = 0x4CF9A8; // i32: current layer, 1-base
 constexpr uintptr_t RVA_PAGE_STACKS    = 0xE55CA4; // per layer, stride 0x254: +0 depth, +4 i32 page[4] (1-based)
 constexpr int       PAGE_STACK_STRIDE  = 0x254;
 constexpr int       PAGE_STACK_MAX     = 4;
+// The Esc menu over the track. Online it is not a page (the stack stays {mtrackm}) and the
+// simulation keeps running behind it, so these are what tell it apart from riding. Found on
+// beta21f by diffing the writable sections across three Esc toggles on a hidden rig
+// (2026-11-24); both flipped every time and nothing else did as cleanly.
+constexpr uintptr_t RVA_UI_DEPTH       = 0x57AE88; // i32: 1 riding, 2 with the Esc menu up
+constexpr uintptr_t RVA_GAME_INPUT     = 0x57A81C; // u8: 1 riding, 0 with the Esc menu up
 constexpr int       SEL_FIRST          = 0xAE0;    // bike folder - first field the panel writes
 constexpr int       SEL_SPAN           = 0xCE0 - 0xAE0 + 0x20;   // through the last gear field
 constexpr uintptr_t RVA_RIDER_LINK     = 0x629A0;  // GAME_MESSAGE kind 15: int(int[2]{race_num, slot})

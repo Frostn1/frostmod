@@ -10,9 +10,15 @@ A fix for the beta21f "Banned Cheating" on every server.
   server's list of tyre sizes for the bike comes out empty, so any tyre size but the first is
   out of range and the rider is banned as a cheater ("Banned Cheating (-1)"). FrostServer now
   re-checks a setup the game rejects and lets it through only when every failure is a tyre size
-  against an empty list. Any other setting out of range still gets the game's ban. FrostMod does
-  the same when you host from the game. Off with `setup_guard: false` (FrostServer) or
-  `setupguard=0` (FrostMod). Only active on beta21f.
+  against an empty list. Any other setting out of range still gets the game's ban.
+  - **Dedicated servers:** a stock dedicated server never loads `plugins\*.dlo`, so the fix ships
+    as `dinput8.dll` (`FrostServerSetupFix.zip`): copy it next to the server's `mxbikes.exe` and
+    restart. It only acts with `-dedicated` and only on beta21f; in a normal game it just passes
+    DirectInput through. `setupfix.log` beside it shows `[setup] on`.
+  - **Hosting from the game:** FrostMod 0.53.3 does the same (`setupguard=0` turns it off).
+  - FrostServer itself has the guard too (`setup_guard`), for setups that load it.
+- **FrostServer docs said plugins load on a dedicated server. They don't.** The game scans
+  `plugins\*.dlo` only in its client start-up. The docs now say so.
 
 ## 2026-11-24 - v0.53.2
 

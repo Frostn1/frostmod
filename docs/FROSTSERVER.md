@@ -180,9 +180,17 @@ the server. Any other setting out of range, or a tyre size past a list the serve
 still gets the game's ban. It only switches on when the game's code matches beta21f exactly; on
 any other build it logs that it was not applied and changes nothing.
 
-`setup_guard: true` is the default. Set it to `false` to run the setup check exactly as PiBoSo
-ships it. FrostMod has the same fix for players who host from the game (`setupguard=0` turns
-it off there).
+**Installing it on a dedicated server.** A stock dedicated server never loads `plugins\*.dlo`
+(the game scans for plugins only in its client start-up), so this fix ships separately as
+`dinput8.dll` in `FrostServerSetupFix.zip`. Copy `dinput8.dll` into the server's folder, next
+to `mxbikes.exe`, and restart. `mxbikes.exe` loads `dinput8.dll` on every start; this one passes
+DirectInput through to Windows' own copy and, only when the command line has `-dedicated`,
+installs the setup guard and nothing else. `setupfix.log` beside it says `[setup] on: ...`.
+Delete the file to undo.
+
+Inside `frostserver.dlo` the same guard is `setup_guard: true` by default (`false` runs the setup
+check exactly as PiBoSo ships it). FrostMod has the same fix for players who host from the game,
+where plugins do load (`setupguard=0` turns it off there).
 
 ## Styled announcements
 
@@ -372,7 +380,11 @@ per-row server-IP RE). FrostServer (step 1) is the contract they build against.
 Confirmed against the decompiled `mxbikes.exe` (image base `0x140000000`), so we
 don't need a live server to trust the mechanism:
 
-- **Plugins load on the dedicated build.** The `.dlo` loader (`0x14012A4F0`,
+- **Correction (2026-11-24): a stock dedicated server does not load plugins.** The scan of
+  `plugins\*.dlo` runs from the client's start-up (event 0); `-dedicated` runs the server
+  start-up (event 45) instead, and a live 21e and 21f dedicated server had no `.dlo` loaded.
+  What follows describes the loader and the dispatch once a plugin *is* loaded (in the game
+  client, or put into the server by other means). The `.dlo` loader (`0x14012A4F0`,
   enumerated at `0x14012A9B7`) resolves exports by name and appends each plugin
   struct (stride `0x118`) to a global list — **base `0x565CC0`, count
   `0x565CB8`**. `RaceEvent` is stored at `plugin+0x68`.

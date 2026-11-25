@@ -21,6 +21,12 @@ on the wire. See [Keeping distant riders visible](#keeping-distant-riders-visibl
 for exactly what it changes and how to turn it off. Nothing else in FrostServer
 touches the game.
 
+> **A stock dedicated server never loads `.dlo` plugins.** MX Bikes scans `plugins\*.dlo` only
+> when it starts as a game client. `mxbikes.exe -dedicated` skips that scan, on beta21e and
+> beta21f alike, so `frostserver.dlo` in a dedicated server's `plugins` folder does nothing.
+> The beta21f "Cheat - Bike Setup" fix for dedicated servers therefore ships as `dinput8.dll`
+> (see [Riders banned for "Cheat - Bike Setup"](#riders-banned-for-cheat---bike-setup-beta21f)).
+
 ## How it loads
 
 FrostServer is a **PiBoSo plugin**: `frostserver.dlo`. Drop it in the dedicated

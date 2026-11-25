@@ -170,6 +170,7 @@ static void SessionClear() {
 }
 #include "cmdchannel.h" // MXB App command files: which one is new, and what it says
 #include "version.h"    // FROSTMOD_VERSION
+#include "petride.h"    // riding vs paused (the panel waits for Esc) + Pip riding along
 
 using hookutil::AllocNear;
 using hookutil::GetExecRange;
@@ -2661,6 +2662,41 @@ static int ReadPageNames(char (&names)[64][24], const char* (&ptrs)[64]) {
     return n;
 }
 
+// Riding by the page stack (petride::TrackOnTop): 1 the track page with nothing over it, 0 a
+// page over it (Esc menu, pits, chat), -1 unreadable. Read at most every 50 ms, and the stack
+// is logged when it changes, so a report shows which screen hid or showed the panel.
+static int PageRiding() {
+    if (g_game != &GAME_MXB || !g_base) return -1;
+    static std::atomic<uint64_t> next{0};
+    static std::atomic<int> last{-1};
+    const uint64_t now = GetTickCount64();
+    if (now < next.load(std::memory_order_relaxed)) return last.load(std::memory_order_relaxed);
+    next.store(now + 50, std::memory_order_relaxed);
+    char names[64][24];
+    const char* ptrs[64] = {};
+    const int n = ReadPageNames(names, ptrs);
+    int r = n < 0 ? -1 : (petride::TrackOnTop(ptrs, n) ? 1 : 0);
+    // Online the Esc menu is not a page: it is drawn over the track page, and two globals say
+    // it is up (read on beta21f, offsets.h). Both have to agree before it counts.
+    int uiDepth = -1, gameInput = -1;
+    if (r == 1) {
+        uiDepth   = SafeReadInt((const int*)(g_base + mxb::RVA_UI_DEPTH));
+        gameInput = (int)(unsigned char)SafeReadInt((const int*)(g_base + mxb::RVA_GAME_INPUT));
+        if (petride::EscMenuOver(uiDepth, gameInput)) r = 0;
+    }
+    static std::mutex m;
+    static std::string shown;
+    std::string cur;
+    for (int i = 0; i < n; ++i) { if (i) cur += ","; cur += names[i]; }
+    {
+        std::lock_guard<std::mutex> lk(m);
+        cur += uiDepth >= 0 ? (petride::EscMenuOver(uiDepth, gameInput) ? " +esc" : "") : "";
+        if (cur != shown) { shown = cur; Log("[pages] {%s} -> %s", cur.c_str(), r == 1 ? "riding" : r == 0 ? "not riding" : "unknown"); }
+    }
+    last.store(r, std::memory_order_relaxed);
+    return r;
+}
+
 // The page holding the lists, for the log; nullptr when it is safe to refresh now. Only
 // MX Bikes has the page offsets - another title (no partial refresh, full reload refused
 // unless armed) goes straight through, as before.
@@ -4659,6 +4695,10 @@ static void MenuKeyName(char* out, size_t n) { frostmod::hotkey::Format(MenuKey(
 // ---- persistence: frostmod_radar.cfg, next to frostmod.log ------------------
 // Radar/outline toggles and the overlay size. The filename stays as it was so an
 // existing install keeps its settings.
+// Pip (MXB App's pet) riding along: the corner it sits in, 0 = off. pet= in
+// frostmod_radar.cfg (MXB App writes it from its pet switch), F8 > P moves it.
+static std::atomic<int> g_petCorner{0};
+
 static void OverlaySettingsPath(char* out, size_t n) {
     strncpy_s(out, n, g_logPath, _TRUNCATE);
     char* slash = strrchr(out, '\\');
@@ -4706,6 +4746,7 @@ static void SaveOverlaySettings() {
     fprintf(f, "servermsg=%d\nservermsgy=%d\nservermsgport=%d\n",
             g_msgOn.load() ? 1 : 0, g_msgAnchor.load(), g_msgPort.load());
     fprintf(f, "modelsync=%d\n", g_rsOn.load() ? 1 : 0);
+    fprintf(f, "pet=%d\n", g_petCorner.load());
     if (g_devMenu) fprintf(f, "devmenu=1\n");
     if (g_gfxWatch.load()) fprintf(f, "gfxwatch=1\n");
     if (MenuKey() != frostmod::hotkey::Default()) {
@@ -4748,6 +4789,7 @@ static void LoadOverlaySettings() {
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf_s(line, "uiscale=%d",  &v) == 1 && v >= 50 && v <= 300) g_uiPct.store(v);
         else if (sscanf_s(line, "devmenu=%d",  &v) == 1) g_devMenu = (v != 0);
+        else if (sscanf_s(line, "pet=%d", &v) == 1) g_petCorner.store(v >= 0 && v < petride::kCorners ? v : 0);
         else if (sscanf_s(line, "gfxwatch=%d", &v) == 1) g_gfxWatch.store(v == 1);
         // A key that cannot be parsed, or one that may not open the menu, keeps F8: a
         // hand-edited typo must never leave the player with no way into the menu.
@@ -4915,6 +4957,18 @@ std::atomic<bool>      g_overlayOn{true};
 // they cannot see. Not persisted: it is a per-session thing you turn on to record.
 std::atomic<bool>      g_cleanView{false};
 std::atomic<bool>      g_menuOpen{false};       // the menu key (F8) opens the action menu
+// Riding or paused (src/petride.h). RunStart/RunStop set g_simRunning; RunTelemetry stamps
+// g_lastTeleMs. While riding nothing of the panel draws, not even its frame: it is for Esc.
+std::atomic<bool>      g_simRunning{false};
+std::atomic<uint64_t>  g_lastTeleMs{0};
+static int PageRiding();   // the page stack's say (defined with ReadPageNames)
+static bool RidingNow() {
+    return petride::Riding(PageRiding(), g_simRunning.load(), GetTickCount64(), g_lastTeleMs.load());
+}
+std::mutex             g_petMutex;
+petride::Sample        g_petSample;             // the latest telemetry, under g_petMutex
+std::atomic<int>       g_drawState{-1};         // Draw()'s _iState: 0 track, 1 spectate, 2 replay
+std::atomic<float>     g_screenAspect{16.0f / 9.0f};
 // "Change menu key": the next key pressed becomes the menu key, Esc cancels. Set by
 // MenuAction() and run by Tick(), both on the render thread; atomic for the renderers.
 std::atomic<bool>      g_menuKeyCapture{false};
@@ -4944,6 +4998,7 @@ static const MenuItem kMenu[] = {
     { '9', "Hide overlay (recording)",      false, 7  },
     { '0', "Rebuild riders (new gear)", false, 9 },
     { 'K', "Change menu key",               false, 16 },
+    { 'P', "Pet",                           false, 18 },
     // Hidden (code kept, not reachable from the menu): Track manager, Switch track,
     // Track list, Direct connect. Re-add a row here to expose one again.
 };
@@ -4962,6 +5017,9 @@ static void MenuRowText(int i, char* out, size_t n) {
     else if (kMenu[i].action == 16) {                // the menu key row shows the key
         char mk[48]; MenuKeyName(mk, sizeof(mk));
         sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label, mk);
+    } else if (kMenu[i].action == 18) {              // the pet row shows where it sits
+        sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label,
+                  petride::CornerName((petride::Corner)g_petCorner.load()));
     } else if (kMenu[i].action == 17) {              // the shaders row shows on / off
         sprintf_s(out, n, "  %c   %s  (%s)", kMenu[i].key, kMenu[i].label, g_suCfg.on ? "on" : "off");
     } else
@@ -5709,9 +5767,49 @@ static void DText(float x, float y, const char* s, unsigned long abgr, float siz
 // Normalized-coord mirror of DrawOverlay: quads are backgrounds/highlights/bars
 // (no font needed), strings are labels (font index 1). Panel widths are fractions
 // tuned to match the GL layout's proportions - adjust here if text overflows.
+// Pip riding along (src/petride.h), on track only. Drawn first so an open panel covers it.
+static void BuildPetDrawList() {
+    static petride::Mood mood;
+    static uint64_t lastMs = 0;
+    const int corner = g_petCorner.load();
+    if (corner == 0 || g_drawState.load() != 0 || g_abi != &kAbiMxb) { lastMs = 0; return; }
+    const uint64_t now = GetTickCount64();
+    const float dt = lastMs ? (float)(now - lastMs) / 1000.0f : 0.0f;
+    lastMs = now;
+    petride::Sample s;
+    { std::lock_guard<std::mutex> lk(g_petMutex); s = g_petSample; }
+    mood.step(s, RidingNow(), dt);
+    static std::vector<petride::Quad> quads;
+    quads.clear();
+    const float aspect = g_screenAspect.load();
+    petride::Build(quads, (petride::Corner)corner, aspect, mood);
+    for (const petride::Quad& q : quads)
+        DQuad(q.x0, q.y0, q.x1, q.y1,
+              ToABGR(((q.rgb >> 16) & 0xff) / 255.0f, ((q.rgb >> 8) & 0xff) / 255.0f,
+                     (q.rgb & 0xff) / 255.0f, q.alpha));
+    if (mood.face == petride::SLEEP) {
+        float x, y; petride::ZPos((petride::Corner)corner, aspect, &x, &y);
+        DText(x, y, "z z", ToABGR(0.85f, 0.88f, 0.95f, 0.9f), 0.022f);
+    }
+}
+
+// While riding the panel stays shut: nothing of it draws, and what was open closes, so a
+// digit pressed on the bike can never run a menu row. Esc (the pause screen) brings it back.
+static void ClosePanelsForRiding() {
+    if (g_menuOpen.exchange(false)) Log("[overlay] riding - menu closed (it opens from the pause screen)");
+    g_menuKeyCapture.store(false);
+    if (g_chOpen.load()) CloseChange();
+    if (g_msOpen.load()) CloseModelSwap();
+    if (g_trkOpen.load()) CloseTrackManager();
+    if (g_swOpen.load()) CloseSwitcher();
+    if (g_dcOpen.load()) CloseDirectConnect();
+}
+
 static void BuildOverlayDrawLists() {
     g_nDrawQuads = 0; g_nDrawStrs = 0; g_dScale = 1.0f;
     if (g_cleanView.load()) return;      // hand the engine nothing at all
+    BuildPetDrawList();
+    if (RidingNow()) return;             // the panel is for the pause screen only
     if (!g_overlayOn.load() && !g_menuOpen.load() && !g_reloadActive.load()
         && !g_trkOpen.load() && !g_swOpen.load() && !g_dcOpen.load() && !g_msOpen.load()
         && !g_chOpen.load()) return;
@@ -5912,7 +6010,7 @@ static void BuildOverlayDrawLists() {
         }
         const float w = 0.20f, h = reloading ? 0.060f : 0.034f;
         DQuad(MX, MY, MX + w, MY + h, ToABGR(0.0f, 0.0f, 0.0f, 0.45f));   // faded black
-        DText(MX + PADX, MY + 0.006f, line, ToABGR(0.0f, 0.443f, 0.890f, 1.0f), FS);   // #0071e3
+        DText(MX + PADX, MY + 0.006f, line, cBlue, FS);   // light blue: #0071e3 was unreadable on the dark pill
         if (reloading) {
             const float bx0 = MX + PADX, bx1 = MX + w - PADX, by0 = MY + h - 0.014f, by1 = by0 + 0.008f;
             DQuad(bx0, by0, bx1, by1, ToABGR(1.0f, 1.0f, 1.0f, 0.25f));
@@ -6083,6 +6181,10 @@ void MenuAction(int d) {   // d = the row's action, not its key
     case 9: g_menuOpen.store(false); RebuildRiders(); break;   // EXPERIMENTAL
     case 10: g_menuOpen.store(false); ClearClean(); OpenChange(); break;   // change bike / gear
     // Menu stays open: the next key pressed is the new menu key (Tick), Esc cancels.
+    // Menu stays open so the new place is visible in the row; walks the corners, then off.
+    case 18: { const int c = (int)petride::NextCorner((petride::Corner)g_petCorner.load());
+               g_petCorner.store(c); SaveOverlaySettings();
+               Log("[pet] %s", petride::CornerName((petride::Corner)c)); } break;
     case 16: g_menuKeyCapture.store(true);
              Log("[menu] change menu key: press the new key (Esc cancels)");
              break;
@@ -7241,7 +7343,10 @@ void Tick() {
     const frostmod::hotkey::Hotkey menuKey = MenuKey();
     const bool menuKeyDown = (GetAsyncKeyState(menuKey.vk) & 0x8000) != 0 &&
                              frostmod::hotkey::Matches(menuKey, ctrlDown, shiftDown, altDown);
-    if (menuKeyDown && !prevMenuKey && !g_menuKeyCapture.load()) {
+    const bool riding = RidingNow();
+    if (riding) ClosePanelsForRiding();
+    if (riding && menuKeyDown && !prevMenuKey) Log("[menu] menu key while riding - press Esc first");
+    if (menuKeyDown && !prevMenuKey && !g_menuKeyCapture.load() && !riding) {
         ClearClean();                                    // never open something invisible
         if (g_chOpen.load()) {
             CloseChange(); Log("[change] panel closed (menu key)");
@@ -7489,6 +7594,14 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc) {
     // fires (count is stable) -> GL draws the overlay as before.
     static uint64_t lastDraw = 0;
     uint64_t now = g_drawCalls.load(std::memory_order_relaxed);
+    // The screen's shape, for Pip's square pixels in Draw()'s 0..1 space. Asked every 64th
+    // frame, and only while Pip is on: glGetIntegerv waits on the driver.
+    static unsigned aspAge = 0;
+    if (g_petCorner.load() != 0 && (aspAge++ & 63) == 0) {
+        GLint vp[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_VIEWPORT, vp);
+        if (vp[2] > 0 && vp[3] > 0) g_screenAspect.store((float)vp[2] / (float)vp[3]);
+    }
     su::GradePass();   // grade=1 only (with shaders=1): before our overlay, so the overlay stays ungraded
     if (now == lastDraw) DrawOverlay(hdc);
     lastDraw = now;
@@ -9284,6 +9397,48 @@ __declspec(dllexport) void Shutdown() {
     RunTeardown(true, "Shutdown");
 }
 
+// The font the on-track panel's text is drawn with. SPluginString_t::m_iFont indexes the font
+// table this plugin hands back from DrawInit (names relative to the plugins folder); before
+// v0.54 FrostMod registered none, so on track the engine dropped every string and only the
+// panel's boxes showed: an empty dark bar where "Game Integration - F8" should have been.
+// The .fnt is embedded (resource 200, Coach's font) and written beside the .dlo here, the one
+// moment it is certain to be on disk before the game reads it.
+static char g_fontName[64] = {0};   // handed to the game; must outlive DrawInit
+
+__declspec(dllexport) int DrawInit(int* _piNumSprites, char** _pszSpriteName, int* _piNumFonts,
+                                   char** _pszFontName) {
+    if (_piNumSprites) *_piNumSprites = 0;
+    if (_pszSpriteName) *_pszSpriteName = nullptr;
+    if (_piNumFonts) *_piNumFonts = 0;
+    if (_pszFontName) *_pszFontName = nullptr;
+    if (!_piNumFonts || !_pszFontName || !g_selfModule) return -1;
+    char dir[MAX_PATH];
+    if (!GetModuleFileNameA(g_selfModule, dir, sizeof(dir))) return -1;
+    char* slash = strrchr(dir, '\\');
+    if (!slash) return -1;
+    slash[1] = 0;
+    HRSRC   res  = FindResourceA(g_selfModule, MAKEINTRESOURCEA(200), MAKEINTRESOURCEA(10));
+    HGLOBAL data = res ? LoadResource(g_selfModule, res) : nullptr;
+    const void* p = data ? LockResource(data) : nullptr;
+    const DWORD n = res ? SizeofResource(g_selfModule, res) : 0;
+    if (!p || n == 0) { Log("[overlay] DrawInit: no embedded font - on-track text will not show"); return -1; }
+    std::string folder = std::string(dir) + "frostmod_data";
+    CreateDirectoryA(folder.c_str(), nullptr);
+    FILE* f = nullptr;
+    if (fopen_s(&f, (folder + "\\frostmod.fnt").c_str(), "wb") || !f) {
+        Log("[overlay] DrawInit: could not write %s\\frostmod.fnt", folder.c_str());
+        return -1;
+    }
+    const size_t wrote = fwrite(p, 1, n, f);
+    fclose(f);
+    if (wrote != n) return -1;
+    strcpy_s(g_fontName, "frostmod_data\\frostmod.fnt");
+    *_piNumFonts  = 1;
+    *_pszFontName = g_fontName;
+    Log("[overlay] DrawInit: font %s (%lu bytes)", g_fontName, (unsigned long)n);
+    return 0;
+}
+
 // Optional. Called each frame while on track (0), spectating (1), or in a replay
 // (2) - NOT in menus. We build our overlay as quads+strings and hand the engine
 // the (persistent) arrays to render. Bumping g_drawCalls tells the swap hook the
@@ -9303,6 +9458,7 @@ __declspec(dllexport) void Draw(int _iState, int* _piNumQuads, void** _ppQuad,
         return;
     }
     g_drawCalls.fetch_add(1, std::memory_order_relaxed);
+    g_drawState.store(_iState, std::memory_order_relaxed);
     // The one signal that says where the player was when the game died: the game only
     // calls Draw() on track, spectating or in a replay, and it hands us which.
     {
@@ -9327,6 +9483,9 @@ __declspec(dllexport) void RunTelemetry(void* _pData, int _iDataSize, float _fTi
     if (g_sessionOnly) return;
     LogCallbackOnce("RunTelemetry", _iDataSize);
     RadStoreTelemetry(_pData, _iDataSize);
+    g_lastTeleMs.store(GetTickCount64());
+    petride::Sample ps;
+    if (petride::Read(_pData, _iDataSize, &ps)) { std::lock_guard<std::mutex> lk(g_petMutex); g_petSample = ps; }
 }
 // Every vehicle's live world position + yaw, once per update. The radar + outlines.
 __declspec(dllexport) void RaceTrackPosition(int _iNumVehicles, void* _pArray, int _iElemSize) {
@@ -9496,9 +9655,9 @@ __declspec(dllexport) void RaceDeinit() {
 __declspec(dllexport) void RunInit(void* _pData, int _iDataSize) {
     if (!g_standDown.load()) g_feed.RunInit(_pData, _iDataSize);
 }
-__declspec(dllexport) void RunDeinit()  { if (!g_standDown.load()) g_feed.RunDeinit(); }
-__declspec(dllexport) void RunStart()   { if (!g_standDown.load()) g_feed.RunStart(); }
-__declspec(dllexport) void RunStop()    { if (!g_standDown.load()) g_feed.RunStop(); }
+__declspec(dllexport) void RunDeinit()  { g_simRunning.store(false); if (!g_standDown.load()) g_feed.RunDeinit(); }
+__declspec(dllexport) void RunStart()   { g_simRunning.store(true);  if (!g_standDown.load()) g_feed.RunStart(); }
+__declspec(dllexport) void RunStop()    { g_simRunning.store(false); if (!g_standDown.load()) g_feed.RunStop(); }
 __declspec(dllexport) void RunLap(void* _pData, int _iDataSize) {
     if (!g_standDown.load()) g_feed.RunLap(_pData, _iDataSize);
 }

@@ -95,7 +95,7 @@ jobs:
           ./scripts/sign-windows.ps1 `
             "$bin/frostmod.exe" "$bin/frostmod.dll" `
             "$bin/frostserver.exe" "$bin/frostserver.dll" `
-            "$bin/mxbcoach.dll" "$bin/frostmod_fixes.dll"
+            "$bin/mxbcoach.dll" "$bin/frostmod_fixes.dll" "$bin/dinput8.dll"
           foreach ($name in 'frostmod','frostserver','mxbcoach','frostmod_fixes') {
             Copy-Item "$bin/$name.dll" "$bin/$name.dlo" -Force
           }
@@ -103,7 +103,7 @@ jobs:
           $signtool = $env:ARTIFACT_SIGNING_SIGNTOOL
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
                          'frostserver.exe','frostserver.dll','frostserver.dlo',
-                         'mxbcoach.dlo','frostmod_fixes.dlo') {
+                         'mxbcoach.dlo','frostmod_fixes.dlo','dinput8.dll') {
             $verification = & $signtool verify /pa /tw /v "$bin/$f" 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Error "$bin/$f has no valid timestamped Authenticode signature"; exit 1 }
             $signature = Get-AuthenticodeSignature "$bin/$f"
@@ -126,7 +126,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           foreach ($f in 'frostmod.exe','frostmod.dll','frostmod.dlo',
                          'frostserver.exe','frostserver.dll','frostserver.dlo',
-                         'mxbcoach.dlo','frostmod_fixes.dlo') {
+                         'mxbcoach.dlo','frostmod_fixes.dlo','dinput8.dll') {
             if (-not (Test-Path "$bin/$f")) { Write-Error "missing $bin/$f"; exit 1 }
             Copy-Item "$bin/$f" dist/
           }
@@ -312,6 +312,30 @@ jobs:
           Write-Host "--- FrostServer.zip contents ---"
           Get-ChildItem $stage | Select-Object Name, Length
 
+      # Dedicated servers never load plugins\*.dlo. The setup fix ships as dinput8.dll, which a
+      # dedicated server does load from beside its mxbikes.exe.
+      - name: Package FrostServerSetupFix.zip
+        shell: pwsh
+        run: |
+          $stage = 'staging/FrostServerSetupFix'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/dinput8.dll $stage
+          $readme = @(
+            "FrostServer setup fix - for MX Bikes beta21f DEDICATED servers"
+            "https://github.com/Frostn1/frostmod  (docs/FROSTSERVER.md)"
+            ""
+            "Stops beta21f banning every rider with 'Cheat - Bike Setup'."
+            ""
+            "INSTALL"
+            "  1. Copy dinput8.dll into the dedicated server's folder, next to mxbikes.exe."
+            "  2. Restart the server. setupfix.log next to the dll says '[setup] on: ...'."
+            ""
+            "It only acts when mxbikes.exe runs with -dedicated, and only on beta21f."
+            "In a normal game it just passes DirectInput through. Remove the file to undo."
+          ) -join "`r`n"
+          Set-Content -Path "$stage/README.txt" -Value $readme -Encoding utf8
+          Compress-Archive -Path $stage -DestinationPath dist/FrostServerSetupFix.zip -Force
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -328,6 +352,7 @@ jobs:
           gh release upload $env:RELEASE_TAG `
             dist/frostmod.exe dist/frostmod.dll dist/frostmod.dlo dist/Release.zip `
             dist/frostserver.exe dist/frostserver.dll dist/frostserver.dlo dist/FrostServer.zip `
+            dist/dinput8.dll dist/FrostServerSetupFix.zip `
             dist/mxbcoach.dlo dist/frostmod_fixes.dlo dist/FrostModFixes.zip --clobber
 
       # Mirror the same release (same tag, title, notes, assets) to the public release-only

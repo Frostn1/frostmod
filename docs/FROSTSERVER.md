@@ -21,6 +21,12 @@ on the wire. See [Keeping distant riders visible](#keeping-distant-riders-visibl
 for exactly what it changes and how to turn it off. Nothing else in FrostServer
 touches the game.
 
+> **A stock dedicated server never loads `.dlo` plugins.** MX Bikes scans `plugins\*.dlo` only
+> when it starts as a game client. `mxbikes.exe -dedicated` skips that scan, on beta21e and
+> beta21f alike, so `frostserver.dlo` in a dedicated server's `plugins` folder does nothing.
+> The beta21f "Cheat - Bike Setup" fix for dedicated servers therefore ships as `dinput8.dll`
+> (see [Riders banned for "Cheat - Bike Setup"](#riders-banned-for-cheat---bike-setup-beta21f)).
+
 ## How it loads
 
 FrostServer is a **PiBoSo plugin**: `frostserver.dlo`. Drop it in the dedicated
@@ -162,6 +168,35 @@ crash fixes applies there: the host crash at `+0x7A860`, where the game asks for
 not in its list, gets no answer written, and copies two lists of whatever length was left on
 the stack. FrostServer answers such a request with empty lists instead. `crash_guards: false`
 turns it off.
+
+## Riders banned for "Cheat - Bike Setup" (beta21f)
+
+On a beta21f dedicated server every rider who joins is banned within seconds, with
+`Ban (Cheat - Bike Setup)` in the server log. The client's game build, bike and saved setups
+make no difference, and a beta21e server does not do it.
+
+When a rider's setup arrives, the server checks every setting against the steps the bike
+allows. On beta21f the server's list of tyre sizes for the rider's bike comes out empty, so any
+tyre size but the first is out of range and the rider is banned as a cheater. The OEM KTM's
+rear tyre, for example, offers two sizes on the rider's screen and none on the server.
+
+`setup_guard` re-checks a setup the game rejects, field by field, and logs what failed. It lets
+the setup through only when every failure is a tyre size checked against an empty size list on
+the server. Any other setting out of range, or a tyre size past a list the server did build,
+still gets the game's ban. It only switches on when the game's code matches beta21f exactly; on
+any other build it logs that it was not applied and changes nothing.
+
+**Installing it on a dedicated server.** A stock dedicated server never loads `plugins\*.dlo`
+(the game scans for plugins only in its client start-up), so this fix ships separately as
+`dinput8.dll` in `FrostServerSetupFix.zip`. Copy `dinput8.dll` into the server's folder, next
+to `mxbikes.exe`, and restart. `mxbikes.exe` loads `dinput8.dll` on every start; this one passes
+DirectInput through to Windows' own copy and, only when the command line has `-dedicated`,
+installs the setup guard and nothing else. `setupfix.log` beside it says `[setup] on: ...`.
+Delete the file to undo.
+
+Inside `frostserver.dlo` the same guard is `setup_guard: true` by default (`false` runs the setup
+check exactly as PiBoSo ships it). FrostMod has the same fix for players who host from the game,
+where plugins do load (`setupguard=0` turns it off there).
 
 ## Styled announcements
 
@@ -351,7 +386,11 @@ per-row server-IP RE). FrostServer (step 1) is the contract they build against.
 Confirmed against the decompiled `mxbikes.exe` (image base `0x140000000`), so we
 don't need a live server to trust the mechanism:
 
-- **Plugins load on the dedicated build.** The `.dlo` loader (`0x14012A4F0`,
+- **Correction (2026-11-24): a stock dedicated server does not load plugins.** The scan of
+  `plugins\*.dlo` runs from the client's start-up (event 0); `-dedicated` runs the server
+  start-up (event 45) instead, and a live 21e and 21f dedicated server had no `.dlo` loaded.
+  What follows describes the loader and the dispatch once a plugin *is* loaded (in the game
+  client, or put into the server by other means). The `.dlo` loader (`0x14012A4F0`,
   enumerated at `0x14012A9B7`) resolves exports by name and appends each plugin
   struct (stride `0x118`) to a global list — **base `0x565CC0`, count
   `0x565CB8`**. `RaceEvent` is stored at `plugin+0x68`.

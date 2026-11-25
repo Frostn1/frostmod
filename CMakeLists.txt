@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.53.2")
+set(FROSTMOD_VERSION "0.53.3")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -50,6 +50,7 @@ frostmod_version_rc(FROSTMOD_FIXES_DLL_RC VFT_DLL "frostmod_fixes.dlo" "FrostMod
 frostmod_version_rc(FROSTMOD_EXE_RC VFT_APP "frostmod.exe" "FrostMod launcher / mod loader for PiBoSo sims")
 frostmod_version_rc(FROSTSERVER_DLL_RC VFT_DLL "frostserver.dlo" "FrostServer - dedicated-server map/link API for MX Bikes")
 frostmod_version_rc(FROSTSERVER_EXE_RC VFT_APP "frostserver.exe" "FrostServer standalone - map/link API for MX Bikes")
+frostmod_version_rc(SETUPFIX_DLL_RC VFT_DLL "dinput8.dll" "FrostServer setup fix - beta21f Cheat - Bike Setup fix for MX Bikes dedicated servers")
 # mxbcoach.dlo's spoken cues: one clip per spoken cue kind, in each voice the rider can pick.
 # The resource id is 100 + voice * 20 + kind, so the female set keeps the ids 101-110 it has
 # always had, the male set 121-130, and ROLL (12) takes 112 and 132 - which must agree with
@@ -133,6 +134,20 @@ add_library(frostserver SHARED src/frostserver.cpp ${FROSTSERVER_DLL_RC})
 target_link_libraries(frostserver PRIVATE ws2_32 minhook)
 target_include_directories(frostserver PRIVATE "${minhook_SOURCE_DIR}/include")
 set_target_properties(frostserver PROPERTIES OUTPUT_NAME "frostserver" PREFIX "")
+
+# --- setupfix: dinput8.dll for a stock dedicated server --------------------------
+# A dedicated server never loads plugins\*.dlo, but mxbikes.exe imports DINPUT8.dll, so a
+# dinput8.dll beside the server's exe is loaded on every start. It forwards DirectInput8Create
+# and, in a -dedicated process only, installs the beta21f setup guard (src/setupfix.cpp).
+# Static CRT and MinHook compiled in: this DLL is a load-time import of the game, so it must
+# not depend on a VC++ redistributable the server box may not have.
+add_library(setupfix SHARED src/setupfix.cpp
+    "${minhook_SOURCE_DIR}/src/buffer.c" "${minhook_SOURCE_DIR}/src/hook.c"
+    "${minhook_SOURCE_DIR}/src/trampoline.c" "${minhook_SOURCE_DIR}/src/hde/hde64.c"
+    ${SETUPFIX_DLL_RC})
+set_property(TARGET setupfix PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+target_include_directories(setupfix PRIVATE "${minhook_SOURCE_DIR}/include")
+set_target_properties(setupfix PROPERTIES OUTPUT_NAME "dinput8" PREFIX "")
 
 add_executable(frostserver_app src/frostserver.cpp ${FROSTSERVER_EXE_RC})
 target_compile_definitions(frostserver_app PRIVATE FROSTSERVER_EXE)
@@ -355,6 +370,8 @@ add_test(NAME protection COMMAND protection_test)
 # FrostServer's rejoin fix: the departure code's bytes and the owner rule.
 add_executable(serverrejoin_test tests/serverrejoin_test.cpp)
 add_test(NAME serverrejoin COMMAND serverrejoin_test)
+add_executable(setupguard_test tests/setupguard_test.cpp)
+add_test(NAME setupguard COMMAND setupguard_test)
 
 # --- NaN bike reset test ---------------------------------------------------------
 # The offsets the per-step check reads and the place-bike call it makes, proved against the
@@ -531,7 +548,7 @@ endif()
 
 # put the exe and dll next to each other so frostmod.exe finds frostmod.dll by
 # default. frostmod.exe + frostmod.dll coexist fine (different extensions).
-set_target_properties(frostmod frostmod_app frostserver frostserver_app mxbcoach PROPERTIES
+set_target_properties(frostmod frostmod_app frostserver frostserver_app mxbcoach setupfix PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 if(FROSTMOD_FIXES)
@@ -567,7 +584,7 @@ if(FROSTMOD_SIGN)
     else()
         message(FATAL_ERROR "FROSTMOD_SIGN=ON but neither FROSTMOD_SIGN_PFX nor FROSTMOD_SIGN_SHA1 is set.")
     endif()
-    set(_frostmod_sign_targets frostmod frostmod_app frostserver frostserver_app mxbcoach)
+    set(_frostmod_sign_targets frostmod frostmod_app frostserver frostserver_app mxbcoach setupfix)
     if(FROSTMOD_FIXES)
         list(APPEND _frostmod_sign_targets frostmod_fixes)
     endif()

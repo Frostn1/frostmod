@@ -4728,6 +4728,7 @@ static void SaveOverlaySettings() {
     if (!guards::listboxguard_on.load()) fprintf(f, "listboxguard=0\n");
     if (!guards::ptr64fix_on.load()) fprintf(f, "ptr64fix=0\n");
     if (!guards::riderinfoguard_on.load()) fprintf(f, "riderinfoguard=0\n");
+    if (!guards::setupguard_on.load()) fprintf(f, "setupguard=0\n");
     if (!guards::mipmapguard_on.load()) fprintf(f, "mipmapguard=0\n");
     if (!guards::eventcfgguard_on.load()) fprintf(f, "eventcfgguard=0\n");
     if (!guards::lookupguard_on.load()) fprintf(f, "lookupguard=0\n");
@@ -4782,6 +4783,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "listboxguard=%d", &v) == 1) guards::listboxguard_on.store(v != 0);
         else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) guards::ptr64fix_on.store(v != 0);
         else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) guards::riderinfoguard_on.store(v != 0);
+        else if (sscanf_s(line, "setupguard=%d", &v) == 1) guards::setupguard_on.store(v != 0);
         else if (sscanf_s(line, "mipmapguard=%d", &v) == 1) guards::mipmapguard_on.store(v != 0);
         else if (sscanf_s(line, "eventcfgguard=%d", &v) == 1) guards::eventcfgguard_on.store(v != 0);
         else if (sscanf_s(line, "lookupguard=%d", &v) == 1) guards::lookupguard_on.store(v != 0);

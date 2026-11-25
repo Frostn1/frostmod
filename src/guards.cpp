@@ -22,6 +22,7 @@
 #include "protection.h"
 #include "hookutil.h"
 #include "lookupguard.h"
+#include "setupguard.h"
 
 namespace guards {
 
@@ -42,6 +43,7 @@ std::atomic<bool> wakeguard_on{true};
 std::atomic<bool> listboxguard_on{true};
 std::atomic<bool> ptr64fix_on{true};
 std::atomic<bool> riderinfoguard_on{true};
+std::atomic<bool> setupguard_on{true};
 std::atomic<bool> mipmapguard_on{true};
 std::atomic<bool> eventcfgguard_on{true};
 std::atomic<bool> lookupguard_on{true};
@@ -1616,6 +1618,87 @@ static void LookupGuardTick() {
     }
 }
 
+// ---- beta21f "Cheat - Bike Setup" on every joiner (setupguard.h) -------------------------
+// Only runs when this game hosts (the setup check is the server's). Same rule as FrostServer:
+// a setup the game rejects is re-checked field by field, and it passes only when every failure
+// is a tyre size checked against a size list the host built empty.
+using SgValidateFn = int (*)(const uint8_t* def, const uint8_t* setup);
+using SgSetupJobFn = int (*)(int world, const uint8_t* setup);
+static SgValidateFn g_origSgValidate = nullptr;
+static SgSetupJobFn g_origSgSetupJob = nullptr;
+static thread_local bool t_sgValidatorRan = false;
+static std::atomic<uint32_t> g_sgPassed{0}, g_sgKept{0};
+
+static void SgLogFailures(const setupguard::Failure* f, size_t n, const char* verdict) {
+    char line[1024];
+    int at = _snprintf_s(line, sizeof(line), _TRUNCATE, "[setupguard] host rejected a rider's setup (%s):", verdict);
+    for (size_t i = 0; i < n && i < 12 && at > 0 && at < (int)sizeof(line) - 80; ++i) {
+        const auto& fd = setupguard::kFields[f[i].field];
+        const int w = f[i].gear >= 0
+            ? _snprintf_s(line + at, sizeof(line) - at, _TRUNCATE, " gear%d(+0x%X)=%d max %d",
+                          f[i].gear, fd.setup + 4 * f[i].gear, f[i].value, f[i].limit)
+            : _snprintf_s(line + at, sizeof(line) - at, _TRUNCATE, " %s(+0x%X)=%d max %d [def+0x%X]",
+                          fd.name, fd.setup, f[i].value, f[i].limit, fd.limit);
+        if (w > 0) at += w;
+    }
+    Log("%s", line);
+}
+
+static size_t SgEvaluate(const uint8_t* def, const uint8_t* setup, setupguard::Failure* f, size_t cap, bool* ok) {
+    __try { *ok = true; return setupguard::Evaluate(def, setup, f, cap); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *ok = false; return 0; }
+}
+
+static int hkSgValidate(const uint8_t* def, const uint8_t* setup) {
+    t_sgValidatorRan = true;
+    const int rc = g_origSgValidate(def, setup);
+    if (rc == 0 || !def || !setup) return rc;
+    setupguard::Failure f[48];
+    bool ok = false;
+    size_t n = SgEvaluate(def, setup, f, 48, &ok);
+    if (!ok) { Log("[setupguard] could not read the setup or the bike; the game's ban stands"); return rc; }
+    if (n > 48) n = 48;
+    if (setupguard::OnlyBroken(f, n)) {
+        const uint32_t k = g_sgPassed.fetch_add(1) + 1;
+        if (sessionguards::ShouldLog(k)) SgLogFailures(f, n, "beta21f empty tyre-size list, let through");
+        return 0;
+    }
+    const uint32_t k = g_sgKept.fetch_add(1) + 1;
+    if (sessionguards::ShouldLog(k))
+        SgLogFailures(f, n, n ? "out of range, the game's ban stands" : "no field out of range by our table");
+    return rc;
+}
+
+static int hkSgSetupJob(int world, const uint8_t* setup) {
+    t_sgValidatorRan = false;
+    const int rc = g_origSgSetupJob(world, setup);
+    if (rc != 0 && !t_sgValidatorRan)
+        Log("[setupguard] no bike found for world %d; the game bans this rider for Bike Setup", world);
+    return rc;
+}
+
+static void InstallSetupBanGuard() {
+    using namespace setupguard;
+    if (!SsgMxbOnly("setupguard")) return;
+    if (!setupguard_on.load()) { Log("[setupguard] off by config (setupguard=0)"); return; }
+    if (g_origSgValidate || g_unloading.load()) return;
+    if (!SsgCodeIs(kRvaValidator, kValidator, kValidatorLen) || !SsgCodeIs(kRvaSetupJob, kSetupJob, kSetupJobLen)) {
+        Log("[setupguard] not applied: the setup check is not beta21f's (another game build). Nothing patched.");
+        return;
+    }
+    if (!InstallHook((void*)(g_base + kRvaValidator), (void*)&hkSgValidate, (void**)&g_origSgValidate,
+                     "setupValidate(0x198a90)")) {
+        g_origSgValidate = nullptr;
+        return;
+    }
+    if (!InstallHook((void*)(g_base + kRvaSetupJob), (void*)&hkSgSetupJob, (void**)&g_origSgSetupJob,
+                     "setupJob(0x1684d0)")) {
+        g_origSgSetupJob = nullptr;   // the validator hook alone still applies the fix
+    }
+    Log("[setupguard] on: when this game hosts, a tyre size checked against an empty size list no "
+        "longer bans the rider for \"Cheat - Bike Setup\" (beta21f, +0x%llX)", (unsigned long long)kRvaValidator);
+}
+
 static void InstallSessionGuardsImpl() {
     InstallBikeListGuard();
     InstallWakeGuard();
@@ -1625,6 +1708,7 @@ static void InstallSessionGuardsImpl() {
     InstallMipmapGuard();
     InstallEventCfgGuard();
     InstallLookupGuard();
+    InstallSetupBanGuard();
 }
 
 // ===========================================================================

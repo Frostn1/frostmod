@@ -17,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # etc.). Embedding CompanyName/ProductName/FileDescription/FileVersion gives each
 # binary a legitimate identity and removes one packaging red flag. Keep
 # FROSTMOD_VERSION in sync with src/version.h. See docs/antivirus-false-positives.md.
-set(FROSTMOD_VERSION "0.54.0")
+set(FROSTMOD_VERSION "0.54.1")
 string(REPLACE "." ";" _frostmod_ver_parts "${FROSTMOD_VERSION}")
 list(GET _frostmod_ver_parts 0 FROSTMOD_VERSION_MAJOR)
 list(GET _frostmod_ver_parts 1 FROSTMOD_VERSION_MINOR)
@@ -274,6 +274,9 @@ add_test(NAME hotkey COMMAND hotkey_test)
 # --- riding vs paused, and Pip riding along (src/petride.h) ---------------------
 add_executable(petride_test tests/petride_test.cpp)
 add_test(NAME petride COMMAND petride_test)
+# --- a stack in the log when the game stops presenting frames (src/hangwatch.h) ---
+add_executable(hangwatch_test tests/hangwatch_test.cpp)
+add_test(NAME hangwatch COMMAND hangwatch_test)
 
 # What a crash report says - the trail's ring and the report layout, both pure (the
 # Win32 half of crashreport.h is behind _WIN32), so this runs anywhere too.

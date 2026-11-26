@@ -173,6 +173,48 @@ inline size_t Evaluate(const uint8_t* def, const uint8_t* setup, Failure* out, s
     return n;
 }
 
+// ---------------------------------------------------------------------------------------
+// HOST ONLY. The setup job (0x287) is posted from four places in beta21f. One is the host's:
+// +0x88CF0 finds the connection that sent the setup in its client table (+0x3E73C0, 0x2324
+// per connection), posts 0x287 with that connection's setup copy (connection + 0xA48) and turns
+// a non-zero answer into the ban (job 0x320). The other three (+0x5DE9C, +0x5FA28, +0x61108)
+// run on every client for the riders on its own list (+0xF4EE20, 0x5B24 per rider, setup at
+// +0x5840) and ignore the answer: a setup the validator rejects there is simply not applied,
+// and the remote bike keeps the one it had.
+//
+// FrostMod 0.53.3/0.54.0 let the tyre-size failure through on all four, so a client applied
+// other riders' setups with a rear tyre size pointing into a size list its copy of that bike
+// never built (Lxntrip's log, 2026-11-25: "f98(+0x98)=1 max 0" on a client, a game freeze a few
+// minutes later). Nothing is banned on a client, so there is nothing to fix there: the guard
+// now only answers for the host's call, told apart by where the setup it is handed lives.
+constexpr uintptr_t kRvaHostPoster  = 0x88D45;   // lea rsi,[client table] ... mov ecx,0x287 ; call
+constexpr size_t    kHostPosterLen  = 62;
+constexpr uint8_t   kHostPoster[kHostPosterLen] = {
+    0x48, 0x8D, 0x35, 0x74, 0xE6, 0x35, 0x00,                    // lea rsi, [rip -> +0x3E73C0]
+    0x4C, 0x8D, 0x44, 0x24, 0x38,                                // lea r8, [rsp+0x38]
+    0xB9, 0x2D, 0x03, 0x00, 0x00,                                // mov ecx, 0x32D
+    0x48, 0x69, 0xFF, 0x24, 0x23, 0x00, 0x00,                    // imul rdi, rdi, 0x2324
+    0x48, 0x8D, 0x9C, 0x37, 0x48, 0x0A, 0x00, 0x00,              // lea rbx, [rdi+rsi+0xA48]
+    0x4C, 0x8B, 0xCB, 0xFF, 0x15, 0xDA, 0xDE, 0x4D, 0x00,        // mov r9, rbx ; call [post]
+    0x8B, 0x94, 0x37, 0xE4, 0x02, 0x00, 0x00,                    // mov edx, [rdi+rsi+0x2E4]
+    0x4C, 0x8B, 0xC3,                                            // mov r8, rbx   (the setup)
+    0xB9, 0x87, 0x02, 0x00, 0x00,                                // mov ecx, 0x287
+    0xFF, 0x15, 0xC5, 0xDE, 0x4D, 0x00,                          // call [post]
+};
+constexpr uintptr_t kRvaHostClients  = 0x3E73C0;   // the host's client table (lea rsi above)
+constexpr size_t    kHostClientSize  = 0x2324;
+constexpr size_t    kHostSetupOff    = 0xA48;
+constexpr size_t    kHostClients     = 100;        // +0x88CF0 walks up to +0x4C2DD4
+
+/// Is `setupRva` (the setup pointer the job got, minus the module base) one of the host's
+/// connection setups? Only then may a rejected setup be let through.
+inline bool IsHostSetup(uintptr_t setupRva) {
+    const uintptr_t first = kRvaHostClients + kHostSetupOff;
+    if (setupRva < first) return false;
+    const uintptr_t off = setupRva - first;
+    return off % kHostClientSize == 0 && off / kHostClientSize < kHostClients;
+}
+
 /// True when every failure is one the build gets wrong (and there was at least one).
 inline bool OnlyBroken(const Failure* f, size_t n) {
     if (n == 0) return false;

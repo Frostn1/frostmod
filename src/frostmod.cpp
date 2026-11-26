@@ -171,6 +171,8 @@ static void SessionClear() {
 #include "cmdchannel.h" // MXB App command files: which one is new, and what it says
 #include "version.h"    // FROSTMOD_VERSION
 #include "petride.h"    // riding vs paused (the panel waits for Esc) + Pip riding along
+#include "hangwatch.h"  // a stack in the log when the game stops presenting frames
+#include <tlhelp32.h>   // the hang report walks the game's threads
 
 using hookutil::AllocNear;
 using hookutil::GetExecRange;
@@ -4698,6 +4700,8 @@ static void MenuKeyName(char* out, size_t n) { frostmod::hotkey::Format(MenuKey(
 // Pip (MXB App's pet) riding along: the corner it sits in, 0 = off. pet= in
 // frostmod_radar.cfg (MXB App writes it from its pet switch), F8 > P moves it.
 static std::atomic<int> g_petCorner{0};
+// The hang watchdog (src/hangwatch.h): on unless hangwatch=0.
+static std::atomic<bool> g_hwOn{true};
 
 static void OverlaySettingsPath(char* out, size_t n) {
     strncpy_s(out, n, g_logPath, _TRUNCATE);
@@ -4770,6 +4774,7 @@ static void SaveOverlaySettings() {
     if (!guards::ptr64fix_on.load()) fprintf(f, "ptr64fix=0\n");
     if (!guards::riderinfoguard_on.load()) fprintf(f, "riderinfoguard=0\n");
     if (!guards::setupguard_on.load()) fprintf(f, "setupguard=0\n");
+    if (!g_hwOn.load()) fprintf(f, "hangwatch=0\n");
     if (!guards::mipmapguard_on.load()) fprintf(f, "mipmapguard=0\n");
     if (!guards::eventcfgguard_on.load()) fprintf(f, "eventcfgguard=0\n");
     if (!guards::lookupguard_on.load()) fprintf(f, "lookupguard=0\n");
@@ -4826,6 +4831,7 @@ static void LoadOverlaySettings() {
         else if (sscanf_s(line, "ptr64fix=%d", &v) == 1) guards::ptr64fix_on.store(v != 0);
         else if (sscanf_s(line, "riderinfoguard=%d", &v) == 1) guards::riderinfoguard_on.store(v != 0);
         else if (sscanf_s(line, "setupguard=%d", &v) == 1) guards::setupguard_on.store(v != 0);
+        else if (sscanf_s(line, "hangwatch=%d", &v) == 1) g_hwOn.store(v != 0);
         else if (sscanf_s(line, "mipmapguard=%d", &v) == 1) guards::mipmapguard_on.store(v != 0);
         else if (sscanf_s(line, "eventcfgguard=%d", &v) == 1) guards::eventcfgguard_on.store(v != 0);
         else if (sscanf_s(line, "lookupguard=%d", &v) == 1) guards::lookupguard_on.store(v != 0);
@@ -7181,7 +7187,218 @@ static void MirrorPluginSession() {
     ctx.inSession.store(copy.trackId[0] != 0, std::memory_order_relaxed);
 }
 
+// ---- hang watchdog (src/hangwatch.h) --------------------------------------------------
+// The render thread stamps g_hwBeat every frame (Tick). A thread of ours checks it twice a
+// second; past 5 s with no frame it writes where the render thread is, and the top of every
+// other thread of the game, to frostmod.log. A freeze otherwise leaves nothing behind.
+//
+// Written so a stuck game cannot also stick the report: the render thread is suspended only
+// for GetThreadContext; addresses are named from a module table read while the game was still
+// healthy (no loader lock); every read of the stuck stack is under SEH; and the log is
+// written with WriteFile, taking FrostMod's log lock only if it is free within a second (the
+// stuck thread may be the one holding it).
+static std::atomic<uint64_t> g_hwBeat{0};
+static std::atomic<DWORD>    g_hwRenderTid{0};
+static std::atomic<bool>     g_hwStarted{false};
+static HANDLE                g_hwThread = nullptr;
+static HANDLE                g_hwQuit = nullptr;
+static hangwatch::Module     g_hwMods[96];
+static int                   g_hwModCount = 0;
+
+static void HwRefreshModules() {
+    HMODULE mods[96]; DWORD need = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) return;
+    int n = (int)(need / sizeof(HMODULE)); if (n > 96) n = 96;
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        MODULEINFO mi{};
+        if (!GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi))) continue;
+        hangwatch::Module& m = g_hwMods[k++];
+        m.base = (uintptr_t)mi.lpBaseOfDll; m.size = mi.SizeOfImage;
+        if (!GetModuleBaseNameA(GetCurrentProcess(), mods[i], m.name, sizeof(m.name))) strcpy_s(m.name, "?");
+    }
+    g_hwModCount = k;
+}
+
+static void HwName(uintptr_t a, char* out, size_t n) {
+    const hangwatch::Module* m = nullptr; uintptr_t rva = 0;
+    if (hangwatch::Describe(g_hwMods, g_hwModCount, a, &m, &rva))
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%llX", m->name, (unsigned long long)rva);
+    else
+        _snprintf_s(out, n, _TRUNCATE, "0x%llX", (unsigned long long)a);
+}
+
+// The report, built in memory first and written in one go.
+static char   g_hwBuf[48 * 1024];
+static size_t g_hwLen = 0;
+static void HwLine(const char* fmt, ...) {
+    SYSTEMTIME st; GetLocalTime(&st);
+    char line[1200];
+    int at = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+    if (at < 0) return;
+    va_list ap; va_start(ap, fmt);
+    const int w = _vsnprintf_s(line + at, sizeof(line) - at, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    size_t len = strlen(line);
+    if (w < 0) len = sizeof(line) - 2;
+    if (g_hwLen + len + 2 > sizeof(g_hwBuf)) return;
+    memcpy(g_hwBuf + g_hwLen, line, len); g_hwLen += len;
+    g_hwBuf[g_hwLen++] = '\r'; g_hwBuf[g_hwLen++] = '\n';
+}
+static void HwFlush() {
+    bool locked = false;
+    for (int i = 0; i < 100 && !(locked = g_logMutex.try_lock()); ++i) Sleep(10);
+    HANDLE h = g_logPath[0]
+        ? CreateFileA(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)
+        : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        WriteFile(h, g_hwBuf, (DWORD)g_hwLen, &wrote, nullptr);
+        CloseHandle(h);
+    }
+    if (locked) g_logMutex.unlock();
+    g_hwLen = 0;
+}
+
+// The stuck thread's own unwind, frame addresses only (named afterwards).
+static int HwUnwind(CONTEXT ctx, uintptr_t* out, int max) {
+    int n = 0;
+    __try {
+        for (int frame = 0; frame < 64 && n < max && ctx.Rip; ++frame) {
+            out[n++] = (uintptr_t)ctx.Rip;
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+            if (!fn) { ctx.Rip = *(DWORD64*)ctx.Rsp; ctx.Rsp += 8; continue; }
+            PVOID hd = nullptr; DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
+}
+
+// Another thread: its rip, plus the first return-address-looking values on its stack (a copy
+// taken while it was suspended). A scan, not an unwind: it may list a stale value or two.
+static size_t HwCopyStack(uintptr_t rsp, uint8_t* buf, size_t cap) {
+    size_t got = 0;
+    __try {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)rsp, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return 0;
+        const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        got = end > rsp ? (size_t)(end - rsp) : 0;
+        if (got > cap) got = cap;
+        memcpy(buf, (const void*)rsp, got);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { got = 0; }
+    return got;
+}
+
+static void HwReport(uint64_t stalledMs, bool again) {
+    const DWORD tid = g_hwRenderTid.load();
+    HwLine("[hang] no frame for %.1f s%s - the game's render thread (tid %lu) is stuck. Where it is:",
+           stalledMs / 1000.0, again ? " (still)" : "", tid);
+    if (HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid)) {
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
+        bool got = false;
+        if (SuspendThread(th) != (DWORD)-1) { got = GetThreadContext(th, &ctx) != 0; ResumeThread(th); }
+        CloseHandle(th);
+        if (got) {
+            uintptr_t frames[48]; const int n = HwUnwind(ctx, frames, 48);
+            for (int i = 0; i < n; ++i) { char w[96]; HwName(frames[i], w, sizeof(w)); HwLine("[hang]   #%-2d %s", i, w); }
+            if (n == 0) HwLine("[hang]   (could not unwind; rip %llX)", (unsigned long long)ctx.Rip);
+        } else HwLine("[hang]   (could not read its registers)");
+    } else HwLine("[hang]   (could not open it, error %lu)", GetLastError());
+
+    // Every other thread, briefly: a freeze that waits on a lock shows the holder here.
+    if (!again) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{}; te.dwSize = sizeof(te);
+            const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+            static uint8_t stack[16 * 1024];
+            int shown = 0;
+            for (BOOL ok = Thread32First(snap, &te); ok && shown < 40; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || te.th32ThreadID == tid) continue;
+                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!th) continue;
+                CONTEXT c{}; c.ContextFlags = CONTEXT_FULL;
+                size_t got = 0; bool haveCtx = false;
+                if (SuspendThread(th) != (DWORD)-1) {
+                    haveCtx = GetThreadContext(th, &c) != 0;
+                    if (haveCtx) got = HwCopyStack((uintptr_t)c.Rsp, stack, sizeof(stack));
+                    ResumeThread(th);
+                }
+                CloseHandle(th);
+                if (!haveCtx) continue;
+                char line[900]; int at = 0;
+                char w[96]; HwName((uintptr_t)c.Rip, w, sizeof(w));
+                at = _snprintf_s(line, sizeof(line), _TRUNCATE, "%s", w);
+                int hits = 0;
+                for (size_t o = 0; o + 8 <= got && hits < 8 && at > 0; o += 8) {
+                    uintptr_t v; memcpy(&v, stack + o, 8);
+                    const hangwatch::Module* m = nullptr; uintptr_t rva = 0;
+                    if (!hangwatch::Describe(g_hwMods, g_hwModCount, v, &m, &rva) || rva < 0x1000) continue;
+                    HwName(v, w, sizeof(w));
+                    const int k = _snprintf_s(line + at, sizeof(line) - at, _TRUNCATE, " <- %s", w);
+                    if (k > 0) at += k;
+                    ++hits;
+                }
+                HwLine("[hang] thread %lu: %s", te.th32ThreadID, line);
+                ++shown;
+            }
+            CloseHandle(snap);
+        }
+    }
+    HwFlush();
+    frostmod::crash::Note("no frame for %.1f s (hang report in frostmod.log)", stalledMs / 1000.0);
+}
+
+static DWORD WINAPI HangWatchThread(LPVOID) {
+    hangwatch::State st;
+    uint64_t nextMods = 0;
+    while (WaitForSingleObject(g_hwQuit, hangwatch::kPollMs) == WAIT_TIMEOUT) {
+        if (g_unloading.load()) break;
+        const uint64_t now = GetTickCount64(), beat = g_hwBeat.load();
+        // The module table, while the game is healthy: a stuck thread may hold the loader lock.
+        if (now >= nextMods && beat && now - beat < 2000) { HwRefreshModules(); nextMods = now + 10000; }
+        const uint64_t stallFrom = st.stallBeat;
+        switch (hangwatch::Step(st, now, beat)) {
+            case hangwatch::Action::Report:      HwReport(now - beat, false); break;
+            case hangwatch::Action::ReportAgain: HwReport(now - beat, true);  break;
+            case hangwatch::Action::Recovered:
+                Log("[hang] frames again after %.1f s (a long load, or the game got unstuck)",
+                    (beat - stallFrom) / 1000.0);
+                break;
+            default: break;
+        }
+    }
+    return 0;
+}
+
+// Called by Tick on the render thread, every frame.
+static void HangBeat() {
+    g_hwBeat.store(GetTickCount64(), std::memory_order_relaxed);
+    if (g_hwStarted.load(std::memory_order_relaxed)) return;
+    g_hwStarted.store(true);
+    if (!g_hwOn.load()) { Log("[hang] watchdog off (hangwatch=0)"); return; }
+    g_hwRenderTid.store(GetCurrentThreadId());
+    HwRefreshModules();
+    g_hwQuit = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    g_hwThread = g_hwQuit ? CreateThread(nullptr, 0, HangWatchThread, nullptr, 0, nullptr) : nullptr;
+    Log("[hang] watchdog %s: no frame for %.0f s writes the render thread's stack here",
+        g_hwThread ? "on" : "could NOT start", hangwatch::kStallMs / 1000.0);
+}
+
+static void HangWatchStop(bool canBlock) {
+    if (g_hwQuit) SetEvent(g_hwQuit);
+    if (g_hwThread && canBlock) {
+        WaitForSingleObject(g_hwThread, 2000);
+        CloseHandle(g_hwThread);
+        g_hwThread = nullptr;
+    }
+}
+
 void Tick() {
+    HangBeat();
     // Heartbeat: proves the render hook fires. No [tick] line in the log => the game
     // isn't calling the SwapBuffers we hooked, so F8 / reload can't run.
     static bool firstFrame = true;
@@ -9228,6 +9445,7 @@ static void PinSelf() {
 // ---- teardown (src/unload.h has the order and why) -------------------------------------------
 static void TdStopThreads(bool canBlock) {
     MsgFeedStop(canBlock);   // no-op in the plugin copy, which never started one
+    HangWatchStop(canBlock);
     MdStop(canBlock);
     // The model index checks g_unloading between files, so shutdown can join it promptly.
     if (g_rsIndexThread && canBlock) {

@@ -1619,7 +1619,7 @@ static void LookupGuardTick() {
 }
 
 // ---- beta21f "Cheat - Bike Setup" on every joiner (setupguard.h) -------------------------
-// Only runs when this game hosts (the setup check is the server's). Same rule as FrostServer:
+// Acts only on the host's own setup check (IsHostSetup). Same rule as FrostServer:
 // a setup the game rejects is re-checked field by field, and it passes only when every failure
 // is a tyre size checked against a size list the host built empty.
 using SgValidateFn = int (*)(const uint8_t* def, const uint8_t* setup);
@@ -1627,7 +1627,7 @@ using SgSetupJobFn = int (*)(int world, const uint8_t* setup);
 static SgValidateFn g_origSgValidate = nullptr;
 static SgSetupJobFn g_origSgSetupJob = nullptr;
 static thread_local bool t_sgValidatorRan = false;
-static std::atomic<uint32_t> g_sgPassed{0}, g_sgKept{0};
+static std::atomic<uint32_t> g_sgPassed{0}, g_sgKept{0}, g_sgClient{0};
 
 static void SgLogFailures(const setupguard::Failure* f, size_t n, const char* verdict) {
     char line[1024];
@@ -1653,6 +1653,17 @@ static int hkSgValidate(const uint8_t* def, const uint8_t* setup) {
     t_sgValidatorRan = true;
     const int rc = g_origSgValidate(def, setup);
     if (rc == 0 || !def || !setup) return rc;
+    // Only the host's own check (setupguard.h, HOST ONLY). On a client the game drops a
+    // rejected setup and keeps the bike as it was; letting it through there applied a tyre
+    // size into a list that bike never built, and the game froze minutes later.
+    if (!setupguard::IsHostSetup((uintptr_t)setup - g_base)) {
+        const uint32_t k = g_sgClient.fetch_add(1) + 1;
+        if (sessionguards::ShouldLog(k))
+            Log("[setupguard] a rider's setup was rejected on this client (setup at +0x%llX): left to "
+                "the game, which keeps that bike's old setup. %u so far.",
+                (unsigned long long)((uintptr_t)setup - g_base), k);
+        return rc;
+    }
     setupguard::Failure f[48];
     bool ok = false;
     size_t n = SgEvaluate(def, setup, f, 48, &ok);
@@ -1682,7 +1693,8 @@ static void InstallSetupBanGuard() {
     if (!SsgMxbOnly("setupguard")) return;
     if (!setupguard_on.load()) { Log("[setupguard] off by config (setupguard=0)"); return; }
     if (g_origSgValidate || g_unloading.load()) return;
-    if (!SsgCodeIs(kRvaValidator, kValidator, kValidatorLen) || !SsgCodeIs(kRvaSetupJob, kSetupJob, kSetupJobLen)) {
+    if (!SsgCodeIs(kRvaValidator, kValidator, kValidatorLen) || !SsgCodeIs(kRvaSetupJob, kSetupJob, kSetupJobLen) ||
+        !SsgCodeIs(kRvaHostPoster, kHostPoster, kHostPosterLen)) {
         Log("[setupguard] not applied: the setup check is not beta21f's (another game build). Nothing patched.");
         return;
     }
@@ -1696,7 +1708,8 @@ static void InstallSetupBanGuard() {
         g_origSgSetupJob = nullptr;   // the validator hook alone still applies the fix
     }
     Log("[setupguard] on: when this game hosts, a tyre size checked against an empty size list no "
-        "longer bans the rider for \"Cheat - Bike Setup\" (beta21f, +0x%llX)", (unsigned long long)kRvaValidator);
+        "longer bans the rider for \"Cheat - Bike Setup\" (beta21f, +0x%llX). Host check only: on a "
+        "client the game's own answer stands.", (unsigned long long)kRvaValidator);
 }
 
 static void InstallSessionGuardsImpl() {

@@ -79,6 +79,24 @@ int main() {
     n = Evaluate(d3.data(), s4.data(), f, 48);
     CHECK(n == 1 && !OnlyBroken(f, n), "absurd size index keeps the ban");
 
+    // Host only: the poster's own bytes name the table, the stride and the setup offset.
+    int32_t lea; std::memcpy(&lea, kHostPoster + 3, 4);
+    CHECK(kRvaHostPoster + 7 + lea == kRvaHostClients, "poster's lea is the host client table");
+    int32_t stride; std::memcpy(&stride, kHostPoster + 20, 4);
+    CHECK((size_t)stride == kHostClientSize, "poster's imul is the connection size");
+    int32_t soff; std::memcpy(&soff, kHostPoster + 28, 4);
+    CHECK((size_t)soff == kHostSetupOff, "poster's lea rbx is the setup offset");
+    CHECK(kHostPoster[51] == 0xB9 && kHostPoster[52] == 0x87 && kHostPoster[53] == 0x02, "poster posts job 0x287");
+    CHECK(kRvaHostClients + 4 + kHostClientSize * (kHostClients - 1) < 0x4C2DD4 &&
+          kRvaHostClients + 4 + kHostClientSize * kHostClients >= 0x4C2DD4, "100 connections, as the walk");
+    CHECK(IsHostSetup(kRvaHostClients + kHostSetupOff), "first connection is the host's");
+    CHECK(IsHostSetup(kRvaHostClients + kHostSetupOff + kHostClientSize * 99), "last connection");
+    CHECK(!IsHostSetup(kRvaHostClients + kHostSetupOff + kHostClientSize * 100), "past the table");
+    CHECK(!IsHostSetup(kRvaHostClients + kHostSetupOff + 4), "not a setup's start");
+    CHECK(!IsHostSetup(0xF4EE20 + 0x5840), "a client's rider-list setup is not the host's");
+    CHECK(!IsHostSetup(0xF4EE20 + 0x5840 + 0x5B24 * 7), "nor any other rider's");
+    CHECK(!IsHostSetup(0), "null");
+
     if (g_failures) { std::printf("%d failure(s)\n", g_failures); return 1; }
     std::printf("setupguard: all checks passed\n");
     return 0;

@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-11-25 - v0.54.1
+
+A fix for a game freeze online, and a record of any freeze that is left.
+
+### Fixed
+- **The game froze mid-lap online a few minutes after another rider joined.** FrostMod
+  0.53.3's fix for the beta21f "Cheat - Bike Setup" ban is for the host: when the host's check
+  rejects a rider's setup only because the server built that bike's tyre-size list empty, the
+  setup is let through. It also ran on every client, where the game checks the other riders'
+  setups again and simply does not apply one it rejects. FrostMod let those through too, so the
+  client applied another rider's setup with a tyre size from a list its copy of that bike does
+  not have ("[setupguard] host rejected a rider's setup ... let through" in a client's log), and
+  the game later stopped responding, around when a rider left. The guard now acts only on the
+  host's own check; on a client the game's answer stands, as before 0.53.3. A host still lets
+  the tyre-size setups through (`setupguard=0` turns that off).
+
+### Added
+- **A stack in frostmod.log when the game freezes.** If the game shows no new frame for 5
+  seconds, FrostMod writes where the game's render thread is (and where every other thread of
+  the game is) to `frostmod.log`, as `[hang]` lines, and once more at 30 seconds. When frames
+  come back it logs how long the pause was, so a long load reads as a load. A freeze otherwise
+  leaves no crash report. `hangwatch=0` in `frostmod_radar.cfg` turns it off.
+
 ## 2026-11-24 - v0.54.0
 
 The Game Integration panel waits for the pause screen, its text shows on track again, and Pip

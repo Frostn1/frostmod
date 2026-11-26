@@ -7384,8 +7384,8 @@ static void HangBeat() {
     HwRefreshModules();
     g_hwQuit = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     g_hwThread = g_hwQuit ? CreateThread(nullptr, 0, HangWatchThread, nullptr, 0, nullptr) : nullptr;
-    Log("[hang] watchdog %s: no frame for %.0f s writes the render thread's stack here",
-        g_hwThread ? "on" : "could NOT start", hangwatch::kStallMs / 1000.0);
+    Log("[hang] watchdog %s: no frame for %.0f s writes the render thread's stack here (render thread %lu)",
+        g_hwThread ? "on" : "could NOT start", hangwatch::kStallMs / 1000.0, GetCurrentThreadId());
 }
 
 static void HangWatchStop(bool canBlock) {

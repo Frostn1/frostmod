@@ -1112,8 +1112,8 @@ static void StartSetupGuard() {
         (unsigned long long)kRvaSetupJob);
 }
 
-constexpr uintptr_t kRvaWriterInit = 0x2837B0;   // writer_init(w, buf, cap)
-constexpr uintptr_t kRvaBuilderCallRet = 0x29D6D0;  // the instruction after the builder's call
+constexpr uintptr_t kRvaWriterInit = 0x2837F0;   // writer_init(w, buf, cap)
+constexpr uintptr_t kRvaBuilderCallRet = 0x29D710;  // the instruction after the builder's call
 
 using WriterInitFn = void* (*)(void*, void*, int);
 static WriterInitFn g_writerInitOrig = nullptr;

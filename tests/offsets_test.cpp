@@ -63,7 +63,7 @@ static void mx_table_is_unchanged() {
     for (int i = 0; i < kMxExpectedCount; ++i)
         CHECK(same(mxb::kReloadSteps[i], kMxExpected[i]), "MX step %d differs", i);
 
-    CHECK(mxb::RVA_RELOAD_STR == 0x33342B, "MX reload_str moved");
+    CHECK(mxb::RVA_RELOAD_STR == 0x33592C, "MX reload_str moved");
     CHECK(mxb::RVA_RELOAD_MODS == 0xE54B44, "MX reload_mods moved");
 }
 

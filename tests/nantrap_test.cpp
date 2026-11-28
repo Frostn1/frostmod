@@ -74,13 +74,13 @@ static void cfg() {
 }
 
 static void signature() {
-    // The first 43 bytes of 0x1BE3A0 in beta21e, transcribed from the disassembly on its own so
+    // The first 43 bytes of 0x1BE3E0 in beta21e, transcribed from the disassembly on its own so
     // an edit to offsets.h is noticed here.
     static const uint8_t kBeta21e[] = {
         0x40, 0x55, 0x48, 0x83, 0xEC, 0x50, 0xFF, 0xC9, 0x0F, 0x29, 0x74, 0x24, 0x30, 0x0F, 0x28,
         0xF1, 0x83, 0xF9, 0x02, 0x0F, 0x87, 0xD2, 0x04, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x60,
         0x48, 0x89, 0x74, 0x24, 0x68, 0x48, 0x89, 0x7C, 0x24, 0x70, 0x48, 0x63, 0xF9};
-    CHECK(mxb::RVA_SIM_STEP == 0x1BE3A0, "rva");
+    CHECK(mxb::RVA_SIM_STEP == 0x1BE3E0, "rva");
     CHECK(std::strlen(mxb::SIG_SIM_STEP_MASK) == sizeof(mxb::SIG_SIM_STEP) - 1,
           "mask and signature the same length");
     CHECK(std::strlen(mxb::SIG_SIM_STEP_MASK) == sizeof(kBeta21e), "signature covers the prologue");

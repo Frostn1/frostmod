@@ -163,7 +163,7 @@ static void TestPtr64() {
     CHECK(kFixedSite[8] == 0x48 && kFixedSite[9] == 0x8b && kFixedSite[10] == 0x09, "mov rcx, [rcx] - 64 bits");
     CHECK(Disp32(kFixedSite + 4) == kSlot, "lea rcx, [rsp+0x2D8]");
     CHECK(kFixedSite[11] == 0xe8 && kRvaFixedSite + 11 + 5 + Disp32(kFixedSite + 12) == kRvaCallee,
-          "beta21f's job calls 0x2A4530");
+          "beta21f's job calls 0x2A4570");
     CHECK(kFixedJob == 864, "job 863 became 864");
     CHECK(kRvaSite + kCallInSite == kRvaBack, "the stub returns to the call");
     CHECK(kCallee[0] == 0x8b && kCallee[1] == 0x11, "0x2A42F0: mov edx, [rcx] - it is a pointer");
@@ -376,7 +376,7 @@ static void TestMipmap() {
     CHECK(kColumn[2] == 0x48 && kColumn[3] == 0x8b && kColumn[4] == 0xfa, "column: rdi = dst");
     CHECK(kRow[2] == 0x48 && kRow[3] == 0x8b && kRow[4] == 0xfa, "row: rdi = dst");
     CHECK(kBox[17] == 0x41 && kBox[18] == 0x8b && kBox[19] == 0xc0, "box: eax = w");
-    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x256190, "faults inside the box filter");
+    CHECK(kRvaFaultWrite > kRvaBox && kRvaFaultRead > kRvaBox && kRvaFaultWrite < 0x2561D0, "faults inside the box filter");
     uint8_t a = 0, b = 0;
     CHECK(Admit(&a, &b) && !Admit(nullptr, &b) && !Admit(&a, nullptr), "NULL either side is refused");
 }

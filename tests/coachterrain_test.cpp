@@ -65,8 +65,8 @@ static void the_slots_come_out_of_the_accessors_own_lea() {
               "any displacement matches (disp %d)", disp);
         CHECK(DecodeSlots(b.data()) == b.data() + mxb::TRACK_SLOT_LEA_END_OFF + disp, "decoded from the lea's end");
     }
-    // beta21e: the lea at RVA 0x1BB57E decodes to 0x568488.
-    CHECK(mxb::RVA_TRACK_SLOT_ACCESSOR + mxb::TRACK_SLOT_LEA_END_OFF + 0x3ACF03 == mxb::RVA_TRACK_SLOTS,
+    // beta21g: the lea at RVA 0x1BB5BE decodes to 0x568488 (beta21e: 0x1BB57E, disp 0x3ACF03).
+    CHECK(mxb::RVA_TRACK_SLOT_ACCESSOR + mxb::TRACK_SLOT_LEA_END_OFF + 0x3ACEC3 == mxb::RVA_TRACK_SLOTS,
           "the recorded RVAs agree with the recorded displacement");
     // Four slots, or a different stride, is a different array.
     std::vector<uint8_t> b = AccessorBytes(0);

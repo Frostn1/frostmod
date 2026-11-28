@@ -58,7 +58,7 @@ namespace nanrecover {
 // ---- the game, mxbikes.exe beta21f (image base 0x140000000) -------------------------------
 /// place-bike: int (int handle, float x, float z, float headingDeg, float y). 0 placed, 1 no
 /// such bike. The bus job 0x25B's handler (0x25A in beta21e) (kRvaJob) is a straight call into it.
-constexpr uintptr_t kRvaReset = 0x197070;
+constexpr uintptr_t kRvaReset = 0x1970B0;
 constexpr uintptr_t kRvaJob   = 0x124A1A;
 using ResetFn = int32_t (*)(int32_t handle, float x, float z, float headingDeg, float y);
 
@@ -116,42 +116,42 @@ struct Check {
 inline constexpr Check kChecks[] = {
     // place-bike: its prologue through the handle lookup, then the suspension reset before it
     // reads the fork and shock, the body placements, and the reset counter.
-    {0x197070, "\x41\x54\x48\x81\xEC\x40\x0C\x00\x00", 9, "place-bike prologue"},
-    {0x1970B2, "\xE8\xE9\x80\x02\x00\x4C\x8B\xE0", 8, "handle -> bike (0x1BF1A0)"},
-    {0x197133, "\xE8\x08\xF4\xFF\xFF", 5, "suspension reset (0x196540) first"},
-    {0x197163, "\xF2\x41\x0F\x10\x84\x24\xC8\x52\x00\x00", 10, "fork [bike+0x52C8]"},
-    {0x197191, "\xF2\x41\x0F\x10\x8C\x24\xF8\x67\x00\x00", 10, "shock [bike+0x67F8]"},
-    {0x1976F5, "\x49\x8B\x8C\x24\x40\x04\x00\x00", 8, "main body [bike+0x440]"},
-    {0x1977D0, "\xE8\x9B\xE5\xFF\xFF", 5, "place bodies (0x195D70)"},
-    {0x197AA4, "\xE8\x87\xDD\xFF\xFF", 5, "place rider (0x195830)"},
-    {0x198227, "\x41\xFE\x44\x24\x3C", 5, "reset counter [bike+0x3C]"},
+    {0x1970B0, "\x41\x54\x48\x81\xEC\x40\x0C\x00\x00", 9, "place-bike prologue"},
+    {0x1970F2, "\xE8\xE9\x80\x02\x00\x4C\x8B\xE0", 8, "handle -> bike (0x1BF1A0)"},
+    {0x197173, "\xE8\x08\xF4\xFF\xFF", 5, "suspension reset (0x196540) first"},
+    {0x1971A3, "\xF2\x41\x0F\x10\x84\x24\xC8\x52\x00\x00", 10, "fork [bike+0x52C8]"},
+    {0x1971D1, "\xF2\x41\x0F\x10\x8C\x24\xF8\x67\x00\x00", 10, "shock [bike+0x67F8]"},
+    {0x197735, "\x49\x8B\x8C\x24\x40\x04\x00\x00", 8, "main body [bike+0x440]"},
+    {0x197810, "\xE8\x9B\xE5\xFF\xFF", 5, "place bodies (0x195D70)"},
+    {0x197AE4, "\xE8\x87\xDD\xFF\xFF", 5, "place rider (0x195830)"},
+    {0x198267, "\x41\xFE\x44\x24\x3C", 5, "reset counter [bike+0x3C]"},
     // the bus job: (handle, x, z, heading, y) from its argument block, straight into place-bike
     {0x124A1A, "\x48\x8D\x84\x24\xD8\x02\x00\x00\xF2\x0F\x5A\x40\x20\xF2\x0F\x5A\x48\x08"
                "\xF2\x0F\x5A\x50\x10\x8B\x08\xF2\x0F\x5A\x58\x18\xF3\x0F\x11\x44\x24\x20"
-               "\xE8\x2D\x26\x07\x00", 41, "bus job 0x25B -> place-bike"},
+               "\xE8\x6D\x26\x07\x00", 41, "bus job 0x25B -> place-bike"},
     // 0x196540 zeroes what we check and it does not place
-    {0x196BBA, "\x4C\x89\xAD\x00\x68\x00\x00", 7, "shock velocity zeroed"},
-    {0x196BC1, "\xF2\x0F\x11\xAD\xF8\x67\x00\x00", 8, "shock length written"},
-    {0x196D50, "\x48\x8D\x9D\x30\x6C\x00\x00", 7, "wheel loop base bike+0x6C30"},
-    {0x196DE0, "\x4C\x89\xAB\x80\xC7\x00\x00", 7, "tyre deflection zeroed"},
-    {0x196E15, "\x4C\x89\xAB\x10\xC1\x00\x00", 7, "wheel spin zeroed"},
+    {0x196BFA, "\x4C\x89\xAD\x00\x68\x00\x00", 7, "shock velocity zeroed"},
+    {0x196C01, "\xF2\x0F\x11\xAD\xF8\x67\x00\x00", 8, "shock length written"},
+    {0x196D90, "\x48\x8D\x9D\x30\x6C\x00\x00", 7, "wheel loop base bike+0x6C30"},
+    {0x196E20, "\x4C\x89\xAB\x80\xC7\x00\x00", 7, "tyre deflection zeroed"},
+    {0x196E55, "\x4C\x89\xAB\x10\xC1\x00\x00", 7, "wheel spin zeroed"},
     // the bodies
-    {0x195D9B, "\x48\x8B\x89\x98\x37\x00\x00", 7, "frame body [bike+0x3798]"},
-    {0x195DB0, "\x83\xBF\xBC\x00\x00\x00\x03", 7, "front gate [bike+0xBC] == 3"},
-    {0x195DB9, "\x48\x8B\x8F\x68\x53\x00\x00", 7, "front body [bike+0x5368]"},
-    {0x195DD3, "\x83\xBF\xF8\x00\x00\x00\x05", 7, "rear gate [bike+0xF8] == 5"},
-    {0x195DDC, "\x48\x8B\x8F\xD8\x68\x00\x00", 7, "rear body [bike+0x68D8]"},
-    {0x195DF6, "\x48\x8B\x8F\xE8\x4B\x01\x00", 7, "wheel 0 body [bike+0x14BE8]"},
-    {0x195E0C, "\x48\x8B\x8F\xF8\x2E\x02\x00", 7, "wheel 1 body [bike+0x22EF8]"},
-    {0x195A6B, "\x48\x8B\x8F\xB8\x3F\x02\x00", 7, "rider body [bike+0x23FB8]"},
+    {0x195DDB, "\x48\x8B\x89\x98\x37\x00\x00", 7, "frame body [bike+0x3798]"},
+    {0x195DF0, "\x83\xBF\xBC\x00\x00\x00\x03", 7, "front gate [bike+0xBC] == 3"},
+    {0x195DF9, "\x48\x8B\x8F\x68\x53\x00\x00", 7, "front body [bike+0x5368]"},
+    {0x195E13, "\x83\xBF\xF8\x00\x00\x00\x05", 7, "rear gate [bike+0xF8] == 5"},
+    {0x195E1C, "\x48\x8B\x8F\xD8\x68\x00\x00", 7, "rear body [bike+0x68D8]"},
+    {0x195E36, "\x48\x8B\x8F\xE8\x4B\x01\x00", 7, "wheel 0 body [bike+0x14BE8]"},
+    {0x195E4C, "\x48\x8B\x8F\xF8\x2E\x02\x00", 7, "wheel 1 body [bike+0x22EF8]"},
+    {0x195AAB, "\x48\x8B\x8F\xB8\x3F\x02\x00", 7, "rider body [bike+0x23FB8]"},
     // ODE's dxBody
-    {0x2AC9DA, "\xF3\x0F\x11\x89\xC0\x00\x00\x00", 8, "dBodySetPosition +0xC0"},
-    {0x2ACAF0, "\x48\x8D\x81\xD0\x00\x00\x00", 7, "dBodyGetRotation +0xD0"},
-    {0x2ACB00, "\x48\x8D\x81\x00\x01\x00\x00", 7, "dBodyGetQuaternion +0x100"},
-    {0x2ACAA0, "\xF3\x0F\x11\x89\x10\x01\x00\x00", 8, "dBodySetLinearVel +0x110"},
-    {0x2ACAC0, "\xF3\x0F\x11\x89\x20\x01\x00\x00", 8, "dBodySetAngularVel +0x120"},
-    {0x2ACBC0, "\xF3\x0F\x58\x89\x30\x01\x00\x00", 8, "dBodyAddForce +0x130"},
-    {0x2ACC00, "\xF3\x0F\x58\x89\x40\x01\x00\x00", 8, "dBodyAddTorque +0x140"},
+    {0x2ACA1A, "\xF3\x0F\x11\x89\xC0\x00\x00\x00", 8, "dBodySetPosition +0xC0"},
+    {0x2ACB30, "\x48\x8D\x81\xD0\x00\x00\x00", 7, "dBodyGetRotation +0xD0"},
+    {0x2ACB40, "\x48\x8D\x81\x00\x01\x00\x00", 7, "dBodyGetQuaternion +0x100"},
+    {0x2ACAE0, "\xF3\x0F\x11\x89\x10\x01\x00\x00", 8, "dBodySetLinearVel +0x110"},
+    {0x2ACB00, "\xF3\x0F\x11\x89\x20\x01\x00\x00", 8, "dBodySetAngularVel +0x120"},
+    {0x2ACC00, "\xF3\x0F\x58\x89\x30\x01\x00\x00", 8, "dBodyAddForce +0x130"},
+    {0x2ACC40, "\xF3\x0F\x58\x89\x40\x01\x00\x00", 8, "dBodyAddTorque +0x140"},
 };
 
 // ---- the check -------------------------------------------------------------------------------

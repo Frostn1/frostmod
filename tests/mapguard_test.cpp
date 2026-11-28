@@ -276,10 +276,10 @@ static void TestWalkerFault() {
     // The batch table the handler trusts is the one the flush's own lea names.
     CHECK(RipTarget(kMapWin, kRvaMapWin, 0, 3, 7) == kRvaBatchTable, "lea r13 names the batch table");
     // The store that crashes is inside the watched range, and so are its two siblings in the
-    // reports (+0x2408C4 texcoords, +0x240904 colours); the loop's count update is not.
-    CHECK(InWalkerStores(0x240A9C) && InWalkerStores(0x240B04) && InWalkerStores(0x240B44), "stores watched");
-    CHECK(!InWalkerStores(0x240BB0) && !InWalkerStores(0x240A8F) && !InWalkerStores(0x240DAC), "only the walker");
-    CHECK(kRvaWalkLoLoop + 12 == 0x240A9C && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24085C");
+    // reports (+0x240904 texcoords, +0x240944 colours); the loop's count update is not.
+    CHECK(InWalkerStores(0x240ADC) && InWalkerStores(0x240B44) && InWalkerStores(0x240B84), "stores watched");
+    CHECK(!InWalkerStores(0x240C30) && !InWalkerStores(0x240ACF) && !InWalkerStores(0x240DEC), "only the walker");
+    CHECK(kRvaWalkLoLoop + 12 == 0x240ADC && kWalkHead[12] == 0x41 && kWalkHead[13] == 0x89, "the store at +0x24089C");
     // The exit we jump to is the walker's own epilogue: xor eax,eax ... pop rsi; ret.
     CHECK(kWalkExit[0] == 0x33 && kWalkExit[kWalkExitLen - 1] == 0xc3 && kWalkExit[kWalkExitLen - 2] == 0x5e,
           "epilogue ends pop rsi; ret");

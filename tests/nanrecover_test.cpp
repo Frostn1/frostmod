@@ -64,44 +64,44 @@ static uint32_t CallTo(const Check* c) {
 static void TestChecks() {
     for (const Check& c : kChecks) CHECK(c.len > 0 && c.len <= 64 && c.what && c.what[0], "check at 0x%X", c.rva);
     // place-bike, and what it calls first
-    const Check* c = Find(0x1970B2);
-    CHECK(CallTo(c) == 0x1BF1A0, "place-bike resolves its handle through 0x1BF1A0");
+    const Check* c = Find(0x1970F2);
+    CHECK(CallTo(c) == 0x1BF1E0, "place-bike resolves its handle through 0x1BF1E0");
     CHECK(c && (uint8_t)c->bytes[5] == 0x4C && (uint8_t)c->bytes[7] == 0xE0, "and keeps the bike in r12");
-    CHECK(CallTo(Find(0x197133)) == 0x196540, "the suspension reset 0x196540 runs first");
-    CHECK(0x197133 < 0x197163 && 0x197133 < 0x197191, "before the fork and shock are read");
-    CHECK(CallTo(Find(0x1977D0)) == 0x195D70, "then the bodies are placed (0x195D70)");
-    CHECK(CallTo(Find(0x197AA4)) == 0x195830, "and the rider (0x195830)");
+    CHECK(CallTo(Find(0x197173)) == 0x196580, "the suspension reset 0x196580 runs first");
+    CHECK(0x197173 < 0x1971A3 && 0x197173 < 0x1971D1, "before the fork and shock are read");
+    CHECK(CallTo(Find(0x197810)) == 0x195DB0, "then the bodies are placed (0x195DB0)");
+    CHECK(CallTo(Find(0x197AE4)) == 0x195870, "and the rider (0x195870)");
     // the fields: r12-based disp32 at byte 6 for movsd, byte 4 for mov rcx, [r12+d]
-    CHECK(Disp(Find(0x197163)->bytes + 6) == (int32_t)kForkLen, "fork at 0x52C8");
-    CHECK(Disp(Find(0x197191)->bytes + 6) == (int32_t)kShockLen, "shock at 0x67F8");
-    CHECK(Disp(Find(0x1976F5)->bytes + 4) == (int32_t)kBodyMain, "main body at 0x440");
-    CHECK(Disp(Find(0x195D9B)->bytes + 3) == (int32_t)kBodyFrame, "frame body at 0x3798");
-    CHECK(Disp(Find(0x195DB9)->bytes + 3) == (int32_t)kBodyFront, "front body at 0x5368");
-    CHECK(Disp(Find(0x195DDC)->bytes + 3) == (int32_t)kBodyRear, "rear body at 0x68D8");
-    CHECK(Disp(Find(0x195DF6)->bytes + 3) == (int32_t)kBodyWheel, "wheel 0 body at 0x14BE8");
-    CHECK(Disp(Find(0x195E0C)->bytes + 3) == (int32_t)(kBodyWheel + kWheelStride), "wheel 1 body one stride on");
-    CHECK(Disp(Find(0x195A6B)->bytes + 3) == (int32_t)kBodyRider, "rider body at 0x23FB8");
-    CHECK(Disp(Find(0x195DB0)->bytes + 2) == (int32_t)kGateFront && Find(0x195DB0)->bytes[6] == kGateFrontNone,
+    CHECK(Disp(Find(0x1971A3)->bytes + 6) == (int32_t)kForkLen, "fork at 0x52C8");
+    CHECK(Disp(Find(0x1971D1)->bytes + 6) == (int32_t)kShockLen, "shock at 0x67F8");
+    CHECK(Disp(Find(0x197735)->bytes + 4) == (int32_t)kBodyMain, "main body at 0x440");
+    CHECK(Disp(Find(0x195DDB)->bytes + 3) == (int32_t)kBodyFrame, "frame body at 0x3798");
+    CHECK(Disp(Find(0x195DF9)->bytes + 3) == (int32_t)kBodyFront, "front body at 0x5368");
+    CHECK(Disp(Find(0x195E1C)->bytes + 3) == (int32_t)kBodyRear, "rear body at 0x68D8");
+    CHECK(Disp(Find(0x195E36)->bytes + 3) == (int32_t)kBodyWheel, "wheel 0 body at 0x14BE8");
+    CHECK(Disp(Find(0x195E4C)->bytes + 3) == (int32_t)(kBodyWheel + kWheelStride), "wheel 1 body one stride on");
+    CHECK(Disp(Find(0x195AAB)->bytes + 3) == (int32_t)kBodyRider, "rider body at 0x23FB8");
+    CHECK(Disp(Find(0x195DF0)->bytes + 2) == (int32_t)kGateFront && Find(0x195DF0)->bytes[6] == kGateFrontNone,
           "cmp [bike+0xBC], 3");
-    CHECK(Disp(Find(0x195DD3)->bytes + 2) == (int32_t)kGateRear && Find(0x195DD3)->bytes[6] == kGateRearNone,
+    CHECK(Disp(Find(0x195E13)->bytes + 2) == (int32_t)kGateRear && Find(0x195E13)->bytes[6] == kGateRearNone,
           "cmp [bike+0xF8], 5");
     // what 0x196540 zeroes: shock velocity, and per wheel (base bike+0x6C30) spin and deflection
-    CHECK(Disp(Find(0x196BBA)->bytes + 3) == (int32_t)kShockVel, "shock velocity zeroed");
-    CHECK(Disp(Find(0x196BC1)->bytes + 4) == (int32_t)kShockLen, "shock length rewritten");
-    const int32_t base = Disp(Find(0x196D50)->bytes + 3);
+    CHECK(Disp(Find(0x196BFA)->bytes + 3) == (int32_t)kShockVel, "shock velocity zeroed");
+    CHECK(Disp(Find(0x196C01)->bytes + 4) == (int32_t)kShockLen, "shock length rewritten");
+    const int32_t base = Disp(Find(0x196D90)->bytes + 3);
     CHECK(base == 0x6C30, "wheel loop base");
-    CHECK(base + Disp(Find(0x196E15)->bytes + 3) == (int32_t)kWheelSpin, "spin zeroed");
-    CHECK(base + Disp(Find(0x196DE0)->bytes + 3) == (int32_t)kWheelDefl, "deflection zeroed");
-    CHECK((uint8_t)Find(0x198227)->bytes[1] == 0xFE && Find(0x198227)->bytes[4] == (char)kBikeResets,
+    CHECK(base + Disp(Find(0x196E55)->bytes + 3) == (int32_t)kWheelSpin, "spin zeroed");
+    CHECK(base + Disp(Find(0x196E20)->bytes + 3) == (int32_t)kWheelDefl, "deflection zeroed");
+    CHECK((uint8_t)Find(0x198267)->bytes[1] == 0xFE && Find(0x198267)->bytes[4] == (char)kBikeResets,
           "inc byte [r12+0x3C]: the reset counter");
     // ODE's dxBody
-    CHECK(Disp(Find(0x2AC9DA)->bytes + 4) == (int32_t)kBodyPos, "pos");
-    CHECK(Disp(Find(0x2ACAF0)->bytes + 3) == (int32_t)kBodyR, "R");
-    CHECK(Disp(Find(0x2ACB00)->bytes + 3) == (int32_t)kBodyQ, "q");
-    CHECK(Disp(Find(0x2ACAA0)->bytes + 4) == (int32_t)kBodyLvel, "lvel");
-    CHECK(Disp(Find(0x2ACAC0)->bytes + 4) == (int32_t)kBodyAvel, "avel");
-    CHECK(Disp(Find(0x2ACBC0)->bytes + 4) == (int32_t)kBodyFacc, "facc");
-    CHECK(Disp(Find(0x2ACC00)->bytes + 4) == (int32_t)kBodyTacc, "tacc");
+    CHECK(Disp(Find(0x2ACA1A)->bytes + 4) == (int32_t)kBodyPos, "pos");
+    CHECK(Disp(Find(0x2ACB30)->bytes + 3) == (int32_t)kBodyR, "R");
+    CHECK(Disp(Find(0x2ACB40)->bytes + 3) == (int32_t)kBodyQ, "q");
+    CHECK(Disp(Find(0x2ACAE0)->bytes + 4) == (int32_t)kBodyLvel, "lvel");
+    CHECK(Disp(Find(0x2ACB00)->bytes + 4) == (int32_t)kBodyAvel, "avel");
+    CHECK(Disp(Find(0x2ACC00)->bytes + 4) == (int32_t)kBodyFacc, "facc");
+    CHECK(Disp(Find(0x2ACC40)->bytes + 4) == (int32_t)kBodyTacc, "tacc");
     CHECK(kBodyQ == kBodyR + 0x30 && kBodyLvel == kBodyQ + 0x10, "dxBody posr then q then lvel");
 }
 
@@ -450,13 +450,13 @@ static const uint8_t kSetPosition[] = {   // 0x2AC9D0 dBodySetPosition (beta21e 
     0x00, 0x00, 0x48, 0x85, 0xdb, 0x74, 0x18, 0x48, 0x8b, 0xcb, 0xe8, 0x01, 0x34, 0x00, 0x00, 0x48,
     0x8b, 0xcb, 0xe8, 0x49, 0x1b, 0x00, 0x00, 0x48, 0x8b, 0xd8, 0x48, 0x85, 0xc0, 0x75, 0xe8, 0x48,
     0x83, 0xc4, 0x20, 0x5b, 0xc3};
-static const uint8_t kSetLinearVel[] = {   // 0x2ACAA0
+static const uint8_t kSetLinearVel[] = {   // 0x2ACAE0
     0xf3, 0x0f, 0x11, 0x89, 0x10, 0x01, 0x00, 0x00, 0xf3, 0x0f, 0x11, 0x91, 0x14, 0x01, 0x00, 0x00,
     0xf3, 0x0f, 0x11, 0x99, 0x18, 0x01, 0x00, 0x00, 0xc3};
-static const uint8_t kSetAngularVel[] = {   // 0x2ACAC0
+static const uint8_t kSetAngularVel[] = {   // 0x2ACB00
     0xf3, 0x0f, 0x11, 0x89, 0x20, 0x01, 0x00, 0x00, 0xf3, 0x0f, 0x11, 0x91, 0x24, 0x01, 0x00, 0x00,
     0xf3, 0x0f, 0x11, 0x99, 0x28, 0x01, 0x00, 0x00, 0xc3};
-static const uint8_t kAddForce[] = {   // 0x2ACBC0
+static const uint8_t kAddForce[] = {   // 0x2ACC00
     0xf3, 0x0f, 0x58, 0x89, 0x30, 0x01, 0x00, 0x00, 0xf3, 0x0f, 0x58, 0x91, 0x34, 0x01, 0x00, 0x00,
     0xf3, 0x0f, 0x58, 0x99, 0x38, 0x01, 0x00, 0x00, 0xf3, 0x0f, 0x11, 0x89, 0x30, 0x01, 0x00, 0x00,
     0xf3, 0x0f, 0x11, 0x91, 0x34, 0x01, 0x00, 0x00, 0xf3, 0x0f, 0x11, 0x99, 0x38, 0x01, 0x00, 0x00, 0xc3};
@@ -480,9 +480,9 @@ static void TestLive() {
     const Set3 addTorque = put(kAddTorque, sizeof(kAddTorque));
     FlushInstructionCache(GetCurrentProcess(), mem, 0x1000);
     // The bytes the install checks are these functions' own.
-    CHECK(std::memcmp(kSetPosition + 10, Find(0x2AC9DA)->bytes, 8) == 0, "dBodySetPosition matches its check");
-    CHECK(std::memcmp(kSetLinearVel, Find(0x2ACAA0)->bytes, 8) == 0, "dBodySetLinearVel matches its check");
-    CHECK(std::memcmp(kAddForce, Find(0x2ACBC0)->bytes, 8) == 0, "dBodyAddForce matches its check");
+    CHECK(std::memcmp(kSetPosition + 10, Find(0x2ACA1A)->bytes, 8) == 0, "dBodySetPosition matches its check");
+    CHECK(std::memcmp(kSetLinearVel, Find(0x2ACAE0)->bytes, 8) == 0, "dBodySetLinearVel matches its check");
+    CHECK(std::memcmp(kAddForce, Find(0x2ACC00)->bytes, 8) == 0, "dBodyAddForce matches its check");
 
     FakeBike fb;   // geom pointer [body+0x40] is null: dBodySetPosition writes and returns
     Bad bad;

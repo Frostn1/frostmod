@@ -177,7 +177,7 @@ inline bool BuildSitePatch(uintptr_t siteVa, uintptr_t stubVa, size_t len, uint8
 
 // ---- family 2: the animation phase -----------------------------------------------------
 // 0x2202E1 .. 0x22030B: keys, phase, key = (int)((keys-1)*t), and the branch on key+1 < keys.
-constexpr uint32_t kAnimWin = 0x2202E1;
+constexpr uint32_t kAnimWin = 0x220321;
 constexpr uint8_t  kAnimWinBytes[] = {
     0x8b, 0x4d, 0x64,                          // mov ecx, [rbp+0x64]      keys
     0xf3, 0x0f, 0x10, 0xb5, 0x84, 0x00, 0x00, 0x00,   // movss xmm6, [rbp+0x84]  t
@@ -191,10 +191,10 @@ constexpr uint8_t  kAnimWinBytes[] = {
     0x7c, 0x52,                                // jl 0x220359
 };
 constexpr size_t   kAnimWinLen = sizeof(kAnimWinBytes);
-constexpr uint32_t kAnimSite = 0x2202FA;
+constexpr uint32_t kAnimSite = 0x22033A;
 constexpr size_t   kAnimLen  = 8;              // cvttss2si + lea
-constexpr uint32_t kAnimBack = 0x220302;       // cmp r9d, ecx
-constexpr uint32_t kAnimFault = 0x2686C0;
+constexpr uint32_t kAnimBack = 0x220342;       // cmp r9d, ecx
+constexpr uint32_t kAnimFault = 0x268700;
 
 /// Phase NaN: t = 0 (register and [rbp+0x84]), key 0, counted. Then key is held to
 /// [0, keys-1] (keys in ecx). Touches xmm6 (only when it is NaN), edx, r9d and the flags,
@@ -243,14 +243,14 @@ inline int AnimKey(float t, int keys, bool* nan) {
 
 // ---- family 3: NULL objects ------------------------------------------------------------
 // +0x2544A3: `bt dword [rax+0x110], 8` then `jb 0x2547AC` (skip this item).
-constexpr uint32_t kNull1Site = 0x2544A3;
+constexpr uint32_t kNull1Site = 0x2544E3;
 constexpr uint8_t  kNull1Bytes[] = {0x0f, 0xba, 0xa0, 0x10, 0x01, 0x00, 0x00, 0x08,   // bt [rax+0x110], 8
                                     0x0f, 0x82, 0xfb, 0x02, 0x00, 0x00};               // jb 0x2547AC
 constexpr size_t   kNull1Len  = sizeof(kNull1Bytes);
-constexpr uint32_t kNull1Skip = 0x2547AC;    // inc ebp; cmp ebp, edi; jl (the next item)
-constexpr uint32_t kNull1Back = 0x2544B1;
-constexpr uint8_t  kNull1Call[] = {0xe8, 0x35, 0x78, 0xf0, 0xff};   // 0x254496 call 0x15BCD0
-constexpr uint32_t kNull1CallRva = 0x254496;
+constexpr uint32_t kNull1Skip = 0x2547EC;    // inc ebp; cmp ebp, edi; jl (the next item)
+constexpr uint32_t kNull1Back = 0x2544F1;
+constexpr uint8_t  kNull1Call[] = {0xe8, 0xF5, 0x77, 0xf0, 0xff};   // 0x254496 call 0x15BCD0
+constexpr uint32_t kNull1CallRva = 0x2544D6;
 
 inline size_t BuildNull1(uint8_t* s, uintptr_t stubVa, uint64_t base, uint64_t counter) {
     Emit e{s, 0, stubVa};
@@ -267,14 +267,14 @@ inline size_t BuildNull1(uint8_t* s, uintptr_t stubVa, uint64_t base, uint64_t c
 }
 
 // +0x290371: rcx = [rbx]; `mov rax, [rcx]` and `call [rax+0x58]`.
-constexpr uint32_t kNull2Site = 0x290371;
+constexpr uint32_t kNull2Site = 0x2903B1;
 constexpr uint8_t  kNull2Bytes[] = {0x48, 0x8b, 0x01,   // mov rax, [rcx]
                                     0xff, 0x50, 0x58};  // call [rax+0x58]
 constexpr size_t   kNull2Len  = sizeof(kNull2Bytes);
-constexpr uint32_t kNull2Fail = 0x2903E2;               // mov eax, 1: the failure return
-constexpr uint32_t kNull2Back = 0x290377;
+constexpr uint32_t kNull2Fail = 0x290422;               // mov eax, 1: the failure return
+constexpr uint32_t kNull2Back = 0x2903B7;
 constexpr uint8_t  kNull2Load[] = {0x48, 0x8b, 0x0b};   // 0x290367 mov rcx, [rbx]
-constexpr uint32_t kNull2LoadRva = 0x290367;
+constexpr uint32_t kNull2LoadRva = 0x2903A7;
 
 inline size_t BuildNull2(uint8_t* s, uintptr_t stubVa, uint64_t base, uint64_t counter) {
     Emit e{s, 0, stubVa};

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-27 - v0.54.2
+
+MX Bikes beta21g support.
+
+### Changed
+- **beta21g (Steam build 26980871).** PiBoSo's update moved most of the game's code by 0x40
+  bytes. Every address FrostMod, MXB Coach and FrostServer's setup fix use is moved with it, so
+  all crash guards, the trainer guards, the setup-ban fix, Aussie mode's check and the server
+  browser work on the new build. Nothing about how they behave changed. beta21f is no longer
+  supported; update the game.
+
 ## 2026-11-25 - v0.54.1
 
 A fix for a game freeze online, and a record of any freeze that is left.

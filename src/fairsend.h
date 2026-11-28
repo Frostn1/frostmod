@@ -48,7 +48,7 @@ namespace fairsend {
 // ---- the game's candidate list ----------------------------------------------------------
 // RVAs from the module base, MX Bikes. The builder memsets the whole array at entry, so a
 // record whose slot pointer is null has not been filled this pass.
-constexpr uintptr_t kRvaBuilder    = 0x29C9A0;  // builds SERVER_DATA for one recipient
+constexpr uintptr_t kRvaBuilder    = 0x29C9E0;  // builds SERVER_DATA for one recipient
 constexpr uintptr_t kRvaCandidates = 0x9D7460;  // the candidate array
 constexpr uintptr_t kRvaServerTick = 0x9E3AC0;  // the current network tick
 constexpr size_t    kRecStride     = 0x20;      // 32 bytes per candidate

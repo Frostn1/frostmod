@@ -146,10 +146,10 @@ constexpr char SIG_SCAN_FOLDER_MASK[] = "xxxxxxxxxxxxxxxxxxxx";
 //     (filled on JOIN, msg 0x385 -> RVA_SB_CONNECT_TARGET; flag = password/lock bit)
 
 // ---- transport (UDP, ws2_32) ----
-constexpr uintptr_t RVA_NET_RECVFROM_W   = 0x284D30; // recvfrom wrapper(sock rcx, buf rdx, len r8)
-constexpr uintptr_t RVA_NET_SENDTO_W     = 0x284DF0; // sendto wrapper
-constexpr uintptr_t RVA_NET_RESOLVE_HOST = 0x285700; // host:port -> getaddrinfo
-constexpr uintptr_t RVA_NET_DISPATCH     = 0x284670; // recv + per-peer dispatch
+constexpr uintptr_t RVA_NET_RECVFROM_W   = 0x284D70; // recvfrom wrapper(sock rcx, buf rdx, len r8)
+constexpr uintptr_t RVA_NET_SENDTO_W     = 0x284E30; // sendto wrapper
+constexpr uintptr_t RVA_NET_RESOLVE_HOST = 0x285740; // host:port -> getaddrinfo
+constexpr uintptr_t RVA_NET_DISPATCH     = 0x2846B0; // recv + per-peer dispatch
 constexpr uintptr_t RVA_NET_PEER_BASE    = 0x3993B0; // peer/conn table base (stride 0x5B4)
 constexpr uintptr_t RVA_NET_PEER_COUNT   = 0x3993AC; // peer count (cap 10)
 
@@ -158,16 +158,16 @@ constexpr uintptr_t RVA_NET_PEER_COUNT   = 0x3993AC; // peer count (cap 10)
 // as TEXT into the blob at 0x9E3AE0. Hooking 0x2A10E0 (clean prologue + AOB) and
 // editing that blob before the browser parses it lets us drop spam servers with
 // no code cave. Blob is records via read_str (NUL/\n) + read_u32.
-constexpr uintptr_t RVA_MP_MSG_HANDLER   = 0x2A1320; // client opcode handler; HOSTED = server-list reply
-constexpr uintptr_t RVA_MP_REFRESH_DRV   = 0x2A6AD0; // sends GETLIST to masters, 3000ms refresh timer
-constexpr uintptr_t RVA_MP_ENDPOINT_ADD  = 0x2A8570; // append MASTER endpoint (not game servers), cap 10
+constexpr uintptr_t RVA_MP_MSG_HANDLER   = 0x2A1360; // client opcode handler; HOSTED = server-list reply
+constexpr uintptr_t RVA_MP_REFRESH_DRV   = 0x2A6B10; // sends GETLIST to masters, 3000ms refresh timer
+constexpr uintptr_t RVA_MP_ENDPOINT_ADD  = 0x2A85B0; // append MASTER endpoint (not game servers), cap 10
 constexpr uintptr_t RVA_MP_ENDPOINT_BASE = 0x597560; // master endpoint array (stride 0x28, cap 10)
 constexpr uintptr_t RVA_MP_ENDPOINT_CNT  = 0x3D8014; // master endpoint count
 constexpr uintptr_t RVA_MP_LIST_BLOB     = 0x9E3AE0; // HOSTED payload text buffer (written by 0x2A10E0)
 constexpr uintptr_t RVA_MP_STATE         = 0x9D7AA4; // 0 idle /1 requesting /2 connected /3 list-complete
-constexpr uintptr_t RVA_MP_READ_INIT     = 0x2837C0; // reader: init
-constexpr uintptr_t RVA_MP_READ_U32      = 0x2836B0; // reader: read_u32
-constexpr uintptr_t RVA_MP_READ_STR      = 0x283A20; // reader: read_str (inline NUL/\n-terminated)
+constexpr uintptr_t RVA_MP_READ_INIT     = 0x283800; // reader: init
+constexpr uintptr_t RVA_MP_READ_U32      = 0x2836F0; // reader: read_u32
+constexpr uintptr_t RVA_MP_READ_STR      = 0x283A60; // reader: read_str (inline NUL/\n-terminated)
 
 // ---- world session: the browser's own master login (RE'd 2026-09-16) ---------
 // What actually prints "connection timeout". One global state machine drives the in-game
@@ -376,8 +376,8 @@ constexpr char SIG_GHS_SAVE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // arg3 is the out-pointer: the prologue homes r8 to [rsp+0x18] and the success path writes
 // [rax], [rax+4], [rax+8] through it. arg5 is read at [rsp+0x170], which is entry [rsp+0x28]
 // once the `push rbx` and `sub rsp,0x140` are accounted for.
-constexpr uintptr_t RVA_TERRAIN_SAMPLE = 0x1F1960;  // the bilinear height sample
-constexpr uintptr_t RVA_TERRAIN_FAULT  = 0x1F1B63;  // the corner read that faults, for the log
+constexpr uintptr_t RVA_TERRAIN_SAMPLE = 0x1F19A0;  // the bilinear height sample
+constexpr uintptr_t RVA_TERRAIN_FAULT  = 0x1F1BA3;  // the corner read that faults, for the log
 constexpr size_t    OFF_TERRAIN_GRID   = 0x750;     // qword: the 16-bit height grid, or null
 constexpr size_t    OFF_TERRAIN_WIDTH  = 0x740;     // dword
 constexpr size_t    OFF_TERRAIN_HEIGHT = 0x744;     // dword
@@ -394,8 +394,8 @@ constexpr char SIG_TERRAIN_SAMPLE_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 // of 0x1F1720. A NaN faults at 0x1F1EFC (a player's dump, 2026-09-27). 0x1F5AC0 calls it
 // first and bails on 1, so guarding this covers that caller's own grid read too.
 // Map: game/terrain.c.
-constexpr uintptr_t RVA_TERRAIN_SAMPLE2 = 0x1F1F50;
-constexpr uintptr_t RVA_TERRAIN_FAULT2  = 0x1F213C;
+constexpr uintptr_t RVA_TERRAIN_SAMPLE2 = 0x1F1F90;
+constexpr uintptr_t RVA_TERRAIN_FAULT2  = 0x1F217C;
 // 38 fixed bytes, no RIP-relative operand. Unique in beta21e's .text.
 constexpr char SIG_TERRAIN_SAMPLE2[] =
     "\x4C\x89\x44\x24\x18\x41\x57\x48\x81\xEC\xC0\x00\x00\x00\x48\x83\xB9\x50\x07"
@@ -412,7 +412,7 @@ constexpr char SIG_TERRAIN_SAMPLE2_MASK[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 //
 // No ldmxcsr / stmxcsr anywhere in the exe, and no _controlfp/_statusfp import: the game
 // never reads or sets MXCSR itself, so what the trap does to it is invisible to the game.
-constexpr uintptr_t RVA_SIM_STEP = 0x1BE3A0;
+constexpr uintptr_t RVA_SIM_STEP = 0x1BE3E0;
 // The prologue through the slot check, the ja's rel32 masked. Unique in beta21e's .text.
 constexpr char SIG_SIM_STEP[] =
     "\x40\x55\x48\x83\xEC\x50\xFF\xC9\x0F\x29\x74\x24\x30\x0F\x28\xF1\x83\xF9\x02\x0F\x87"
@@ -436,7 +436,7 @@ constexpr char SIG_SIM_STEP_MASK[] = "xxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxx
 // accessor at 0x1BB570 indexes (`dec ecx; cmp ecx,2; ja; lea rax,[rip+disp]; imul rcx,0x6160`).
 // Decoded from that lea at runtime, as for the GHS table. On a loaded track slots 1 and 2 both
 // carry its grid; slot 3 was empty.
-constexpr uintptr_t RVA_TRACK_SLOT_ACCESSOR = 0x1BB570;
+constexpr uintptr_t RVA_TRACK_SLOT_ACCESSOR = 0x1BB5B0;
 constexpr uintptr_t RVA_TRACK_SLOTS         = 0x568488;  // .data, what the lea decodes to
 constexpr size_t    TRACK_SLOT_STRIDE       = 0x6160;
 constexpr int       TRACK_SLOT_COUNT        = 3;
@@ -588,7 +588,7 @@ constexpr int kReloadStepCount = (int)(sizeof(kReloadSteps) / sizeof(kReloadStep
 // The two operands the DIR steps pass. `RELOAD_STR` is the empty string the game hands
 // its loaders for "the game dir" (cwd); `RELOAD_MODS` is the mods-folder path global,
 // scanned only when non-empty — exactly the `cmp byte ptr [mods], 0 / je` the game does.
-constexpr uintptr_t RVA_RELOAD_STR  = 0x33342B;
+constexpr uintptr_t RVA_RELOAD_STR  = 0x33592C;   // the NUL after "mods" (rederive derives it)
 constexpr uintptr_t RVA_RELOAD_MODS = 0xE54B44;
 
 // ---- live paints (add-only) -------------------------------------------------
